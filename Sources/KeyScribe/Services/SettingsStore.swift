@@ -5,8 +5,6 @@ import Foundation
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
-    private static let supportedShortcutModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift, .function]
-    private static let modifierOnlyKeyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
     private static let defaultShortcutKeyCode: UInt16 = 49
     private static let defaultShortcutModifiers: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
 
@@ -133,7 +131,7 @@ final class SettingsStore: ObservableObject {
             ? Self.defaultShortcutModifiers
             : UInt(storedModifiers)
 
-        if !Self.isValidShortcut(keyCode: initialShortcutKeyCode, modifiers: initialShortcutModifiers) {
+        if !ShortcutValidationRules.isValid(keyCode: initialShortcutKeyCode, modifiers: initialShortcutModifiers) {
             initialShortcutKeyCode = Self.defaultShortcutKeyCode
             initialShortcutModifiers = Self.defaultShortcutModifiers
         }
@@ -248,7 +246,7 @@ final class SettingsStore: ObservableObject {
     }
 
     var shortcutModifierFlags: NSEvent.ModifierFlags {
-        NSEvent.ModifierFlags(rawValue: shortcutModifiers)
+        ShortcutValidationRules.filteredModifiers(rawValue: shortcutModifiers)
     }
 
     var textCleanupMode: TextCleanupMode {
@@ -266,27 +264,5 @@ final class SettingsStore: ObservableObject {
         } else {
             shortcutModifiers &= ~modifier.rawValue
         }
-    }
-
-    private static func modifierCount(_ flags: NSEvent.ModifierFlags) -> Int {
-        var count = 0
-        if flags.contains(.function) { count += 1 }
-        if flags.contains(.control) { count += 1 }
-        if flags.contains(.option) { count += 1 }
-        if flags.contains(.shift) { count += 1 }
-        if flags.contains(.command) { count += 1 }
-        return count
-    }
-
-    private static func isValidShortcut(keyCode: UInt16, modifiers: UInt) -> Bool {
-        let filteredModifiers = NSEvent.ModifierFlags(rawValue: modifiers).intersection(supportedShortcutModifiers)
-        let count = modifierCount(filteredModifiers)
-
-        if keyCode == UInt16.max {
-            return (2...3).contains(count)
-        }
-
-        guard !modifierOnlyKeyCodes.contains(keyCode) else { return false }
-        return (1...2).contains(count)
     }
 }

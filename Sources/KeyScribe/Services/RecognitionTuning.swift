@@ -24,6 +24,22 @@ enum RecognitionTuning {
     }
 
     static func contextualHints(defaults: [String], custom: [String], limit: Int = 80) -> [String] {
-        Array(Set(defaults + custom)).prefix(limit).map { $0 }
+        guard limit > 0 else { return [] }
+
+        var seen = Set<String>()
+        var ordered: [String] = []
+
+        for phrase in defaults + custom {
+            let normalized = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else { continue }
+            if seen.insert(normalized).inserted {
+                ordered.append(normalized)
+                if ordered.count == limit {
+                    break
+                }
+            }
+        }
+
+        return ordered
     }
 }

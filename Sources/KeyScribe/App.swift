@@ -351,29 +351,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         let result = TextInserter.insert(text, copyToClipboard: settings.copyToClipboard)
-        switch result {
-        case .pasted:
-            statusLabelItem?.title = "Ready"
-            lastTargetApplication = nil
-        case .copiedOnly:
-            if retriesRemaining > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, retriesRemaining: retriesRemaining - 1)
-                }
-            } else {
-                statusLabelItem?.title = "Copied to clipboard"
-                lastTargetApplication = nil
+        let plan = InsertionRetryPolicy.plan(for: result, retriesRemaining: retriesRemaining)
+
+        switch plan {
+        case .retry(let delay, let nextRetriesRemaining):
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.attemptInsertText(text, retriesRemaining: nextRetriesRemaining)
             }
-        case .notInserted:
-            if retriesRemaining > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, retriesRemaining: retriesRemaining - 1)
-                }
-            } else {
-                statusLabelItem?.title = "Paste unavailable"
-                lastTargetApplication = nil
+        case .complete(let statusMessage):
+            if let statusMessage {
+                statusLabelItem?.title = statusMessage
             }
-        case .empty:
             lastTargetApplication = nil
         }
     }
@@ -462,7 +450,7 @@ struct SettingsView: View {
             ShortcutCaptureMonitor(
                 isCapturing: $isCapturingShortcut,
                 onCapture: { keyCode, modifiers in
-                    let filteredModifiers = NSEvent.ModifierFlags(rawValue: modifiers).intersection(shortcutModifierMask).rawValue
+                    let filteredModifiers = ShortcutValidationRules.filteredModifiers(rawValue: modifiers).rawValue
                     guard isValidShortcut(keyCode: keyCode, modifiers: filteredModifiers) else {
                         shortcutCaptureMessage = "Shortcut must use 2 or 3 keys. Try again."
                         return
@@ -647,11 +635,7 @@ struct SettingsView: View {
     }
 
     private var shortcutModifierMask: NSEvent.ModifierFlags {
-        [.command, .option, .control, .shift, .function]
-    }
-
-    private var modifierOnlyKeyCodes: Set<UInt16> {
-        [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+        ShortcutValidationRules.supportedModifiers
     }
 
     private var shortcutSegments: [String] {
@@ -676,25 +660,7 @@ struct SettingsView: View {
     }
 
     private func isValidShortcut(keyCode: UInt16, modifiers: UInt) -> Bool {
-        let flags = NSEvent.ModifierFlags(rawValue: modifiers).intersection(shortcutModifierMask)
-        let modifierCount = countModifiers(in: flags)
-
-        if keyCode == UInt16.max {
-            return (2...3).contains(modifierCount)
-        }
-
-        guard !modifierOnlyKeyCodes.contains(keyCode) else { return false }
-        return (1...2).contains(modifierCount)
-    }
-
-    private func countModifiers(in flags: NSEvent.ModifierFlags) -> Int {
-        var count = 0
-        if flags.contains(.function) { count += 1 }
-        if flags.contains(.control) { count += 1 }
-        if flags.contains(.option) { count += 1 }
-        if flags.contains(.shift) { count += 1 }
-        if flags.contains(.command) { count += 1 }
-        return count
+        ShortcutValidationRules.isValid(keyCode: keyCode, modifiers: modifiers)
     }
 
     private func keyName(for code: UInt16) -> String {
@@ -851,8 +817,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
     }
 
     final class Coordinator {
-        private static let modifierOnlyKeyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
-
         private var parent: ShortcutCaptureMonitor
         private var globalKeyMonitor: Any?
         private var localKeyMonitor: Any?
@@ -868,7 +832,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
             guard globalKeyMonitor == nil, localKeyMonitor == nil, globalFlagsMonitor == nil, localFlagsMonitor == nil else { return }
             didCapture = false
 
-            let mask = NSEvent.ModifierFlags([.command, .option, .control, .shift, .function])
+            let mask = ShortcutValidationRules.supportedModifiers
 
             globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 _ = self?.handleKeyDown(event, mask: mask)
@@ -906,7 +870,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
             }
 
             let capturedCode = event.keyCode
-            if Self.modifierOnlyKeyCodes.contains(capturedCode) {
+            if ShortcutValidationRules.modifierOnlyKeyCodes.contains(capturedCode) {
                 return false
             }
 
@@ -924,7 +888,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
             guard !didCapture else { return true }
 
             let capturedFlags = event.modifierFlags.intersection(mask)
-            let count = Self.countModifiers(in: capturedFlags)
+            let count = ShortcutValidationRules.modifierCount(in: capturedFlags)
             guard (2...3).contains(count) else { return false }
 
             didCapture = true
@@ -934,15 +898,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
             return true
         }
 
-        private static func countModifiers(in flags: NSEvent.ModifierFlags) -> Int {
-            var count = 0
-            if flags.contains(.function) { count += 1 }
-            if flags.contains(.control) { count += 1 }
-            if flags.contains(.option) { count += 1 }
-            if flags.contains(.shift) { count += 1 }
-            if flags.contains(.command) { count += 1 }
-            return count
-        }
 
         func stop() {
             if let globalKeyMonitor {
