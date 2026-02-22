@@ -243,7 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func attemptInsertText(_ text: String, attemptsRemaining: Int) {
         guard attemptsRemaining > 0 else {
-            statusLabelItem?.title = "Paste unavailable"
+            setUIStatus(.pasteUnavailable)
             lastTargetApplication = nil
             return
         }
@@ -264,31 +264,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let result = TextInserter.insert(text, copyToClipboard: settings.copyToClipboard)
-        switch result {
-        case .pasted:
-            setUIStatus(.ready)
-            lastTargetApplication = nil
-        case .copiedOnly:
-            if attemptsRemaining > 1 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
-                }
-            } else {
-                setUIStatus(.copiedToClipboard)
-                lastTargetApplication = nil
+        let retryPlan = InsertionRetryPolicy.plan(
+            for: result,
+            retriesRemaining: attemptsRemaining - 1,
+            debugStatus: TextInserter.lastDebugStatus
+        )
+
+        switch retryPlan {
+        case let .retry(delay, nextRetriesRemaining):
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.attemptInsertText(text, attemptsRemaining: nextRetriesRemaining + 1)
             }
-        case .notInserted:
-            if attemptsRemaining > 1 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
-                }
-            } else {
-                setUIStatus(.pasteUnavailable)
-                lastTargetApplication = nil
-            }
-        case .empty:
+
+        case let .complete(statusMessage):
+            applyInsertionStatusMessage(statusMessage)
             lastTargetApplication = nil
         }
+    }
+
+    private func applyInsertionStatusMessage(_ statusMessage: String?) {
+        guard let statusMessage else {
+            return
+        }
+
+        if statusMessage == "Ready" {
+            setUIStatus(.ready)
+            return
+        }
+
+        if statusMessage.hasPrefix("Copied to clipboard") {
+            if statusMessage == "Copied to clipboard" {
+                setUIStatus(.copiedToClipboard)
+            } else {
+                setUIStatus(.message(statusMessage))
+            }
+            return
+        }
+
+        if statusMessage.hasPrefix("Paste unavailable") {
+            if statusMessage == "Paste unavailable" {
+                setUIStatus(.pasteUnavailable)
+            } else {
+                setUIStatus(.message(statusMessage))
+            }
+            return
+        }
+
+        setUIStatus(.message(statusMessage))
     }
 
     private func setUIStatus(_ status: DictationUIStatus) {
