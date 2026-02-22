@@ -1,5 +1,4 @@
 import AppKit
-import Carbon
 
 enum TextInserter {
     enum Result: String {
@@ -7,6 +6,23 @@ enum TextInserter {
         case copiedOnly = "copied-only"
         case notInserted = "not-inserted"
         case empty = "empty"
+    }
+
+    enum PasteAttemptOutcome: Equatable {
+        case inserted
+        case notInserted
+        case unverified
+    }
+
+    enum PasteFallbackDecision: Equatable {
+        case skipCommandOptionV
+        case tryCommandOptionV
+    }
+
+    struct VerificationState: Equatable {
+        let value: String?
+        let selectedText: String?
+        let selectedRange: NSRange?
     }
 
     @MainActor
@@ -54,7 +70,7 @@ enum TextInserter {
 
         if copyToClipboard {
             copyTextToPasteboard(text)
-            let pasted = sendSpecialPasteShortcut()
+            let pasted = pasteFromClipboard(text)
             let decision = InsertionDecisionModel.evaluate(
                 text: text,
                 copyToClipboard: copyToClipboard,
@@ -66,13 +82,13 @@ enum TextInserter {
         }
 
         // Clipboard writes are disabled, but we still need a robust paste fallback.
-        // Temporarily use the clipboard for the special paste shortcut, then restore previous clipboard content.
+        // Temporarily use the clipboard for paste shortcuts, then restore previous clipboard content.
         let pasteboard = NSPasteboard.general
         let previousItems = pasteboard.pasteboardItems?.compactMap { $0.copy() as? NSPasteboardItem } ?? []
 
         copyTextToPasteboard(text)
         let temporaryWriteChangeCount = pasteboard.changeCount
-        let pasted = sendSpecialPasteShortcut()
+        let pasted = pasteFromClipboard(text)
         restorePasteboardItems(previousItems, expectedChangeCount: temporaryWriteChangeCount)
 
         let decision = InsertionDecisionModel.evaluate(
@@ -89,6 +105,50 @@ enum TextInserter {
     private static func complete(with decision: InsertionDecision, text: String, copyToClipboard: Bool) -> Result {
         InsertionDiagnostics.record(decision: decision, text: text, copyToClipboard: copyToClipboard)
         return decision.result
+    }
+
+    static func pasteFallbackDecision(afterPrimaryOutcome outcome: PasteAttemptOutcome) -> PasteFallbackDecision {
+        switch outcome {
+        case .notInserted:
+            return .tryCommandOptionV
+        case .inserted, .unverified:
+            return .skipCommandOptionV
+        }
+    }
+
+    static func didInsertText(_ text: String, before: VerificationState, after: VerificationState) -> Bool {
+        if let beforeValue = before.value,
+           let afterValue = after.value,
+           beforeValue != afterValue {
+            return true
+        }
+
+        if let beforeSelected = before.selectedText,
+           let afterSelected = after.selectedText,
+           beforeSelected != afterSelected,
+           !text.isEmpty,
+           afterSelected == text {
+            return true
+        }
+
+        if let beforeRange = before.selectedRange,
+           let afterRange = after.selectedRange {
+            let replacementLength = (text as NSString).length
+            let expectedCaret = beforeRange.location + max(0, replacementLength - beforeRange.length)
+            if afterRange.length == 0,
+               afterRange.location == expectedCaret,
+               (beforeRange.length > 0 || replacementLength > 0) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func hasComparableObservation(before: VerificationState, after: VerificationState) -> Bool {
+        (before.value != nil && after.value != nil)
+            || (before.selectedText != nil && after.selectedText != nil)
+            || (before.selectedRange != nil && after.selectedRange != nil)
     }
 
     @MainActor
@@ -113,7 +173,40 @@ enum TextInserter {
         }
     }
 
-    private static func sendSpecialPasteShortcut() -> Bool {
+    @MainActor
+    private static func pasteFromClipboard(_ text: String) -> Bool {
+        let baseline = focusedElementSnapshot()
+
+        guard sendPasteShortcut(.commandV) else {
+            return false
+        }
+
+        let primaryOutcome = verifyInsertionOutcome(expectedText: text, baseline: baseline)
+        switch primaryOutcome {
+        case .inserted, .unverified:
+            return true
+        case .notInserted:
+            break
+        }
+
+        guard pasteFallbackDecision(afterPrimaryOutcome: primaryOutcome) == .tryCommandOptionV else {
+            return false
+        }
+
+        guard sendPasteShortcut(.commandOptionV) else {
+            return false
+        }
+
+        let specialOutcome = verifyInsertionOutcome(expectedText: text, baseline: baseline)
+        return specialOutcome != .notInserted
+    }
+
+    private enum PasteShortcut {
+        case commandV
+        case commandOptionV
+    }
+
+    private static func sendPasteShortcut(_ shortcut: PasteShortcut) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState) ?? CGEventSource(stateID: .hidSystemState)
         guard let source else {
             return false
@@ -121,43 +214,64 @@ enum TextInserter {
 
         let commandKeyCode: CGKeyCode = 55 // Left Command
         let optionKeyCode: CGKeyCode = 58 // Left Option
-        let vKeyV: CGKeyCode = 9 // kVK_ANSI_V
+        let vKeyCode: CGKeyCode = 9 // kVK_ANSI_V
 
         guard
             let commandDown = CGEvent(keyboardEventSource: source, virtualKey: commandKeyCode, keyDown: true),
-            let optionDown = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: true),
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyV, keyDown: true),
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyV, keyDown: false),
-            let optionUp = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: false),
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false),
             let commandUp = CGEvent(keyboardEventSource: source, virtualKey: commandKeyCode, keyDown: false)
         else {
             return false
         }
 
-        commandDown.post(tap: .cgSessionEventTap)
-        optionDown.post(tap: .cgSessionEventTap)
+        switch shortcut {
+        case .commandV:
+            commandDown.post(tap: .cgSessionEventTap)
 
-        keyDown.flags = [.maskCommand, .maskAlternate]
-        keyDown.post(tap: .cgSessionEventTap)
+            keyDown.flags = [.maskCommand]
+            keyDown.post(tap: .cgSessionEventTap)
 
-        keyUp.flags = [.maskCommand, .maskAlternate]
-        keyUp.post(tap: .cgSessionEventTap)
+            keyUp.flags = [.maskCommand]
+            keyUp.post(tap: .cgSessionEventTap)
 
-        optionUp.post(tap: .cgSessionEventTap)
-        commandUp.post(tap: .cgSessionEventTap)
+            commandUp.post(tap: .cgSessionEventTap)
+            return true
+        case .commandOptionV:
+            guard
+                let optionDown = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: true),
+                let optionUp = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: false)
+            else {
+                return false
+            }
 
-        return true
+            commandDown.post(tap: .cgSessionEventTap)
+            optionDown.post(tap: .cgSessionEventTap)
+
+            keyDown.flags = [.maskCommand, .maskAlternate]
+            keyDown.post(tap: .cgSessionEventTap)
+
+            keyUp.flags = [.maskCommand, .maskAlternate]
+            keyUp.post(tap: .cgSessionEventTap)
+
+            optionUp.post(tap: .cgSessionEventTap)
+            commandUp.post(tap: .cgSessionEventTap)
+            return true
+        }
     }
 
     // Non-clipboard fallback: types text directly into the focused field.
+    @MainActor
     private static func insertByTyping(_ text: String) -> Bool {
+        let baseline = focusedElementSnapshot()
+
         let source = CGEventSource(stateID: .combinedSessionState) ?? CGEventSource(stateID: .hidSystemState)
         guard let source else {
             return false
         }
 
         for scalar in text.unicodeScalars {
-            if scalar.value == 10 {
+            if scalar.value == 10 || scalar.value == 13 {
                 guard
                     let returnDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
                     let returnUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false)
@@ -184,14 +298,18 @@ enum TextInserter {
             keyUp.post(tap: .cgSessionEventTap)
         }
 
-        return true
+        let outcome = verifyInsertionOutcome(expectedText: text, baseline: baseline)
+        return outcome != .notInserted
     }
 
     // Tries to insert/replace text in the currently focused element via Accessibility.
+    @MainActor
     private static func insertDirectlyIntoFocusedTextInput(_ text: String) -> Bool {
-        guard let focusedElement = focusedTextElement() else {
+        guard let baseline = focusedElementSnapshot() else {
             return false
         }
+
+        let focusedElement = baseline.element
 
         // Preferred path for rich text/native editors: replace currently selected text.
         if AXUIElementSetAttributeValue(
@@ -199,40 +317,14 @@ enum TextInserter {
             kAXSelectedTextAttribute as CFString,
             text as CFTypeRef
         ) == .success {
-            return true
+            if verifyInsertionOutcome(expectedText: text, baseline: baseline) == .inserted {
+                return true
+            }
         }
 
-        var currentValueRef: CFTypeRef?
-        let valueResult = AXUIElementCopyAttributeValue(
-            focusedElement,
-            kAXValueAttribute as CFString,
-            &currentValueRef
-        )
-        guard valueResult == .success, let currentValue = currentValueRef as? String else {
-            return false
-        }
-
-        var selectedRangeRef: CFTypeRef?
-        let rangeResult = AXUIElementCopyAttributeValue(
-            focusedElement,
-            kAXSelectedTextRangeAttribute as CFString,
-            &selectedRangeRef
-        )
-        guard rangeResult == .success, let selectedRangeRef else {
-            return false
-        }
-
-        guard CFGetTypeID(selectedRangeRef) == AXValueGetTypeID() else {
-            return false
-        }
-
-        let selectedRangeAX = unsafeBitCast(selectedRangeRef, to: AXValue.self)
-        guard AXValueGetType(selectedRangeAX) == .cfRange else {
-            return false
-        }
-
-        var selectedRange = CFRange(location: 0, length: 0)
-        guard AXValueGetValue(selectedRangeAX, .cfRange, &selectedRange) else {
+        guard let currentValue = stringAttribute(kAXValueAttribute as CFString, from: focusedElement),
+              let selectedRange = rangeAttribute(kAXSelectedTextRangeAttribute as CFString, from: focusedElement)
+        else {
             return false
         }
 
@@ -260,7 +352,109 @@ enum TextInserter {
             )
         }
 
-        return true
+        if stringAttribute(kAXValueAttribute as CFString, from: focusedElement) == updatedValue {
+            return true
+        }
+
+        return verifyInsertionOutcome(expectedText: text, baseline: baseline) == .inserted
+    }
+
+    private struct FocusedElementSnapshot {
+        let element: AXUIElement
+        let state: VerificationState
+    }
+
+    @MainActor
+    private static func verifyInsertionOutcome(expectedText: String, baseline: FocusedElementSnapshot?) -> PasteAttemptOutcome {
+        let pollCount = 4
+        var outcome: PasteAttemptOutcome = .unverified
+
+        for index in 0..<pollCount {
+            outcome = evaluateInsertionOutcome(expectedText: expectedText, baseline: baseline)
+            if outcome == .inserted {
+                return .inserted
+            }
+
+            if index < pollCount - 1 {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.03))
+            }
+        }
+
+        return outcome
+    }
+
+    @MainActor
+    private static func evaluateInsertionOutcome(expectedText: String, baseline: FocusedElementSnapshot?) -> PasteAttemptOutcome {
+        guard let baseline else {
+            return .unverified
+        }
+
+        guard let after = focusedElementSnapshot() else {
+            return .unverified
+        }
+
+        guard CFEqual(baseline.element, after.element) else {
+            return .unverified
+        }
+
+        guard hasComparableObservation(before: baseline.state, after: after.state) else {
+            return .unverified
+        }
+
+        if didInsertText(expectedText, before: baseline.state, after: after.state) {
+            return .inserted
+        }
+
+        return .notInserted
+    }
+
+    @MainActor
+    private static func focusedElementSnapshot() -> FocusedElementSnapshot? {
+        guard let element = focusedTextElement() else {
+            return nil
+        }
+
+        let state = VerificationState(
+            value: stringAttribute(kAXValueAttribute as CFString, from: element),
+            selectedText: stringAttribute(kAXSelectedTextAttribute as CFString, from: element),
+            selectedRange: rangeAttribute(kAXSelectedTextRangeAttribute as CFString, from: element)
+        )
+
+        return FocusedElementSnapshot(element: element, state: state)
+    }
+
+    private static func stringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
+        var valueRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &valueRef)
+        guard result == .success else {
+            return nil
+        }
+
+        return valueRef as? String
+    }
+
+    private static func rangeAttribute(_ attribute: CFString, from element: AXUIElement) -> NSRange? {
+        var valueRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &valueRef)
+        guard result == .success, let valueRef else {
+            return nil
+        }
+
+        guard CFGetTypeID(valueRef) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let axValue = unsafeBitCast(valueRef, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cfRange else {
+            return nil
+        }
+
+        var range = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(axValue, .cfRange, &range) else {
+            return nil
+        }
+
+        return NSRange(location: range.location, length: range.length)
     }
 
     private static func focusedTextElement() -> AXUIElement? {

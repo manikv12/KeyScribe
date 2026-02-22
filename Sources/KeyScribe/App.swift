@@ -238,56 +238,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func insertText(_ text: String) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        attemptInsertText(text, attemptsRemaining: 5)
+        // 4 retries means up to 5 total insertion attempts.
+        attemptInsertText(text, insertionRetriesRemaining: 4, activationRetriesRemaining: 4)
     }
 
-    private func attemptInsertText(_ text: String, attemptsRemaining: Int) {
-        guard attemptsRemaining > 0 else {
-            statusLabelItem?.title = "Paste unavailable"
+    private func attemptInsertText(_ text: String, insertionRetriesRemaining: Int, activationRetriesRemaining: Int) {
+        if let target = lastTargetApplication, target.isTerminated {
             lastTargetApplication = nil
-            return
         }
 
-        if let target = lastTargetApplication,
-           !target.isTerminated,
-           !target.isActive {
-            _ = target.activate(options: [.activateIgnoringOtherApps])
-            if attemptsRemaining > 1 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
+        if let target = lastTargetApplication {
+            let activationPlan = InsertionRetryPolicy.activationPlan(
+                hasTargetApplication: true,
+                targetIsActive: target.isActive,
+                retriesRemaining: activationRetriesRemaining
+            )
+
+            switch activationPlan {
+            case let .retry(delay, nextRetriesRemaining):
+                _ = target.activate(options: [.activateIgnoringOtherApps])
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.attemptInsertText(
+                        text,
+                        insertionRetriesRemaining: insertionRetriesRemaining,
+                        activationRetriesRemaining: nextRetriesRemaining
+                    )
                 }
                 return
+            case .proceed:
+                if !target.isActive {
+                    // Best effort final nudge before insertion retries continue.
+                    _ = target.activate(options: [.activateIgnoringOtherApps])
+                }
             }
-
-            // Activation failed repeatedly; fall back to best-effort insertion/copy behavior.
-            lastTargetApplication = nil
         }
 
         let result = TextInserter.insert(text, copyToClipboard: settings.copyToClipboard)
-        switch result {
-        case .pasted:
+        let retryPlan = InsertionRetryPolicy.plan(for: result, retriesRemaining: insertionRetriesRemaining)
+
+        switch retryPlan {
+        case let .retry(delay, nextRetriesRemaining):
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.attemptInsertText(
+                    text,
+                    insertionRetriesRemaining: nextRetriesRemaining,
+                    activationRetriesRemaining: activationRetriesRemaining
+                )
+            }
+        case let .complete(statusMessage):
+            applyInsertionCompletionStatus(statusMessage)
+            lastTargetApplication = nil
+        }
+    }
+
+    private func applyInsertionCompletionStatus(_ statusMessage: String?) {
+        guard let statusMessage else { return }
+
+        switch statusMessage {
+        case "Ready":
             setUIStatus(.ready)
-            lastTargetApplication = nil
-        case .copiedOnly:
-            if attemptsRemaining > 1 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
-                }
-            } else {
-                setUIStatus(.copiedToClipboard)
-                lastTargetApplication = nil
-            }
-        case .notInserted:
-            if attemptsRemaining > 1 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
-                }
-            } else {
-                setUIStatus(.pasteUnavailable)
-                lastTargetApplication = nil
-            }
-        case .empty:
-            lastTargetApplication = nil
+        case "Copied to clipboard":
+            setUIStatus(.copiedToClipboard)
+        case "Paste unavailable":
+            setUIStatus(.pasteUnavailable)
+        default:
+            setUIStatus(.message(statusMessage))
         }
     }
 
