@@ -15,6 +15,7 @@ final class SettingsStore: ObservableObject {
         static let autoDetectMicrophone = "KeyScribe.autoDetectMicrophone"
         static let selectedMicrophoneUID = "KeyScribe.selectedMicrophoneUID"
         static let copyToClipboard = "KeyScribe.copyToClipboard"
+        static let insertionDiagnosticsEnabled = "KeyScribe.insertionDiagnosticsEnabled"
         static let enableContextualBias = "KeyScribe.enableContextualBias"
         static let keepTextAcrossPauses = "KeyScribe.keepTextAcrossPauses"
         static let preferOnDeviceRecognition = "KeyScribe.preferOnDeviceRecognition"
@@ -61,6 +62,12 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var copyToClipboard: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var insertionDiagnosticsEnabled: Bool {
         didSet {
             save()
         }
@@ -153,6 +160,12 @@ final class SettingsStore: ObservableObject {
             copyToClipboard = defaults.bool(forKey: Keys.copyToClipboard)
         }
 
+        if defaults.object(forKey: Keys.insertionDiagnosticsEnabled) == nil {
+            insertionDiagnosticsEnabled = false
+        } else {
+            insertionDiagnosticsEnabled = defaults.bool(forKey: Keys.insertionDiagnosticsEnabled)
+        }
+
         if defaults.object(forKey: Keys.enableContextualBias) == nil {
             enableContextualBias = true
         } else {
@@ -232,6 +245,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(autoDetectMicrophone, forKey: Keys.autoDetectMicrophone)
         defaults.set(selectedMicrophoneUID, forKey: Keys.selectedMicrophoneUID)
         defaults.set(copyToClipboard, forKey: Keys.copyToClipboard)
+        defaults.set(insertionDiagnosticsEnabled, forKey: Keys.insertionDiagnosticsEnabled)
         defaults.set(enableContextualBias, forKey: Keys.enableContextualBias)
         defaults.set(keepTextAcrossPauses, forKey: Keys.keepTextAcrossPauses)
         defaults.set(preferOnDeviceRecognition, forKey: Keys.preferOnDeviceRecognition)

@@ -420,6 +420,9 @@ struct SettingsView: View {
             Toggle("Copy transcript to clipboard", isOn: $settings.copyToClipboard)
                 .help("Disable to avoid filling clipboard history. If disabled, dictation is only pasted directly when possible.")
 
+            Toggle("Enable insertion diagnostics (developer)", isOn: $settings.insertionDiagnosticsEnabled)
+                .help("Writes JSON lines for insertion path/result. Enable only while debugging reliability.")
+
             if settings.continuousMode {
                 Text("Continuous mode is enabled. Use the menu bar action to start/stop.")
                     .font(.callout)

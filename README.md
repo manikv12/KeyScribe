@@ -52,6 +52,59 @@ This is a functional scaffold, not a finished product yet:
 3. Keep app running.
 4. Hold **⌥⌘Space** to dictate, release to insert.
 
+## Copy/paste reliability diagnostics
+When debugging transcribe → clipboard → paste behavior, use the lightweight insertion diagnostics mode.
+
+### Enable diagnostics
+Use either option:
+- **Settings → General → "Enable insertion diagnostics (developer)"**
+- or environment flag: `KEYSCRIBE_INSERTION_DIAGNOSTICS=1`
+
+Optional log path override:
+- `KEYSCRIBE_INSERTION_DIAGNOSTICS_PATH=/tmp/my-keyscribe-diag.log`
+
+Default log path:
+- `/tmp/keyscribe-insertion-diagnostics.log`
+
+Diagnostics are emitted as JSON lines with:
+- `timestamp`
+- `path`
+- `result`
+- `copyToClipboard`
+- `textLength`
+
+### Path values
+- `direct-accessibility` — AX selected-text/value replacement succeeded
+- `typed-unicode-events` — unicode typing fallback succeeded
+- `special-paste-clipboard` — clipboard + special paste path used
+- `special-paste-temporary-clipboard` — temporary clipboard paste path used (clipboard restored)
+- `empty-input` — nothing to insert
+
+### Result values
+- `pasted`
+- `copied-only`
+- `not-inserted`
+- `empty`
+
+### Smoke/regression runner
+Run all core + insertion reliability tests:
+
+```bash
+Scripts/run-tests.sh
+```
+
+Run insertion decision simulation directly:
+
+```bash
+Scripts/run-insertion-reliability.sh --regression
+
+Scripts/run-insertion-reliability.sh \
+  --text "hello" --copy true --direct false --typing false --special false \
+  --expect-path special-paste-clipboard --expect-result copied-only
+```
+
+Use this to validate decision outcomes without requiring live UI automation.
+
 ## Built-in Apple model question
 Yes — Apple’s `Speech` framework can use on-device recognition where available.
 In this scaffold:
