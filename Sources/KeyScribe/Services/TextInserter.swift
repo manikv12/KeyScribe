@@ -1,143 +1,165 @@
 import AppKit
+import Carbon
+import OSLog
 
 enum TextInserter {
-    enum Result: String {
-        case pasted = "pasted"
-        case copiedOnly = "copied-only"
-        case notInserted = "not-inserted"
-        case empty = "empty"
-    }
-
-    enum PasteAttemptOutcome: Equatable {
-        case inserted
+    enum Result: Equatable {
+        case pasted
+        case copiedOnly
         case notInserted
-        case unverified
+        case empty
     }
 
-    enum PasteFallbackDecision: Equatable {
-        case skipCommandOptionV
-        case tryCommandOptionV
+    struct InsertOutcome: Equatable {
+        let result: Result
+        let debugStatus: String?
     }
 
-    struct VerificationState: Equatable {
-        let value: String?
-        let selectedText: String?
-        let selectedRange: NSRange?
+    enum ClipboardWriteOutcome: Equatable {
+        case success(changeCount: Int)
+        case failure(debugStatus: String)
     }
+
+    struct ClipboardSnapshot {
+        fileprivate let items: [NSPasteboardItem]
+
+        init(items: [NSPasteboardItem] = []) {
+            self.items = items
+        }
+    }
+
+    struct Runtime {
+        var insertDirect: (String) -> Bool
+        var insertTyping: (String) -> Bool
+        var writeClipboard: (String) -> ClipboardWriteOutcome
+        var sendSpecialPaste: () -> Bool
+        var captureClipboard: () -> ClipboardSnapshot
+        var restoreClipboard: (ClipboardSnapshot, Int) -> Void
+        var log: (String) -> Void
+        var pasteRetryBackoff: [TimeInterval]
+
+        init(
+            insertDirect: @escaping (String) -> Bool,
+            insertTyping: @escaping (String) -> Bool,
+            writeClipboard: @escaping (String) -> ClipboardWriteOutcome,
+            sendSpecialPaste: @escaping () -> Bool,
+            captureClipboard: @escaping () -> ClipboardSnapshot = { ClipboardSnapshot() },
+            restoreClipboard: @escaping (ClipboardSnapshot, Int) -> Void = { _, _ in },
+            log: @escaping (String) -> Void = { _ in },
+            pasteRetryBackoff: [TimeInterval] = [0, 0.04, 0.1]
+        ) {
+            self.insertDirect = insertDirect
+            self.insertTyping = insertTyping
+            self.writeClipboard = writeClipboard
+            self.sendSpecialPaste = sendSpecialPaste
+            self.captureClipboard = captureClipboard
+            self.restoreClipboard = restoreClipboard
+            self.log = log
+            self.pasteRetryBackoff = pasteRetryBackoff
+        }
+    }
+
+    @MainActor
+    private(set) static var lastDebugStatus: String?
+
+    private static let logger = Logger(subsystem: "KeyScribe", category: "TextInserter")
+    private static let clipboardWriteRetryBackoff: [TimeInterval] = [0, 0.015, 0.05]
+    private static let clipboardRestoreDelay: TimeInterval = 0.24
 
     @MainActor
     static func insert(_ text: String, copyToClipboard: Bool) -> Result {
-        if text.isEmpty {
-            let decision = InsertionDecisionModel.evaluate(
-                text: text,
-                copyToClipboard: copyToClipboard,
-                directInsertSucceeded: false,
-                typingInsertSucceeded: false,
-                specialPasteSucceeded: false
-            )
-            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
+        let outcome = performInsert(text, copyToClipboard: copyToClipboard, runtime: makeLiveRuntime())
+        lastDebugStatus = outcome.debugStatus
+
+        if let debugStatus = outcome.debugStatus, outcome.result != .pasted {
+            logger.debug("Insertion finished as \(resultLabel(outcome.result), privacy: .public) [\(debugStatus, privacy: .public)]")
         }
 
-        if insertDirectlyIntoFocusedTextInput(text) {
+        return outcome.result
+    }
+
+    // Test-only insertion entrypoint used by smoke tests to validate clipboard flow deterministically.
+    static func insertForSmokeTests(_ text: String, copyToClipboard: Bool, runtime: Runtime) -> InsertOutcome {
+        performInsert(text, copyToClipboard: copyToClipboard, runtime: runtime)
+    }
+
+    private static func performInsert(_ text: String, copyToClipboard: Bool, runtime: Runtime) -> InsertOutcome {
+        guard !text.isEmpty else { return InsertOutcome(result: .empty, debugStatus: nil) }
+
+        if runtime.insertDirect(text) {
             if copyToClipboard {
-                copyTextToPasteboard(text)
+                if case let .failure(debugStatus) = runtime.writeClipboard(text) {
+                    runtime.log("Direct insert succeeded but clipboard copy failed [\(debugStatus)]")
+                }
             }
-
-            let decision = InsertionDecisionModel.evaluate(
-                text: text,
-                copyToClipboard: copyToClipboard,
-                directInsertSucceeded: true,
-                typingInsertSucceeded: false,
-                specialPasteSucceeded: false
-            )
-            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
-        }
-
-        if insertByTyping(text) {
-            if copyToClipboard {
-                copyTextToPasteboard(text)
-            }
-
-            let decision = InsertionDecisionModel.evaluate(
-                text: text,
-                copyToClipboard: copyToClipboard,
-                directInsertSucceeded: false,
-                typingInsertSucceeded: true,
-                specialPasteSucceeded: false
-            )
-            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
+            return InsertOutcome(result: .pasted, debugStatus: nil)
         }
 
         if copyToClipboard {
-            copyTextToPasteboard(text)
-            let pasted = pasteFromClipboard(text)
-            let decision = InsertionDecisionModel.evaluate(
-                text: text,
-                copyToClipboard: copyToClipboard,
-                directInsertSucceeded: false,
-                typingInsertSucceeded: false,
-                specialPasteSucceeded: pasted
-            )
-            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
+            return insertWithClipboardPreferred(text, runtime: runtime)
         }
 
-        // Clipboard writes are disabled, but we still need a robust paste fallback.
-        // Temporarily use the clipboard for paste shortcuts, then restore previous clipboard content.
-        let pasteboard = NSPasteboard.general
-        let previousItems = pasteboard.pasteboardItems?.compactMap { $0.copy() as? NSPasteboardItem } ?? []
+        if runtime.insertTyping(text) {
+            return InsertOutcome(result: .pasted, debugStatus: nil)
+        }
 
-        copyTextToPasteboard(text)
-        let temporaryWriteChangeCount = pasteboard.changeCount
-        let pasted = pasteFromClipboard(text)
-        restorePasteboardItems(previousItems, expectedChangeCount: temporaryWriteChangeCount)
-
-        let decision = InsertionDecisionModel.evaluate(
-            text: text,
-            copyToClipboard: copyToClipboard,
-            directInsertSucceeded: false,
-            typingInsertSucceeded: false,
-            specialPasteSucceeded: pasted
-        )
-        return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
+        return insertWithTemporaryClipboardFallback(text, runtime: runtime)
     }
 
-    @MainActor
-    private static func complete(with decision: InsertionDecision, text: String, copyToClipboard: Bool) -> Result {
-        InsertionDiagnostics.record(decision: decision, text: text, copyToClipboard: copyToClipboard)
-        return decision.result
-    }
+    private static func insertWithClipboardPreferred(_ text: String, runtime: Runtime) -> InsertOutcome {
+        switch runtime.writeClipboard(text) {
+        case let .failure(debugStatus):
+            runtime.log("Clipboard write verification failed before paste [\(debugStatus)]")
+            if runtime.insertTyping(text) {
+                return InsertOutcome(result: .pasted, debugStatus: nil)
+            }
+            return InsertOutcome(result: .notInserted, debugStatus: debugStatus)
 
-    static func pasteFallbackDecision(afterPrimaryOutcome outcome: PasteAttemptOutcome) -> PasteFallbackDecision {
-        switch outcome {
-        case .notInserted:
-            return .tryCommandOptionV
-        case .inserted, .unverified:
-            return .skipCommandOptionV
+        case .success:
+            if triggerPasteShortcutWithRetry(runtime: runtime) {
+                return InsertOutcome(result: .pasted, debugStatus: nil)
+            }
+
+            runtime.log("Special paste shortcut failed; attempting typing fallback")
+            if runtime.insertTyping(text) {
+                return InsertOutcome(result: .pasted, debugStatus: nil)
+            }
+
+            return InsertOutcome(result: .copiedOnly, debugStatus: "paste-shortcut-unavailable")
         }
     }
 
-    static func didInsertText(_ text: String, before: VerificationState, after: VerificationState) -> Bool {
-        if let beforeValue = before.value,
-           let afterValue = after.value,
-           beforeValue != afterValue {
-            return true
-        }
+    private static func insertWithTemporaryClipboardFallback(_ text: String, runtime: Runtime) -> InsertOutcome {
+        let snapshot = runtime.captureClipboard()
 
-        if let beforeSelected = before.selectedText,
-           let afterSelected = after.selectedText,
-           beforeSelected != afterSelected,
-           !text.isEmpty,
-           afterSelected == text {
-            return true
-        }
+        switch runtime.writeClipboard(text) {
+        case let .failure(debugStatus):
+            runtime.log("Temporary clipboard write verification failed [\(debugStatus)]")
+            return InsertOutcome(result: .notInserted, debugStatus: debugStatus)
 
-        if let beforeRange = before.selectedRange,
-           let afterRange = after.selectedRange {
-            let replacementLength = (text as NSString).length
-            let expectedCaret = beforeRange.location + max(0, replacementLength - beforeRange.length)
-            if afterRange.length == 0,
-               afterRange.location == expectedCaret,
-               (beforeRange.length > 0 || replacementLength > 0) {
+        case let .success(changeCount):
+            if triggerPasteShortcutWithRetry(runtime: runtime) {
+                runtime.restoreClipboard(snapshot, changeCount)
+                return InsertOutcome(result: .pasted, debugStatus: nil)
+            }
+
+            // Keep transcript on clipboard when the temporary paste flow fails.
+            // This gives the user a manual fallback instead of losing both insert + clipboard states.
+            runtime.log("Temporary paste failed; leaving transcript on clipboard for manual paste")
+            return InsertOutcome(result: .copiedOnly, debugStatus: "paste-shortcut-unavailable")
+        }
+    }
+
+    private static func triggerPasteShortcutWithRetry(runtime: Runtime) -> Bool {
+        for (attemptIndex, delay) in runtime.pasteRetryBackoff.enumerated() {
+            if delay > 0 {
+                Thread.sleep(forTimeInterval: delay)
+            }
+
+            if runtime.sendSpecialPaste() {
+                if attemptIndex > 0 {
+                    runtime.log("Special paste shortcut succeeded on retry \(attemptIndex + 1)")
+                }
                 return true
             }
         }
@@ -145,68 +167,92 @@ enum TextInserter {
         return false
     }
 
-    private static func hasComparableObservation(before: VerificationState, after: VerificationState) -> Bool {
-        (before.value != nil && after.value != nil)
-            || (before.selectedText != nil && after.selectedText != nil)
-            || (before.selectedRange != nil && after.selectedRange != nil)
+    @MainActor
+    private static func makeLiveRuntime() -> Runtime {
+        Runtime(
+            insertDirect: { text in
+                insertDirectlyIntoFocusedTextInput(text)
+            },
+            insertTyping: { text in
+                insertByTyping(text)
+            },
+            writeClipboard: { text in
+                verifiedClipboardWrite(text)
+            },
+            sendSpecialPaste: {
+                sendSpecialPasteShortcutOnce()
+            },
+            captureClipboard: {
+                capturePasteboardSnapshot()
+            },
+            restoreClipboard: { snapshot, changeCount in
+                restorePasteboardSnapshot(snapshot, expectedChangeCount: changeCount)
+            },
+            log: { message in
+                logger.debug("\(message, privacy: .public)")
+            }
+        )
     }
 
     @MainActor
-    private static func copyTextToPasteboard(_ text: String) {
+    private static func verifiedClipboardWrite(_ text: String) -> ClipboardWriteOutcome {
         let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        var lastFailure = "clipboard-write-rejected"
+
+        for delay in clipboardWriteRetryBackoff {
+            if delay > 0 {
+                Thread.sleep(forTimeInterval: delay)
+            }
+
+            let beforeChangeCount = pasteboard.changeCount
+            pasteboard.clearContents()
+
+            guard pasteboard.setString(text, forType: .string) else {
+                lastFailure = "clipboard-write-rejected"
+                continue
+            }
+
+            let afterChangeCount = pasteboard.changeCount
+            guard pasteboard.string(forType: .string) == text else {
+                lastFailure = "clipboard-readback-mismatch"
+                continue
+            }
+
+            guard afterChangeCount != beforeChangeCount else {
+                lastFailure = "clipboard-change-count-stale"
+                continue
+            }
+
+            return .success(changeCount: afterChangeCount)
+        }
+
+        return .failure(debugStatus: lastFailure)
     }
 
     @MainActor
-    private static func restorePasteboardItems(_ items: [NSPasteboardItem], expectedChangeCount: Int) {
+    private static func capturePasteboardSnapshot() -> ClipboardSnapshot {
+        let items = NSPasteboard.general.pasteboardItems?.compactMap { $0.copy() as? NSPasteboardItem } ?? []
+        return ClipboardSnapshot(items: items)
+    }
+
+    @MainActor
+    private static func restorePasteboardSnapshot(_ snapshot: ClipboardSnapshot, expectedChangeCount: Int) {
         let pasteboard = NSPasteboard.general
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+        let savedItems = snapshot.items
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + clipboardRestoreDelay) {
             guard pasteboard.changeCount == expectedChangeCount else {
                 return
             }
 
             pasteboard.clearContents()
-            if !items.isEmpty {
-                pasteboard.writeObjects(items)
+            if !savedItems.isEmpty, !pasteboard.writeObjects(savedItems) {
+                logger.debug("Pasteboard restore writeObjects failed")
             }
         }
     }
 
-    @MainActor
-    private static func pasteFromClipboard(_ text: String) -> Bool {
-        let baseline = focusedElementSnapshot()
-
-        guard sendPasteShortcut(.commandV) else {
-            return false
-        }
-
-        let primaryOutcome = verifyInsertionOutcome(expectedText: text, baseline: baseline)
-        switch primaryOutcome {
-        case .inserted, .unverified:
-            return true
-        case .notInserted:
-            break
-        }
-
-        guard pasteFallbackDecision(afterPrimaryOutcome: primaryOutcome) == .tryCommandOptionV else {
-            return false
-        }
-
-        guard sendPasteShortcut(.commandOptionV) else {
-            return false
-        }
-
-        let specialOutcome = verifyInsertionOutcome(expectedText: text, baseline: baseline)
-        return specialOutcome != .notInserted
-    }
-
-    private enum PasteShortcut {
-        case commandV
-        case commandOptionV
-    }
-
-    private static func sendPasteShortcut(_ shortcut: PasteShortcut) -> Bool {
+    private static func sendSpecialPasteShortcutOnce() -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState) ?? CGEventSource(stateID: .hidSystemState)
         guard let source else {
             return false
@@ -214,64 +260,47 @@ enum TextInserter {
 
         let commandKeyCode: CGKeyCode = 55 // Left Command
         let optionKeyCode: CGKeyCode = 58 // Left Option
-        let vKeyCode: CGKeyCode = 9 // kVK_ANSI_V
+        let vKeyV: CGKeyCode = 9 // kVK_ANSI_V
 
         guard
             let commandDown = CGEvent(keyboardEventSource: source, virtualKey: commandKeyCode, keyDown: true),
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false),
+            let optionDown = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: true),
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyV, keyDown: true),
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyV, keyDown: false),
+            let optionUp = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: false),
             let commandUp = CGEvent(keyboardEventSource: source, virtualKey: commandKeyCode, keyDown: false)
         else {
             return false
         }
 
-        switch shortcut {
-        case .commandV:
-            commandDown.post(tap: .cgSessionEventTap)
+        commandDown.post(tap: .cgSessionEventTap)
+        optionDown.post(tap: .cgSessionEventTap)
 
-            keyDown.flags = [.maskCommand]
-            keyDown.post(tap: .cgSessionEventTap)
+        Thread.sleep(forTimeInterval: 0.006)
 
-            keyUp.flags = [.maskCommand]
-            keyUp.post(tap: .cgSessionEventTap)
+        keyDown.flags = [.maskCommand, .maskAlternate]
+        keyDown.post(tap: .cgSessionEventTap)
 
-            commandUp.post(tap: .cgSessionEventTap)
-            return true
-        case .commandOptionV:
-            guard
-                let optionDown = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: true),
-                let optionUp = CGEvent(keyboardEventSource: source, virtualKey: optionKeyCode, keyDown: false)
-            else {
-                return false
-            }
+        keyUp.flags = [.maskCommand, .maskAlternate]
+        keyUp.post(tap: .cgSessionEventTap)
 
-            commandDown.post(tap: .cgSessionEventTap)
-            optionDown.post(tap: .cgSessionEventTap)
+        Thread.sleep(forTimeInterval: 0.004)
 
-            keyDown.flags = [.maskCommand, .maskAlternate]
-            keyDown.post(tap: .cgSessionEventTap)
+        optionUp.post(tap: .cgSessionEventTap)
+        commandUp.post(tap: .cgSessionEventTap)
 
-            keyUp.flags = [.maskCommand, .maskAlternate]
-            keyUp.post(tap: .cgSessionEventTap)
-
-            optionUp.post(tap: .cgSessionEventTap)
-            commandUp.post(tap: .cgSessionEventTap)
-            return true
-        }
+        return true
     }
 
     // Non-clipboard fallback: types text directly into the focused field.
-    @MainActor
     private static func insertByTyping(_ text: String) -> Bool {
-        let baseline = focusedElementSnapshot()
-
         let source = CGEventSource(stateID: .combinedSessionState) ?? CGEventSource(stateID: .hidSystemState)
         guard let source else {
             return false
         }
 
         for scalar in text.unicodeScalars {
-            if scalar.value == 10 || scalar.value == 13 {
+            if scalar.value == 10 {
                 guard
                     let returnDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
                     let returnUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false)
@@ -298,18 +327,14 @@ enum TextInserter {
             keyUp.post(tap: .cgSessionEventTap)
         }
 
-        let outcome = verifyInsertionOutcome(expectedText: text, baseline: baseline)
-        return outcome != .notInserted
+        return true
     }
 
     // Tries to insert/replace text in the currently focused element via Accessibility.
-    @MainActor
     private static func insertDirectlyIntoFocusedTextInput(_ text: String) -> Bool {
-        guard let baseline = focusedElementSnapshot() else {
+        guard let focusedElement = focusedTextElement() else {
             return false
         }
-
-        let focusedElement = baseline.element
 
         // Preferred path for rich text/native editors: replace currently selected text.
         if AXUIElementSetAttributeValue(
@@ -317,14 +342,40 @@ enum TextInserter {
             kAXSelectedTextAttribute as CFString,
             text as CFTypeRef
         ) == .success {
-            if verifyInsertionOutcome(expectedText: text, baseline: baseline) == .inserted {
-                return true
-            }
+            return true
         }
 
-        guard let currentValue = stringAttribute(kAXValueAttribute as CFString, from: focusedElement),
-              let selectedRange = rangeAttribute(kAXSelectedTextRangeAttribute as CFString, from: focusedElement)
-        else {
+        var currentValueRef: CFTypeRef?
+        let valueResult = AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXValueAttribute as CFString,
+            &currentValueRef
+        )
+        guard valueResult == .success, let currentValue = currentValueRef as? String else {
+            return false
+        }
+
+        var selectedRangeRef: CFTypeRef?
+        let rangeResult = AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXSelectedTextRangeAttribute as CFString,
+            &selectedRangeRef
+        )
+        guard rangeResult == .success, let selectedRangeRef else {
+            return false
+        }
+
+        guard CFGetTypeID(selectedRangeRef) == AXValueGetTypeID() else {
+            return false
+        }
+
+        let selectedRangeAX = unsafeBitCast(selectedRangeRef, to: AXValue.self)
+        guard AXValueGetType(selectedRangeAX) == .cfRange else {
+            return false
+        }
+
+        var selectedRange = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(selectedRangeAX, .cfRange, &selectedRange) else {
             return false
         }
 
@@ -352,109 +403,7 @@ enum TextInserter {
             )
         }
 
-        if stringAttribute(kAXValueAttribute as CFString, from: focusedElement) == updatedValue {
-            return true
-        }
-
-        return verifyInsertionOutcome(expectedText: text, baseline: baseline) == .inserted
-    }
-
-    private struct FocusedElementSnapshot {
-        let element: AXUIElement
-        let state: VerificationState
-    }
-
-    @MainActor
-    private static func verifyInsertionOutcome(expectedText: String, baseline: FocusedElementSnapshot?) -> PasteAttemptOutcome {
-        let pollCount = 4
-        var outcome: PasteAttemptOutcome = .unverified
-
-        for index in 0..<pollCount {
-            outcome = evaluateInsertionOutcome(expectedText: expectedText, baseline: baseline)
-            if outcome == .inserted {
-                return .inserted
-            }
-
-            if index < pollCount - 1 {
-                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.03))
-            }
-        }
-
-        return outcome
-    }
-
-    @MainActor
-    private static func evaluateInsertionOutcome(expectedText: String, baseline: FocusedElementSnapshot?) -> PasteAttemptOutcome {
-        guard let baseline else {
-            return .unverified
-        }
-
-        guard let after = focusedElementSnapshot() else {
-            return .unverified
-        }
-
-        guard CFEqual(baseline.element, after.element) else {
-            return .unverified
-        }
-
-        guard hasComparableObservation(before: baseline.state, after: after.state) else {
-            return .unverified
-        }
-
-        if didInsertText(expectedText, before: baseline.state, after: after.state) {
-            return .inserted
-        }
-
-        return .notInserted
-    }
-
-    @MainActor
-    private static func focusedElementSnapshot() -> FocusedElementSnapshot? {
-        guard let element = focusedTextElement() else {
-            return nil
-        }
-
-        let state = VerificationState(
-            value: stringAttribute(kAXValueAttribute as CFString, from: element),
-            selectedText: stringAttribute(kAXSelectedTextAttribute as CFString, from: element),
-            selectedRange: rangeAttribute(kAXSelectedTextRangeAttribute as CFString, from: element)
-        )
-
-        return FocusedElementSnapshot(element: element, state: state)
-    }
-
-    private static func stringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
-        var valueRef: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &valueRef)
-        guard result == .success else {
-            return nil
-        }
-
-        return valueRef as? String
-    }
-
-    private static func rangeAttribute(_ attribute: CFString, from element: AXUIElement) -> NSRange? {
-        var valueRef: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &valueRef)
-        guard result == .success, let valueRef else {
-            return nil
-        }
-
-        guard CFGetTypeID(valueRef) == AXValueGetTypeID() else {
-            return nil
-        }
-
-        let axValue = unsafeBitCast(valueRef, to: AXValue.self)
-        guard AXValueGetType(axValue) == .cfRange else {
-            return nil
-        }
-
-        var range = CFRange(location: 0, length: 0)
-        guard AXValueGetValue(axValue, .cfRange, &range) else {
-            return nil
-        }
-
-        return NSRange(location: range.location, length: range.length)
+        return true
     }
 
     private static func focusedTextElement() -> AXUIElement? {
@@ -474,5 +423,18 @@ enum TextInserter {
         }
 
         return unsafeBitCast(focusedRef, to: AXUIElement.self)
+    }
+
+    private static func resultLabel(_ result: Result) -> String {
+        switch result {
+        case .pasted:
+            return "pasted"
+        case .copiedOnly:
+            return "copiedOnly"
+        case .notInserted:
+            return "notInserted"
+        case .empty:
+            return "empty"
+        }
     }
 }

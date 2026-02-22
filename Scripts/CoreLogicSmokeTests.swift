@@ -16,8 +16,7 @@ struct CoreLogicSmokeTests {
         testTextCleanupPipeline()
         testRecognitionTuningDeterminism()
         testInsertionRetryPolicyBounds()
-        testFocusActivationRetryPolicy()
-        testTextInsertionDecisionHelpers()
+        testTextInserterClipboardPaths()
 
         print("✅ Core logic smoke tests passed")
     }
@@ -114,87 +113,92 @@ struct CoreLogicSmokeTests {
                 == .complete(statusMessage: "Copied to clipboard"),
             "Retry input should be bounded at zero to avoid unbounded loops"
         )
-    }
-
-    private static func testFocusActivationRetryPolicy() {
-        check(
-            InsertionRetryPolicy.activationPlan(hasTargetApplication: false, targetIsActive: false, retriesRemaining: 5)
-                == .proceed,
-            "Activation should proceed immediately when there is no target app"
-        )
 
         check(
-            InsertionRetryPolicy.activationPlan(hasTargetApplication: true, targetIsActive: true, retriesRemaining: 5)
-                == .proceed,
-            "Activation should proceed immediately when target is already active"
-        )
-
-        check(
-            InsertionRetryPolicy.activationPlan(hasTargetApplication: true, targetIsActive: false, retriesRemaining: 2)
-                == .retry(delay: 0.18, nextRetriesRemaining: 1),
-            "Activation should retry while inactive target retries remain"
-        )
-
-        check(
-            InsertionRetryPolicy.activationPlan(hasTargetApplication: true, targetIsActive: false, retriesRemaining: 0)
-                == .proceed,
-            "Activation should stop retrying once retries are exhausted"
+            InsertionRetryPolicy.plan(for: .notInserted, retriesRemaining: 0, debugStatus: "clipboard-write-rejected")
+                == .complete(statusMessage: "Paste unavailable [clipboard-write-rejected]"),
+            "Final insertion status should include debug details when available"
         )
     }
 
-    private static func testTextInsertionDecisionHelpers() {
-        let before = TextInserter.VerificationState(
-            value: "Hello",
-            selectedText: nil,
-            selectedRange: NSRange(location: 5, length: 0)
+    private static func testTextInserterClipboardPaths() {
+        var callOrder: [String] = []
+        let orderedRuntime = TextInserter.Runtime(
+            insertDirect: { _ in
+                callOrder.append("direct")
+                return false
+            },
+            insertTyping: { _ in
+                callOrder.append("typing")
+                return false
+            },
+            writeClipboard: { _ in
+                callOrder.append("write")
+                return .success(changeCount: 5)
+            },
+            sendSpecialPaste: {
+                callOrder.append("paste")
+                return false
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0]
         )
 
-        let afterValueChanged = TextInserter.VerificationState(
-            value: "Hello world",
-            selectedText: nil,
-            selectedRange: NSRange(location: 11, length: 0)
+        let orderedOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: true, runtime: orderedRuntime)
+        check(orderedOutcome.result == .copiedOnly, "Clipboard path should still return copied-only when paste and typing both fail")
+        check(callOrder == ["direct", "write", "paste", "typing"], "Copy-enabled flow should prefer clipboard paste before typing fallback")
+
+        var pasteAttempts = 0
+        let retryRuntime = TextInserter.Runtime(
+            insertDirect: { _ in false },
+            insertTyping: { _ in false },
+            writeClipboard: { _ in .success(changeCount: 7) },
+            sendSpecialPaste: {
+                pasteAttempts += 1
+                return pasteAttempts == 2
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0, 0]
         )
 
-        check(
-            TextInserter.didInsertText(" world", before: before, after: afterValueChanged),
-            "Value change should count as insertion"
+        let retryOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: true, runtime: retryRuntime)
+        check(retryOutcome.result == .pasted, "Special paste retry should recover transient paste trigger failures")
+        check(pasteAttempts == 2, "Special paste retry should invoke paste trigger until success")
+
+        var restoreCalls = 0
+        let temporaryRuntime = TextInserter.Runtime(
+            insertDirect: { _ in false },
+            insertTyping: { _ in false },
+            writeClipboard: { _ in .success(changeCount: 19) },
+            sendSpecialPaste: { false },
+            captureClipboard: { TextInserter.ClipboardSnapshot() },
+            restoreClipboard: { _, _ in
+                restoreCalls += 1
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0]
         )
 
-        let afterOnlySelectionMoved = TextInserter.VerificationState(
-            value: "Hello",
-            selectedText: nil,
-            selectedRange: NSRange(location: 11, length: 0)
+        let temporaryOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: temporaryRuntime)
+        check(temporaryOutcome.result == .copiedOnly, "Temporary clipboard flow should leave transcript copied if paste fails")
+        check(restoreCalls == 0, "Temporary clipboard restore should be skipped when paste does not trigger")
+
+        var restoredChangeCount: Int?
+        let restoreRuntime = TextInserter.Runtime(
+            insertDirect: { _ in false },
+            insertTyping: { _ in false },
+            writeClipboard: { _ in .success(changeCount: 33) },
+            sendSpecialPaste: { true },
+            captureClipboard: { TextInserter.ClipboardSnapshot() },
+            restoreClipboard: { _, changeCount in
+                restoredChangeCount = changeCount
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0]
         )
 
-        check(
-            TextInserter.didInsertText(" world", before: before, after: afterOnlySelectionMoved),
-            "Caret movement consistent with inserted text should count as insertion"
-        )
-
-        let unchanged = TextInserter.VerificationState(
-            value: "Hello",
-            selectedText: nil,
-            selectedRange: NSRange(location: 5, length: 0)
-        )
-
-        check(
-            !TextInserter.didInsertText(" world", before: before, after: unchanged),
-            "Unchanged state should not count as insertion"
-        )
-
-        check(
-            TextInserter.pasteFallbackDecision(afterPrimaryOutcome: .inserted) == .skipCommandOptionV,
-            "Command+Option+V should be skipped after successful primary paste"
-        )
-
-        check(
-            TextInserter.pasteFallbackDecision(afterPrimaryOutcome: .unverified) == .skipCommandOptionV,
-            "Command+Option+V should be skipped when primary paste cannot be verified"
-        )
-
-        check(
-            TextInserter.pasteFallbackDecision(afterPrimaryOutcome: .notInserted) == .tryCommandOptionV,
-            "Command+Option+V should only be attempted after a verified non-insertion"
-        )
+        let restoreOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: restoreRuntime)
+        check(restoreOutcome.result == .pasted, "Temporary clipboard flow should report pasted on successful special paste")
+        check(restoredChangeCount == 33, "Temporary clipboard restore should receive the verified clipboard change count")
     }
 }
