@@ -129,10 +129,21 @@ struct WaveformPanelView: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.black.opacity(0.74))
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.16),
+                            Color.white.opacity(0.08),
+                            Color.black.opacity(0.42)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.white.opacity(0.16), lineWidth: 0.6)
+                        .stroke(Color.white.opacity(0.22), lineWidth: 0.7)
                 )
 
             SoundWaveLine(level: model.level, phase: model.phase, impulse: model.impulse)

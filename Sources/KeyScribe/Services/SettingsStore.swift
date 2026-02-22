@@ -25,6 +25,7 @@ final class SettingsStore: ObservableObject {
         static let preferOnDeviceRecognition = "KeyScribe.preferOnDeviceRecognition"
         static let finalizeDelaySeconds = "KeyScribe.finalizeDelaySeconds"
         static let customContextPhrases = "KeyScribe.customContextPhrases"
+        static let textCleanupMode = "KeyScribe.textCleanupMode"
     }
 
     @Published var shortcutKeyCode: UInt16 {
@@ -94,6 +95,12 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var customContextPhrases: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var textCleanupModeRawValue: String {
         didSet {
             save()
         }
@@ -169,6 +176,13 @@ final class SettingsStore: ObservableObject {
 
         customContextPhrases = defaults.string(forKey: Keys.customContextPhrases) ?? ""
 
+        let storedCleanup = defaults.string(forKey: Keys.textCleanupMode) ?? TextCleanupMode.light.rawValue
+        if TextCleanupMode(rawValue: storedCleanup) == nil {
+            textCleanupModeRawValue = TextCleanupMode.light.rawValue
+        } else {
+            textCleanupModeRawValue = storedCleanup
+        }
+
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
         refreshMicrophones()
@@ -213,6 +227,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(preferOnDeviceRecognition, forKey: Keys.preferOnDeviceRecognition)
         defaults.set(min(1.2, max(0.15, finalizeDelaySeconds)), forKey: Keys.finalizeDelaySeconds)
         defaults.set(customContextPhrases, forKey: Keys.customContextPhrases)
+        defaults.set(textCleanupModeRawValue, forKey: Keys.textCleanupMode)
 
         guard !isApplyingChanges else { return }
         onChange?()
@@ -220,6 +235,11 @@ final class SettingsStore: ObservableObject {
 
     var shortcutModifierFlags: NSEvent.ModifierFlags {
         NSEvent.ModifierFlags(rawValue: shortcutModifiers)
+    }
+
+    var textCleanupMode: TextCleanupMode {
+        get { TextCleanupMode(rawValue: textCleanupModeRawValue) ?? .light }
+        set { textCleanupModeRawValue = newValue.rawValue }
     }
 
     func hasModifier(_ modifier: NSEvent.ModifierFlags) -> Bool {

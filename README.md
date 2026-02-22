@@ -11,6 +11,12 @@ A macOS menu-bar transcription assistant: hold a keyboard shortcut to record spe
   - **start recording on key-down**
   - **stop on key-up**
 - Speech transcription with Apple Speech framework
+- Smart cleanup pipeline before insertion:
+  - **Light** mode (safe spacing/punctuation/duplicate-word cleanup)
+  - **Aggressive** mode (stronger normalization + sentence capitalization)
+- Transcript History panel:
+  - stores last 20 dictations with timestamp
+  - quick actions for **Copy** and **Re-insert**
 - Paste-injection workflow (copies transcript to clipboard then sends `⌘V`)
 - Uses macOS inbuilt speech recognition (`SFSpeechRecognizer`) with
   on-device preference (`requiresOnDeviceRecognition = true` when available)

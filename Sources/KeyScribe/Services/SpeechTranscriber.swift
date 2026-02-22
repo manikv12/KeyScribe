@@ -63,8 +63,8 @@ final class SpeechTranscriber: NSObject {
         self.enableContextualBias = enableContextualBias
         self.keepTextAcrossPauses = keepTextAcrossPauses
         self.preferOnDeviceRecognition = preferOnDeviceRecognition
-        self.finalizeDelaySeconds = min(1.2, max(0.15, finalizeDelaySeconds))
-        self.customContextPhrases = parseCustomPhrases(customContextPhrases)
+        self.finalizeDelaySeconds = RecognitionTuning.clampedFinalizeDelay(finalizeDelaySeconds)
+        self.customContextPhrases = RecognitionTuning.parseCustomPhrases(customContextPhrases)
     }
 
     private func requestedAudioPermission() {
@@ -204,15 +204,14 @@ final class SpeechTranscriber: NSObject {
         }
         request.taskHint = .dictation
         if enableContextualBias {
-            var hints = [
+            let defaults = [
                 "KeyScribe",
                 "OpenClaw",
                 "dictation",
                 "transcription",
                 "macOS"
             ]
-            hints.append(contentsOf: customContextPhrases)
-            request.contextualStrings = Array(Set(hints)).prefix(80).map { $0 }
+            request.contextualStrings = RecognitionTuning.contextualHints(defaults: defaults, custom: customContextPhrases, limit: 80)
         }
 
         bestTranscriptInCurrentSegment = ""
@@ -267,20 +266,15 @@ final class SpeechTranscriber: NSObject {
 
         guard !candidateText.isEmpty else { return }
 
-        if scoreTranscript(candidateText) >= scoreTranscript(existingText) {
+        if RecognitionTuning.scoreTranscript(candidateText) >= RecognitionTuning.scoreTranscript(existingText) {
             bestTranscriptInCurrentSegment = candidateText
         }
-    }
-
-    private func scoreTranscript(_ text: String) -> Int {
-        let words = text.split { $0.isWhitespace || $0.isNewline }.count
-        return words * 100 + text.count
     }
 
     private func commitBestSegmentTranscript() {
         let fallback = liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         let best = bestTranscriptInCurrentSegment.trimmingCharacters(in: .whitespacesAndNewlines)
-        let chunk = scoreTranscript(best) >= scoreTranscript(fallback) ? best : fallback
+        let chunk = RecognitionTuning.chooseBetterTranscript(primary: best, fallback: fallback)
 
         guard !chunk.isEmpty else {
             liveTranscript = ""
@@ -314,18 +308,11 @@ final class SpeechTranscriber: NSObject {
     private func mergedTranscript() -> String {
         let current = liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         let best = bestTranscriptInCurrentSegment.trimmingCharacters(in: .whitespacesAndNewlines)
-        let tail = scoreTranscript(best) >= scoreTranscript(current) ? best : current
+        let tail = RecognitionTuning.chooseBetterTranscript(primary: best, fallback: current)
 
         if committedTranscript.isEmpty { return tail }
         if tail.isEmpty { return committedTranscript }
         return committedTranscript + " " + tail
-    }
-
-    private func parseCustomPhrases(_ text: String) -> [String] {
-        text
-            .components(separatedBy: CharacterSet(charactersIn: ",\n"))
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
     }
 
     private func applyMicSelection() {

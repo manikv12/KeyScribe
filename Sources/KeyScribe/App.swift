@@ -21,6 +21,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let waveform = WaveformHUDManager()
     private var hotkeyManager: HoldToTalkManager?
     private var settingsWindowController: NSWindowController?
+    private var historyWindowController: NSWindowController?
+    private let transcriptHistory = TranscriptHistoryStore.shared
+    private var historyTargetApplication: NSRunningApplication?
 
     private var statusItem: NSStatusItem?
     private var statusLabelItem: NSMenuItem?
@@ -75,13 +78,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         transcriber.onFinalText = { [weak self] text in
-            self?.insertText(text)
+            guard let self else { return }
+            let cleaned = TextCleanup.process(text, mode: self.settings.textCleanupMode)
+            guard !cleaned.isEmpty else { return }
+
+            self.transcriptHistory.add(cleaned)
+            self.insertText(cleaned)
             Task { @MainActor in
-                self?.statusLabelItem?.title = "Ready"
-                self?.isDictating = false
-                self?.currentAudioLevel = 0
-                self?.waveform.hide()
-                self?.updateMenuState()
+                self.statusLabelItem?.title = "Ready"
+                self.isDictating = false
+                self.currentAudioLevel = 0
+                self.waveform.hide()
+                self.updateMenuState()
             }
         }
 
@@ -105,6 +113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         waveform.hide()
         settingsWindowController?.close()
         settingsWindowController = nil
+        historyWindowController?.close()
+        historyWindowController = nil
         isDictating = false
     }
 
@@ -128,6 +138,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startStopMenuItem = NSMenuItem(title: "Transcribe", action: #selector(toggleDictation), keyEquivalent: "")
         startStopMenuItem?.target = self
         menu.addItem(startStopMenuItem!)
+
+        let historyItem = NSMenuItem(title: "History…", action: #selector(openHistoryMenuItem(_:)), keyEquivalent: "h")
+        historyItem.target = self
+        menu.addItem(historyItem)
 
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsMenuItem(_:)), keyEquivalent: ",")
         settingsItem.target = self
@@ -176,6 +190,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         openSettingsWindow()
     }
 
+    @objc private func openHistoryMenuItem(_ sender: Any?) {
+        openHistoryWindow()
+    }
+
     private func openSettingsWindow() {
         statusLabelItem?.title = "Opening settings…"
 
@@ -211,6 +229,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         statusLabelItem?.title = "Ready"
+    }
+
+    private func openHistoryWindow() {
+        if let frontmost = NSWorkspace.shared.frontmostApplication,
+           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            historyTargetApplication = frontmost
+        }
+
+        if historyWindowController == nil {
+            let historyView = TranscriptHistoryView(
+                onCopy: { [weak self] text in
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(text, forType: .string)
+                    self?.statusLabelItem?.title = "Copied from history"
+                },
+                onReinsert: { [weak self] text in
+                    guard let self else { return }
+                    if let target = self.historyTargetApplication, !target.isTerminated {
+                        _ = target.activate(options: [.activateIgnoringOtherApps])
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+                            self.insertText(text)
+                        }
+                    } else {
+                        self.insertText(text)
+                    }
+                }
+            )
+            .environmentObject(transcriptHistory)
+
+            let hostingController = NSHostingController(rootView: historyView)
+            let panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 540, height: 420),
+                styleMask: [.titled, .closable, .utilityWindow, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            panel.title = "Transcript History"
+            panel.contentViewController = hostingController
+            panel.isFloatingPanel = false
+            panel.hidesOnDeactivate = false
+            panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            panel.isReleasedWhenClosed = false
+            panel.center()
+            panel.delegate = self
+
+            historyWindowController = NSWindowController(window: panel)
+        }
+
+        guard let window = historyWindowController?.window else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        historyWindowController?.showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
     }
 
     @objc private func toggleDictation() {
@@ -345,8 +416,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        if let closingWindow = notification.object as? NSWindow, closingWindow === settingsWindowController?.window {
-            settingsWindowController = nil
+        if let closingWindow = notification.object as? NSWindow {
+            if closingWindow === settingsWindowController?.window {
+                settingsWindowController = nil
+            } else if closingWindow === historyWindowController?.window {
+                historyWindowController = nil
+            }
         }
     }
 }
@@ -542,6 +617,13 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Picker("Cleanup mode", selection: $settings.textCleanupModeRawValue) {
+                ForEach(TextCleanupMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode.rawValue)
+                }
+            }
+            .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
+
             VStack(alignment: .leading, spacing: 6) {
                 Text("Custom phrases (comma or new line separated)")
                     .font(.callout)
@@ -691,6 +773,51 @@ struct SettingsView: View {
     }
 
 
+}
+
+struct TranscriptHistoryView: View {
+    @EnvironmentObject private var history: TranscriptHistoryStore
+    let onCopy: (String) -> Void
+    let onReinsert: (String) -> Void
+
+    private let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f
+    }()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Recent dictations")
+                .font(.headline)
+
+            if history.entries.isEmpty {
+                Text("No transcripts yet.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            } else {
+                List(history.entries) { entry in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(formatter.string(from: entry.createdAt))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Copy") { onCopy(entry.text) }
+                            Button("Re-insert") { onReinsert(entry.text) }
+                        }
+                        Text(entry.text)
+                            .textSelection(.enabled)
+                            .lineLimit(3)
+                    }
+                    .padding(.vertical, 4)
+                }
+                .listStyle(.inset)
+            }
+        }
+        .padding()
+    }
 }
 
 struct ShortcutCaptureMonitor: NSViewRepresentable {
