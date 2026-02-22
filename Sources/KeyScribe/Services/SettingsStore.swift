@@ -116,6 +116,7 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var availableMicrophones: [MicrophoneOption] = []
+    @Published var accessibilityTrusted: Bool = AXIsProcessTrusted()
 
     /// Called whenever user-facing settings change. The app can subscribe and reconfigure features.
     var onChange: (() -> Void)?
@@ -207,9 +208,19 @@ final class SettingsStore: ObservableObject {
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
         refreshMicrophones(notifyChange: false)
+        refreshAccessibilityStatus(prompt: false)
 
         isApplyingChanges = false
         save()
+    }
+
+    func refreshAccessibilityStatus(prompt: Bool) {
+        if prompt {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+        }
+
+        accessibilityTrusted = AXIsProcessTrusted()
     }
 
     func refreshMicrophones(notifyChange: Bool = true) {

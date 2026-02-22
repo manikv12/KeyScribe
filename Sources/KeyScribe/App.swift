@@ -99,10 +99,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         transcriber.requestPermissions()
+        requestAccessibilityIfNeeded(prompt: true)
         applyHotkeyMode()
-        if !AXIsProcessTrusted() {
-            setUIStatus(.accessibilityHint)
-        }
         updateMenuState()
     }
 
@@ -113,6 +111,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowCoordinator?.closeAllWindows()
         windowCoordinator = nil
         isDictating = false
+    }
+
+    private func requestAccessibilityIfNeeded(prompt: Bool) {
+        settings.refreshAccessibilityStatus(prompt: prompt)
+        guard !settings.accessibilityTrusted else { return }
+        setUIStatus(.accessibilityHint)
     }
 
     private func setupStatusBar() {
@@ -143,6 +147,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsMenuItem(_:)), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
+
+        let accessibilityItem = NSMenuItem(title: "Grant Accessibility Access…", action: #selector(requestAccessibilityMenuItem(_:)), keyEquivalent: "")
+        accessibilityItem.target = self
+        menu.addItem(accessibilityItem)
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
@@ -190,6 +199,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openHistoryMenuItem(_ sender: Any?) {
         windowCoordinator?.openHistoryWindow()
+    }
+
+    @objc private func requestAccessibilityMenuItem(_ sender: Any?) {
+        requestAccessibilityIfNeeded(prompt: true)
     }
 
     @objc private func toggleDictation() {
@@ -243,7 +256,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func attemptInsertText(_ text: String, copyToClipboard: Bool, attemptsRemaining: Int) {
         guard attemptsRemaining > 0 else {
-            setUIStatus(.pasteUnavailable)
+            ensureClipboardFallback(text)
+            setUIStatus(.message("Paste unavailable — copied to clipboard"))
             lastTargetApplication = nil
             return
         }
@@ -277,9 +291,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case let .complete(statusMessage):
-            applyInsertionStatusMessage(statusMessage)
+            if let statusMessage, statusMessage.hasPrefix("Paste unavailable") {
+                ensureClipboardFallback(text)
+                applyInsertionStatusMessage("Paste unavailable — copied to clipboard")
+            } else {
+                applyInsertionStatusMessage(statusMessage)
+            }
             lastTargetApplication = nil
         }
+    }
+
+    private func ensureClipboardFallback(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        _ = pasteboard.setString(trimmed, forType: .string)
     }
 
     private func applyInsertionStatusMessage(_ statusMessage: String?) {
@@ -436,6 +463,8 @@ struct SettingsView: View {
     private var sectionContent: some View {
         switch selectedSection {
         case .general:
+            accessibilityCard
+
             Toggle("Use continuous mode", isOn: $settings.continuousMode)
                 .help("Use the menu bar button to start/stop dictation until you stop it manually.")
 
@@ -581,6 +610,56 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private var accessibilityCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: settings.accessibilityTrusted ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(settings.accessibilityTrusted ? .green : .orange)
+                Text(settings.accessibilityTrusted ? "Accessibility access granted" : "Accessibility access required")
+                    .font(.callout.weight(.semibold))
+            }
+
+            Text(settings.accessibilityTrusted
+                 ? "KeyScribe can control paste and insertion reliably."
+                 : "Enable KeyScribe in Privacy & Security → Accessibility so paste and text insertion work across apps.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Button("Check again") {
+                    settings.refreshAccessibilityStatus(prompt: false)
+                }
+                .buttonStyle(.bordered)
+
+                if !settings.accessibilityTrusted {
+                    Button("Grant Accessibility Access…") {
+                        settings.refreshAccessibilityStatus(prompt: true)
+                        openAccessibilitySettings()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+        )
+        .onAppear {
+            settings.refreshAccessibilityStatus(prompt: false)
+        }
+    }
+
+    private func openAccessibilitySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private var shortcutSegments: [String] {
