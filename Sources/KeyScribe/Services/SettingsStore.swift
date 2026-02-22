@@ -5,11 +5,6 @@ import Foundation
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
-    private static let supportedShortcutModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift, .function]
-    private static let modifierOnlyKeyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
-    private static let defaultShortcutKeyCode: UInt16 = 49
-    private static let defaultShortcutModifiers: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
-
     private let defaults = UserDefaults.standard
     private var isApplyingChanges = false
 
@@ -123,22 +118,22 @@ final class SettingsStore: ObservableObject {
 
         var initialShortcutKeyCode: UInt16
         if defaults.object(forKey: Keys.shortcutKeyCode) == nil {
-            initialShortcutKeyCode = Self.defaultShortcutKeyCode
+            initialShortcutKeyCode = ShortcutValidation.defaultKeyCode
         } else {
             initialShortcutKeyCode = UInt16(defaults.integer(forKey: Keys.shortcutKeyCode))
         }
 
         let storedModifiers = defaults.integer(forKey: Keys.shortcutModifiers)
         var initialShortcutModifiers = storedModifiers == 0
-            ? Self.defaultShortcutModifiers
+            ? ShortcutValidation.defaultModifiers
             : UInt(storedModifiers)
 
-        if !Self.isValidShortcut(keyCode: initialShortcutKeyCode, modifiers: initialShortcutModifiers) {
-            initialShortcutKeyCode = Self.defaultShortcutKeyCode
-            initialShortcutModifiers = Self.defaultShortcutModifiers
+        if !ShortcutValidation.isValid(keyCode: initialShortcutKeyCode, modifiersRaw: initialShortcutModifiers) {
+            initialShortcutKeyCode = ShortcutValidation.defaultKeyCode
+            initialShortcutModifiers = ShortcutValidation.defaultModifiers
         }
         shortcutKeyCode = initialShortcutKeyCode
-        shortcutModifiers = initialShortcutModifiers
+        shortcutModifiers = ShortcutValidation.filteredModifierRawValue(from: initialShortcutModifiers)
 
         if defaults.object(forKey: Keys.continuousMode) == nil {
             continuousMode = true
@@ -230,7 +225,7 @@ final class SettingsStore: ObservableObject {
 
     func save() {
         defaults.set(Int(shortcutKeyCode), forKey: Keys.shortcutKeyCode)
-        defaults.set(Int(shortcutModifiers), forKey: Keys.shortcutModifiers)
+        defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: shortcutModifiers)), forKey: Keys.shortcutModifiers)
         defaults.set(continuousMode, forKey: Keys.continuousMode)
         defaults.set(autoDetectMicrophone, forKey: Keys.autoDetectMicrophone)
         defaults.set(selectedMicrophoneUID, forKey: Keys.selectedMicrophoneUID)
@@ -248,7 +243,7 @@ final class SettingsStore: ObservableObject {
     }
 
     var shortcutModifierFlags: NSEvent.ModifierFlags {
-        NSEvent.ModifierFlags(rawValue: shortcutModifiers)
+        ShortcutValidation.filteredModifierFlags(from: shortcutModifiers)
     }
 
     var textCleanupMode: TextCleanupMode {
@@ -268,25 +263,4 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    private static func modifierCount(_ flags: NSEvent.ModifierFlags) -> Int {
-        var count = 0
-        if flags.contains(.function) { count += 1 }
-        if flags.contains(.control) { count += 1 }
-        if flags.contains(.option) { count += 1 }
-        if flags.contains(.shift) { count += 1 }
-        if flags.contains(.command) { count += 1 }
-        return count
-    }
-
-    private static func isValidShortcut(keyCode: UInt16, modifiers: UInt) -> Bool {
-        let filteredModifiers = NSEvent.ModifierFlags(rawValue: modifiers).intersection(supportedShortcutModifiers)
-        let count = modifierCount(filteredModifiers)
-
-        if keyCode == UInt16.max {
-            return (2...3).contains(count)
-        }
-
-        guard !modifierOnlyKeyCodes.contains(keyCode) else { return false }
-        return (1...2).contains(count)
-    }
 }

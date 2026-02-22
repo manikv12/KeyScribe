@@ -15,15 +15,13 @@ struct KeyScribeApp: App {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private let transcriber = SpeechTranscriber()
     private let settings = SettingsStore.shared
     private let waveform = WaveformHUDManager()
     private var hotkeyManager: HoldToTalkManager?
-    private var settingsWindowController: NSWindowController?
-    private var historyWindowController: NSWindowController?
     private let transcriptHistory = TranscriptHistoryStore.shared
-    private var historyTargetApplication: NSRunningApplication?
+    private var windowCoordinator: AppWindowCoordinator?
 
     private var statusItem: NSStatusItem?
     private var statusLabelItem: NSMenuItem?
@@ -34,6 +32,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
+
+        windowCoordinator = AppWindowCoordinator(
+            settings: settings,
+            transcriptHistory: transcriptHistory,
+            onStatusUpdate: { [weak self] status in
+                self?.setUIStatus(status)
+            },
+            onInsertText: { [weak self] text in
+                self?.insertText(text)
+            }
+        )
 
         settings.refreshMicrophones()
         transcriber.applyMicrophoneSettings(autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID)
@@ -47,14 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
 
         transcriber.onStatusUpdate = { [weak self] message in
-            DispatchQueue.main.async {
-                self?.statusLabelItem?.title = message
-                if message == "Ready" {
-                    self?.isDictating = false
-                    self?.currentAudioLevel = 0
-                    self?.waveform.hide()
-                }
-                self?.updateMenuState()
+            Task { @MainActor in
+                self?.setUIStatus(DictationUIStatus.fromTranscriberMessage(message))
             }
         }
 
@@ -69,11 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         transcriber.onRecordingStateChange = { [weak self] isRecording in
             Task { @MainActor in
                 self?.isDictating = isRecording
-                self?.updateMenuState()
                 if !isRecording {
-                    self?.currentAudioLevel = 0
-                    self?.waveform.hide()
-                    self?.statusLabelItem?.title = "Ready"
+                    self?.setUIStatus(.ready)
+                } else {
+                    self?.updateMenuState()
                 }
             }
         }
@@ -86,11 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.transcriptHistory.add(cleaned)
             self.insertText(cleaned)
             Task { @MainActor in
-                self.statusLabelItem?.title = "Ready"
-                self.isDictating = false
-                self.currentAudioLevel = 0
-                self.waveform.hide()
-                self.updateMenuState()
+                self.setUIStatus(.ready)
             }
         }
 
@@ -103,7 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         transcriber.requestPermissions()
         applyHotkeyMode()
         if !AXIsProcessTrusted() {
-            statusLabelItem?.title = "Enable Accessibility for reliable hotkeys"
+            setUIStatus(.accessibilityHint)
         }
         updateMenuState()
     }
@@ -112,10 +110,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkeyManager?.stop()
         transcriber.stopRecording()
         waveform.hide()
-        settingsWindowController?.close()
-        settingsWindowController = nil
-        historyWindowController?.close()
-        historyWindowController = nil
+        windowCoordinator?.closeAllWindows()
+        windowCoordinator = nil
         isDictating = false
     }
 
@@ -131,7 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         menu.addItem(NSMenuItem(title: "KeyScribe", action: nil, keyEquivalent: ""))
 
-        statusLabelItem = NSMenuItem(title: "Ready", action: nil, keyEquivalent: "")
+        statusLabelItem = NSMenuItem(title: DictationUIStatus.ready.menuText, action: nil, keyEquivalent: "")
         menu.addItem(statusLabelItem!)
 
         menu.addItem(NSMenuItem.separator())
@@ -189,101 +185,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func openSettingsMenuItem(_ sender: Any?) {
-        openSettingsWindow()
+        windowCoordinator?.openSettingsWindow()
     }
 
     @objc private func openHistoryMenuItem(_ sender: Any?) {
-        openHistoryWindow()
-    }
-
-    private func openSettingsWindow() {
-        statusLabelItem?.title = "Opening settings…"
-
-        if settingsWindowController == nil {
-            let hostingController = NSHostingController(rootView: SettingsView().environmentObject(settings))
-            let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 460, height: 430),
-                styleMask: [.titled, .closable, .utilityWindow],
-                backing: .buffered,
-                defer: false
-            )
-
-            panel.title = "KeyScribe Settings"
-            panel.contentViewController = hostingController
-            panel.isFloatingPanel = true
-            panel.level = .floating
-            panel.hidesOnDeactivate = false
-            panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-            panel.isReleasedWhenClosed = false
-            panel.center()
-            panel.delegate = self
-
-            settingsWindowController = NSWindowController(window: panel)
-        }
-
-        guard let window = settingsWindowController?.window else {
-            statusLabelItem?.title = "Could not open settings"
-            return
-        }
-
-        NSApp.activate(ignoringOtherApps: true)
-        settingsWindowController?.showWindow(nil)
-        window.orderFrontRegardless()
-        window.makeKeyAndOrderFront(nil)
-        statusLabelItem?.title = "Ready"
-    }
-
-    private func openHistoryWindow() {
-        if let frontmost = NSWorkspace.shared.frontmostApplication,
-           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
-            historyTargetApplication = frontmost
-        }
-
-        if historyWindowController == nil {
-            let historyView = TranscriptHistoryView(
-                onCopy: { [weak self] text in
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(text, forType: .string)
-                    self?.statusLabelItem?.title = "Copied from history"
-                },
-                onReinsert: { [weak self] text in
-                    guard let self else { return }
-                    if let target = self.historyTargetApplication, !target.isTerminated {
-                        _ = target.activate(options: [.activateIgnoringOtherApps])
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
-                            self.insertText(text)
-                        }
-                    } else {
-                        self.insertText(text)
-                    }
-                }
-            )
-            .environmentObject(transcriptHistory)
-
-            let hostingController = NSHostingController(rootView: historyView)
-            let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 540, height: 420),
-                styleMask: [.titled, .closable, .utilityWindow, .resizable],
-                backing: .buffered,
-                defer: false
-            )
-            panel.title = "Transcript History"
-            panel.contentViewController = hostingController
-            panel.isFloatingPanel = false
-            panel.hidesOnDeactivate = false
-            panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-            panel.isReleasedWhenClosed = false
-            panel.center()
-            panel.delegate = self
-
-            historyWindowController = NSWindowController(window: panel)
-        }
-
-        guard let window = historyWindowController?.window else { return }
-        NSApp.activate(ignoringOtherApps: true)
-        historyWindowController?.showWindow(nil)
-        window.makeKeyAndOrderFront(nil)
+        windowCoordinator?.openHistoryWindow()
     }
 
     @objc private func toggleDictation() {
@@ -303,19 +209,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         currentAudioLevel = 0
-        statusLabelItem?.title = "Listening…"
+        setUIStatus(.listening)
         waveform.show()
-        updateMenuState()
 
         let started = transcriber.startRecording()
         isDictating = started
+        updateMenuState()
 
         if !started {
-            statusLabelItem?.title = "Ready"
-            isDictating = false
-            currentAudioLevel = 0
-            waveform.hide()
-            updateMenuState()
+            setUIStatus(.ready)
         }
     }
 
@@ -326,12 +228,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
-        statusLabelItem?.title = "Finalizing…"
-        updateMenuState()
+        setUIStatus(.finalizing)
         transcriber.stopRecording()
         isDictating = false
         currentAudioLevel = 0
         waveform.hide()
+        updateMenuState()
     }
 
     private func insertText(_ text: String) {
@@ -353,7 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let result = TextInserter.insert(text, copyToClipboard: settings.copyToClipboard)
         switch result {
         case .pasted:
-            statusLabelItem?.title = "Ready"
+            setUIStatus(.ready)
             lastTargetApplication = nil
         case .copiedOnly:
             if retriesRemaining > 0 {
@@ -361,7 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.attemptInsertText(text, retriesRemaining: retriesRemaining - 1)
                 }
             } else {
-                statusLabelItem?.title = "Copied to clipboard"
+                setUIStatus(.copiedToClipboard)
                 lastTargetApplication = nil
             }
         case .notInserted:
@@ -370,12 +272,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.attemptInsertText(text, retriesRemaining: retriesRemaining - 1)
                 }
             } else {
-                statusLabelItem?.title = "Paste unavailable"
+                setUIStatus(.pasteUnavailable)
                 lastTargetApplication = nil
             }
         case .empty:
             lastTargetApplication = nil
         }
+    }
+
+    private func setUIStatus(_ status: DictationUIStatus) {
+        statusLabelItem?.title = status.menuText
+
+        if status.resetsDictationIndicators {
+            isDictating = false
+            currentAudioLevel = 0
+            waveform.hide()
+        }
+
+        updateMenuState()
     }
 
     private func updateMenuState() {
@@ -416,16 +330,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         configured?.isTemplate = true
         return configured
     }
-
-    func windowWillClose(_ notification: Notification) {
-        if let closingWindow = notification.object as? NSWindow {
-            if closingWindow === settingsWindowController?.window {
-                settingsWindowController = nil
-            } else if closingWindow === historyWindowController?.window {
-                historyWindowController = nil
-            }
-        }
-    }
 }
 
 struct SettingsView: View {
@@ -462,8 +366,8 @@ struct SettingsView: View {
             ShortcutCaptureMonitor(
                 isCapturing: $isCapturingShortcut,
                 onCapture: { keyCode, modifiers in
-                    let filteredModifiers = NSEvent.ModifierFlags(rawValue: modifiers).intersection(shortcutModifierMask).rawValue
-                    guard isValidShortcut(keyCode: keyCode, modifiers: filteredModifiers) else {
+                    let filteredModifiers = ShortcutValidation.filteredModifierRawValue(from: modifiers)
+                    guard ShortcutValidation.isValid(keyCode: keyCode, modifiersRaw: filteredModifiers) else {
                         shortcutCaptureMessage = "Shortcut must use 2 or 3 keys. Try again."
                         return
                     }
@@ -646,137 +550,16 @@ struct SettingsView: View {
         }
     }
 
-    private var shortcutModifierMask: NSEvent.ModifierFlags {
-        [.command, .option, .control, .shift, .function]
-    }
-
-    private var modifierOnlyKeyCodes: Set<UInt16> {
-        [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
-    }
-
     private var shortcutSegments: [String] {
-        let flags = settings.shortcutModifierFlags.intersection(shortcutModifierMask)
-        var segments: [String] = []
-
-        if flags.contains(.function) { segments.append("Fn") }
-        if flags.contains(.control) { segments.append("⌃") }
-        if flags.contains(.option) { segments.append("⌥") }
-        if flags.contains(.shift) { segments.append("⇧") }
-        if flags.contains(.command) { segments.append("⌘") }
-
-        if settings.shortcutKeyCode != UInt16.max {
-            segments.append(keyName(for: settings.shortcutKeyCode))
-        }
-
-        return segments.isEmpty ? ["Not set"] : segments
+        ShortcutValidation.displaySegments(
+            keyCode: settings.shortcutKeyCode,
+            modifiersRaw: settings.shortcutModifiers
+        )
     }
 
     private var isCurrentShortcutValid: Bool {
-        isValidShortcut(keyCode: settings.shortcutKeyCode, modifiers: settings.shortcutModifiers)
+        ShortcutValidation.isValid(keyCode: settings.shortcutKeyCode, modifiersRaw: settings.shortcutModifiers)
     }
-
-    private func isValidShortcut(keyCode: UInt16, modifiers: UInt) -> Bool {
-        let flags = NSEvent.ModifierFlags(rawValue: modifiers).intersection(shortcutModifierMask)
-        let modifierCount = countModifiers(in: flags)
-
-        if keyCode == UInt16.max {
-            return (2...3).contains(modifierCount)
-        }
-
-        guard !modifierOnlyKeyCodes.contains(keyCode) else { return false }
-        return (1...2).contains(modifierCount)
-    }
-
-    private func countModifiers(in flags: NSEvent.ModifierFlags) -> Int {
-        var count = 0
-        if flags.contains(.function) { count += 1 }
-        if flags.contains(.control) { count += 1 }
-        if flags.contains(.option) { count += 1 }
-        if flags.contains(.shift) { count += 1 }
-        if flags.contains(.command) { count += 1 }
-        return count
-    }
-
-    private func keyName(for code: UInt16) -> String {
-        let names: [UInt16: String] = [
-            0: "A",
-            1: "S",
-            2: "D",
-            3: "F",
-            4: "H",
-            5: "G",
-            6: "Z",
-            7: "X",
-            8: "C",
-            9: "V",
-            11: "B",
-            12: "Q",
-            13: "W",
-            14: "E",
-            15: "R",
-            16: "Y",
-            17: "T",
-            18: "1",
-            19: "2",
-            20: "3",
-            21: "4",
-            22: "6",
-            23: "5",
-            24: "=",
-            25: "9",
-            26: "7",
-            27: "-",
-            28: "8",
-            29: "0",
-            30: "]",
-            31: "O",
-            32: "U",
-            33: "[",
-            34: "I",
-            35: "P",
-            36: "Return",
-            37: "L",
-            38: "J",
-            39: "'",
-            40: "K",
-            41: ";",
-            42: "\\\\",
-            43: ",",
-            44: "/",
-            45: "N",
-            46: "M",
-            47: ".",
-            48: "`",
-            49: "Space",
-            50: "`",
-            51: "Delete",
-            53: "Esc",
-            122: "F1",
-            120: "F2",
-            99: "F3",
-            118: "F4",
-            96: "F5",
-            97: "F6",
-            98: "F7",
-            100: "F8",
-            101: "F9",
-            109: "F10",
-            103: "F11",
-            111: "F12",
-            105: "F13",
-            107: "F14",
-            113: "F15",
-            106: "F16",
-            64: "F17",
-            79: "F18",
-            80: "F19",
-            90: "F20",
-            63: "Fn"
-        ]
-
-        return names[code] ?? "Key \(code)"
-    }
-
 
 }
 
@@ -851,8 +634,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
     }
 
     final class Coordinator {
-        private static let modifierOnlyKeyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
-
         private var parent: ShortcutCaptureMonitor
         private var globalKeyMonitor: Any?
         private var localKeyMonitor: Any?
@@ -868,7 +649,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
             guard globalKeyMonitor == nil, localKeyMonitor == nil, globalFlagsMonitor == nil, localFlagsMonitor == nil else { return }
             didCapture = false
 
-            let mask = NSEvent.ModifierFlags([.command, .option, .control, .shift, .function])
+            let mask = ShortcutValidation.supportedModifierFlags
 
             globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 _ = self?.handleKeyDown(event, mask: mask)
@@ -906,11 +687,11 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
             }
 
             let capturedCode = event.keyCode
-            if Self.modifierOnlyKeyCodes.contains(capturedCode) {
+            if ShortcutValidation.isModifierOnlyKeyCode(capturedCode) {
                 return false
             }
 
-            let capturedMods = event.modifierFlags.intersection(mask).rawValue
+            let capturedMods = ShortcutValidation.filteredModifierRawValue(from: event.modifierFlags.intersection(mask).rawValue)
             guard capturedMods != 0 else { return false }
             didCapture = true
             DispatchQueue.main.async {
@@ -924,7 +705,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
             guard !didCapture else { return true }
 
             let capturedFlags = event.modifierFlags.intersection(mask)
-            let count = Self.countModifiers(in: capturedFlags)
+            let count = ShortcutValidation.modifierCount(in: capturedFlags)
             guard (2...3).contains(count) else { return false }
 
             didCapture = true
@@ -932,16 +713,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
                 self.parent.onCapture(UInt16.max, capturedFlags.rawValue)
             }
             return true
-        }
-
-        private static func countModifiers(in flags: NSEvent.ModifierFlags) -> Int {
-            var count = 0
-            if flags.contains(.function) { count += 1 }
-            if flags.contains(.control) { count += 1 }
-            if flags.contains(.option) { count += 1 }
-            if flags.contains(.shift) { count += 1 }
-            if flags.contains(.command) { count += 1 }
-            return count
         }
 
         func stop() {
