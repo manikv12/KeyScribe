@@ -16,6 +16,8 @@ struct CoreLogicSmokeTests {
         testTextCleanupPipeline()
         testRecognitionTuningDeterminism()
         testInsertionRetryPolicyBounds()
+        testFocusActivationRetryPolicy()
+        testTextInsertionDecisionHelpers()
 
         print("✅ Core logic smoke tests passed")
     }
@@ -111,6 +113,88 @@ struct CoreLogicSmokeTests {
             InsertionRetryPolicy.plan(for: .copiedOnly, retriesRemaining: -5)
                 == .complete(statusMessage: "Copied to clipboard"),
             "Retry input should be bounded at zero to avoid unbounded loops"
+        )
+    }
+
+    private static func testFocusActivationRetryPolicy() {
+        check(
+            InsertionRetryPolicy.activationPlan(hasTargetApplication: false, targetIsActive: false, retriesRemaining: 5)
+                == .proceed,
+            "Activation should proceed immediately when there is no target app"
+        )
+
+        check(
+            InsertionRetryPolicy.activationPlan(hasTargetApplication: true, targetIsActive: true, retriesRemaining: 5)
+                == .proceed,
+            "Activation should proceed immediately when target is already active"
+        )
+
+        check(
+            InsertionRetryPolicy.activationPlan(hasTargetApplication: true, targetIsActive: false, retriesRemaining: 2)
+                == .retry(delay: 0.18, nextRetriesRemaining: 1),
+            "Activation should retry while inactive target retries remain"
+        )
+
+        check(
+            InsertionRetryPolicy.activationPlan(hasTargetApplication: true, targetIsActive: false, retriesRemaining: 0)
+                == .proceed,
+            "Activation should stop retrying once retries are exhausted"
+        )
+    }
+
+    private static func testTextInsertionDecisionHelpers() {
+        let before = TextInserter.VerificationState(
+            value: "Hello",
+            selectedText: nil,
+            selectedRange: NSRange(location: 5, length: 0)
+        )
+
+        let afterValueChanged = TextInserter.VerificationState(
+            value: "Hello world",
+            selectedText: nil,
+            selectedRange: NSRange(location: 11, length: 0)
+        )
+
+        check(
+            TextInserter.didInsertText(" world", before: before, after: afterValueChanged),
+            "Value change should count as insertion"
+        )
+
+        let afterOnlySelectionMoved = TextInserter.VerificationState(
+            value: "Hello",
+            selectedText: nil,
+            selectedRange: NSRange(location: 11, length: 0)
+        )
+
+        check(
+            TextInserter.didInsertText(" world", before: before, after: afterOnlySelectionMoved),
+            "Caret movement consistent with inserted text should count as insertion"
+        )
+
+        let unchanged = TextInserter.VerificationState(
+            value: "Hello",
+            selectedText: nil,
+            selectedRange: NSRange(location: 5, length: 0)
+        )
+
+        check(
+            !TextInserter.didInsertText(" world", before: before, after: unchanged),
+            "Unchanged state should not count as insertion"
+        )
+
+        check(
+            TextInserter.pasteFallbackDecision(afterPrimaryOutcome: .inserted) == .skipCommandOptionV,
+            "Command+Option+V should be skipped after successful primary paste"
+        )
+
+        check(
+            TextInserter.pasteFallbackDecision(afterPrimaryOutcome: .unverified) == .skipCommandOptionV,
+            "Command+Option+V should be skipped when primary paste cannot be verified"
+        )
+
+        check(
+            TextInserter.pasteFallbackDecision(afterPrimaryOutcome: .notInserted) == .tryCommandOptionV,
+            "Command+Option+V should only be attempted after a verified non-insertion"
         )
     }
 }
