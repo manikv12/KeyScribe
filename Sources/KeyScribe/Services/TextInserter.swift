@@ -3,11 +3,11 @@ import Carbon
 import OSLog
 
 enum TextInserter {
-    enum Result: Equatable {
-        case pasted
-        case copiedOnly
-        case notInserted
-        case empty
+    enum Result: String, Equatable {
+        case pasted = "pasted"
+        case copiedOnly = "copied-only"
+        case notInserted = "not-inserted"
+        case empty = "empty"
     }
 
     struct InsertOutcome: Equatable {
