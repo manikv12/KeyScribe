@@ -2,34 +2,67 @@ import AppKit
 import Carbon
 
 enum TextInserter {
-    enum Result {
-        case pasted
-        case copiedOnly
-        case notInserted
-        case empty
+    enum Result: String {
+        case pasted = "pasted"
+        case copiedOnly = "copied-only"
+        case notInserted = "not-inserted"
+        case empty = "empty"
     }
 
     @MainActor
     static func insert(_ text: String, copyToClipboard: Bool) -> Result {
-        guard !text.isEmpty else { return .empty }
+        if text.isEmpty {
+            let decision = InsertionDecisionModel.evaluate(
+                text: text,
+                copyToClipboard: copyToClipboard,
+                directInsertSucceeded: false,
+                typingInsertSucceeded: false,
+                specialPasteSucceeded: false
+            )
+            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
+        }
 
         if insertDirectlyIntoFocusedTextInput(text) {
             if copyToClipboard {
                 copyTextToPasteboard(text)
             }
-            return .pasted
+
+            let decision = InsertionDecisionModel.evaluate(
+                text: text,
+                copyToClipboard: copyToClipboard,
+                directInsertSucceeded: true,
+                typingInsertSucceeded: false,
+                specialPasteSucceeded: false
+            )
+            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
         }
 
         if insertByTyping(text) {
             if copyToClipboard {
                 copyTextToPasteboard(text)
             }
-            return .pasted
+
+            let decision = InsertionDecisionModel.evaluate(
+                text: text,
+                copyToClipboard: copyToClipboard,
+                directInsertSucceeded: false,
+                typingInsertSucceeded: true,
+                specialPasteSucceeded: false
+            )
+            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
         }
 
         if copyToClipboard {
             copyTextToPasteboard(text)
-            return sendSpecialPasteShortcut() ? .pasted : .copiedOnly
+            let pasted = sendSpecialPasteShortcut()
+            let decision = InsertionDecisionModel.evaluate(
+                text: text,
+                copyToClipboard: copyToClipboard,
+                directInsertSucceeded: false,
+                typingInsertSucceeded: false,
+                specialPasteSucceeded: pasted
+            )
+            return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
         }
 
         // Clipboard writes are disabled, but we still need a robust paste fallback.
@@ -42,7 +75,20 @@ enum TextInserter {
         let pasted = sendSpecialPasteShortcut()
         restorePasteboardItems(previousItems, expectedChangeCount: temporaryWriteChangeCount)
 
-        return pasted ? .pasted : .notInserted
+        let decision = InsertionDecisionModel.evaluate(
+            text: text,
+            copyToClipboard: copyToClipboard,
+            directInsertSucceeded: false,
+            typingInsertSucceeded: false,
+            specialPasteSucceeded: pasted
+        )
+        return complete(with: decision, text: text, copyToClipboard: copyToClipboard)
+    }
+
+    @MainActor
+    private static func complete(with decision: InsertionDecision, text: String, copyToClipboard: Bool) -> Result {
+        InsertionDiagnostics.record(decision: decision, text: text, copyToClipboard: copyToClipboard)
+        return decision.result
     }
 
     @MainActor
