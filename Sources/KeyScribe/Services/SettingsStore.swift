@@ -26,6 +26,7 @@ final class SettingsStore: ObservableObject {
         static let finalizeDelaySeconds = "KeyScribe.finalizeDelaySeconds"
         static let customContextPhrases = "KeyScribe.customContextPhrases"
         static let textCleanupMode = "KeyScribe.textCleanupMode"
+        static let autoPunctuation = "KeyScribe.autoPunctuation"
     }
 
     @Published var shortcutKeyCode: UInt16 {
@@ -106,6 +107,12 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var autoPunctuation: Bool {
+        didSet {
+            save()
+        }
+    }
+
     @Published var availableMicrophones: [MicrophoneOption] = []
 
     /// Called whenever user-facing settings change. The app can subscribe and reconfigure features.
@@ -170,7 +177,7 @@ final class SettingsStore: ObservableObject {
         }
 
         let storedFinalizeDelay = defaults.object(forKey: Keys.finalizeDelaySeconds) == nil
-            ? 0.35
+            ? 0.25
             : defaults.double(forKey: Keys.finalizeDelaySeconds)
         finalizeDelaySeconds = min(1.2, max(0.15, storedFinalizeDelay))
 
@@ -181,6 +188,12 @@ final class SettingsStore: ObservableObject {
             textCleanupModeRawValue = TextCleanupMode.light.rawValue
         } else {
             textCleanupModeRawValue = storedCleanup
+        }
+
+        if defaults.object(forKey: Keys.autoPunctuation) == nil {
+            autoPunctuation = true
+        } else {
+            autoPunctuation = defaults.bool(forKey: Keys.autoPunctuation)
         }
 
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
@@ -228,6 +241,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(min(1.2, max(0.15, finalizeDelaySeconds)), forKey: Keys.finalizeDelaySeconds)
         defaults.set(customContextPhrases, forKey: Keys.customContextPhrases)
         defaults.set(textCleanupModeRawValue, forKey: Keys.textCleanupMode)
+        defaults.set(autoPunctuation, forKey: Keys.autoPunctuation)
 
         guard !isApplyingChanges else { return }
         onChange?()

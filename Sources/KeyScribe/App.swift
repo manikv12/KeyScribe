@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             enableContextualBias: settings.enableContextualBias,
             keepTextAcrossPauses: settings.keepTextAcrossPauses,
             preferOnDeviceRecognition: settings.preferOnDeviceRecognition,
+            autoPunctuation: settings.autoPunctuation,
             finalizeDelaySeconds: settings.finalizeDelaySeconds,
             customContextPhrases: settings.customContextPhrases
         )
@@ -161,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             enableContextualBias: settings.enableContextualBias,
             keepTextAcrossPauses: settings.keepTextAcrossPauses,
             preferOnDeviceRecognition: settings.preferOnDeviceRecognition,
+            autoPunctuation: settings.autoPunctuation,
             finalizeDelaySeconds: settings.finalizeDelaySeconds,
             customContextPhrases: settings.customContextPhrases
         )
@@ -607,6 +609,9 @@ struct SettingsView: View {
 
             Toggle("Prefer on-device recognition (faster/private)", isOn: $settings.preferOnDeviceRecognition)
                 .help("Turn off to allow Apple hybrid fallback for tougher speech cases.")
+
+            Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
+                .help("Uses Apple Speech punctuation generation during recognition.")
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("Finalize delay: \(Int(settings.finalizeDelaySeconds * 1000)) ms")

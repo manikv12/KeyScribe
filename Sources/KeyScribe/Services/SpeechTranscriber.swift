@@ -30,6 +30,7 @@ final class SpeechTranscriber: NSObject {
     private var preferOnDeviceRecognition = true
     private var finalizeDelaySeconds: TimeInterval = 0.35
     private var customContextPhrases: [String] = []
+    private var autoPunctuation = true
 
     override init() {
         let locale = Locale.current
@@ -57,12 +58,14 @@ final class SpeechTranscriber: NSObject {
         enableContextualBias: Bool,
         keepTextAcrossPauses: Bool,
         preferOnDeviceRecognition: Bool,
+        autoPunctuation: Bool,
         finalizeDelaySeconds: TimeInterval,
         customContextPhrases: String
     ) {
         self.enableContextualBias = enableContextualBias
         self.keepTextAcrossPauses = keepTextAcrossPauses
         self.preferOnDeviceRecognition = preferOnDeviceRecognition
+        self.autoPunctuation = autoPunctuation
         self.finalizeDelaySeconds = RecognitionTuning.clampedFinalizeDelay(finalizeDelaySeconds)
         self.customContextPhrases = RecognitionTuning.parseCustomPhrases(customContextPhrases)
     }
@@ -201,6 +204,7 @@ final class SpeechTranscriber: NSObject {
         request.shouldReportPartialResults = true
         if #available(macOS 13, *) {
             request.requiresOnDeviceRecognition = preferOnDeviceRecognition
+            request.addsPunctuation = autoPunctuation
         }
         request.taskHint = .dictation
         if enableContextualBias {

@@ -20,6 +20,8 @@ A macOS menu-bar transcription assistant: hold a keyboard shortcut to record spe
 - Paste-injection workflow (copies transcript to clipboard then sends `⌘V`)
 - Uses macOS inbuilt speech recognition (`SFSpeechRecognizer`) with
   on-device preference (`requiresOnDeviceRecognition = true` when available)
+- Enables Apple automatic punctuation (`addsPunctuation`) by default for cleaner sentence output
+- Lower default finalization delay (250ms) for reduced perceived latency
 
 ## Status
 This is a functional scaffold, not a finished product yet:
