@@ -2,9 +2,9 @@ import AppKit
 import SwiftUI
 
 private enum HUDLayout {
-    static let width: CGFloat = 90
+    static let width: CGFloat = 106
     static let height: CGFloat = 28
-    static let bottomInset: CGFloat = 10
+    static let bottomInset: CGFloat = 24
 }
 
 @MainActor
@@ -75,7 +75,6 @@ final class WaveformModel: ObservableObject {
     @Published var level: Double = 0
     @Published var phase: Double = 0
     @Published var impulse: Double = 0
-    @Published var verticalLift: Double = 0
 
     private var targetLevel: Double = 0
     private var animationTimer: Timer?
@@ -84,7 +83,6 @@ final class WaveformModel: ObservableObject {
         level = 0
         phase = 0
         impulse = 0
-        verticalLift = 0
         targetLevel = 0
     }
 
@@ -112,18 +110,16 @@ final class WaveformModel: ObservableObject {
 
     private func tick() {
         let delta = targetLevel - level
-        let attack: Double = 0.45
-        let release: Double = 0.24
+        let attack: Double = 0.40
+        let release: Double = 0.20
         level += delta * (delta > 0 ? attack : release)
 
         let spike = max(0, delta)
-        impulse = max(spike, impulse * 0.84)
-        targetLevel *= 0.88
-        let targetLift = (level * 3.6) + (impulse * 5.8)
-        verticalLift += (targetLift - verticalLift) * 0.34
+        impulse = max(spike, impulse * 0.82)
+        targetLevel *= 0.90
 
-        // Keep a subtle idle motion so it still feels alive between level samples.
-        phase += 0.15 + (level * 0.70) + (impulse * 0.42)
+        // Faster, clean motion without "warping" the shape.
+        phase += 0.22 + (level * 0.56) + (impulse * 0.34)
     }
 }
 
@@ -132,20 +128,11 @@ struct WaveformPanelView: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.07, green: 0.08, blue: 0.12).opacity(0.92),
-                            Color(red: 0.05, green: 0.06, blue: 0.10).opacity(0.88)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.black.opacity(0.74))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.white.opacity(0.14), lineWidth: 0.6)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.white.opacity(0.16), lineWidth: 0.6)
                 )
 
             SoundWaveLine(level: model.level, phase: model.phase, impulse: model.impulse)
@@ -153,8 +140,7 @@ struct WaveformPanelView: View {
                 .padding(.vertical, 5)
         }
         .frame(width: HUDLayout.width, height: HUDLayout.height)
-        .offset(y: -model.verticalLift)
-        .shadow(color: .black.opacity(0.22), radius: 4, x: 0, y: 2)
+        .shadow(color: .black.opacity(0.24), radius: 5, x: 0, y: 2)
     }
 }
 
@@ -166,22 +152,25 @@ struct SoundWaveLine: View {
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let baseline = size.height * 0.54
-            let baseAmplitude = 1.9 + (level * 2.8) + (impulse * 1.5)
-            let phaseShift = phase * 0.18
+            let baseline = size.height * 0.52
+            let baseAmplitude = 2.2 + (level * 2.1) + (impulse * 1.0)
+            let phaseShift = phase * 0.08
 
             let wavePath = Path { path in
                 let width = max(1, size.width)
-                let samples = max(24, Int(width * 1.25))
+                let samples = max(28, Int(width * 1.5))
 
                 for step in 0...samples {
                     let t = Double(step) / Double(samples)
                     let x = CGFloat(t) * width
-                    let primary = sin((t * 2.6 + phaseShift) * .pi * 2.0) * 0.74
-                    let detail = sin((t * 7.8 + phaseShift * 1.3) * .pi * 2.0) * 0.22
-                    let sparkle = sin((t * 12.4 + phaseShift * 2.1) * .pi * 2.0) * 0.10
-                    let centerWeight = 0.42 + (sin(t * .pi) * 0.58)
-                    let y = baseline - CGFloat((primary + detail + sparkle) * centerWeight * baseAmplitude)
+                    // Signature-style profile: one major wave and smaller tail ripples.
+                    let bigWave = sin((t * 2.2 + phaseShift) * .pi * 2.0)
+                        * exp(-pow((t - 0.31) / 0.23, 2)) * 1.0
+                    let ripple = sin((t * 7.6 + phaseShift * 1.7) * .pi * 2.0)
+                        * exp(-pow((t - 0.67) / 0.19, 2)) * 0.24
+                    let tail = sin((t * 10.5 + phaseShift * 2.2) * .pi * 2.0)
+                        * exp(-pow((t - 0.82) / 0.14, 2)) * 0.10
+                    let y = baseline - CGFloat((bigWave + ripple + tail) * baseAmplitude)
 
                     if step == 0 {
                         path.move(to: CGPoint(x: x, y: y))
@@ -193,24 +182,24 @@ struct SoundWaveLine: View {
 
             ZStack {
                 wavePath
-                    .applying(CGAffineTransform(translationX: 0, y: 1.0))
+                    .applying(CGAffineTransform(translationX: 0, y: 0.9))
                     .stroke(
                         Color.black.opacity(0.35),
-                        style: StrokeStyle(lineWidth: 2.1, lineCap: .round, lineJoin: .round)
+                        style: StrokeStyle(lineWidth: 2.0, lineCap: .round, lineJoin: .round)
                     )
 
                 wavePath
                     .stroke(
                         LinearGradient(
                             colors: [
-                                Color(red: 0.51, green: 0.79, blue: 0.95).opacity(0.82),
-                                Color(red: 0.48, green: 0.61, blue: 0.97).opacity(0.90),
-                                Color(red: 0.70, green: 0.42, blue: 0.91).opacity(0.82)
+                                Color(red: 0.58, green: 0.82, blue: 0.98).opacity(0.82),
+                                Color(red: 0.53, green: 0.66, blue: 0.98).opacity(0.88),
+                                Color(red: 0.78, green: 0.52, blue: 0.92).opacity(0.78)
                             ],
                             startPoint: .leading,
                             endPoint: .trailing
                         ),
-                        style: StrokeStyle(lineWidth: 1.75, lineCap: .round, lineJoin: .round)
+                        style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round)
                     )
             }
         }

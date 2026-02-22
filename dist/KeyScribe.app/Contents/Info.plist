@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>KeyScribe</string>
+  <key>CFBundleDisplayName</key>
+  <string>KeyScribe</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.local.keyscribe</string>
+  <key>CFBundleExecutable</key>
+  <string>KeyScribe</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>KeyScribe needs microphone access to transcribe your voice.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>KeyScribe uses speech recognition so you can transcribe while holding the shortcut.</string>
+</dict>
+</plist>
