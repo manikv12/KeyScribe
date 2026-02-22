@@ -38,8 +38,9 @@ enum TextInserter {
         let previousItems = pasteboard.pasteboardItems?.compactMap { $0.copy() as? NSPasteboardItem } ?? []
 
         copyTextToPasteboard(text)
+        let temporaryWriteChangeCount = pasteboard.changeCount
         let pasted = sendSpecialPasteShortcut()
-        restorePasteboardItems(previousItems)
+        restorePasteboardItems(previousItems, expectedChangeCount: temporaryWriteChangeCount)
 
         return pasted ? .pasted : .notInserted
     }
@@ -52,9 +53,13 @@ enum TextInserter {
     }
 
     @MainActor
-    private static func restorePasteboardItems(_ items: [NSPasteboardItem]) {
+    private static func restorePasteboardItems(_ items: [NSPasteboardItem], expectedChangeCount: Int) {
         let pasteboard = NSPasteboard.general
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            guard pasteboard.changeCount == expectedChangeCount else {
+                return
+            }
+
             pasteboard.clearContents()
             if !items.isEmpty {
                 pasteboard.writeObjects(items)
@@ -170,7 +175,12 @@ enum TextInserter {
         guard rangeResult == .success, let selectedRangeRef else {
             return false
         }
-        let selectedRangeAX = selectedRangeRef as! AXValue
+
+        guard CFGetTypeID(selectedRangeRef) == AXValueGetTypeID() else {
+            return false
+        }
+
+        let selectedRangeAX = unsafeBitCast(selectedRangeRef, to: AXValue.self)
         guard AXValueGetType(selectedRangeAX) == .cfRange else {
             return false
         }
@@ -218,6 +228,11 @@ enum TextInserter {
         guard focusedResult == .success, let focusedRef else {
             return nil
         }
-        return (focusedRef as! AXUIElement)
+
+        guard CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else {
+            return nil
+        }
+
+        return unsafeBitCast(focusedRef, to: AXUIElement.self)
     }
 }

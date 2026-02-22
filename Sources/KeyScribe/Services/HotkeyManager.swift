@@ -36,10 +36,32 @@ final class HoldToTalkManager {
     }
 
     func start() {
-        stop()
+        if Thread.isMainThread {
+            startOnMain()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.startOnMain()
+            }
+        }
+    }
+
+    func stop() {
+        if Thread.isMainThread {
+            stopOnMain()
+        } else {
+            DispatchQueue.main.sync {
+                self.stopOnMain()
+            }
+        }
+    }
+
+    private func startOnMain() {
+        stopOnMain()
 
         flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            self?.handleFlagsChanged(event)
+            DispatchQueue.main.async {
+                self?.handleFlagsChanged(event)
+            }
         }
         localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.handleFlagsChanged(event)
@@ -51,7 +73,9 @@ final class HoldToTalkManager {
         }
 
         keyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handle(event: event, isDown: true)
+            DispatchQueue.main.async {
+                self?.handle(event: event, isDown: true)
+            }
         }
         localKeyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handle(event: event, isDown: true)
@@ -59,7 +83,9 @@ final class HoldToTalkManager {
         }
 
         keyUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyUp) { [weak self] event in
-            self?.handle(event: event, isDown: false)
+            DispatchQueue.main.async {
+                self?.handle(event: event, isDown: false)
+            }
         }
         localKeyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
             self?.handle(event: event, isDown: false)
@@ -67,7 +93,7 @@ final class HoldToTalkManager {
         }
     }
 
-    func stop() {
+    private func stopOnMain() {
         if let keyDownMonitor {
             NSEvent.removeMonitor(keyDownMonitor)
             self.keyDownMonitor = nil
