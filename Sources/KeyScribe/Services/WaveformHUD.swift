@@ -2,9 +2,10 @@ import AppKit
 import SwiftUI
 
 private enum HUDLayout {
-    static let width: CGFloat = 106
-    static let height: CGFloat = 28
-    static let bottomInset: CGFloat = 24
+    static let width: CGFloat = 92
+    static let height: CGFloat = 24
+    static let bottomInset: CGFloat = 10
+    static let dockClearance: CGFloat = 6
 }
 
 @MainActor
@@ -64,8 +65,14 @@ final class WaveformHUDManager {
 
         let panelFrame = panel.frame
         let visible = screen.visibleFrame
+        let full = screen.frame
+
         let x = visible.midX - (panelFrame.width * 0.5)
-        let y = visible.minY + HUDLayout.bottomInset
+
+        // visibleFrame excludes Dock/menu bar. Pin HUD just above Dock area.
+        let dockTop = visible.minY
+        let y = max(full.minY + HUDLayout.bottomInset, dockTop + HUDLayout.dockClearance)
+
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 }
@@ -127,31 +134,36 @@ struct WaveformPanelView: View {
     @ObservedObject var model: WaveformModel
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+        HStack(spacing: 6) {
+            Circle()
                 .fill(
                     LinearGradient(
                         colors: [
-                            Color.white.opacity(0.16),
-                            Color.white.opacity(0.08),
-                            Color.black.opacity(0.42)
+                            Color(red: 0.90, green: 0.42, blue: 0.88),
+                            Color(red: 0.50, green: 0.67, blue: 0.98)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.white.opacity(0.22), lineWidth: 0.7)
-                )
+                .frame(width: 7, height: 7)
+                .shadow(color: .white.opacity(0.2), radius: 1, x: 0, y: 0)
 
             SoundWaveLine(level: model.level, phase: model.phase, impulse: model.impulse)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 5)
+                .frame(height: 12)
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .stroke(Color.white.opacity(0.22), lineWidth: 0.6)
+                )
+        )
         .frame(width: HUDLayout.width, height: HUDLayout.height)
-        .shadow(color: .black.opacity(0.24), radius: 5, x: 0, y: 2)
+        .shadow(color: .black.opacity(0.18), radius: 4, x: 0, y: 2)
     }
 }
 
@@ -163,9 +175,9 @@ struct SoundWaveLine: View {
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let baseline = size.height * 0.52
-            let baseAmplitude = 2.2 + (level * 2.1) + (impulse * 1.0)
-            let phaseShift = phase * 0.08
+            let baseline = size.height * 0.53
+            let baseAmplitude = 1.8 + (level * 1.7) + (impulse * 0.85)
+            let phaseShift = phase * 0.075
 
             let wavePath = Path { path in
                 let width = max(1, size.width)
@@ -193,24 +205,24 @@ struct SoundWaveLine: View {
 
             ZStack {
                 wavePath
-                    .applying(CGAffineTransform(translationX: 0, y: 0.9))
+                    .applying(CGAffineTransform(translationX: 0, y: 0.7))
                     .stroke(
-                        Color.black.opacity(0.35),
-                        style: StrokeStyle(lineWidth: 2.0, lineCap: .round, lineJoin: .round)
+                        Color.black.opacity(0.28),
+                        style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round)
                     )
 
                 wavePath
                     .stroke(
                         LinearGradient(
                             colors: [
-                                Color(red: 0.58, green: 0.82, blue: 0.98).opacity(0.82),
-                                Color(red: 0.53, green: 0.66, blue: 0.98).opacity(0.88),
-                                Color(red: 0.78, green: 0.52, blue: 0.92).opacity(0.78)
+                                Color(red: 0.58, green: 0.82, blue: 0.98).opacity(0.8),
+                                Color(red: 0.53, green: 0.66, blue: 0.98).opacity(0.86),
+                                Color(red: 0.78, green: 0.52, blue: 0.92).opacity(0.74)
                             ],
                             startPoint: .leading,
                             endPoint: .trailing
                         ),
-                        style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round)
+                        style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round)
                     )
             }
         }
