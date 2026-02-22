@@ -35,7 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
 
-        settings.refreshMicrophones()
+        settings.refreshMicrophones(notifyChange: false)
         transcriber.applyMicrophoneSettings(autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID)
         transcriber.applyRecognitionSettings(
             enableContextualBias: settings.enableContextualBias,
@@ -156,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func applySettingsChanges() {
-        settings.refreshMicrophones()
+        settings.refreshMicrophones(notifyChange: false)
         transcriber.applyMicrophoneSettings(autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID)
         transcriber.applyRecognitionSettings(
             enableContextualBias: settings.enableContextualBias,
@@ -336,18 +336,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func insertText(_ text: String) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        attemptInsertText(text, retriesRemaining: 2)
+        attemptInsertText(text, attemptsRemaining: 5)
     }
 
-    private func attemptInsertText(_ text: String, retriesRemaining: Int) {
+    private func attemptInsertText(_ text: String, attemptsRemaining: Int) {
+        guard attemptsRemaining > 0 else {
+            statusLabelItem?.title = "Paste unavailable"
+            lastTargetApplication = nil
+            return
+        }
+
         if let target = lastTargetApplication,
            !target.isTerminated,
            !target.isActive {
             _ = target.activate(options: [.activateIgnoringOtherApps])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-                self?.attemptInsertText(text, retriesRemaining: retriesRemaining)
+            if attemptsRemaining > 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
+                }
+                return
             }
-            return
+
+            // Activation failed repeatedly; fall back to best-effort insertion/copy behavior.
+            lastTargetApplication = nil
         }
 
         let result = TextInserter.insert(text, copyToClipboard: settings.copyToClipboard)
@@ -356,18 +367,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             statusLabelItem?.title = "Ready"
             lastTargetApplication = nil
         case .copiedOnly:
-            if retriesRemaining > 0 {
+            if attemptsRemaining > 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, retriesRemaining: retriesRemaining - 1)
+                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
                 }
             } else {
                 statusLabelItem?.title = "Copied to clipboard"
                 lastTargetApplication = nil
             }
         case .notInserted:
-            if retriesRemaining > 0 {
+            if attemptsRemaining > 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                    self?.attemptInsertText(text, retriesRemaining: retriesRemaining - 1)
+                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
                 }
             } else {
                 statusLabelItem?.title = "Paste unavailable"

@@ -39,22 +39,76 @@ final class SpeechTranscriber: NSObject {
     }
 
     func requestPermissions() {
-        SFSpeechRecognizer.requestAuthorization { [weak self] status in
-            switch status {
-            case .authorized:
-                self?.requestedAudioPermission()
-            default:
-                self?.update("Speech permission not granted")
+        if Thread.isMainThread {
+            requestPermissionsOnMain()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.requestPermissionsOnMain()
             }
         }
     }
 
     func applyMicrophoneSettings(autoDetect: Bool, microphoneUID: String) {
+        if Thread.isMainThread {
+            applyMicrophoneSettingsOnMain(autoDetect: autoDetect, microphoneUID: microphoneUID)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.applyMicrophoneSettingsOnMain(autoDetect: autoDetect, microphoneUID: microphoneUID)
+            }
+        }
+    }
+
+    func applyRecognitionSettings(
+        enableContextualBias: Bool,
+        keepTextAcrossPauses: Bool,
+        preferOnDeviceRecognition: Bool,
+        autoPunctuation: Bool,
+        finalizeDelaySeconds: TimeInterval,
+        customContextPhrases: String
+    ) {
+        if Thread.isMainThread {
+            applyRecognitionSettingsOnMain(
+                enableContextualBias: enableContextualBias,
+                keepTextAcrossPauses: keepTextAcrossPauses,
+                preferOnDeviceRecognition: preferOnDeviceRecognition,
+                autoPunctuation: autoPunctuation,
+                finalizeDelaySeconds: finalizeDelaySeconds,
+                customContextPhrases: customContextPhrases
+            )
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.applyRecognitionSettingsOnMain(
+                    enableContextualBias: enableContextualBias,
+                    keepTextAcrossPauses: keepTextAcrossPauses,
+                    preferOnDeviceRecognition: preferOnDeviceRecognition,
+                    autoPunctuation: autoPunctuation,
+                    finalizeDelaySeconds: finalizeDelaySeconds,
+                    customContextPhrases: customContextPhrases
+                )
+            }
+        }
+    }
+
+    private func requestPermissionsOnMain() {
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch status {
+                case .authorized:
+                    self.requestedAudioPermissionOnMain()
+                default:
+                    self.update("Speech permission not granted")
+                }
+            }
+        }
+    }
+
+    private func applyMicrophoneSettingsOnMain(autoDetect: Bool, microphoneUID: String) {
         autoDetectMicrophone = autoDetect
         selectedMicrophoneUID = microphoneUID
     }
 
-    func applyRecognitionSettings(
+    private func applyRecognitionSettingsOnMain(
         enableContextualBias: Bool,
         keepTextAcrossPauses: Bool,
         preferOnDeviceRecognition: Bool,
@@ -70,25 +124,53 @@ final class SpeechTranscriber: NSObject {
         self.customContextPhrases = RecognitionTuning.parseCustomPhrases(customContextPhrases)
     }
 
-    private func requestedAudioPermission() {
+    private func requestedAudioPermissionOnMain() {
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            if granted {
-                self?.granted = true
-                self?.update("Permissions ready")
-            } else {
-                self?.update("Microphone permission not granted")
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if granted {
+                    self.granted = true
+                    self.update("Permissions ready")
+                } else {
+                    self.update("Microphone permission not granted")
+                }
             }
         }
     }
 
     private func update(_ message: String) {
-        DispatchQueue.main.async {
-            self.onStatusUpdate?(message)
+        if Thread.isMainThread {
+            onStatusUpdate?(message)
+        } else {
+            DispatchQueue.main.async {
+                self.onStatusUpdate?(message)
+            }
         }
     }
 
     @discardableResult
     func startRecording() -> Bool {
+        if Thread.isMainThread {
+            return startRecordingOnMain()
+        }
+
+        return DispatchQueue.main.sync {
+            startRecordingOnMain()
+        }
+    }
+
+    func stopRecording(emitFinalText: Bool = true) {
+        if Thread.isMainThread {
+            stopRecordingOnMain(emitFinalText: emitFinalText)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.stopRecordingOnMain(emitFinalText: emitFinalText)
+            }
+        }
+    }
+
+    @discardableResult
+    private func startRecordingOnMain() -> Bool {
         guard granted else {
             update("Permissions missing")
             return false
@@ -124,11 +206,13 @@ final class SpeechTranscriber: NSObject {
 
         let inputNode = audioEngine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
+        let activeRecognitionRequest = recognitionRequest
 
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            activeRecognitionRequest?.append(buffer)
             guard let self else { return }
-            self.recognitionRequest?.append(buffer)
+
             let audioLevel = self.normalizedAudioLevel(from: buffer)
             DispatchQueue.main.async {
                 self.onAudioLevel?(audioLevel)
@@ -142,12 +226,12 @@ final class SpeechTranscriber: NSObject {
             return true
         } catch {
             update("Audio setup failed: \(error.localizedDescription)")
-            stopRecording(emitFinalText: false)
+            stopRecordingOnMain(emitFinalText: false)
             return false
         }
     }
 
-    func stopRecording(emitFinalText: Bool = true) {
+    private func stopRecordingOnMain(emitFinalText: Bool = true) {
         guard isRecording || isStopping else {
             onAudioLevel?(0)
             onRecordingStateChange?(false)
@@ -222,46 +306,51 @@ final class SpeechTranscriber: NSObject {
 
         recognitionRequest = request
         recognitionTask = recognitionEngine.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-            guard self.isRecording || self.isStopping else { return }
-
-            if let error {
-                let nsError = error as NSError
-                // Ignore expected cancellation noise when we stop/restart the task intentionally.
-                if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216 {
-                    return
-                }
-                if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
-                    return
-                }
-
-                self.update("Error: \(error.localizedDescription)")
-                self.stopRecording(emitFinalText: false)
-                return
-            }
-
-            guard let result else { return }
-            let candidate = result.bestTranscription.formattedString
-            self.liveTranscript = candidate
-
-            if self.keepTextAcrossPauses {
-                self.updateBestTranscriptForCurrentSegment(with: candidate)
-            }
-
-            if result.isFinal {
-                if self.keepTextAcrossPauses {
-                    self.commitBestSegmentTranscript()
-                } else {
-                    self.commitLiveTranscript()
-                }
-
-                if self.isRecording {
-                    _ = self.startRecognitionTask()
-                }
+            DispatchQueue.main.async { [weak self] in
+                self?.handleRecognitionCallback(result: result, error: error)
             }
         }
 
         return true
+    }
+
+    private func handleRecognitionCallback(result: SFSpeechRecognitionResult?, error: Error?) {
+        guard isRecording || isStopping else { return }
+
+        if let error {
+            let nsError = error as NSError
+            // Ignore expected cancellation noise when we stop/restart the task intentionally.
+            if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216 {
+                return
+            }
+            if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                return
+            }
+
+            update("Error: \(error.localizedDescription)")
+            stopRecordingOnMain(emitFinalText: false)
+            return
+        }
+
+        guard let result else { return }
+        let candidate = result.bestTranscription.formattedString
+        liveTranscript = candidate
+
+        if keepTextAcrossPauses {
+            updateBestTranscriptForCurrentSegment(with: candidate)
+        }
+
+        if result.isFinal {
+            if keepTextAcrossPauses {
+                commitBestSegmentTranscript()
+            } else {
+                commitLiveTranscript()
+            }
+
+            if isRecording {
+                _ = startRecognitionTask()
+            }
+        }
     }
 
     private func updateBestTranscriptForCurrentSegment(with candidate: String) {

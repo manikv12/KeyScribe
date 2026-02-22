@@ -198,14 +198,15 @@ final class SettingsStore: ObservableObject {
 
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
-        refreshMicrophones()
+        refreshMicrophones(notifyChange: false)
 
         isApplyingChanges = false
         save()
     }
 
-    func refreshMicrophones() {
+    func refreshMicrophones(notifyChange: Bool = true) {
         isApplyingChanges = true
+        let previousSelectedMicrophoneUID = selectedMicrophoneUID
 
         let list = MicrophoneManager.availableMicrophones()
         availableMicrophones = list
@@ -221,7 +222,8 @@ final class SettingsStore: ObservableObject {
             }
         }
 
-        let shouldNotify = onChange != nil
+        let didChangeSelectedMicrophone = selectedMicrophoneUID != previousSelectedMicrophoneUID
+        let shouldNotify = notifyChange && didChangeSelectedMicrophone && onChange != nil
         isApplyingChanges = false
         if shouldNotify {
             onChange?()
