@@ -40,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.setUIStatus(status)
             },
             onInsertText: { [weak self] text in
-                self?.insertText(text)
+                self?.insertText(text, forceCopyToClipboard: true)
             }
         )
 
@@ -236,12 +236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenuState()
     }
 
-    private func insertText(_ text: String) {
+    private func insertText(_ text: String, forceCopyToClipboard: Bool = false) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        attemptInsertText(text, attemptsRemaining: 5)
+        attemptInsertText(text, copyToClipboard: settings.copyToClipboard || forceCopyToClipboard, attemptsRemaining: 5)
     }
 
-    private func attemptInsertText(_ text: String, attemptsRemaining: Int) {
+    private func attemptInsertText(_ text: String, copyToClipboard: Bool, attemptsRemaining: Int) {
         guard attemptsRemaining > 0 else {
             setUIStatus(.pasteUnavailable)
             lastTargetApplication = nil
@@ -254,7 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = target.activate(options: [.activateIgnoringOtherApps])
             if attemptsRemaining > 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-                    self?.attemptInsertText(text, attemptsRemaining: attemptsRemaining - 1)
+                    self?.attemptInsertText(text, copyToClipboard: copyToClipboard, attemptsRemaining: attemptsRemaining - 1)
                 }
                 return
             }
@@ -263,7 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastTargetApplication = nil
         }
 
-        let result = TextInserter.insert(text, copyToClipboard: settings.copyToClipboard)
+        let result = TextInserter.insert(text, copyToClipboard: copyToClipboard)
         let retryPlan = InsertionRetryPolicy.plan(
             for: result,
             retriesRemaining: attemptsRemaining - 1,
@@ -273,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch retryPlan {
         case let .retry(delay, nextRetriesRemaining):
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.attemptInsertText(text, attemptsRemaining: nextRetriesRemaining + 1)
+                self?.attemptInsertText(text, copyToClipboard: copyToClipboard, attemptsRemaining: nextRetriesRemaining + 1)
             }
 
         case let .complete(statusMessage):
