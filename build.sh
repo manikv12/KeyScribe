@@ -1,21 +1,94 @@
 #!/bin/bash
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
+set -euo pipefail
 
-echo "Building KeyScribe..."
-swift build
+APP_NAME="KeyScribe"
+APP_EXECUTABLE="$APP_NAME"
+APP_BUNDLE_ID="com.keyscribe.KeyScribe"
+APP_DIR="dist/${APP_NAME}.app"
+INSTALL_DIR="/Applications/${APP_NAME}.app"
+DMG_ROOT="dist/dmg-root"
+DMG_FINAL="dist/${APP_NAME}.dmg"
+DMG_VOLUME_NAME="${APP_NAME} Installer"
 
-echo "Creating macOS App Bundle..."
-mkdir -p KeyScribe.app/Contents/MacOS
-mkdir -p KeyScribe.app/Contents/Resources
+INSTALL_APP=false
+NO_DMG=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --install)
+            INSTALL_APP=true
+            ;;
+        --no-dmg)
+            NO_DMG=true
+            ;;
+        *)
+            echo "Unknown argument: $arg"
+            echo "Usage: ./build.sh [--install] [--no-dmg]"
+            exit 1
+            ;;
+    esac
+done
+
+echo "Building ${APP_NAME} (Release)..."
+swift build -c release
+
+echo "Creating macOS App Bundle at ${APP_DIR}..."
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/Resources"
 
 echo "Copying executable..."
-cp .build/debug/KeyScribe KeyScribe.app/Contents/MacOS/
-chmod +x KeyScribe.app/Contents/MacOS/KeyScribe
+cp ".build/release/${APP_EXECUTABLE}" "$APP_DIR/Contents/MacOS/"
+chmod +x "$APP_DIR/Contents/MacOS/${APP_EXECUTABLE}"
 
+echo "Copying Info.plist and resources..."
+cp Resources/Info.plist "$APP_DIR/Contents/"
+cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
 
-echo "Copying Info.plist..."
-cp Resources/Info.plist KeyScribe.app/Contents/
+echo "Applying code signature..."
+if [ -n "${DEVELOPER_ID:-}" ]; then
+    echo "  Signing with Developer ID: $DEVELOPER_ID"
+    codesign --force --deep --options runtime --sign "Developer ID Application: $DEVELOPER_ID" "$APP_DIR"
+else
+    echo "  No DEVELOPER_ID set — using ad-hoc signature."
+    echo "  (Set DEVELOPER_ID env var for distribution-ready signing)"
+    codesign --force --deep --sign - "$APP_DIR"
+fi
 
-echo "Build complete! You can run the app with: open KeyScribe.app"
+if [ "$NO_DMG" = false ]; then
+    echo "Creating professional drag-and-drop DMG at ${DMG_FINAL}..."
+    rm -f "$DMG_FINAL"
+
+    # Use create-dmg to build a professional-looking installer with an arrow background
+    # and correct icon positions
+    npx -y create-dmg "$APP_DIR" dist/ --overwrite --no-version-in-filename --icon-size 128
+fi
+
+if [ "$INSTALL_APP" = true ]; then
+    echo "Installing to /Applications..."
+    osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
+    sleep 1
+    rm -rf "$INSTALL_DIR"
+    cp -R "$APP_DIR" "$INSTALL_DIR"
+
+    echo "Resetting Accessibility permission..."
+    sudo tccutil reset Accessibility "$APP_BUNDLE_ID" || echo "  (sudo failed — run manually: sudo tccutil reset Accessibility ${APP_BUNDLE_ID})"
+
+    echo ""
+    echo "Build complete! Installed to ${INSTALL_DIR}"
+    echo "Run with: open ${INSTALL_DIR}"
+    if [ "$NO_DMG" = false ]; then
+        echo "Drag-and-drop installer created at: ${DMG_FINAL}"
+    fi
+    echo "Then re-grant Accessibility access in System Settings -> Privacy & Security -> Accessibility"
+else
+    echo ""
+    echo "Build complete! App bundle at: ${APP_DIR}"
+    if [ "$NO_DMG" = false ]; then
+        echo "Drag-and-drop installer ready at: ${DMG_FINAL}"
+        echo "Open installer with: open ${DMG_FINAL}"
+    fi
+    echo "Run app directly with: open ${APP_DIR}"
+    echo "To install to /Applications, run: ./build.sh --install"
+fi

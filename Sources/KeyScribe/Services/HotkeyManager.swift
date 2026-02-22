@@ -235,3 +235,158 @@ final class HoldToTalkManager {
         return true
     }
 }
+
+final class OneShotHotkeyManager {
+    typealias Action = () -> Void
+
+    private static let supportedModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift, .function]
+
+    private let keyCode: UInt16
+    private let modifiers: NSEvent.ModifierFlags
+    private let onTrigger: Action
+
+    private var keyDownMonitor: Any?
+    private var keyUpMonitor: Any?
+    private var flagsMonitor: Any?
+    private var active = false
+
+    init(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, onTrigger: @escaping Action) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers.intersection(Self.supportedModifiers)
+        self.onTrigger = onTrigger
+    }
+
+    deinit {
+        stop()
+    }
+
+    func start() {
+        if Thread.isMainThread {
+            startOnMain()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.startOnMain()
+            }
+        }
+    }
+
+    func stop() {
+        if Thread.isMainThread {
+            stopOnMain()
+        } else {
+            DispatchQueue.main.sync {
+                self.stopOnMain()
+            }
+        }
+    }
+
+    private func startOnMain() {
+        stopOnMain()
+
+        keyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleKeyDown(event)
+            }
+        }
+
+        keyUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyUp) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleKeyUp(event)
+            }
+        }
+
+        flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleFlagsChanged(event)
+            }
+        }
+    }
+
+    private func stopOnMain() {
+        if let keyDownMonitor {
+            NSEvent.removeMonitor(keyDownMonitor)
+            self.keyDownMonitor = nil
+        }
+        if let keyUpMonitor {
+            NSEvent.removeMonitor(keyUpMonitor)
+            self.keyUpMonitor = nil
+        }
+        if let flagsMonitor {
+            NSEvent.removeMonitor(flagsMonitor)
+            self.flagsMonitor = nil
+        }
+        active = false
+    }
+
+    private func normalizedModifiers(from event: NSEvent) -> NSEvent.ModifierFlags {
+        event.modifierFlags.intersection(Self.supportedModifiers)
+    }
+
+    private func handleKeyDown(_ event: NSEvent) {
+        let eventModifiers = normalizedModifiers(from: event)
+        guard event.keyCode == keyCode, eventModifiers.isSuperset(of: modifiers) else { return }
+
+        if event.isARepeat {
+            return
+        }
+
+        if active, !isShortcutPhysicallyHeld() {
+            active = false
+        }
+
+        guard !active else { return }
+        active = true
+        onTrigger()
+    }
+
+    private func handleKeyUp(_ event: NSEvent) {
+        guard event.keyCode == keyCode else { return }
+        active = false
+    }
+
+    private func handleFlagsChanged(_ event: NSEvent) {
+        let currentModifiers = normalizedModifiers(from: event)
+        if !currentModifiers.isSuperset(of: modifiers) {
+            active = false
+        }
+    }
+
+    private func isShortcutPhysicallyHeld() -> Bool {
+        let source: CGEventSourceStateID = .combinedSessionState
+
+        if !CGEventSource.keyState(source, key: CGKeyCode(keyCode)) {
+            return false
+        }
+
+        if modifiers.contains(.command) {
+            let left = CGEventSource.keyState(source, key: 55)
+            let right = CGEventSource.keyState(source, key: 54)
+            if !(left || right) { return false }
+        }
+
+        if modifiers.contains(.option) {
+            let left = CGEventSource.keyState(source, key: 58)
+            let right = CGEventSource.keyState(source, key: 61)
+            if !(left || right) { return false }
+        }
+
+        if modifiers.contains(.control) {
+            let left = CGEventSource.keyState(source, key: 59)
+            let right = CGEventSource.keyState(source, key: 62)
+            if !(left || right) { return false }
+        }
+
+        if modifiers.contains(.shift) {
+            let left = CGEventSource.keyState(source, key: 56)
+            let right = CGEventSource.keyState(source, key: 60)
+            if !(left || right) { return false }
+        }
+
+        if modifiers.contains(.function),
+           !CGEventSource.keyState(source, key: 63) {
+            return false
+        }
+
+        return true
+    }
+}

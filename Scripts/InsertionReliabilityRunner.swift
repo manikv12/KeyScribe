@@ -95,23 +95,23 @@ struct InsertionReliabilityRunner {
                 expectedResult: .copiedOnly
             ),
             InsertionScenario(
-                name: "temporary-clipboard-success",
+                name: "transient-clipboard-paste-success",
                 text: "hello",
                 copyToClipboard: false,
                 directInsertSucceeded: false,
                 typingInsertSucceeded: false,
                 specialPasteSucceeded: true,
-                expectedPath: .specialPasteTemporaryClipboard,
+                expectedPath: .specialPasteTransientClipboard,
                 expectedResult: .pasted
             ),
             InsertionScenario(
-                name: "temporary-clipboard-failure",
+                name: "transient-clipboard-paste-failure",
                 text: "hello",
                 copyToClipboard: false,
                 directInsertSucceeded: false,
                 typingInsertSucceeded: false,
                 specialPasteSucceeded: false,
-                expectedPath: .specialPasteTemporaryClipboard,
+                expectedPath: .specialPasteTransientClipboard,
                 expectedResult: .notInserted
             )
         ]
@@ -227,7 +227,7 @@ struct InsertionReliabilityRunner {
             Simulate one scenario.
 
           Optional assertions:
-            --expect-path <empty-input|direct-accessibility|typed-unicode-events|special-paste-clipboard|special-paste-temporary-clipboard>
+            --expect-path <empty-input|direct-accessibility|typed-unicode-events|special-paste-clipboard|special-paste-transient-clipboard>
             --expect-result <empty|pasted|copied-only|not-inserted>
 
         Example:

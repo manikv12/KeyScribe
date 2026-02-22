@@ -13,6 +13,8 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String) {
 struct CoreLogicSmokeTests {
     static func main() {
         testShortcutValidationRules()
+        testShortcutCollisionRules()
+        testDictationInputModeStateMachine()
         testTextCleanupPipeline()
         testRecognitionTuningDeterminism()
         testInsertionRetryPolicyBounds()
@@ -46,6 +48,69 @@ struct CoreLogicSmokeTests {
                 == ShortcutValidationRules.filteredModifiers(rawValue: oneKeyModifier),
             "Unsupported modifier bits should be filtered"
         )
+    }
+
+    private static func testShortcutCollisionRules() {
+        let holdToTalk = normalizedShortcut(
+            keyCode: 49,
+            modifiers: NSEvent.ModifierFlags([.command, .option]).rawValue
+        )
+        let continuousDefault = normalizedShortcut(
+            keyCode: 49,
+            modifiers: NSEvent.ModifierFlags([.command, .option, .control]).rawValue
+        )
+        let pasteLast = normalizedShortcut(
+            keyCode: 9,
+            modifiers: NSEvent.ModifierFlags([.command, .option]).rawValue
+        )
+
+        check(!shortcutsConflict(holdToTalk, continuousDefault), "Default hold-to-talk and continuous shortcuts should not conflict")
+
+        let sameAsHold = normalizedShortcut(
+            keyCode: holdToTalk.keyCode,
+            modifiers: holdToTalk.modifiers
+        )
+        check(shortcutsConflict(holdToTalk, sameAsHold), "Hold and continuous should conflict when key+modifiers are identical")
+
+        let sameAsPasteLast = normalizedShortcut(
+            keyCode: pasteLast.keyCode,
+            modifiers: pasteLast.modifiers
+        )
+        check(shortcutsConflict(pasteLast, sameAsPasteLast), "Continuous shortcut should conflict with paste-last when identical")
+    }
+
+    private static func testDictationInputModeStateMachine() {
+        check(
+            DictationInputModeStateMachine.onHoldStart(.idle) == .holdToTalk,
+            "Idle + hold-down should enter hold-to-talk mode"
+        )
+        check(
+            DictationInputModeStateMachine.onHoldStop(.holdToTalk) == .idle,
+            "Hold mode + hold-up should return to idle"
+        )
+        check(
+            DictationInputModeStateMachine.onContinuousToggle(.idle) == .continuous,
+            "Idle + continuous toggle should enter continuous mode"
+        )
+        check(
+            DictationInputModeStateMachine.onContinuousToggle(.continuous) == .idle,
+            "Continuous + continuous toggle should return to idle"
+        )
+        check(
+            DictationInputModeStateMachine.onHoldStart(.continuous) == .continuous,
+            "Continuous + hold-down should stay in continuous mode"
+        )
+    }
+
+    private static func normalizedShortcut(keyCode: UInt16, modifiers: UInt) -> (keyCode: UInt16, modifiers: UInt) {
+        (keyCode, ShortcutValidationRules.filteredModifiers(rawValue: modifiers).rawValue)
+    }
+
+    private static func shortcutsConflict(
+        _ lhs: (keyCode: UInt16, modifiers: UInt),
+        _ rhs: (keyCode: UInt16, modifiers: UInt)
+    ) -> Bool {
+        lhs.keyCode == rhs.keyCode && lhs.modifiers == rhs.modifiers
     }
 
     private static func testTextCleanupPipeline() {
@@ -165,40 +230,108 @@ struct CoreLogicSmokeTests {
         check(retryOutcome.result == .pasted, "Special paste retry should recover transient paste trigger failures")
         check(pasteAttempts == 2, "Special paste retry should invoke paste trigger until success")
 
-        var restoreCalls = 0
-        let temporaryRuntime = TextInserter.Runtime(
+        var nonClipboardCallOrder: [String] = []
+        let nonClipboardRuntime = TextInserter.Runtime(
+            insertDirect: { _ in
+                nonClipboardCallOrder.append("direct")
+                return false
+            },
+            insertTyping: { _ in
+                nonClipboardCallOrder.append("typing")
+                return false
+            },
+            writeClipboard: { _ in
+                nonClipboardCallOrder.append("write")
+                return .success(changeCount: 19)
+            },
+            writeTransientClipboard: { _ in
+                nonClipboardCallOrder.append("write-transient")
+                return .success(changeCount: 19)
+            },
+            sendSpecialPaste: {
+                nonClipboardCallOrder.append("paste")
+                return true
+            },
+            captureClipboard: {
+                nonClipboardCallOrder.append("capture")
+                return TextInserter.ClipboardSnapshot()
+            },
+            restoreClipboard: { _, _ in
+                nonClipboardCallOrder.append("restore")
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0]
+        )
+
+        let nonClipboardOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: nonClipboardRuntime)
+        check(nonClipboardOutcome.result == .pasted, "Transient clipboard fallback should recover when direct/typing insertion fails")
+        check(
+            nonClipboardCallOrder == ["direct", "capture", "write-transient", "paste", "restore"],
+            "Non-clipboard fallback should use transient clipboard + paste + restore sequence"
+        )
+
+        var typingPathClipboardWrites = 0
+        var typingPathTransientWrites = 0
+        let typingSuccessRuntime = TextInserter.Runtime(
+            insertDirect: { _ in false },
+            insertTyping: { _ in true },
+            writeClipboard: { _ in
+                typingPathClipboardWrites += 1
+                return .success(changeCount: 41)
+            },
+            writeTransientClipboard: { _ in
+                typingPathTransientWrites += 1
+                return .success(changeCount: 42)
+            },
+            sendSpecialPaste: { true },
+            captureClipboard: { TextInserter.ClipboardSnapshot() },
+            restoreClipboard: { _, _ in },
+            log: { _ in },
+            pasteRetryBackoff: [0]
+        )
+
+        let typingSuccessOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: typingSuccessRuntime)
+        check(typingSuccessOutcome.result == .pasted, "Typing fallback should still succeed when clipboard mode is disabled")
+        check(typingPathClipboardWrites == 0, "Typing success in non-clipboard mode should not write to clipboard")
+        check(typingPathTransientWrites == 1, "Non-clipboard mode should attempt transient clipboard before typing fallback")
+
+        var transientRestoreCalls = 0
+        let transientFailureRuntime = TextInserter.Runtime(
             insertDirect: { _ in false },
             insertTyping: { _ in false },
-            writeClipboard: { _ in .success(changeCount: 19) },
+            writeClipboard: { _ in .success(changeCount: 51) },
+            writeTransientClipboard: { _ in .success(changeCount: 52) },
             sendSpecialPaste: { false },
             captureClipboard: { TextInserter.ClipboardSnapshot() },
             restoreClipboard: { _, _ in
-                restoreCalls += 1
+                transientRestoreCalls += 1
             },
             log: { _ in },
             pasteRetryBackoff: [0]
         )
 
-        let temporaryOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: temporaryRuntime)
-        check(temporaryOutcome.result == .copiedOnly, "Temporary clipboard flow should leave transcript copied if paste fails")
-        check(restoreCalls == 0, "Temporary clipboard restore should be skipped when paste does not trigger")
+        let transientFailureOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: transientFailureRuntime)
+        check(transientFailureOutcome.result == .notInserted, "Transient clipboard fallback should report not-inserted when paste trigger fails")
+        check(transientRestoreCalls == 1, "Transient clipboard fallback should restore original clipboard when paste trigger fails")
 
-        var restoredChangeCount: Int?
-        let restoreRuntime = TextInserter.Runtime(
+        var transientTypingRetryCalls = 0
+        let transientTypingRetryRuntime = TextInserter.Runtime(
             insertDirect: { _ in false },
-            insertTyping: { _ in false },
-            writeClipboard: { _ in .success(changeCount: 33) },
-            sendSpecialPaste: { true },
-            captureClipboard: { TextInserter.ClipboardSnapshot() },
-            restoreClipboard: { _, changeCount in
-                restoredChangeCount = changeCount
+            insertTyping: { _ in
+                transientTypingRetryCalls += 1
+                return transientTypingRetryCalls == 1
             },
+            writeClipboard: { _ in .success(changeCount: 61) },
+            writeTransientClipboard: { _ in .success(changeCount: 62) },
+            sendSpecialPaste: { false },
+            captureClipboard: { TextInserter.ClipboardSnapshot() },
+            restoreClipboard: { _, _ in },
             log: { _ in },
             pasteRetryBackoff: [0]
         )
 
-        let restoreOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: restoreRuntime)
-        check(restoreOutcome.result == .pasted, "Temporary clipboard flow should report pasted on successful special paste")
-        check(restoredChangeCount == 33, "Temporary clipboard restore should receive the verified clipboard change count")
+        let transientTypingRetryOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: transientTypingRetryRuntime)
+        check(transientTypingRetryOutcome.result == .pasted, "Typing fallback should run when transient clipboard paste fails")
+        check(transientTypingRetryCalls == 1, "Typing fallback should execute exactly once after transient clipboard failure")
     }
 }

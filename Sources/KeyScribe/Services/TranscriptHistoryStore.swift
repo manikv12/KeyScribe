@@ -37,6 +37,18 @@ final class TranscriptHistoryStore: ObservableObject {
         save()
     }
 
+    func remove(id: UUID) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries.remove(at: index)
+        save()
+    }
+
+    func clear() {
+        guard !entries.isEmpty else { return }
+        entries.removeAll()
+        save()
+    }
+
     private func load() {
         guard let data = defaults.data(forKey: key) else {
             entries = []

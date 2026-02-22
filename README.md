@@ -1,120 +1,146 @@
 # KeyScribe
 
-A macOS menu-bar transcription assistant: hold a keyboard shortcut to record speech and automatically insert the text into the current focused app.
+KeyScribe is a macOS menu-bar dictation app that transcribes speech and inserts the result into the currently focused text field.
 
-**Name idea:** **KeyScribe** (“speak with a key press, write with your voice”).
+The app runs as a menu bar utility (`LSUIElement`), so it does not show a Dock icon.
 
-## What’s included
-- SwiftUI + AppKit starter app structure
-- Menu-bar app that runs in the background
-- Hold-to-talk behavior:
-  - **start recording on key-down**
-  - **stop on key-up**
-- Speech transcription with Apple Speech framework
-- Smart cleanup pipeline before insertion:
-  - **Light** mode (safe spacing/punctuation/duplicate-word cleanup)
-  - **Aggressive** mode (stronger normalization + sentence capitalization)
-- Transcript History panel:
-  - stores last 20 dictations with timestamp
-  - quick actions for **Copy** and **Re-insert**
-- Paste-injection workflow (copies transcript to clipboard then sends `⌘V`)
-- Uses macOS inbuilt speech recognition (`SFSpeechRecognizer`) with
-  on-device preference (`requiresOnDeviceRecognition = true` when available)
-- Enables Apple automatic punctuation (`addsPunctuation`) by default for cleaner sentence output
-- Lower default finalization delay (250ms) for reduced perceived latency
+## What the app does
+
+- Captures speech using Apple Speech (`SFSpeechRecognizer`) and microphone input.
+- Cleans transcript text before insert (spacing, punctuation, capitalization, duplicate-word cleanup).
+- Inserts text into the active app with reliability fallbacks.
+- Stores the last 20 transcripts in local history.
+- Lets you paste the most recent transcript with `⌥⌘V` without needing to copy from history first.
+
+## How insertion works
+
+When a transcript is finalized (or when you trigger paste-last), KeyScribe uses this insertion flow:
+
+1. Attempt direct Accessibility text insertion only when explicitly enabled for compatibility testing.
+2. If clipboard copy mode is ON:
+   write to system clipboard, send paste shortcut, then fall back to typed unicode events if needed.
+3. If clipboard copy mode is OFF (default privacy mode):
+   use transient clipboard metadata, send paste shortcut, restore prior clipboard contents, then fall back to typed unicode events if needed.
+
+This keeps normal dictation out of persistent clipboard history when privacy mode is enabled.
+
+## Controls and shortcuts
+
+- Menu item toggles continuous dictation:
+  - `Start Continuous Dictation`
+  - `Stop Continuous Dictation`
+- Hold-to-talk shortcut is always active for quick burst dictation (default `⌥⌘Space`).
+- Continuous toggle shortcut is always active for session dictation (default `⌃⌥⌘Space`).
+- While continuous dictation is running, hold-to-talk input is ignored.
+- Paste last transcript: `⌥⌘V` (also available in the menu as **Paste Last Transcript**).
 
 ## Status
-This is a functional scaffold, not a finished product yet:
-- hotkey handling is implemented for a default shortcut
-  **⌥⌘Space**
-- global event monitoring may need Accessibility permissions depending on macOS version
-- in macOS sandboxed/bundled environments, permissions and key capture behavior can vary
 
-## Planned app behavior
-1. User holds the configured key combo.
-2. App records and transcribes speech in near-real-time.
-3. User releases the key combo.
-4. Final transcript is inserted into the active text field.
+KeyScribe is a fully functional macOS transcription assistant ready for daily use:
 
-## Project layout
-- `Package.swift` – local Swift package scaffold
-- `Sources/KeyScribe/App.swift` – app bootstrap + status/menu
-- `Sources/KeyScribe/Services/`
-  - `SpeechTranscriber.swift` – mic + speech recognition
-  - `HotkeyManager.swift` – global hold shortcut tracking
-  - `TextInserter.swift` – paste last transcript into active field
-- `Resources/Info.plist` – permission strings
+- Default hold-to-talk shortcut: **⌥⌘Space** (customizable in Settings)
+- Default continuous toggle shortcut: **⌃⌥⌘Space** (customizable in Settings)
+- Requires **Accessibility**, **Microphone**, and **Speech Recognition** permissions (prompted on first launch)
+- Tested on macOS 13 (Ventura) and later
 
-## Quick run
-1. Open this folder in Xcode (or convert to your preferred Xcode project style),
-   then run on macOS.
-2. Grant **Microphone** and **Speech Recognition** permissions.
-3. Keep app running.
-4. Hold **⌥⌘Space** to dictate, release to insert.
+### Reset Accessibility permission (dev/testing)
 
-## Copy/paste reliability diagnostics
-When debugging transcribe → clipboard → paste behavior, use the lightweight insertion diagnostics mode.
+If you are testing permission flows and want to force macOS to ask again:
 
-### Enable diagnostics
-Use either option:
-- **Settings → General → "Enable insertion diagnostics (developer)"**
-- or environment flag: `KEYSCRIBE_INSERTION_DIAGNOSTICS=1`
+```bash
+sudo tccutil reset Accessibility com.keyscribe.KeyScribe
+```
 
-Optional log path override:
+## Distribution
+
+KeyScribe can be distributed as a drag-and-drop DMG installer.
+
+### For trusted testers (ad-hoc signed)
+
+The default `./build.sh` produces an ad-hoc signed app. Recipients will need to
+right-click → Open the first time to bypass Gatekeeper.
+
+### For public distribution (Developer ID signed + notarized)
+
+Set your Developer ID credentials, then build and notarize:
+
+```bash
+export DEVELOPER_ID="Your Name (TEAMID)"
+./build.sh
+Scripts/notarize.sh
+```
+
+This produces a notarized DMG that opens without Gatekeeper warnings on any Mac.
+
+## Privacy model
+
+- `Also copy transcript to system clipboard` is OFF by default.
+- With this OFF setting, KeyScribe still pastes reliably via transient clipboard flow and history, but avoids permanently pushing dictation text into clipboard managers when possible.
+- Explicit copy actions from History always copy to system clipboard by design.
+
+## Build and install
+
+Build app + drag-and-drop DMG:
+
+```bash
+./build.sh
+```
+
+Output artifacts:
+
+- `dist/KeyScribe.app`
+- `dist/KeyScribe.dmg` (contains `KeyScribe.app` + `Applications` alias for drag-and-drop install)
+
+Optional build flags:
+
+- `./build.sh --install` installs directly to `/Applications`
+- `./build.sh --no-dmg` skips DMG generation
+
+Run app directly:
+
+```bash
+open dist/KeyScribe.app
+```
+
+Open installer DMG:
+
+```bash
+open dist/KeyScribe.dmg
+```
+
+## Diagnostics and reliability testing
+
+Enable insertion diagnostics:
+
+- Settings -> General -> `Enable insertion diagnostics (developer)`
+- or environment variable: `KEYSCRIBE_INSERTION_DIAGNOSTICS=1`
+
+Optional custom log path:
+
 - `KEYSCRIBE_INSERTION_DIAGNOSTICS_PATH=/tmp/my-keyscribe-diag.log`
 
-Default log path:
+Default diagnostics log:
+
 - `/tmp/keyscribe-insertion-diagnostics.log`
 
-Diagnostics are emitted as JSON lines with:
-- `timestamp`
-- `path`
-- `result`
-- `copyToClipboard`
-- `textLength`
-
-### Path values
-- `direct-accessibility` — AX selected-text/value replacement succeeded
-- `typed-unicode-events` — unicode typing fallback succeeded
-- `special-paste-clipboard` — clipboard + special paste path used
-- `special-paste-temporary-clipboard` — temporary clipboard paste path used (clipboard restored)
-- `empty-input` — nothing to insert
-
-### Result values
-- `pasted`
-- `copied-only`
-- `not-inserted`
-- `empty`
-
-### Smoke/regression runner
-Run all core + insertion reliability tests:
+Run smoke/regression suite:
 
 ```bash
 Scripts/run-tests.sh
 ```
 
-Run insertion decision simulation directly:
+Run insertion decision regression only:
 
 ```bash
 Scripts/run-insertion-reliability.sh --regression
-
-Scripts/run-insertion-reliability.sh \
-  --text "hello" --copy true --direct false --typing false --special false \
-  --expect-path special-paste-clipboard --expect-result copied-only
 ```
 
-Use this to validate decision outcomes without requiring live UI automation.
+## Project structure
 
-## Built-in Apple model question
-Yes — Apple’s `Speech` framework can use on-device recognition where available.
-In this scaffold:
-- we request standard speech authorizations from system
-- we set `requiresOnDeviceRecognition = true` when the API supports it
-
-So it uses Apple’s built-in stack first, and can still fallback to Apple’s
-back-end path if the on-device constraints aren’t met on a particular machine/config.
-
-## Notes for future (iOS / Windows)
-- macOS scaffold is complete starter here.
-- iOS version should use similar `Speech` + local shortcut UX (different permissions/UX).
-- Windows version will need a separate implementation path (not covered here).
+- `Package.swift` - Swift package entry
+- `Sources/KeyScribe/App.swift` - app lifecycle, status menu, permission flow, icon state, insertion orchestration
+- `Sources/KeyScribe/Services/SpeechTranscriber.swift` - speech capture + recognition pipeline
+- `Sources/KeyScribe/Services/TextInserter.swift` - insertion engine and paste/typing fallbacks
+- `Sources/KeyScribe/Services/HotkeyManager.swift` - hold-to-talk and one-shot hotkeys
+- `Sources/KeyScribe/Services/TranscriptHistoryStore.swift` - local transcript history persistence
+- `Resources/Info.plist` - app metadata and permission keys

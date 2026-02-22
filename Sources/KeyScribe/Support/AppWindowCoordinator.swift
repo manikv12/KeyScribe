@@ -3,6 +3,11 @@ import SwiftUI
 
 @MainActor
 final class AppWindowCoordinator: NSObject, NSWindowDelegate {
+    private let settingsDefaultSize = NSSize(width: 900, height: 680)
+    private let settingsMinimumSize = NSSize(width: 820, height: 560)
+    private let historyDefaultSize = NSSize(width: 620, height: 500)
+    private let historyMinimumSize = NSSize(width: 520, height: 360)
+
     private let settings: SettingsStore
     private let transcriptHistory: TranscriptHistoryStore
     private let onStatusUpdate: (DictationUIStatus) -> Void
@@ -30,24 +35,27 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
         if settingsWindowController == nil {
             let hostingController = NSHostingController(rootView: SettingsView().environmentObject(settings))
-            let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 460, height: 430),
-                styleMask: [.titled, .closable, .utilityWindow],
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: settingsDefaultSize),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
             )
 
-            panel.title = "KeyScribe Settings"
-            panel.contentViewController = hostingController
-            panel.isFloatingPanel = true
-            panel.level = .floating
-            panel.hidesOnDeactivate = false
-            panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-            panel.isReleasedWhenClosed = false
-            panel.center()
-            panel.delegate = self
+            window.title = "KeyScribe Settings"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.toolbarStyle = .unifiedCompact
+            window.isMovableByWindowBackground = true
+            window.contentViewController = hostingController
+            window.hidesOnDeactivate = false
+            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.isReleasedWhenClosed = false
+            window.minSize = settingsMinimumSize
+            centerWindowOnActiveScreen(window)
+            window.delegate = self
 
-            settingsWindowController = NSWindowController(window: panel)
+            settingsWindowController = NSWindowController(window: window)
         }
 
         guard let window = settingsWindowController?.window else {
@@ -57,6 +65,13 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         settingsWindowController?.showWindow(nil)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        if window.frame.width < settingsMinimumSize.width || window.frame.height < settingsMinimumSize.height {
+            window.setContentSize(settingsDefaultSize)
+        }
+        centerWindowOnActiveScreen(window)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         onStatusUpdate(.ready)
@@ -84,17 +99,22 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
             let hostingController = NSHostingController(rootView: historyView)
             let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 540, height: 420),
-                styleMask: [.titled, .closable, .utilityWindow, .resizable],
+                contentRect: NSRect(origin: .zero, size: historyDefaultSize),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
             )
             panel.title = "Transcript History"
+            panel.titleVisibility = .hidden
+            panel.titlebarAppearsTransparent = true
+            panel.isMovableByWindowBackground = true
+            panel.toolbarStyle = .unifiedCompact
             panel.contentViewController = hostingController
             panel.isFloatingPanel = false
             panel.hidesOnDeactivate = false
             panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
             panel.isReleasedWhenClosed = false
+            panel.minSize = historyMinimumSize
             panel.center()
             panel.delegate = self
 
@@ -104,6 +124,14 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         guard let window = historyWindowController?.window else { return }
         NSApp.activate(ignoringOtherApps: true)
         historyWindowController?.showWindow(nil)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        if window.frame.width < historyMinimumSize.width || window.frame.height < historyMinimumSize.height {
+            window.setContentSize(historyDefaultSize)
+            window.center()
+        }
+        window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -135,5 +163,19 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         } else {
             onInsertText(text)
         }
+    }
+
+    private func centerWindowOnActiveScreen(_ window: NSWindow) {
+        guard let visibleFrame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame else {
+            window.center()
+            return
+        }
+
+        let frame = window.frame
+        let origin = NSPoint(
+            x: visibleFrame.midX - (frame.width / 2),
+            y: visibleFrame.midY - (frame.height / 2)
+        )
+        window.setFrameOrigin(origin)
     }
 }

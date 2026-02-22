@@ -27,7 +27,7 @@ final class SpeechTranscriber: NSObject {
     private var selectedMicrophoneUID = ""
     private var enableContextualBias = true
     private var keepTextAcrossPauses = true
-    private var preferOnDeviceRecognition = true
+    private var recognitionMode: RecognitionMode = .localOnly
     private var finalizeDelaySeconds: TimeInterval = 0.35
     private var customContextPhrases: [String] = []
     private var autoPunctuation = true
@@ -38,12 +38,12 @@ final class SpeechTranscriber: NSObject {
         super.init()
     }
 
-    func requestPermissions() {
+    func requestPermissions(promptIfNeeded: Bool = true) {
         if Thread.isMainThread {
-            requestPermissionsOnMain()
+            requestPermissionsOnMain(promptIfNeeded: promptIfNeeded)
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.requestPermissionsOnMain()
+                self?.requestPermissionsOnMain(promptIfNeeded: promptIfNeeded)
             }
         }
     }
@@ -61,7 +61,7 @@ final class SpeechTranscriber: NSObject {
     func applyRecognitionSettings(
         enableContextualBias: Bool,
         keepTextAcrossPauses: Bool,
-        preferOnDeviceRecognition: Bool,
+        recognitionMode: RecognitionMode,
         autoPunctuation: Bool,
         finalizeDelaySeconds: TimeInterval,
         customContextPhrases: String
@@ -70,7 +70,7 @@ final class SpeechTranscriber: NSObject {
             applyRecognitionSettingsOnMain(
                 enableContextualBias: enableContextualBias,
                 keepTextAcrossPauses: keepTextAcrossPauses,
-                preferOnDeviceRecognition: preferOnDeviceRecognition,
+                recognitionMode: recognitionMode,
                 autoPunctuation: autoPunctuation,
                 finalizeDelaySeconds: finalizeDelaySeconds,
                 customContextPhrases: customContextPhrases
@@ -80,7 +80,7 @@ final class SpeechTranscriber: NSObject {
                 self?.applyRecognitionSettingsOnMain(
                     enableContextualBias: enableContextualBias,
                     keepTextAcrossPauses: keepTextAcrossPauses,
-                    preferOnDeviceRecognition: preferOnDeviceRecognition,
+                    recognitionMode: recognitionMode,
                     autoPunctuation: autoPunctuation,
                     finalizeDelaySeconds: finalizeDelaySeconds,
                     customContextPhrases: customContextPhrases
@@ -89,17 +89,33 @@ final class SpeechTranscriber: NSObject {
         }
     }
 
-    private func requestPermissionsOnMain() {
-        SFSpeechRecognizer.requestAuthorization { [weak self] status in
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                switch status {
-                case .authorized:
-                    self.requestedAudioPermissionOnMain()
-                default:
-                    self.update("Speech permission not granted")
+    private func requestPermissionsOnMain(promptIfNeeded: Bool) {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            requestAudioPermissionIfNeededOnMain(promptIfNeeded: promptIfNeeded)
+
+        case .notDetermined:
+            guard promptIfNeeded else {
+                granted = false
+                return
+            }
+
+            SFSpeechRecognizer.requestAuthorization { [weak self] status in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    switch status {
+                    case .authorized:
+                        self.requestAudioPermissionIfNeededOnMain(promptIfNeeded: promptIfNeeded)
+                    default:
+                        self.granted = false
+                        self.update("Speech permission not granted")
+                    }
                 }
             }
+
+        default:
+            granted = false
+            update("Speech permission not granted")
         }
     }
 
@@ -111,30 +127,47 @@ final class SpeechTranscriber: NSObject {
     private func applyRecognitionSettingsOnMain(
         enableContextualBias: Bool,
         keepTextAcrossPauses: Bool,
-        preferOnDeviceRecognition: Bool,
+        recognitionMode: RecognitionMode,
         autoPunctuation: Bool,
         finalizeDelaySeconds: TimeInterval,
         customContextPhrases: String
     ) {
         self.enableContextualBias = enableContextualBias
         self.keepTextAcrossPauses = keepTextAcrossPauses
-        self.preferOnDeviceRecognition = preferOnDeviceRecognition
+        self.recognitionMode = recognitionMode
         self.autoPunctuation = autoPunctuation
         self.finalizeDelaySeconds = RecognitionTuning.clampedFinalizeDelay(finalizeDelaySeconds)
         self.customContextPhrases = RecognitionTuning.parseCustomPhrases(customContextPhrases)
     }
 
-    private func requestedAudioPermissionOnMain() {
-        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if granted {
-                    self.granted = true
-                    self.update("Permissions ready")
-                } else {
-                    self.update("Microphone permission not granted")
+    private func requestAudioPermissionIfNeededOnMain(promptIfNeeded: Bool) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            granted = true
+            update("Permissions ready")
+
+        case .notDetermined:
+            guard promptIfNeeded else {
+                granted = false
+                return
+            }
+
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if granted {
+                        self.granted = true
+                        self.update("Permissions ready")
+                    } else {
+                        self.granted = false
+                        self.update("Microphone permission not granted")
+                    }
                 }
             }
+
+        default:
+            granted = false
+            update("Microphone permission not granted")
         }
     }
 
@@ -172,6 +205,8 @@ final class SpeechTranscriber: NSObject {
     @discardableResult
     private func startRecordingOnMain() -> Bool {
         guard granted else {
+            // Re-check/request permissions on demand so first-run users are not stuck.
+            requestPermissionsOnMain(promptIfNeeded: true)
             update("Permissions missing")
             return false
         }
@@ -287,7 +322,12 @@ final class SpeechTranscriber: NSObject {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         if #available(macOS 13, *) {
-            request.requiresOnDeviceRecognition = preferOnDeviceRecognition
+            switch recognitionMode {
+            case .localOnly:
+                request.requiresOnDeviceRecognition = true
+            case .cloudOnly, .automatic:
+                request.requiresOnDeviceRecognition = false
+            }
             request.addsPunctuation = autoPunctuation
         }
         request.taskHint = .dictation

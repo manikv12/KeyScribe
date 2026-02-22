@@ -5,7 +5,7 @@ enum InsertionPath: String, CaseIterable {
     case directAccessibility = "direct-accessibility"
     case typedUnicodeEvents = "typed-unicode-events"
     case specialPasteClipboard = "special-paste-clipboard"
-    case specialPasteTemporaryClipboard = "special-paste-temporary-clipboard"
+    case specialPasteTransientClipboard = "special-paste-transient-clipboard"
 }
 
 struct InsertionDecision: Equatable {
@@ -41,7 +41,7 @@ enum InsertionDecisionModel {
         }
 
         return InsertionDecision(
-            path: .specialPasteTemporaryClipboard,
+            path: .specialPasteTransientClipboard,
             result: specialPasteSucceeded ? .pasted : .notInserted
         )
     }
