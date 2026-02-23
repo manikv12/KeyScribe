@@ -91,6 +91,32 @@ This produces a notarized DMG that opens without Gatekeeper warnings on any Mac.
 - With this OFF setting, KeyScribe still pastes reliably via transient clipboard flow and history, but avoids permanently pushing dictation text into clipboard managers when possible.
 - Explicit copy actions from History always copy to system clipboard by design.
 
+## Memory rewrite preview (local)
+
+KeyScribe can now learn from local chat history files and show a rewrite preview before text is inserted.
+
+- Go to `Settings -> Memory & Sources` to control this feature.
+- Turn on `Enable memory indexing` to allow local indexing.
+- Use provider/folder toggles to pick which sources are allowed (for example `.codex`, `.claude`, `.cursor`, `.copilot`, `.gemini`, `.windsurf`, `.codeium`, and similar detected folders).
+- Click `Rescan` to detect source folders and optionally start indexing.
+- Click `Rebuild Index` when you want to re-index from scratch.
+- `Clear Memories` removes indexed memory cards and rewrite entries.
+- `Clear Archive` removes all indexed source/archive rows.
+
+When a final transcript is ready:
+
+- KeyScribe asks the rewrite backend for a suggestion using local memory context.
+- A blocking preview dialog appears with:
+  - `Use Suggested`
+  - `Edit Then Insert`
+  - `Insert Original`
+- If the provider fails, a blocking fallback dialog appears with:
+  - `Retry`
+  - `Insert Original`
+  - `Cancel`
+
+This is opt-in and local-first by default. Provider-backed rewrite behavior can be changed behind the backend service layer.
+
 ## Build and install
 
 Build app + drag-and-drop DMG:
@@ -143,6 +169,8 @@ Run smoke/regression suite:
 ```bash
 Scripts/run-tests.sh
 ```
+
+The smoke suite includes prompt-rewrite and memory-indexing coverage.
 
 Run insertion decision regression only:
 

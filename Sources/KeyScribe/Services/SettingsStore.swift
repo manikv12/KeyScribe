@@ -121,6 +121,12 @@ final class SettingsStore: ObservableObject {
         static let dictationPastedSoundName = "KeyScribe.dictationPastedSoundName"
         static let dictationCorrectionLearnedSoundName = "KeyScribe.dictationCorrectionLearnedSoundName"
         static let dictationFeedbackVolume = "KeyScribe.dictationFeedbackVolume"
+        static let memoryIndexingEnabled = "KeyScribe.memoryIndexingEnabled"
+        static let memoryProviderCatalogAutoUpdate = "KeyScribe.memoryProviderCatalogAutoUpdate"
+        static let memoryDetectedProviderIDs = "KeyScribe.memoryDetectedProviderIDs"
+        static let memoryEnabledProviderIDs = "KeyScribe.memoryEnabledProviderIDs"
+        static let memoryDetectedSourceFolderIDs = "KeyScribe.memoryDetectedSourceFolderIDs"
+        static let memoryEnabledSourceFolderIDs = "KeyScribe.memoryEnabledSourceFolderIDs"
     }
 
     private enum ContinuousToggleDefaults {
@@ -307,6 +313,62 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var memoryIndexingEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var memoryProviderCatalogAutoUpdate: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var memoryDetectedProviderIDs: [String] {
+        didSet {
+            let normalized = Self.normalizedStringList(memoryDetectedProviderIDs)
+            guard normalized == memoryDetectedProviderIDs else {
+                memoryDetectedProviderIDs = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var memoryEnabledProviderIDs: [String] {
+        didSet {
+            let normalized = Self.normalizedStringList(memoryEnabledProviderIDs)
+            guard normalized == memoryEnabledProviderIDs else {
+                memoryEnabledProviderIDs = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var memoryDetectedSourceFolderIDs: [String] {
+        didSet {
+            let normalized = Self.normalizedStringList(memoryDetectedSourceFolderIDs)
+            guard normalized == memoryDetectedSourceFolderIDs else {
+                memoryDetectedSourceFolderIDs = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var memoryEnabledSourceFolderIDs: [String] {
+        didSet {
+            let normalized = Self.normalizedStringList(memoryEnabledSourceFolderIDs)
+            guard normalized == memoryEnabledSourceFolderIDs else {
+                memoryEnabledSourceFolderIDs = normalized
+                return
+            }
+            save()
+        }
+    }
+
     @Published var availableMicrophones: [MicrophoneOption] = []
     @Published var accessibilityTrusted: Bool = AXIsProcessTrusted()
 
@@ -488,6 +550,38 @@ final class SettingsStore: ObservableObject {
             ? Self.defaultDictationFeedbackVolume
             : min(1, max(0, defaults.double(forKey: Keys.dictationFeedbackVolume)))
 
+        if defaults.object(forKey: Keys.memoryIndexingEnabled) == nil {
+            memoryIndexingEnabled = false
+        } else {
+            memoryIndexingEnabled = defaults.bool(forKey: Keys.memoryIndexingEnabled)
+        }
+
+        if defaults.object(forKey: Keys.memoryProviderCatalogAutoUpdate) == nil {
+            memoryProviderCatalogAutoUpdate = true
+        } else {
+            memoryProviderCatalogAutoUpdate = defaults.bool(forKey: Keys.memoryProviderCatalogAutoUpdate)
+        }
+
+        let initialDetectedProviderIDs = Self.normalizedStringList(
+            defaults.stringArray(forKey: Keys.memoryDetectedProviderIDs) ?? []
+        )
+        memoryDetectedProviderIDs = initialDetectedProviderIDs
+        if let storedEnabledProviderIDs = defaults.stringArray(forKey: Keys.memoryEnabledProviderIDs) {
+            memoryEnabledProviderIDs = Self.normalizedStringList(storedEnabledProviderIDs)
+        } else {
+            memoryEnabledProviderIDs = initialDetectedProviderIDs
+        }
+
+        let initialDetectedSourceFolderIDs = Self.normalizedStringList(
+            defaults.stringArray(forKey: Keys.memoryDetectedSourceFolderIDs) ?? []
+        )
+        memoryDetectedSourceFolderIDs = initialDetectedSourceFolderIDs
+        if let storedEnabledSourceFolderIDs = defaults.stringArray(forKey: Keys.memoryEnabledSourceFolderIDs) {
+            memoryEnabledSourceFolderIDs = Self.normalizedStringList(storedEnabledSourceFolderIDs)
+        } else {
+            memoryEnabledSourceFolderIDs = initialDetectedSourceFolderIDs
+        }
+
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
         refreshMicrophones(notifyChange: false)
@@ -569,6 +663,12 @@ final class SettingsStore: ObservableObject {
         defaults.set(dictationPastedSoundName, forKey: Keys.dictationPastedSoundName)
         defaults.set(dictationCorrectionLearnedSoundName, forKey: Keys.dictationCorrectionLearnedSoundName)
         defaults.set(dictationFeedbackVolume, forKey: Keys.dictationFeedbackVolume)
+        defaults.set(memoryIndexingEnabled, forKey: Keys.memoryIndexingEnabled)
+        defaults.set(memoryProviderCatalogAutoUpdate, forKey: Keys.memoryProviderCatalogAutoUpdate)
+        defaults.set(Self.normalizedStringList(memoryDetectedProviderIDs), forKey: Keys.memoryDetectedProviderIDs)
+        defaults.set(Self.normalizedStringList(memoryEnabledProviderIDs), forKey: Keys.memoryEnabledProviderIDs)
+        defaults.set(Self.normalizedStringList(memoryDetectedSourceFolderIDs), forKey: Keys.memoryDetectedSourceFolderIDs)
+        defaults.set(Self.normalizedStringList(memoryEnabledSourceFolderIDs), forKey: Keys.memoryEnabledSourceFolderIDs)
 
         guard !isApplyingChanges else { return }
         onChange?()
@@ -600,6 +700,88 @@ final class SettingsStore: ObservableObject {
     var transcriptionEngine: TranscriptionEngineType {
         get { TranscriptionEngineType(rawValue: transcriptionEngineRawValue) ?? .appleSpeech }
         set { transcriptionEngineRawValue = newValue.rawValue }
+    }
+
+    func isMemoryProviderEnabled(_ providerID: String) -> Bool {
+        let normalizedID = Self.normalizedIdentifier(providerID)
+        guard !normalizedID.isEmpty else { return false }
+        return memoryEnabledProviderIDs.contains(normalizedID)
+    }
+
+    func setMemoryProviderEnabled(_ providerID: String, enabled: Bool) {
+        let normalizedID = Self.normalizedIdentifier(providerID)
+        guard !normalizedID.isEmpty else { return }
+
+        var updated = Set(memoryEnabledProviderIDs)
+        if enabled {
+            updated.insert(normalizedID)
+        } else {
+            updated.remove(normalizedID)
+        }
+        memoryEnabledProviderIDs = Self.normalizedStringList(Array(updated))
+    }
+
+    func isMemorySourceFolderEnabled(_ folderID: String) -> Bool {
+        let normalizedID = Self.normalizedIdentifier(folderID)
+        guard !normalizedID.isEmpty else { return false }
+        return memoryEnabledSourceFolderIDs.contains(normalizedID)
+    }
+
+    func setMemorySourceFolderEnabled(_ folderID: String, enabled: Bool) {
+        let normalizedID = Self.normalizedIdentifier(folderID)
+        guard !normalizedID.isEmpty else { return }
+
+        var updated = Set(memoryEnabledSourceFolderIDs)
+        if enabled {
+            updated.insert(normalizedID)
+        } else {
+            updated.remove(normalizedID)
+        }
+        memoryEnabledSourceFolderIDs = Self.normalizedStringList(Array(updated))
+    }
+
+    func updateDetectedMemoryProviders(_ providerIDs: [String]) {
+        let normalizedProviders = Self.normalizedStringList(providerIDs)
+        let previousDetected = Set(memoryDetectedProviderIDs)
+        let previousEnabled = Set(memoryEnabledProviderIDs)
+
+        memoryDetectedProviderIDs = normalizedProviders
+        memoryEnabledProviderIDs = normalizedProviders.filter { providerID in
+            previousEnabled.contains(providerID) || !previousDetected.contains(providerID)
+        }
+    }
+
+    func updateDetectedMemorySourceFolders(_ sourceFolderIDs: [String]) {
+        let normalizedFolders = Self.normalizedStringList(sourceFolderIDs)
+        let previousDetected = Set(memoryDetectedSourceFolderIDs)
+        let previousEnabled = Set(memoryEnabledSourceFolderIDs)
+
+        memoryDetectedSourceFolderIDs = normalizedFolders
+        memoryEnabledSourceFolderIDs = normalizedFolders.filter { folderID in
+            previousEnabled.contains(folderID) || !previousDetected.contains(folderID)
+        }
+    }
+
+    private static func normalizedIdentifier(_ rawValue: String) -> String {
+        rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizedStringList(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var cleaned: [String] = []
+        cleaned.reserveCapacity(values.count)
+
+        for rawValue in values {
+            let normalized = normalizedIdentifier(rawValue)
+            guard !normalized.isEmpty else { continue }
+            if seen.insert(normalized).inserted {
+                cleaned.append(normalized)
+            }
+        }
+
+        return cleaned.sorted { lhs, rhs in
+            lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
     }
 
     /// Resets all permissions, deletes local app data, and removes the app bundle.

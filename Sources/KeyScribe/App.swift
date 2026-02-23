@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let whisperModelManager = WhisperModelManager.shared
     private let settings = SettingsStore.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
+    private let promptRewriteService = PromptRewriteService.shared
     private let postInsertCorrectionMonitor = PostInsertCorrectionMonitor()
     private let waveform = WaveformHUDManager()
     private var hotkeyManager: HoldToTalkManager?
@@ -52,6 +53,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var dictationInputMode: DictationInputMode = .idle
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
+    private enum PromptRewritePreviewChoice {
+        case useSuggested
+        case editThenInsert
+        case insertOriginal
+    }
+    private enum PromptRewriteFailureChoice {
+        case retry
+        case insertOriginal
+        case cancel
+    }
     private enum DictationFeedbackCue: CaseIterable {
         case startListening
         case stopListening
@@ -213,37 +224,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         transcriber.onFinalText = { [weak self] text in
             guard let self else { return }
-            let cleaned = TextCleanup.process(text, mode: self.settings.textCleanupMode)
-            guard !cleaned.isEmpty else { return }
-
-            let readyForInsert: String
-            var appliedEvents: [AdaptiveCorrectionStore.AppliedEvent] = []
-            if self.settings.adaptiveCorrectionsEnabled {
-                let applyResult = self.adaptiveCorrectionStore.applyWithEvents(to: cleaned)
-                readyForInsert = applyResult.text
-                appliedEvents = applyResult.appliedEvents
-            } else {
-                readyForInsert = cleaned
-            }
-
-            if !appliedEvents.isEmpty {
-                let applyMessage: String
-                if appliedEvents.count == 1, let first = appliedEvents.first {
-                    applyMessage = "Applied learned: \(first.source) -> \(first.replacement)"
-                } else {
-                    applyMessage = "Applied \(appliedEvents.count) learned corrections"
-                }
-                self.waveform.flashEvent(
-                    message: applyMessage,
-                    symbolName: "arrow.triangle.2.circlepath.circle.fill",
-                    duration: 1.2
-                )
-            }
-
-            self.transcriptHistory.add(readyForInsert)
-            self.insertText(readyForInsert, trackCorrections: self.settings.adaptiveCorrectionsEnabled)
             Task { @MainActor in
-                self.setUIStatus(.ready)
+                await self.handleFinalTranscript(text)
             }
         }
 
@@ -710,6 +692,283 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenuState()
     }
 
+    private func handleFinalTranscript(_ text: String) async {
+        let cleaned = TextCleanup.process(text, mode: settings.textCleanupMode)
+        guard !cleaned.isEmpty else {
+            setUIStatus(.ready)
+            return
+        }
+
+        guard let rewriteResolved = await resolvePromptRewriteInsertionText(for: cleaned) else {
+            setUIStatus(.ready)
+            return
+        }
+
+        let readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolved)
+        transcriptHistory.add(readyForInsert)
+        insertText(readyForInsert, trackCorrections: settings.adaptiveCorrectionsEnabled)
+        setUIStatus(.ready)
+    }
+
+    private func resolvePromptRewriteInsertionText(for cleanedTranscript: String) async -> String? {
+        while true {
+            do {
+                guard let suggestion = try await promptRewriteService.retrieveSuggestion(for: cleanedTranscript) else {
+                    return cleanedTranscript
+                }
+
+                switch presentPromptRewritePreviewDialog(
+                    originalText: cleanedTranscript,
+                    suggestion: suggestion
+                ) {
+                case .useSuggested:
+                    await recordPromptRewriteFeedback(
+                        action: .usedSuggested,
+                        originalText: cleanedTranscript,
+                        suggestedText: suggestion.suggestedText,
+                        finalInsertedText: suggestion.suggestedText
+                    )
+                    return suggestion.suggestedText
+                case .editThenInsert:
+                    guard let edited = presentPromptRewriteEditDialog(initialText: suggestion.suggestedText) else {
+                        continue
+                    }
+                    await recordPromptRewriteFeedback(
+                        action: .editedThenInserted,
+                        originalText: cleanedTranscript,
+                        suggestedText: suggestion.suggestedText,
+                        finalInsertedText: edited
+                    )
+                    return edited
+                case .insertOriginal:
+                    await recordPromptRewriteFeedback(
+                        action: .insertedOriginal,
+                        originalText: cleanedTranscript,
+                        suggestedText: suggestion.suggestedText,
+                        finalInsertedText: cleanedTranscript
+                    )
+                    return cleanedTranscript
+                }
+            } catch {
+                let failureDetail = promptRewriteFailureDetail(for: error)
+                switch presentPromptRewriteFailureDialog(failureDetail: failureDetail) {
+                case .retry:
+                    await recordPromptRewriteFeedback(
+                        action: .retriedAfterFailure,
+                        originalText: cleanedTranscript,
+                        failureDetail: failureDetail
+                    )
+                    continue
+                case .insertOriginal:
+                    await recordPromptRewriteFeedback(
+                        action: .insertedOriginalAfterFailure,
+                        originalText: cleanedTranscript,
+                        finalInsertedText: cleanedTranscript,
+                        failureDetail: failureDetail
+                    )
+                    return cleanedTranscript
+                case .cancel:
+                    await recordPromptRewriteFeedback(
+                        action: .canceledAfterFailure,
+                        originalText: cleanedTranscript,
+                        failureDetail: failureDetail
+                    )
+                    return nil
+                }
+            }
+        }
+    }
+
+    private func applyAdaptiveCorrectionsIfNeeded(to text: String) -> String {
+        let readyForInsert: String
+        let appliedEvents: [AdaptiveCorrectionStore.AppliedEvent]
+        if settings.adaptiveCorrectionsEnabled {
+            let applyResult = adaptiveCorrectionStore.applyWithEvents(to: text)
+            readyForInsert = applyResult.text
+            appliedEvents = applyResult.appliedEvents
+        } else {
+            readyForInsert = text
+            appliedEvents = []
+        }
+
+        if !appliedEvents.isEmpty {
+            let applyMessage: String
+            if appliedEvents.count == 1, let first = appliedEvents.first {
+                applyMessage = "Applied learned: \(first.source) -> \(first.replacement)"
+            } else {
+                applyMessage = "Applied \(appliedEvents.count) learned corrections"
+            }
+            waveform.flashEvent(
+                message: applyMessage,
+                symbolName: "arrow.triangle.2.circlepath.circle.fill",
+                duration: 1.2
+            )
+        }
+
+        return readyForInsert
+    }
+
+    private func presentPromptRewritePreviewDialog(
+        originalText: String,
+        suggestion: PromptRewriteSuggestion
+    ) -> PromptRewritePreviewChoice {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Review Suggested Rewrite"
+        alert.informativeText = promptRewritePreviewBody(originalText: originalText, suggestion: suggestion)
+        alert.addButton(withTitle: "Use Suggested")
+        alert.addButton(withTitle: "Edit Then Insert")
+        alert.addButton(withTitle: "Insert Original")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .useSuggested
+        case .alertSecondButtonReturn:
+            return .editThenInsert
+        default:
+            return .insertOriginal
+        }
+    }
+
+    private func presentPromptRewriteEditDialog(initialText: String) -> String? {
+        var draft = initialText
+        while true {
+            let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 190))
+            textView.string = draft
+            textView.font = NSFont.systemFont(ofSize: 13)
+            textView.isRichText = false
+            textView.isAutomaticQuoteSubstitutionEnabled = false
+            textView.isAutomaticDashSubstitutionEnabled = false
+            textView.isAutomaticTextReplacementEnabled = false
+            textView.textContainerInset = NSSize(width: 8, height: 8)
+
+            let scrollView = NSScrollView(frame: textView.frame)
+            scrollView.borderType = .bezelBorder
+            scrollView.hasVerticalScroller = true
+            scrollView.documentView = textView
+
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Edit Suggested Rewrite"
+            alert.informativeText = "Update the text below, then choose Insert Edited."
+            alert.accessoryView = scrollView
+            alert.addButton(withTitle: "Insert Edited")
+            alert.addButton(withTitle: "Back")
+
+            let response = alert.runModal()
+            if response != .alertFirstButtonReturn {
+                return nil
+            }
+
+            let edited = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !edited.isEmpty {
+                return edited
+            }
+
+            draft = textView.string
+            let emptyAlert = NSAlert()
+            emptyAlert.alertStyle = .warning
+            emptyAlert.messageText = "Edited text is empty"
+            emptyAlert.informativeText = "Enter text before inserting, or go back and choose a different action."
+            emptyAlert.addButton(withTitle: "Continue Editing")
+            _ = emptyAlert.runModal()
+        }
+    }
+
+    private func presentPromptRewriteFailureDialog(failureDetail: String) -> PromptRewriteFailureChoice {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Rewrite Provider Unavailable"
+        alert.informativeText = "Could not get a rewrite suggestion.\n\(failureDetail)"
+        alert.addButton(withTitle: "Retry")
+        alert.addButton(withTitle: "Insert Original")
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .retry
+        case .alertSecondButtonReturn:
+            return .insertOriginal
+        default:
+            return .cancel
+        }
+    }
+
+    private func promptRewritePreviewBody(
+        originalText: String,
+        suggestion: PromptRewriteSuggestion
+    ) -> String {
+        let suggestedSnippet = promptRewriteSnippet(for: suggestion.suggestedText)
+        let originalSnippet = promptRewriteSnippet(for: originalText)
+        if let memoryContext = suggestion.memoryContext?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !memoryContext.isEmpty {
+            let memorySnippet = promptRewriteSnippet(for: memoryContext, maxLength: 160)
+            return """
+            Memory context:
+            \(memorySnippet)
+
+            Suggested:
+            \(suggestedSnippet)
+
+            Original:
+            \(originalSnippet)
+            """
+        }
+
+        return """
+        Suggested:
+        \(suggestedSnippet)
+
+        Original:
+        \(originalSnippet)
+        """
+    }
+
+    private func promptRewriteSnippet(for text: String, maxLength: Int = 320) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > maxLength else {
+            return normalized
+        }
+        let prefix = normalized.prefix(maxLength)
+        return "\(prefix)..."
+    }
+
+    private func promptRewriteFailureDetail(for error: Error) -> String {
+        if let serviceError = error as? PromptRewriteServiceError {
+            switch serviceError {
+            case let .timedOut(timeoutSeconds):
+                return "Timed out after \(String(format: "%.1f", timeoutSeconds))s."
+            case let .providerUnavailable(reason):
+                return reason
+            }
+        }
+
+        let raw = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty {
+            return "unknown-provider-error"
+        }
+        return raw
+    }
+
+    private func recordPromptRewriteFeedback(
+        action: PromptRewriteFeedbackAction,
+        originalText: String,
+        suggestedText: String? = nil,
+        finalInsertedText: String? = nil,
+        failureDetail: String? = nil
+    ) async {
+        let event = PromptRewriteFeedbackEvent(
+            action: action,
+            originalText: originalText,
+            suggestedText: suggestedText,
+            finalInsertedText: finalInsertedText,
+            failureDetail: failureDetail
+        )
+        await promptRewriteService.recordFeedback(event)
+    }
+
     private func insertText(
         _ text: String,
         forceCopyToClipboard: Bool = false,
@@ -1043,6 +1302,7 @@ struct SettingsView: View {
         case recognition
         case models
         case corrections
+        case memorySources
         case about
 
         var id: Self { self }
@@ -1055,6 +1315,7 @@ struct SettingsView: View {
             case .recognition: return "Recognition"
             case .models: return "Models"
             case .corrections: return "Corrections"
+            case .memorySources: return "Memory & Sources"
             case .about: return "About & Permissions"
             }
         }
@@ -1067,6 +1328,7 @@ struct SettingsView: View {
             case .recognition: return "Speech behavior and text quality"
             case .models: return "Install and select whisper models"
             case .corrections: return "Learn from and manage text fixes"
+            case .memorySources: return "Indexing controls and source selection"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
         }
@@ -1079,6 +1341,7 @@ struct SettingsView: View {
             case .recognition: return "waveform"
             case .models: return "shippingbox.fill"
             case .corrections: return "text.badge.checkmark"
+            case .memorySources: return "tray.full.fill"
             case .about: return "info.circle"
             }
         }
@@ -1091,6 +1354,7 @@ struct SettingsView: View {
             case .recognition: return .green
             case .models: return .teal
             case .corrections: return .mint
+            case .memorySources: return .cyan
             case .about: return .orange
             }
         }
@@ -1109,6 +1373,8 @@ struct SettingsView: View {
                 return ["whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large"]
             case .corrections:
                 return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
+            case .memorySources:
+                return ["memory", "index", "provider", "source", "folder", "archive", "rescan", "rebuild", "clear"]
             case .about:
                 return ["about", "permission", "uninstall", "version", "crash logs"]
             }
@@ -1187,6 +1453,10 @@ struct SettingsView: View {
     @State private var correctionReplacementDraft = ""
     @State private var correctionEditingSource: String?
     @State private var correctionDialogMessage: String?
+    @State private var detectedMemoryProviders: [MemoryIndexingSettingsService.Provider] = []
+    @State private var detectedMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] = []
+    @State private var memoryActionMessage: String?
+    private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let settingsSidebarWidth: CGFloat = 278
     private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
         ShortcutKeyOption(keyCode: $0, label: ShortcutValidation.keyName(for: $0))
@@ -1433,6 +1703,8 @@ struct SettingsView: View {
             modelsSection
         case .corrections:
             correctionsSection
+        case .memorySources:
+            memorySourcesSection
         case .about:
             aboutSection
         }
@@ -2000,6 +2272,228 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private var memorySourcesSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .memorySources)
+
+            settingsCard(
+                title: "Memory Indexing",
+                subtitle: "Choose if KeyScribe should build and use local memory context."
+            ) {
+                Toggle("Enable memory indexing", isOn: $settings.memoryIndexingEnabled)
+                Toggle("Auto-refresh detected providers and folders", isOn: $settings.memoryProviderCatalogAutoUpdate)
+                Text("Turn this off if you only want to refresh manually with Rescan.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            settingsCard(
+                title: "Detected Providers",
+                subtitle: "Choose which providers can add memory context."
+            ) {
+                if detectedMemoryProviders.isEmpty {
+                    Text("No providers detected yet. Click Rescan to detect providers.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(detectedMemoryProviders) { provider in
+                        Toggle(isOn: Binding(
+                            get: { settings.isMemoryProviderEnabled(provider.id) },
+                            set: { isEnabled in
+                                settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
+                            }
+                        )) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(provider.name)
+                                    .font(.callout.weight(.medium))
+                                Text(provider.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .disabled(!settings.memoryIndexingEnabled)
+                    }
+                }
+            }
+
+            settingsCard(
+                title: "Detected Source Folders",
+                subtitle: "Choose folders that can be indexed for memory context."
+            ) {
+                if detectedMemorySourceFolders.isEmpty {
+                    Text("No source folders detected yet. Click Rescan to find folders.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(detectedMemorySourceFolders) { folder in
+                        Toggle(isOn: Binding(
+                            get: { settings.isMemorySourceFolderEnabled(folder.id) },
+                            set: { isEnabled in
+                                settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
+                            }
+                        )) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(folder.name)
+                                    .font(.callout.weight(.medium))
+                                Text(folder.path)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        .disabled(!settings.memoryIndexingEnabled)
+                    }
+                }
+            }
+
+            settingsCard(
+                title: "Memory Actions",
+                subtitle: "Rescan sources, rebuild the index, or clear local data."
+            ) {
+                HStack(spacing: 8) {
+                    Button("Rescan") {
+                        rescanMemorySources(showMessage: true)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Rebuild Index") {
+                        memoryIndexingSettingsService.rebuildIndex(
+                            enabledProviderIDs: settings.memoryEnabledProviderIDs,
+                            enabledSourceFolderIDs: settings.memoryEnabledSourceFolderIDs
+                        )
+                        memoryActionMessage = "Started rebuilding the memory index."
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.memoryIndexingEnabled)
+                }
+
+                HStack(spacing: 8) {
+                    Button("Clear Memories", role: .destructive) {
+                        memoryIndexingSettingsService.clearMemories()
+                        memoryActionMessage = "Cleared indexed memories."
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.memoryIndexingEnabled)
+
+                    Button("Clear Archive", role: .destructive) {
+                        memoryIndexingSettingsService.clearArchive()
+                        memoryActionMessage = "Cleared archived memory entries."
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.memoryIndexingEnabled)
+                }
+
+                if let memoryActionMessage {
+                    Text(memoryActionMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onAppear {
+            prepareMemorySourcesSection()
+        }
+    }
+
+    private func prepareMemorySourcesSection() {
+        if settings.memoryProviderCatalogAutoUpdate {
+            rescanMemorySources(showMessage: false)
+            return
+        }
+
+        if settings.memoryDetectedProviderIDs.isEmpty && settings.memoryDetectedSourceFolderIDs.isEmpty {
+            rescanMemorySources(showMessage: false)
+            return
+        }
+
+        hydrateMemorySourcesFromSavedSettings()
+    }
+
+    private func hydrateMemorySourcesFromSavedSettings() {
+        let providerLookup = Dictionary(
+            uniqueKeysWithValues: memoryIndexingSettingsService.detectedProviders().map { ($0.id, $0) }
+        )
+        detectedMemoryProviders = settings.memoryDetectedProviderIDs.map { providerID in
+            providerLookup[providerID] ?? MemoryIndexingSettingsService.Provider(
+                id: providerID,
+                name: providerDisplayName(from: providerID),
+                detail: "Previously detected provider.",
+                sourceCount: 0
+            )
+        }
+
+        detectedMemorySourceFolders = settings.memoryDetectedSourceFolderIDs.map { folderPath in
+            let folderURL = URL(fileURLWithPath: folderPath, isDirectory: true)
+            let fallbackName = folderURL.lastPathComponent.isEmpty ? folderPath : folderURL.lastPathComponent
+            return MemoryIndexingSettingsService.SourceFolder(
+                id: folderPath,
+                name: fallbackName,
+                path: folderPath,
+                providerID: inferredProviderID(forFolderPath: folderPath)
+            )
+        }
+    }
+
+    private func inferredProviderID(forFolderPath folderPath: String) -> String {
+        let normalizedPath = folderPath.lowercased()
+        let candidates = Array(
+            Set(settings.memoryDetectedProviderIDs + detectedMemoryProviders.map(\.id))
+        )
+            .map { $0.lowercased() }
+            .filter { !$0.isEmpty }
+            .sorted()
+
+        if let directMatch = candidates.first(where: { normalizedPath.contains($0) }) {
+            return directMatch
+        }
+
+        if normalizedPath.contains("codex") { return MemoryProviderKind.codex.rawValue }
+        if normalizedPath.contains("opencode") { return MemoryProviderKind.opencode.rawValue }
+        if normalizedPath.contains("claude") || normalizedPath.contains("claw") { return MemoryProviderKind.claude.rawValue }
+        if normalizedPath.contains("copilot") { return MemoryProviderKind.copilot.rawValue }
+        if normalizedPath.contains("cursor") { return MemoryProviderKind.cursor.rawValue }
+        if normalizedPath.contains("kimi") { return MemoryProviderKind.kimi.rawValue }
+        if normalizedPath.contains("gemini") || normalizedPath.contains("gmini") { return MemoryProviderKind.gemini.rawValue }
+        if normalizedPath.contains("windsurf") { return MemoryProviderKind.windsurf.rawValue }
+        if normalizedPath.contains("codeium") { return MemoryProviderKind.codeium.rawValue }
+
+        return MemoryProviderKind.unknown.rawValue
+    }
+
+    private func providerDisplayName(from providerID: String) -> String {
+        providerID
+            .replacingOccurrences(of: "-", with: " ")
+            .split(separator: " ")
+            .map { token in
+                let first = token.prefix(1).uppercased()
+                let remainder = String(token.dropFirst())
+                return first + remainder
+            }
+            .joined(separator: " ")
+    }
+
+    private func rescanMemorySources(showMessage: Bool) {
+        let result = memoryIndexingSettingsService.rescan(
+            enabledProviderIDs: settings.memoryEnabledProviderIDs,
+            enabledSourceFolderIDs: settings.memoryEnabledSourceFolderIDs,
+            runIndexing: settings.memoryIndexingEnabled
+        )
+        detectedMemoryProviders = result.providers
+        detectedMemorySourceFolders = result.sourceFolders
+
+        settings.updateDetectedMemoryProviders(result.providers.map(\.id))
+        settings.updateDetectedMemorySourceFolders(result.sourceFolders.map(\.id))
+
+        guard showMessage else { return }
+        if result.indexQueued {
+            memoryActionMessage = "Rescan finished. Found \(result.providers.count) providers and \(result.sourceFolders.count) folders. Indexing started in background."
+        } else {
+            memoryActionMessage = "Rescan finished. Found \(result.providers.count) providers and \(result.sourceFolders.count) folders."
+        }
+    }
+
     private func refreshWhisperModelBrowserState() {
         whisperModelManager.refreshInstallStates()
         ensureSelectedWhisperModelIsValid()
@@ -2392,6 +2886,10 @@ struct SettingsView: View {
             .init(section: .corrections, title: "Adaptive corrections", detail: "Learn from your quick word/phrase fixes", keywords: ["adaptive", "learned", "corrections", "backspace"]),
             .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
             .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
+            .init(section: .memorySources, title: "Memory indexing toggle", detail: "Turn local memory indexing on or off", keywords: ["memory", "indexing", "toggle", "enable"]),
+            .init(section: .memorySources, title: "Provider toggles", detail: "Choose which providers can feed memory context", keywords: ["provider", "source", "memory", "context"]),
+            .init(section: .memorySources, title: "Source folder toggles", detail: "Choose folders that are included in memory indexing", keywords: ["folder", "source", "path", "memory", "index"]),
+            .init(section: .memorySources, title: "Memory actions", detail: "Rescan, rebuild index, clear memories, and clear archive", keywords: ["rescan", "rebuild", "clear memories", "clear archive", "memory"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall KeyScribe", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
