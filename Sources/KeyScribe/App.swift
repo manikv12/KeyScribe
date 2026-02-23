@@ -727,37 +727,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return cleanedTranscript
                 }
 
-                switch presentPromptRewritePreviewDialog(
-                    originalText: cleanedTranscript,
-                    suggestion: suggestion
-                ) {
-                case .useSuggested:
-                    await recordPromptRewriteFeedback(
-                        action: .usedSuggested,
+                while true {
+                    switch presentPromptRewritePreviewDialog(
                         originalText: cleanedTranscript,
-                        suggestedText: suggestion.suggestedText,
-                        finalInsertedText: suggestion.suggestedText
-                    )
-                    return suggestion.suggestedText
-                case .editThenInsert:
-                    guard let edited = presentPromptRewriteEditDialog(initialText: suggestion.suggestedText) else {
-                        continue
+                        suggestion: suggestion
+                    ) {
+                    case .useSuggested:
+                        await recordPromptRewriteFeedback(
+                            action: .usedSuggested,
+                            originalText: cleanedTranscript,
+                            suggestedText: suggestion.suggestedText,
+                            finalInsertedText: suggestion.suggestedText
+                        )
+                        return suggestion.suggestedText
+                    case .editThenInsert:
+                        guard let edited = presentPromptRewriteEditDialog(initialText: suggestion.suggestedText) else {
+                            continue
+                        }
+                        await recordPromptRewriteFeedback(
+                            action: .editedThenInserted,
+                            originalText: cleanedTranscript,
+                            suggestedText: suggestion.suggestedText,
+                            finalInsertedText: edited
+                        )
+                        return edited
+                    case .insertOriginal:
+                        await recordPromptRewriteFeedback(
+                            action: .insertedOriginal,
+                            originalText: cleanedTranscript,
+                            suggestedText: suggestion.suggestedText,
+                            finalInsertedText: cleanedTranscript
+                        )
+                        return cleanedTranscript
                     }
-                    await recordPromptRewriteFeedback(
-                        action: .editedThenInserted,
-                        originalText: cleanedTranscript,
-                        suggestedText: suggestion.suggestedText,
-                        finalInsertedText: edited
-                    )
-                    return edited
-                case .insertOriginal:
-                    await recordPromptRewriteFeedback(
-                        action: .insertedOriginal,
-                        originalText: cleanedTranscript,
-                        suggestedText: suggestion.suggestedText,
-                        finalInsertedText: cleanedTranscript
-                    )
-                    return cleanedTranscript
                 }
             } catch {
                 let failureDetail = promptRewriteFailureDetail(for: error)

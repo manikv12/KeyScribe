@@ -55,6 +55,8 @@ enum PromptRewriteServiceError: Error, Equatable {
 
 final class PromptRewriteService {
     static let shared = PromptRewriteService()
+    private static let minTimeoutSeconds: TimeInterval = 0.25
+    private static let maxTimeoutSeconds: TimeInterval = 120
 
     private let backend: PromptRewriteBackendServing
     private let timeoutSeconds: TimeInterval
@@ -64,7 +66,10 @@ final class PromptRewriteService {
         timeoutSeconds: TimeInterval = 5
     ) {
         self.backend = backend
-        self.timeoutSeconds = max(0.25, timeoutSeconds)
+        self.timeoutSeconds = min(
+            max(Self.minTimeoutSeconds, timeoutSeconds),
+            Self.maxTimeoutSeconds
+        )
     }
 
     func retrieveSuggestion(for cleanedTranscript: String) async throws -> PromptRewriteSuggestion? {
@@ -77,7 +82,7 @@ final class PromptRewriteService {
                     try await self.backend.retrieveSuggestion(for: normalizedTranscript)
                 }
                 group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(self.timeoutSeconds * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: self.timeoutNanoseconds)
                     throw PromptRewriteServiceError.timedOut(timeoutSeconds: self.timeoutSeconds)
                 }
 
@@ -103,6 +108,17 @@ final class PromptRewriteService {
 
     func recordFeedback(_ event: PromptRewriteFeedbackEvent) async {
         await backend.recordFeedback(event)
+    }
+
+    private var timeoutNanoseconds: UInt64 {
+        let nanos = timeoutSeconds * 1_000_000_000
+        if !nanos.isFinite || nanos <= 0 {
+            return UInt64(Self.minTimeoutSeconds * 1_000_000_000)
+        }
+        if nanos >= Double(UInt64.max) {
+            return UInt64.max
+        }
+        return UInt64(nanos.rounded())
     }
 }
 

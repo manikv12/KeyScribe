@@ -8,6 +8,7 @@ enum MemorySQLiteStoreError: LocalizedError {
     case failedToOpenDatabase(path: String, code: Int32, message: String)
     case failedToPrepareStatement(sql: String, code: Int32, message: String)
     case failedToExecuteStatement(sql: String, code: Int32, message: String)
+    case unsupportedSchemaVersion(found: Int, supported: Int)
     case invalidDatabaseState
 
     var errorDescription: String? {
@@ -20,6 +21,8 @@ enum MemorySQLiteStoreError: LocalizedError {
             return "Unable to prepare SQL statement (code: \(code)): \(message)\nSQL: \(sql)"
         case let .failedToExecuteStatement(sql, code, message):
             return "Unable to execute SQL statement (code: \(code)): \(message)\nSQL: \(sql)"
+        case let .unsupportedSchemaVersion(found, supported):
+            return "Memory database schema version \(found) is newer than this app supports (\(supported))."
         case .invalidDatabaseState:
             return "Memory database is not available."
         }
@@ -71,6 +74,14 @@ final class MemorySQLiteStore {
             updated_at REAL NOT NULL
         );
         """)
+
+        if let existingSchemaVersion = try fetchSchemaVersion(),
+           existingSchemaVersion > Self.schemaVersion {
+            throw MemorySQLiteStoreError.unsupportedSchemaVersion(
+                found: existingSchemaVersion,
+                supported: Self.schemaVersion
+            )
+        }
 
         try execute(sql: """
         INSERT INTO memory_schema_meta (id, schema_version, updated_at)
@@ -526,6 +537,22 @@ final class MemorySQLiteStore {
         } catch {
             throw MemorySQLiteStoreError.failedToCreateDirectory(path: parentDirectory.path)
         }
+    }
+
+    private func fetchSchemaVersion() throws -> Int? {
+        let sql = """
+        SELECT schema_version
+        FROM memory_schema_meta
+        WHERE id = 1
+        LIMIT 1;
+        """
+
+        let rows: [Int64] = try query(sql: sql, mapRow: { statement in
+            sqlite3_column_int64(statement, 0)
+        })
+
+        guard let first = rows.first else { return nil }
+        return Int(first)
     }
 
     private func open() throws {

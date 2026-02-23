@@ -26,13 +26,13 @@ final class MemoryIndexingSettingsService {
 
     private let discoveryService: MemoryProviderDiscoveryService
     private let indexingService: MemoryIndexingService
-    private let storeFactory: () throws -> MemorySQLiteStore
+    private let storeFactory: @Sendable () throws -> MemorySQLiteStore
     private var activeIndexTask: Task<Void, Never>?
 
     init(
         discoveryService: MemoryProviderDiscoveryService = .shared,
         indexingService: MemoryIndexingService = .shared,
-        storeFactory: @escaping () throws -> MemorySQLiteStore = { try MemorySQLiteStore() }
+        storeFactory: @escaping @Sendable () throws -> MemorySQLiteStore = { try MemorySQLiteStore() }
     ) {
         self.discoveryService = discoveryService
         self.indexingService = indexingService

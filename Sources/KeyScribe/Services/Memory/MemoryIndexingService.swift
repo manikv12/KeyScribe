@@ -324,7 +324,10 @@ actor MemoryIndexingService {
     private static func relativePath(of fileURL: URL, to rootURL: URL) -> String {
         let rootPath = rootURL.standardizedFileURL.path
         let filePath = fileURL.standardizedFileURL.path
-        if filePath.hasPrefix(rootPath) {
+        if filePath == rootPath {
+            return ""
+        }
+        if filePath.hasPrefix(rootPath + "/") {
             let suffix = String(filePath.dropFirst(rootPath.count))
             return suffix.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         }

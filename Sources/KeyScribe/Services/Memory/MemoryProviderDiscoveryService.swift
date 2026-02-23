@@ -1,6 +1,6 @@
 import Foundation
 
-struct MemoryDiscoveredProvider: Identifiable, Hashable {
+struct MemoryDiscoveredProvider: Identifiable, Hashable, Sendable {
     let id: String
     let kind: MemoryProviderKind
     let name: String
@@ -8,14 +8,14 @@ struct MemoryDiscoveredProvider: Identifiable, Hashable {
     let sourceCount: Int
 }
 
-struct MemoryDiscoveredSourceFolder: Identifiable, Hashable {
+struct MemoryDiscoveredSourceFolder: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
     let path: String
     let providerID: String
 }
 
-struct MemoryDiscoveredSource: Identifiable, Hashable {
+struct MemoryDiscoveredSource: Identifiable, Hashable, Sendable {
     let id: String
     let provider: MemoryProviderKind
     let rootURL: URL
@@ -23,7 +23,7 @@ struct MemoryDiscoveredSource: Identifiable, Hashable {
     let detail: String
 }
 
-struct MemoryProviderDiscoveryResult: Hashable {
+struct MemoryProviderDiscoveryResult: Hashable, Sendable {
     let providers: [MemoryDiscoveredProvider]
     let sourceFolders: [MemoryDiscoveredSourceFolder]
     let sources: [MemoryDiscoveredSource]
@@ -307,7 +307,7 @@ final class MemoryProviderDiscoveryService {
         if normalized.contains("codex") {
             return .codex
         }
-        if normalized.contains("opencode") || normalized.contains("open") {
+        if normalized.contains("opencode") || normalized.contains("open-code") {
             return .opencode
         }
         if normalized.contains("claude") || normalized.contains("claw") {

@@ -64,6 +64,11 @@ struct MemorySourceAdapterRegistry {
 }
 
 private enum MemoryAdapterFileDiscovery {
+    private static let parseableFilenameNeedles: [String] = [
+        "conversation", "conversations", "chat", "history", "session", "prompt",
+        "rewrite", "transcript", "memory", "messages"
+    ]
+
     static func discoverFiles(
         in rootURL: URL,
         fileManager: FileManager,
@@ -107,7 +112,12 @@ private enum MemoryAdapterFileDiscovery {
             guard values.isRegularFile == true else { continue }
 
             let ext = fileURL.pathExtension.lowercased()
-            if !ext.isEmpty && !allowedFileExtensions.contains(ext) {
+            let fileName = (values.name ?? fileURL.lastPathComponent).lowercased()
+            if !shouldIncludeFile(
+                named: fileName,
+                extension: ext,
+                allowedFileExtensions: allowedFileExtensions
+            ) {
                 continue
             }
 
@@ -131,12 +141,34 @@ private enum MemoryAdapterFileDiscovery {
             return false
         }
     }
+
+    private static func shouldIncludeFile(
+        named fileName: String,
+        extension fileExtension: String,
+        allowedFileExtensions: Set<String>
+    ) -> Bool {
+        guard !allowedFileExtensions.isEmpty else { return true }
+
+        if !fileExtension.isEmpty {
+            return allowedFileExtensions.contains(fileExtension)
+        }
+
+        return parseableFilenameNeedles.contains { needle in
+            fileName.contains(needle)
+        }
+    }
 }
 
 private enum MemoryAdapterEventParser {
-    private static let iso8601Parser: ISO8601DateFormatter = {
+    private static let fractionalISO8601Parser: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let plainISO8601Parser: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
 
@@ -426,7 +458,8 @@ private enum MemoryAdapterEventParser {
                 if let numeric = TimeInterval(trimmed) {
                     return parseTimestamp(numeric)
                 }
-                if let parsed = iso8601Parser.date(from: trimmed) {
+                if let parsed = fractionalISO8601Parser.date(from: trimmed)
+                    ?? plainISO8601Parser.date(from: trimmed) {
                     return parsed
                 }
                 let fallbackFormats = [
