@@ -1,7 +1,4 @@
-import AVFoundation
-import CoreAudio
 import Foundation
-import Speech
 
 final class SpeechTranscriber: NSObject {
     var onFinalText: ((String) -> Void)?
@@ -9,52 +6,66 @@ final class SpeechTranscriber: NSObject {
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
-    private let audioEngine = AVAudioEngine()
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionEngine: SFSpeechRecognizer?
-    private var pendingFinalizeWorkItem: DispatchWorkItem?
+    private let appleTranscriber = AppleSpeechTranscriber()
+    private let whisperTranscriber = WhisperTranscriber()
 
-    private var granted = false
-    private(set) var isRecording: Bool = false
-    private var isStopping: Bool = false
-    private var committedTranscript = ""
-    private var liveTranscript = ""
-    private var bestTranscriptInCurrentSegment = ""
-    private var previousDefaultInputDevice: AudioDeviceID?
+    private var currentEngineType: TranscriptionEngineType = .appleSpeech
+    private var isRecording = false
 
-    private var autoDetectMicrophone = true
-    private var selectedMicrophoneUID = ""
-    private var enableContextualBias = true
-    private var keepTextAcrossPauses = true
-    private var recognitionMode: RecognitionMode = .localOnly
-    private var finalizeDelaySeconds: TimeInterval = 0.35
-    private var customContextPhrases: [String] = []
-    private var autoPunctuation = true
+    private struct AppleRecognitionSettings {
+        var enableContextualBias = true
+        var keepTextAcrossPauses = true
+        var recognitionMode: RecognitionMode = .localOnly
+        var autoPunctuation = true
+        var finalizeDelaySeconds: TimeInterval = 0.35
+        var customContextPhrases = ""
+        var adaptiveBiasPhrases: [String] = []
+    }
+
+    private struct WhisperSettings {
+        var selectedModelID = ""
+        var useCoreML = true
+        var finalizeDelaySeconds: TimeInterval = 0.35
+        var biasPhrases: [String] = []
+    }
+
+    private var lastAppleRecognitionSettings = AppleRecognitionSettings()
+    private var lastWhisperSettings = WhisperSettings()
 
     override init() {
-        let locale = Locale.current
-        self.recognitionEngine = SFSpeechRecognizer(locale: locale)
         super.init()
+        wireCallbacks()
     }
 
     func requestPermissions(promptIfNeeded: Bool = true) {
-        if Thread.isMainThread {
-            requestPermissionsOnMain(promptIfNeeded: promptIfNeeded)
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.requestPermissionsOnMain(promptIfNeeded: promptIfNeeded)
+        performOnMain {
+            switch self.currentEngineType {
+            case .appleSpeech:
+                self.appleTranscriber.requestPermissions(promptIfNeeded: promptIfNeeded)
+            case .whisperCpp:
+                self.whisperTranscriber.requestPermissions(promptIfNeeded: promptIfNeeded)
             }
         }
     }
 
-    func applyMicrophoneSettings(autoDetect: Bool, microphoneUID: String) {
-        if Thread.isMainThread {
-            applyMicrophoneSettingsOnMain(autoDetect: autoDetect, microphoneUID: microphoneUID)
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.applyMicrophoneSettingsOnMain(autoDetect: autoDetect, microphoneUID: microphoneUID)
+    func setTranscriptionEngine(_ engineType: TranscriptionEngineType) {
+        performOnMain {
+            guard self.currentEngineType != engineType else { return }
+
+            if self.isRecording {
+                self.activeTranscriber.stopRecording(emitFinalText: false)
+                self.isRecording = false
             }
+
+            self.currentEngineType = engineType
+            self.applyCachedSettingsToActiveEngine()
+        }
+    }
+
+    func applyMicrophoneSettings(autoDetect: Bool, microphoneUID: String) {
+        performOnMain {
+            self.appleTranscriber.applyMicrophoneSettings(autoDetect: autoDetect, microphoneUID: microphoneUID)
+            self.whisperTranscriber.applyMicrophoneSettings(autoDetect: autoDetect, microphoneUID: microphoneUID)
         }
     }
 
@@ -64,120 +75,43 @@ final class SpeechTranscriber: NSObject {
         recognitionMode: RecognitionMode,
         autoPunctuation: Bool,
         finalizeDelaySeconds: TimeInterval,
-        customContextPhrases: String
+        customContextPhrases: String,
+        adaptiveBiasPhrases: [String] = []
     ) {
-        if Thread.isMainThread {
-            applyRecognitionSettingsOnMain(
+        performOnMain {
+            self.lastAppleRecognitionSettings.enableContextualBias = enableContextualBias
+            self.lastAppleRecognitionSettings.keepTextAcrossPauses = keepTextAcrossPauses
+            self.lastAppleRecognitionSettings.recognitionMode = recognitionMode
+            self.lastAppleRecognitionSettings.autoPunctuation = autoPunctuation
+            self.lastAppleRecognitionSettings.finalizeDelaySeconds = finalizeDelaySeconds
+            self.lastAppleRecognitionSettings.customContextPhrases = customContextPhrases
+            self.lastAppleRecognitionSettings.adaptiveBiasPhrases = adaptiveBiasPhrases
+
+            self.lastWhisperSettings.finalizeDelaySeconds = finalizeDelaySeconds
+            self.lastWhisperSettings.biasPhrases = RecognitionTuning.whisperBiasPhrases(
+                customContextPhrases: customContextPhrases,
+                adaptiveBiasPhrases: adaptiveBiasPhrases
+            )
+
+            self.appleTranscriber.applyRecognitionSettings(
                 enableContextualBias: enableContextualBias,
                 keepTextAcrossPauses: keepTextAcrossPauses,
                 recognitionMode: recognitionMode,
                 autoPunctuation: autoPunctuation,
                 finalizeDelaySeconds: finalizeDelaySeconds,
-                customContextPhrases: customContextPhrases
+                customContextPhrases: customContextPhrases,
+                adaptiveBiasPhrases: adaptiveBiasPhrases
             )
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.applyRecognitionSettingsOnMain(
-                    enableContextualBias: enableContextualBias,
-                    keepTextAcrossPauses: keepTextAcrossPauses,
-                    recognitionMode: recognitionMode,
-                    autoPunctuation: autoPunctuation,
-                    finalizeDelaySeconds: finalizeDelaySeconds,
-                    customContextPhrases: customContextPhrases
-                )
-            }
+            self.whisperTranscriber.applyBiasPhrases(self.lastWhisperSettings.biasPhrases)
+            self.whisperTranscriber.applyFinalizeDelaySeconds(finalizeDelaySeconds)
         }
     }
 
-    private func requestPermissionsOnMain(promptIfNeeded: Bool) {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized:
-            requestAudioPermissionIfNeededOnMain(promptIfNeeded: promptIfNeeded)
-
-        case .notDetermined:
-            guard promptIfNeeded else {
-                granted = false
-                return
-            }
-
-            SFSpeechRecognizer.requestAuthorization { [weak self] status in
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    switch status {
-                    case .authorized:
-                        self.requestAudioPermissionIfNeededOnMain(promptIfNeeded: promptIfNeeded)
-                    default:
-                        self.granted = false
-                        self.update("Speech permission not granted")
-                    }
-                }
-            }
-
-        default:
-            granted = false
-            update("Speech permission not granted")
-        }
-    }
-
-    private func applyMicrophoneSettingsOnMain(autoDetect: Bool, microphoneUID: String) {
-        autoDetectMicrophone = autoDetect
-        selectedMicrophoneUID = microphoneUID
-    }
-
-    private func applyRecognitionSettingsOnMain(
-        enableContextualBias: Bool,
-        keepTextAcrossPauses: Bool,
-        recognitionMode: RecognitionMode,
-        autoPunctuation: Bool,
-        finalizeDelaySeconds: TimeInterval,
-        customContextPhrases: String
-    ) {
-        self.enableContextualBias = enableContextualBias
-        self.keepTextAcrossPauses = keepTextAcrossPauses
-        self.recognitionMode = recognitionMode
-        self.autoPunctuation = autoPunctuation
-        self.finalizeDelaySeconds = RecognitionTuning.clampedFinalizeDelay(finalizeDelaySeconds)
-        self.customContextPhrases = RecognitionTuning.parseCustomPhrases(customContextPhrases)
-    }
-
-    private func requestAudioPermissionIfNeededOnMain(promptIfNeeded: Bool) {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            granted = true
-            update("Permissions ready")
-
-        case .notDetermined:
-            guard promptIfNeeded else {
-                granted = false
-                return
-            }
-
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    if granted {
-                        self.granted = true
-                        self.update("Permissions ready")
-                    } else {
-                        self.granted = false
-                        self.update("Microphone permission not granted")
-                    }
-                }
-            }
-
-        default:
-            granted = false
-            update("Microphone permission not granted")
-        }
-    }
-
-    private func update(_ message: String) {
-        if Thread.isMainThread {
-            onStatusUpdate?(message)
-        } else {
-            DispatchQueue.main.async {
-                self.onStatusUpdate?(message)
-            }
+    func applyWhisperSettings(selectedModelID: String, useCoreML: Bool) {
+        performOnMain {
+            self.lastWhisperSettings.selectedModelID = selectedModelID
+            self.lastWhisperSettings.useCoreML = useCoreML
+            self.whisperTranscriber.applyWhisperSettings(selectedModelID: selectedModelID, useCoreML: useCoreML)
         }
     }
 
@@ -193,323 +127,125 @@ final class SpeechTranscriber: NSObject {
     }
 
     func stopRecording(emitFinalText: Bool = true) {
-        if Thread.isMainThread {
-            stopRecordingOnMain(emitFinalText: emitFinalText)
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.stopRecordingOnMain(emitFinalText: emitFinalText)
-            }
+        performOnMain {
+            self.activeTranscriber.stopRecording(emitFinalText: emitFinalText)
         }
     }
 
     @discardableResult
     private func startRecordingOnMain() -> Bool {
-        guard granted else {
-            // Re-check/request permissions on demand so first-run users are not stuck.
-            requestPermissionsOnMain(promptIfNeeded: true)
-            update("Permissions missing")
-            return false
-        }
-
-        guard !isRecording && !isStopping else { return false }
-        guard let recognitionEngine else {
-            update("No speech recognizer for locale")
-            return false
-        }
-        guard recognitionEngine.isAvailable else {
-            update("Speech recognizer unavailable")
-            return false
-        }
-
-        applyMicSelection()
-
-        pendingFinalizeWorkItem?.cancel()
-        pendingFinalizeWorkItem = nil
-        isStopping = false
-
-        committedTranscript = ""
-        liveTranscript = ""
-        bestTranscriptInCurrentSegment = ""
-        isRecording = true
-        onRecordingStateChange?(true)
-
-        guard startRecognitionTask() else {
+        let started = activeTranscriber.startRecording()
+        if !started {
             isRecording = false
-            onRecordingStateChange?(false)
-            return false
         }
+        return started
+    }
 
-        let inputNode = audioEngine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        let activeRecognitionRequest = recognitionRequest
-
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            activeRecognitionRequest?.append(buffer)
-            guard let self else { return }
-
-            let audioLevel = self.normalizedAudioLevel(from: buffer)
-            DispatchQueue.main.async {
-                self.onAudioLevel?(audioLevel)
-            }
-        }
-
-        do {
-            audioEngine.prepare()
-            try audioEngine.start()
-            update("Listening…")
-            return true
-        } catch {
-            update("Audio setup failed: \(error.localizedDescription)")
-            stopRecordingOnMain(emitFinalText: false)
-            return false
+    private var activeTranscriber: EngineTranscriber {
+        switch currentEngineType {
+        case .appleSpeech:
+            return .apple(appleTranscriber)
+        case .whisperCpp:
+            return .whisper(whisperTranscriber)
         }
     }
 
-    private func stopRecordingOnMain(emitFinalText: Bool = true) {
-        guard isRecording || isStopping else {
-            onAudioLevel?(0)
-            onRecordingStateChange?(false)
-            return
-        }
+    private func applyCachedSettingsToActiveEngine() {
+        switch currentEngineType {
+        case .appleSpeech:
+            appleTranscriber.applyRecognitionSettings(
+                enableContextualBias: lastAppleRecognitionSettings.enableContextualBias,
+                keepTextAcrossPauses: lastAppleRecognitionSettings.keepTextAcrossPauses,
+                recognitionMode: lastAppleRecognitionSettings.recognitionMode,
+                autoPunctuation: lastAppleRecognitionSettings.autoPunctuation,
+                finalizeDelaySeconds: lastAppleRecognitionSettings.finalizeDelaySeconds,
+                customContextPhrases: lastAppleRecognitionSettings.customContextPhrases,
+                adaptiveBiasPhrases: lastAppleRecognitionSettings.adaptiveBiasPhrases
+            )
 
-        if isRecording {
-            isRecording = false
-            isStopping = true
-            onRecordingStateChange?(false)
-
-            recognitionRequest?.endAudio()
-
-            audioEngine.inputNode.removeTap(onBus: 0)
-            audioEngine.stop()
-            onAudioLevel?(0)
-        }
-
-        pendingFinalizeWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.finalizeStop(emitFinalText: emitFinalText)
-        }
-        pendingFinalizeWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + finalizeDelaySeconds, execute: workItem)
-    }
-
-    private func finalizeStop(emitFinalText: Bool) {
-        pendingFinalizeWorkItem = nil
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        recognitionRequest = nil
-        restoreMicSelection()
-
-        let text = mergedTranscript().trimmingCharacters(in: .whitespacesAndNewlines)
-        committedTranscript = ""
-        liveTranscript = ""
-        bestTranscriptInCurrentSegment = ""
-        isStopping = false
-
-        update("Ready")
-
-        if emitFinalText && !text.isEmpty {
-            onFinalText?(text)
+        case .whisperCpp:
+            whisperTranscriber.applyWhisperSettings(
+                selectedModelID: lastWhisperSettings.selectedModelID,
+                useCoreML: lastWhisperSettings.useCoreML
+            )
+            whisperTranscriber.applyBiasPhrases(lastWhisperSettings.biasPhrases)
+            whisperTranscriber.applyFinalizeDelaySeconds(lastWhisperSettings.finalizeDelaySeconds)
         }
     }
 
-    private func startRecognitionTask() -> Bool {
-        guard let recognitionEngine else {
-            update("No speech recognizer for locale")
-            return false
+    private func wireCallbacks() {
+        appleTranscriber.onFinalText = { [weak self] text in
+            guard let self, self.currentEngineType == .appleSpeech else { return }
+            self.onFinalText?(text)
         }
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        if #available(macOS 13, *) {
-            switch recognitionMode {
-            case .localOnly:
-                request.requiresOnDeviceRecognition = true
-            case .cloudOnly, .automatic:
-                request.requiresOnDeviceRecognition = false
-            }
-            request.addsPunctuation = autoPunctuation
-        }
-        request.taskHint = .dictation
-        if enableContextualBias {
-            let defaults = [
-                "KeyScribe",
-                "OpenClaw",
-                "dictation",
-                "transcription",
-                "macOS"
-            ]
-            request.contextualStrings = RecognitionTuning.contextualHints(defaults: defaults, custom: customContextPhrases, limit: 80)
+        appleTranscriber.onStatusUpdate = { [weak self] message in
+            guard let self, self.currentEngineType == .appleSpeech else { return }
+            self.onStatusUpdate?(message)
         }
 
-        bestTranscriptInCurrentSegment = ""
-
-        recognitionRequest = request
-        recognitionTask = recognitionEngine.recognitionTask(with: request) { [weak self] result, error in
-            DispatchQueue.main.async { [weak self] in
-                self?.handleRecognitionCallback(result: result, error: error)
-            }
+        appleTranscriber.onAudioLevel = { [weak self] level in
+            guard let self, self.currentEngineType == .appleSpeech else { return }
+            self.onAudioLevel?(level)
         }
 
-        return true
-    }
-
-    private func handleRecognitionCallback(result: SFSpeechRecognitionResult?, error: Error?) {
-        guard isRecording || isStopping else { return }
-
-        if let error {
-            let nsError = error as NSError
-            // Ignore expected cancellation noise when we stop/restart the task intentionally.
-            if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216 {
-                return
-            }
-            if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
-                return
-            }
-
-            update("Error: \(error.localizedDescription)")
-            stopRecordingOnMain(emitFinalText: false)
-            return
+        appleTranscriber.onRecordingStateChange = { [weak self] recording in
+            guard let self, self.currentEngineType == .appleSpeech else { return }
+            self.isRecording = recording
+            self.onRecordingStateChange?(recording)
         }
 
-        guard let result else { return }
-        let candidate = result.bestTranscription.formattedString
-        liveTranscript = candidate
-
-        if keepTextAcrossPauses {
-            updateBestTranscriptForCurrentSegment(with: candidate)
+        whisperTranscriber.onFinalText = { [weak self] text in
+            guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.onFinalText?(text)
         }
 
-        if result.isFinal {
-            if keepTextAcrossPauses {
-                commitBestSegmentTranscript()
-            } else {
-                commitLiveTranscript()
-            }
+        whisperTranscriber.onStatusUpdate = { [weak self] message in
+            guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.onStatusUpdate?(message)
+        }
 
-            if isRecording {
-                _ = startRecognitionTask()
-            }
+        whisperTranscriber.onAudioLevel = { [weak self] level in
+            guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.onAudioLevel?(level)
+        }
+
+        whisperTranscriber.onRecordingStateChange = { [weak self] recording in
+            guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.isRecording = recording
+            self.onRecordingStateChange?(recording)
         }
     }
 
-    private func updateBestTranscriptForCurrentSegment(with candidate: String) {
-        let candidateText = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-        let existingText = bestTranscriptInCurrentSegment.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !candidateText.isEmpty else { return }
-
-        if RecognitionTuning.scoreTranscript(candidateText) >= RecognitionTuning.scoreTranscript(existingText) {
-            bestTranscriptInCurrentSegment = candidateText
-        }
-    }
-
-    private func commitBestSegmentTranscript() {
-        let fallback = liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        let best = bestTranscriptInCurrentSegment.trimmingCharacters(in: .whitespacesAndNewlines)
-        let chunk = RecognitionTuning.chooseBetterTranscript(primary: best, fallback: fallback)
-
-        guard !chunk.isEmpty else {
-            liveTranscript = ""
-            bestTranscriptInCurrentSegment = ""
-            return
-        }
-
-        if committedTranscript.isEmpty {
-            committedTranscript = chunk
+    private func performOnMain(_ block: @escaping () -> Void) {
+        if Thread.isMainThread {
+            block()
         } else {
-            committedTranscript += " " + chunk
-        }
-
-        liveTranscript = ""
-        bestTranscriptInCurrentSegment = ""
-    }
-
-    private func commitLiveTranscript() {
-        let chunk = liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !chunk.isEmpty else { return }
-
-        if committedTranscript.isEmpty {
-            committedTranscript = chunk
-        } else {
-            committedTranscript += " " + chunk
-        }
-        liveTranscript = ""
-        bestTranscriptInCurrentSegment = ""
-    }
-
-    private func mergedTranscript() -> String {
-        let current = liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        let best = bestTranscriptInCurrentSegment.trimmingCharacters(in: .whitespacesAndNewlines)
-        let tail = RecognitionTuning.chooseBetterTranscript(primary: best, fallback: current)
-
-        if committedTranscript.isEmpty { return tail }
-        if tail.isEmpty { return committedTranscript }
-        return committedTranscript + " " + tail
-    }
-
-    private func applyMicSelection() {
-        guard !autoDetectMicrophone else {
-            previousDefaultInputDevice = nil
-            return
-        }
-
-        guard !selectedMicrophoneUID.isEmpty else {
-            previousDefaultInputDevice = nil
-            return
-        }
-
-        guard let selectedDeviceID = MicrophoneManager.deviceID(forUID: selectedMicrophoneUID) else {
-            update("Selected microphone no longer available")
-            previousDefaultInputDevice = nil
-            return
-        }
-
-        guard let currentDefault = MicrophoneManager.defaultInputDeviceID() else {
-            update("Unable to read default microphone")
-            previousDefaultInputDevice = nil
-            return
-        }
-
-        if currentDefault == selectedDeviceID {
-            previousDefaultInputDevice = nil
-            return
-        }
-
-        let changed = MicrophoneManager.setDefaultInput(deviceID: selectedDeviceID)
-        if changed {
-            previousDefaultInputDevice = currentDefault
-        } else {
-            update("Could not switch microphone")
-            previousDefaultInputDevice = nil
+            DispatchQueue.main.async(execute: block)
         }
     }
 
-    private func restoreMicSelection() {
-        guard let previous = previousDefaultInputDevice else { return }
-        _ = MicrophoneManager.setDefaultInput(deviceID: previous)
-        previousDefaultInputDevice = nil
-    }
+    private enum EngineTranscriber {
+        case apple(AppleSpeechTranscriber)
+        case whisper(WhisperTranscriber)
 
-    private func normalizedAudioLevel(from buffer: AVAudioPCMBuffer) -> Float {
-        guard let channelData = buffer.floatChannelData else {
-            return 0
+        @discardableResult
+        func startRecording() -> Bool {
+            switch self {
+            case let .apple(transcriber):
+                return transcriber.startRecording()
+            case let .whisper(transcriber):
+                return transcriber.startRecording()
+            }
         }
 
-        let channelSamples = channelData.pointee
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return 0 }
-
-        var sum: Float = 0
-        for i in 0..<frameCount {
-            let sample = channelSamples[i]
-            sum += sample * sample
+        func stopRecording(emitFinalText: Bool) {
+            switch self {
+            case let .apple(transcriber):
+                transcriber.stopRecording(emitFinalText: emitFinalText)
+            case let .whisper(transcriber):
+                transcriber.stopRecording(emitFinalText: emitFinalText)
+            }
         }
-
-        let meanSquare = sum / Float(frameCount)
-        let rms = sqrtf(max(meanSquare, 1e-12))
-        let db = 20 * log10f(rms)
-        let normalized = (db + 70) / 70
-        return max(0, min(1, normalized))
     }
 }

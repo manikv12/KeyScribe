@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import Speech
 import SwiftUI
 
@@ -18,17 +19,16 @@ struct KeyScribeApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private enum PermissionPromptKeys {
-        static let autoRestartAfterAccessibilityGrant = "KeyScribe.autoRestartAfterAccessibilityGrant"
-    }
-
     private enum PasteLastTranscriptShortcut {
         static let keyCode: UInt16 = 9 // V
         static let modifiers: NSEvent.ModifierFlags = [.command, .option]
     }
 
     private let transcriber = SpeechTranscriber()
+    private let whisperModelManager = WhisperModelManager.shared
     private let settings = SettingsStore.shared
+    private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
+    private let postInsertCorrectionMonitor = PostInsertCorrectionMonitor()
     private let waveform = WaveformHUDManager()
     private var hotkeyManager: HoldToTalkManager?
     private var continuousToggleHotkeyManager: OneShotHotkeyManager?
@@ -39,13 +39,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var statusLabelItem: NSMenuItem?
     private var startStopMenuItem: NSMenuItem?
-    private var accessibilityMenuItem: NSMenuItem?
+    private var permissionSetupMenuItem: NSMenuItem?
     private var accessibilityTrustObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
-    private var isRelaunchingForAccessibility = false
-    private var awaitingAccessibilityGrant = false
-    private var accessibilityGrantMonitorTimer: DispatchSourceTimer?
-    private var accessibilityGrantMonitorDeadline: Date?
+    private var adaptiveCorrectionObserver: AnyCancellable?
+    private var permissionsReady = false
+    private var didRequestStartupPermissionPrompt = false
     private var lastExternalApplication: NSRunningApplication?
     private var lastTargetApplication: NSRunningApplication?
     private var currentAudioLevel: Float = 0
@@ -53,6 +52,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var dictationInputMode: DictationInputMode = .idle
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
+    private enum DictationFeedbackCue: CaseIterable {
+        case startListening
+        case stopListening
+        case processing
+        case pasted
+        case correctionLearned
+
+        var systemSoundName: String {
+            switch self {
+            case .startListening, .processing:
+                return SettingsStore.defaultDictationStartSoundName
+            case .stopListening:
+                return SettingsStore.defaultDictationStopSoundName
+            case .pasted:
+                return SettingsStore.defaultDictationPastedSoundName
+            case .correctionLearned:
+                return SettingsStore.defaultDictationCorrectionLearnedSoundName
+            }
+        }
+
+        @MainActor func resolvedSystemSoundName(settings: SettingsStore) -> String {
+            switch self {
+            case .startListening:
+                return Self.resolveSoundName(settings.dictationStartSoundName, fallback: Self.startingFallback)
+            case .stopListening:
+                return Self.resolveSoundName(settings.dictationStopSoundName, fallback: Self.stopFallback)
+            case .processing:
+                return Self.resolveSoundName(settings.dictationProcessingSoundName, fallback: Self.processingFallback)
+            case .pasted:
+                return Self.resolveSoundName(settings.dictationPastedSoundName, fallback: Self.pastedFallback)
+            case .correctionLearned:
+                return Self.resolveSoundName(settings.dictationCorrectionLearnedSoundName, fallback: Self.correctionLearnedFallback)
+            }
+        }
+
+        @MainActor static func resolveSoundName(_ selected: String, fallback: String) -> String {
+            if selected == SettingsStore.noDictationSoundName {
+                return ""
+            }
+            return SettingsStore.dictationStartSoundOptions.contains(selected)
+                ? selected
+                : fallback
+        }
+
+        private static var startingFallback: String {
+            SettingsStore.defaultDictationStartSoundName
+        }
+
+        private static var stopFallback: String {
+            SettingsStore.defaultDictationStopSoundName
+        }
+
+        private static var processingFallback: String {
+            SettingsStore.defaultDictationProcessingSoundName
+        }
+
+        private static var pastedFallback: String {
+            SettingsStore.defaultDictationPastedSoundName
+        }
+
+        private static var correctionLearnedFallback: String {
+            SettingsStore.defaultDictationCorrectionLearnedSoundName
+        }
+
+        var volumeMultiplier: Float {
+            switch self {
+            case .startListening:
+                return 0.7
+            default:
+                return 1
+            }
+        }
+    }
+
+    private var dictationFeedbackSounds: [DictationFeedbackCue: NSSound] {
+        var sounds: [DictationFeedbackCue: NSSound] = [:]
+        for cue in DictationFeedbackCue.allCases {
+            let soundName = cue.resolvedSystemSoundName(settings: settings)
+            guard !soundName.isEmpty else { continue }
+            if let sound = NSSound(named: NSSound.Name(soundName)) {
+                sounds[cue] = sound
+            }
+        }
+        return sounds
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         CrashReporter.install()
@@ -71,19 +155,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         settings.refreshMicrophones(notifyChange: false)
+        syncWhisperModelSelectionIfNeeded()
+        observeAdaptiveCorrectionChanges()
         transcriber.applyMicrophoneSettings(autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID)
-        transcriber.applyRecognitionSettings(
-            enableContextualBias: settings.enableContextualBias,
-            keepTextAcrossPauses: settings.keepTextAcrossPauses,
-            recognitionMode: settings.recognitionMode,
-            autoPunctuation: settings.autoPunctuation,
-            finalizeDelaySeconds: settings.finalizeDelaySeconds,
-            customContextPhrases: settings.customContextPhrases
+        applyRecognitionSettingsToTranscriber()
+        transcriber.applyWhisperSettings(
+            selectedModelID: settings.selectedWhisperModelID,
+            useCoreML: settings.whisperUseCoreML
         )
+        transcriber.setTranscriptionEngine(settings.transcriptionEngine)
+
+        postInsertCorrectionMonitor.onCorrectionDetected = { [weak self] result in
+            Task { @MainActor in
+                self?.handleLearnedCorrection(
+                    from: result.originalText,
+                    correctedText: result.correctedText,
+                    insertedText: result.insertedText
+                )
+            }
+        }
 
         transcriber.onStatusUpdate = { [weak self] message in
             Task { @MainActor in
-                self?.setUIStatus(DictationUIStatus.fromTranscriberMessage(message))
+                guard let self else { return }
+                let status = DictationUIStatus.fromTranscriberMessage(message)
+                self.showHUDAlertIfNeeded(forTranscriberMessage: message)
+                if status == .finalizing {
+                    self.playDictationFeedbackSound(.processing)
+                }
+                self.setUIStatus(status)
             }
         }
 
@@ -99,7 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in
                 self?.isDictating = isRecording
                 if !isRecording {
-                    if let currentMode = self?.dictationInputMode {
+        if let currentMode = self?.dictationInputMode {
                         self?.dictationInputMode = DictationInputModeStateMachine.onRecordingEnded(currentMode)
                     }
                     self?.stopStatusIconAnimation()
@@ -116,8 +216,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cleaned = TextCleanup.process(text, mode: self.settings.textCleanupMode)
             guard !cleaned.isEmpty else { return }
 
-            self.transcriptHistory.add(cleaned)
-            self.insertText(cleaned)
+            let readyForInsert: String
+            var appliedEvents: [AdaptiveCorrectionStore.AppliedEvent] = []
+            if self.settings.adaptiveCorrectionsEnabled {
+                let applyResult = self.adaptiveCorrectionStore.applyWithEvents(to: cleaned)
+                readyForInsert = applyResult.text
+                appliedEvents = applyResult.appliedEvents
+            } else {
+                readyForInsert = cleaned
+            }
+
+            if !appliedEvents.isEmpty {
+                let applyMessage: String
+                if appliedEvents.count == 1, let first = appliedEvents.first {
+                    applyMessage = "Applied learned: \(first.source) -> \(first.replacement)"
+                } else {
+                    applyMessage = "Applied \(appliedEvents.count) learned corrections"
+                }
+                self.waveform.flashEvent(
+                    message: applyMessage,
+                    symbolName: "arrow.triangle.2.circlepath.circle.fill",
+                    duration: 1.2
+                )
+            }
+
+            self.transcriptHistory.add(readyForInsert)
+            self.insertText(readyForInsert, trackCorrections: self.settings.adaptiveCorrectionsEnabled)
             Task { @MainActor in
                 self.setUIStatus(.ready)
             }
@@ -156,20 +280,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
-                if self.awaitingAccessibilityGrant {
-                    self.setUIStatus(.message("Accessibility updated. Verifying access…"))
-                    self.checkAccessibilityGrantProgress()
-                }
+                self?.updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
             }
         }
 
-        // Safe to call every launch; system prompts only appear when status is undecided.
-        transcriber.requestPermissions(promptIfNeeded: true)
-        maybeAutoPromptAccessibilityOnce()
-        applyHotkeyMode()
-        configurePasteLastTranscriptHotkey()
-        updateMenuState()
+        updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -181,15 +296,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
             self.workspaceActivationObserver = nil
         }
+        adaptiveCorrectionObserver?.cancel()
+        adaptiveCorrectionObserver = nil
         pasteLastTranscriptHotkeyManager?.stop()
         pasteLastTranscriptHotkeyManager = nil
         hotkeyManager?.stop()
         hotkeyManager = nil
         continuousToggleHotkeyManager?.stop()
         continuousToggleHotkeyManager = nil
-        stopAccessibilityGrantMonitor()
         stopStatusIconAnimation()
         transcriber.stopRecording()
+        postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
         waveform.hide()
         windowCoordinator?.closeAllWindows()
         windowCoordinator = nil
@@ -197,183 +314,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dictationInputMode = .idle
     }
 
-    private func requestAccessibilityIfNeeded(prompt: Bool) {
-        settings.refreshAccessibilityStatus(prompt: prompt)
-        if !settings.accessibilityTrusted {
-            setUIStatus(.accessibilityHint)
-        }
-    }
-
-    private func maybeAutoPromptAccessibilityOnce() {
-        settings.refreshAccessibilityStatus(prompt: false)
-        guard !settings.accessibilityTrusted else { return }
-        promptForAccessibilityAccessAtLaunch()
-    }
-
-    private var shouldAutoRestartAfterAccessibilityGrant: Bool {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: PermissionPromptKeys.autoRestartAfterAccessibilityGrant) == nil {
-            defaults.set(true, forKey: PermissionPromptKeys.autoRestartAfterAccessibilityGrant)
-            return true
-        }
-        return defaults.bool(forKey: PermissionPromptKeys.autoRestartAfterAccessibilityGrant)
-    }
-
-    private func promptForAccessibilityAccessAtLaunch() {
-        guard !settings.accessibilityTrusted else { return }
-
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Accessibility Access Needed"
-        alert.informativeText = "KeyScribe needs Accessibility access to paste text into other apps. Grant access in System Settings."
-        alert.addButton(withTitle: "Grant Access")
-        alert.addButton(withTitle: "Not Now")
-
-        let autoRestartCheckbox = NSButton(
-            checkboxWithTitle: "Restart KeyScribe automatically after access is granted",
-            target: nil,
-            action: nil
-        )
-        autoRestartCheckbox.state = shouldAutoRestartAfterAccessibilityGrant ? .on : .off
-        alert.accessoryView = autoRestartCheckbox
-
-        let response = alert.runModal()
-        let autoRestartEnabled = autoRestartCheckbox.state == .on
-        UserDefaults.standard.set(autoRestartEnabled, forKey: PermissionPromptKeys.autoRestartAfterAccessibilityGrant)
-
-        if response == .alertFirstButtonReturn {
-            beginAccessibilityGrantFlow()
-        } else {
-            setUIStatus(.accessibilityHint)
-        }
-    }
-
-    private func beginAccessibilityGrantFlow() {
-        awaitingAccessibilityGrant = true
-        startAccessibilityGrantMonitor()
-        requestAccessibilityIfNeeded(prompt: true)
-
-        if settings.accessibilityTrusted {
-            completeAccessibilityGrantFlow()
-            return
-        }
-
-        setUIStatus(.message("Grant Accessibility in System Settings, then return to KeyScribe"))
-        openAccessibilitySettings()
-    }
-
     func applicationDidBecomeActive(_ notification: Notification) {
-        guard awaitingAccessibilityGrant else { return }
-        checkAccessibilityGrantProgress()
+        updatePermissionGate(openOnboardingIfNeeded: true)
     }
 
-    private func promptToRestartAfterAccessibilityGrant() {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Accessibility Granted"
-        alert.informativeText = "Restart KeyScribe now to apply Accessibility access for reliable paste and hotkeys."
-        alert.addButton(withTitle: "Restart Now")
-        alert.addButton(withTitle: "Later")
+    private func currentPermissionSnapshot() -> PermissionCenter.Snapshot {
+        PermissionCenter.snapshot(using: settings)
+    }
 
-        if alert.runModal() == .alertFirstButtonReturn {
-            relaunchAfterAccessibilityGrant()
+    private func updatePermissionGate(openOnboardingIfNeeded: Bool, reconfigureHotkeysIfReady: Bool = false) {
+        let snapshot = currentPermissionSnapshot()
+        let wasReady = permissionsReady
+        permissionsReady = snapshot.allRequiredGranted
+
+        if permissionsReady {
+            transcriber.requestPermissions(promptIfNeeded: false)
+            windowCoordinator?.closePermissionOnboardingWindow()
+            if !wasReady || reconfigureHotkeysIfReady {
+                applyHotkeyMode()
+                configurePasteLastTranscriptHotkey()
+            }
+            if !isDictating {
+                setUIStatus(.ready)
+            }
         } else {
-            setUIStatus(.message("Accessibility granted. Restart KeyScribe to apply it."))
-        }
-    }
-
-    private func relaunchAfterAccessibilityGrant() {
-        guard !isRelaunchingForAccessibility else { return }
-        isRelaunchingForAccessibility = true
-
-        let bundleURL = Bundle.main.bundleURL.standardizedFileURL
-        guard bundleURL.pathExtension.lowercased() == "app" else {
-            isRelaunchingForAccessibility = false
-            setUIStatus(.message("Accessibility granted. Please restart KeyScribe once."))
-            return
-        }
-
-        setUIStatus(.message("Accessibility granted — restarting KeyScribe…"))
-
-        let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
-        config.createsNewApplicationInstance = true
-
-        NSWorkspace.shared.openApplication(at: bundleURL, configuration: config) { [weak self] _, error in
-            Task { @MainActor in
-                guard let self else { return }
-                if error != nil {
-                    self.isRelaunchingForAccessibility = false
-                    self.setUIStatus(.message("Accessibility granted. Restart KeyScribe manually."))
-                    return
-                }
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    NSApp.terminate(nil)
-                }
+            stopPermissionDependentFeatures()
+            setUIStatus(.message(permissionGateMessage(for: snapshot)))
+            if openOnboardingIfNeeded {
+                windowCoordinator?.openPermissionOnboardingWindow(onComplete: { [weak self] in
+                    Task { @MainActor in
+                        self?.updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+                    }
+                })
+                requestStartupPermissionPromptIfNeeded()
             }
         }
+
+        updateMenuState()
     }
 
-    private func openAccessibilitySettings() {
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else {
-            return
+    private func stopPermissionDependentFeatures() {
+        if isDictating {
+            transcriber.stopRecording(emitFinalText: false)
         }
-        NSWorkspace.shared.open(url)
+        hotkeyManager?.stop()
+        hotkeyManager = nil
+        continuousToggleHotkeyManager?.stop()
+        continuousToggleHotkeyManager = nil
+        pasteLastTranscriptHotkeyManager?.stop()
+        pasteLastTranscriptHotkeyManager = nil
+        isDictating = false
+        dictationInputMode = .idle
+        currentAudioLevel = 0
+        waveform.hide()
+        stopStatusIconAnimation()
     }
 
-    private func startAccessibilityGrantMonitor() {
-        stopAccessibilityGrantMonitor()
-        accessibilityGrantMonitorDeadline = Date().addingTimeInterval(120)
+    private func permissionGateMessage(for snapshot: PermissionCenter.Snapshot) -> String {
+        var missingPermissions: [String] = []
+        if !snapshot.accessibilityGranted {
+            missingPermissions.append("Accessibility")
+        }
+        if !snapshot.microphoneGranted {
+            missingPermissions.append("Microphone")
+        }
+        if snapshot.speechRecognitionRequired && !snapshot.speechRecognitionGranted {
+            missingPermissions.append("Speech Recognition")
+        }
 
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 0.4, repeating: 0.6)
-        timer.setEventHandler { [weak self] in
+        guard !missingPermissions.isEmpty else {
+            return "Complete permission setup to start KeyScribe"
+        }
+
+        if missingPermissions.count == 1, let permission = missingPermissions.first {
+            return "Grant \(permission) permission to start KeyScribe"
+        }
+
+        let permissionList = missingPermissions.joined(separator: ", ")
+        return "Grant required permissions (\(permissionList)) to start KeyScribe"
+    }
+
+    private func requestStartupPermissionPromptIfNeeded() {
+        guard !didRequestStartupPermissionPrompt else { return }
+        didRequestStartupPermissionPrompt = true
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self else { return }
-            self.checkAccessibilityGrantProgress()
-        }
-        accessibilityGrantMonitorTimer = timer
-        timer.resume()
-    }
-
-    private func stopAccessibilityGrantMonitor() {
-        accessibilityGrantMonitorTimer?.cancel()
-        accessibilityGrantMonitorTimer = nil
-        accessibilityGrantMonitorDeadline = nil
-    }
-
-    private func checkAccessibilityGrantProgress() {
-        guard awaitingAccessibilityGrant else {
-            stopAccessibilityGrantMonitor()
-            return
-        }
-
-        settings.refreshAccessibilityStatus(prompt: false)
-        if settings.accessibilityTrusted {
-            completeAccessibilityGrantFlow()
-            return
-        }
-
-        if let deadline = accessibilityGrantMonitorDeadline, Date() >= deadline {
-            stopAccessibilityGrantMonitor()
-            setUIStatus(.accessibilityHint)
-        }
-    }
-
-    private func completeAccessibilityGrantFlow() {
-        guard awaitingAccessibilityGrant else { return }
-        awaitingAccessibilityGrant = false
-        stopAccessibilityGrantMonitor()
-
-        if shouldAutoRestartAfterAccessibilityGrant {
-            relaunchAfterAccessibilityGrant()
-            return
-        }
-
-        if NSApp.isActive {
-            promptToRestartAfterAccessibilityGrant()
-        } else {
-            setUIStatus(.message("Accessibility granted. Open KeyScribe to restart and apply it."))
+            guard !self.permissionsReady else { return }
+            self.transcriber.requestPermissions(promptIfNeeded: true)
         }
     }
 
@@ -411,11 +439,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
-        let accessibilityItem = NSMenuItem(title: "Grant Accessibility Access…", action: #selector(requestAccessibilityMenuItem(_:)), keyEquivalent: "")
-        accessibilityItem.target = self
-        accessibilityItem.isHidden = settings.accessibilityTrusted
-        menu.addItem(accessibilityItem)
-        self.accessibilityMenuItem = accessibilityItem
+        let permissionItem = NSMenuItem(title: "Complete Permission Setup…", action: #selector(requestAccessibilityMenuItem(_:)), keyEquivalent: "")
+        permissionItem.target = self
+        permissionItem.isHidden = permissionsReady
+        menu.addItem(permissionItem)
+        self.permissionSetupMenuItem = permissionItem
 
         if CrashReporter.hasLogs {
             let crashLogsItem = NSMenuItem(title: "View Crash Logs…", action: #selector(viewCrashLogs(_:)), keyEquivalent: "")
@@ -433,17 +461,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func applySettingsChanges() {
         settings.refreshMicrophones(notifyChange: false)
+        syncWhisperModelSelectionIfNeeded()
         transcriber.applyMicrophoneSettings(autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID)
+        applyRecognitionSettingsToTranscriber()
+        transcriber.applyWhisperSettings(
+            selectedModelID: settings.selectedWhisperModelID,
+            useCoreML: settings.whisperUseCoreML
+        )
+        transcriber.setTranscriptionEngine(settings.transcriptionEngine)
+        if !settings.adaptiveCorrectionsEnabled {
+            postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
+        }
+        updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+    }
+
+    private func observeAdaptiveCorrectionChanges() {
+        adaptiveCorrectionObserver = adaptiveCorrectionStore.$learnedCorrections
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.applyRecognitionSettingsToTranscriber()
+            }
+    }
+
+    private func applyRecognitionSettingsToTranscriber() {
+        let adaptiveBiasPhrases: [String]
+        if settings.adaptiveCorrectionsEnabled {
+            adaptiveBiasPhrases = adaptiveCorrectionStore.preferredRecognitionPhrases()
+        } else {
+            adaptiveBiasPhrases = []
+        }
+
         transcriber.applyRecognitionSettings(
             enableContextualBias: settings.enableContextualBias,
             keepTextAcrossPauses: settings.keepTextAcrossPauses,
             recognitionMode: settings.recognitionMode,
             autoPunctuation: settings.autoPunctuation,
             finalizeDelaySeconds: settings.finalizeDelaySeconds,
-            customContextPhrases: settings.customContextPhrases
+            customContextPhrases: settings.customContextPhrases,
+            adaptiveBiasPhrases: adaptiveBiasPhrases
         )
-        applyHotkeyMode()
-        updateMenuState()
+    }
+
+    private func syncWhisperModelSelectionIfNeeded() {
+        guard settings.transcriptionEngine == .whisperCpp else { return }
+
+        whisperModelManager.refreshInstallStates()
+        if whisperModelManager.hasInstalledModel(id: settings.selectedWhisperModelID) {
+            return
+        }
+
+        if let fallbackModel = WhisperModelCatalog.curatedModels.first(where: { whisperModelManager.hasInstalledModel(id: $0.id) }) {
+            settings.selectedWhisperModelID = fallbackModel.id
+        } else {
+            settings.selectedWhisperModelID = ""
+        }
     }
 
     private func applyHotkeyMode() {
@@ -451,10 +522,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager = nil
         continuousToggleHotkeyManager?.stop()
         continuousToggleHotkeyManager = nil
+        guard permissionsReady else { return }
 
         hotkeyManager = HoldToTalkManager(
             keyCode: settings.shortcutKeyCode,
             modifiers: settings.shortcutModifierFlags,
+            suppressSystemShortcutSounds: settings.muteSystemSoundsWhileHoldingShortcut,
             onStart: { [weak self] in self?.startHoldToTalkDictation() },
             onStop: { [weak self] in self?.stopHoldToTalkDictation() }
         )
@@ -499,6 +572,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configurePasteLastTranscriptHotkey() {
         pasteLastTranscriptHotkeyManager?.stop()
+        guard permissionsReady else {
+            pasteLastTranscriptHotkeyManager = nil
+            return
+        }
         pasteLastTranscriptHotkeyManager = OneShotHotkeyManager(
             keyCode: PasteLastTranscriptShortcut.keyCode,
             modifiers: PasteLastTranscriptShortcut.modifiers
@@ -521,7 +598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func requestAccessibilityMenuItem(_ sender: Any?) {
-        beginAccessibilityGrantFlow()
+        updatePermissionGate(openOnboardingIfNeeded: true)
     }
 
     @objc private func pasteLastTranscriptMenuItem(_ sender: Any?) {
@@ -578,6 +655,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startRecording() {
         guard !isDictating else { return }
+        guard permissionsReady else {
+            updatePermissionGate(openOnboardingIfNeeded: true)
+            return
+        }
+        postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
 
         if let frontmost = NSWorkspace.shared.frontmostApplication,
            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
@@ -592,14 +674,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isDictating = started
 
         if started {
+            playDictationFeedbackSound(.startListening)
             setUIStatus(.listening)
             waveform.show()
             startStatusIconAnimation()
         } else {
             waveform.hide()
             stopStatusIconAnimation()
-            // If permissions are missing/undetermined, trigger the request path right away.
-            transcriber.requestPermissions(promptIfNeeded: true)
+            updatePermissionGate(openOnboardingIfNeeded: true)
+            if settings.transcriptionEngine == .whisperCpp,
+               !whisperModelManager.hasInstalledModel(id: settings.selectedWhisperModelID) {
+                setUIStatus(.message("Install a whisper model in Settings > Recognition to start dictation"))
+                windowCoordinator?.openSettingsWindow()
+            }
         }
 
         updateMenuState()
@@ -614,6 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setUIStatus(.finalizing)
+        playDictationFeedbackSound(.stopListening)
         transcriber.stopRecording()
         isDictating = false
         currentAudioLevel = 0
@@ -622,11 +710,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenuState()
     }
 
-    private func insertText(_ text: String, forceCopyToClipboard: Bool = false, overrideCopyToClipboard: Bool? = nil) {
+    private func insertText(
+        _ text: String,
+        forceCopyToClipboard: Bool = false,
+        overrideCopyToClipboard: Bool? = nil,
+        trackCorrections: Bool = false
+    ) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard ensureAccessibilityReadyForInsertion() else { return }
         let copyToClipboard = overrideCopyToClipboard ?? (settings.copyToClipboard || forceCopyToClipboard)
-        attemptInsertText(text, copyToClipboard: copyToClipboard, attemptsRemaining: 5)
+        attemptInsertText(
+            text,
+            copyToClipboard: copyToClipboard,
+            attemptsRemaining: 5
+        ) { [weak self] didInsert in
+            guard let self else { return }
+            if didInsert {
+                self.playDictationFeedbackSound(.pasted)
+            }
+            guard trackCorrections else { return }
+            if didInsert {
+                self.postInsertCorrectionMonitor.startMonitoring(insertedText: text)
+            }
+        }
     }
 
     private func pasteLastTranscriptFromHistory() {
@@ -656,13 +762,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func ensureAccessibilityReadyForInsertion() -> Bool {
         settings.refreshAccessibilityStatus(prompt: false)
         guard settings.accessibilityTrusted else {
-            setUIStatus(.message("Enable Accessibility via menu: Grant Accessibility Access…"))
+            setUIStatus(.message("Enable Accessibility via menu: Complete Permission Setup…"))
+            updatePermissionGate(openOnboardingIfNeeded: true)
             return false
         }
         return true
     }
 
-    private func attemptInsertText(_ text: String, copyToClipboard: Bool, attemptsRemaining: Int) {
+    private func attemptInsertText(
+        _ text: String,
+        copyToClipboard: Bool,
+        attemptsRemaining: Int,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         guard attemptsRemaining > 0 else {
             if copyToClipboard {
                 ensureClipboardFallback(text)
@@ -671,6 +783,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 setUIStatus(.message("Paste unavailable — transcript is in KeyScribe History"))
             }
             lastTargetApplication = nil
+            completion?(false)
             return
         }
 
@@ -686,7 +799,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = target.activate(options: [.activateIgnoringOtherApps])
             if attemptsRemaining > 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { [weak self] in
-                    self?.attemptInsertText(text, copyToClipboard: copyToClipboard, attemptsRemaining: attemptsRemaining - 1)
+                    self?.attemptInsertText(
+                        text,
+                        copyToClipboard: copyToClipboard,
+                        attemptsRemaining: attemptsRemaining - 1,
+                        completion: completion
+                    )
                 }
                 return
             }
@@ -705,10 +823,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch retryPlan {
         case let .retry(delay, nextRetriesRemaining):
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.attemptInsertText(text, copyToClipboard: copyToClipboard, attemptsRemaining: nextRetriesRemaining + 1)
+                self?.attemptInsertText(
+                    text,
+                    copyToClipboard: copyToClipboard,
+                    attemptsRemaining: nextRetriesRemaining + 1,
+                    completion: completion
+                )
             }
 
         case let .complete(statusMessage):
+            let didInsert = result == .pasted
             if let statusMessage, statusMessage.hasPrefix("Paste unavailable") {
                 if copyToClipboard {
                     ensureClipboardFallback(text)
@@ -728,7 +852,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 applyInsertionStatusMessage(statusMessage)
             }
             lastTargetApplication = nil
+            completion?(didInsert)
         }
+    }
+
+    private func handleLearnedCorrection(from originalText: String, correctedText: String, insertedText: String) {
+        guard settings.adaptiveCorrectionsEnabled else { return }
+
+        let learningEvents = adaptiveCorrectionStore.learn(
+            from: originalText,
+            correctedText: correctedText,
+            insertionHint: insertedText
+        )
+        guard !learningEvents.isEmpty else { return }
+
+        let event = learningEvents[0]
+        let source = event.source
+        let replacement = event.replacement
+        let hudMessage = "Learned correction: \(source) -> \(replacement)"
+
+        waveform.flashEvent(
+            message: hudMessage,
+            symbolName: "arrow.triangle.2.circlepath.circle.fill",
+            duration: 1.2
+        )
+        if settings.playCorrectionLearnedSound {
+            playDictationFeedbackSound(.correctionLearned)
+        }
+        setUIStatus(.message(hudMessage))
     }
 
     private func ensureClipboardFallback(_ text: String) {
@@ -770,6 +921,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setUIStatus(.message(statusMessage))
     }
 
+    private func showHUDAlertIfNeeded(forTranscriberMessage message: String) {
+        if message.hasPrefix("Whisper finalize timed out and was reset") {
+            waveform.flashEvent(
+                message: "Whisper stalled and was reset. Retry now.",
+                symbolName: "exclamationmark.triangle.fill",
+                duration: 3.0
+            )
+            return
+        }
+
+        if message.hasPrefix("Whisper error:") {
+            waveform.flashEvent(
+                message: "Whisper failed. Check model and Core ML settings.",
+                symbolName: "xmark.octagon.fill",
+                duration: 2.4
+            )
+        }
+    }
+
     private func setUIStatus(_ status: DictationUIStatus) {
         statusLabelItem?.title = status.menuText
 
@@ -784,11 +954,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenuState()
     }
 
+    private func playDictationFeedbackSound(_ cue: DictationFeedbackCue) {
+        guard let sound = dictationFeedbackSounds[cue] else { return }
+        sound.stop()
+        sound.currentTime = 0
+        let baseVolume = min(1, max(0, Float(settings.dictationFeedbackVolume)))
+        sound.volume = baseVolume * cue.volumeMultiplier
+        sound.play()
+    }
+
     private func updateMenuState() {
         startStopMenuItem?.title = dictationInputMode == .continuous
             ? "Stop Continuous Dictation"
             : "Start Continuous Dictation"
-        accessibilityMenuItem?.isHidden = settings.accessibilityTrusted
+        startStopMenuItem?.isEnabled = permissionsReady
+        permissionSetupMenuItem?.isHidden = permissionsReady
         statusItem?.button?.image = makeStatusIcon(isRecording: isDictating, level: currentAudioLevel)
         statusItem?.button?.contentTintColor = nil
     }
@@ -825,12 +1005,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func makeStatusIcon(isRecording: Bool, level: Float) -> NSImage? {
         let normalizedLevel = max(0, min(1, level))
         let waveMotion = Float((sin(statusIconAnimationPhase) + 1) * 0.5)
-        let idlePulse = isRecording ? 0.10 + (0.07 * waveMotion) : 0
+        // Idle pulse sweeps from 0.3 to 0.7 so bars animate from center outward
+        let idlePulse = isRecording ? 0.30 + (0.40 * waveMotion) : 0
         let animatedLevel = isRecording ? max(normalizedLevel, idlePulse) : normalizedLevel
 
         let symbol: NSImage?
-        if #available(macOS 13.0, *) {
-            let variableValue = isRecording ? max(0.12, Double(animatedLevel)) : 0
+        if #available(macOS 13.3, *) {
+            let variableValue = isRecording ? max(0.30, Double(animatedLevel)) : 0
             symbol = NSImage(systemSymbolName: "waveform", variableValue: variableValue, accessibilityDescription: "KeyScribe")
         } else {
             symbol = NSImage(systemSymbolName: "waveform", accessibilityDescription: "KeyScribe")
@@ -840,20 +1021,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
 
-        let baseConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
         if isRecording {
-            let paletteConfig = NSImage.SymbolConfiguration(paletteColors: [
-                NSColor.white,
-                NSColor(calibratedWhite: 0.85, alpha: 1.0),
-                NSColor(calibratedWhite: 0.70, alpha: 1.0)
-            ])
-            let combined = baseConfig.applying(paletteConfig)
-            let configured = symbol.withSymbolConfiguration(combined)
-            configured?.isTemplate = false
+            let recordingConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .heavy)
+            let configured = symbol.withSymbolConfiguration(recordingConfig)
+            configured?.isTemplate = true
             return configured
         }
 
-        let configured = symbol.withSymbolConfiguration(baseConfig)
+        let idleConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .heavy)
+        let configured = symbol.withSymbolConfiguration(idleConfig)
         configured?.isTemplate = true
         return configured
     }
@@ -865,6 +1041,8 @@ struct SettingsView: View {
         case shortcuts
         case microphone
         case recognition
+        case models
+        case corrections
         case about
 
         var id: Self { self }
@@ -875,6 +1053,8 @@ struct SettingsView: View {
             case .shortcuts: return "Shortcuts"
             case .microphone: return "Microphone"
             case .recognition: return "Recognition"
+            case .models: return "Models"
+            case .corrections: return "Corrections"
             case .about: return "About & Permissions"
             }
         }
@@ -884,7 +1064,9 @@ struct SettingsView: View {
             case .general: return "Output, clipboard, and appearance"
             case .shortcuts: return "Hold-to-talk and continuous toggle keys"
             case .microphone: return "Input device selection and refresh"
-            case .recognition: return "Accuracy, cleanup, and timing controls"
+            case .recognition: return "Speech behavior and text quality"
+            case .models: return "Install and select whisper models"
+            case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
         }
@@ -895,6 +1077,8 @@ struct SettingsView: View {
             case .shortcuts: return "keyboard"
             case .microphone: return "mic.fill"
             case .recognition: return "waveform"
+            case .models: return "shippingbox.fill"
+            case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"
             }
         }
@@ -905,6 +1089,8 @@ struct SettingsView: View {
             case .shortcuts: return .indigo
             case .microphone: return .red
             case .recognition: return .green
+            case .models: return .teal
+            case .corrections: return .mint
             case .about: return .orange
             }
         }
@@ -912,13 +1098,17 @@ struct SettingsView: View {
         var searchTerms: [String] {
             switch self {
             case .general:
-                return ["general", "clipboard", "waveform", "accessibility", "output"]
+                return ["general", "clipboard", "waveform", "accessibility", "output", "sound", "feedback"]
             case .shortcuts:
                 return ["shortcut", "keyboard", "hold to talk", "continuous", "hotkey"]
             case .microphone:
                 return ["microphone", "input", "device", "audio"]
             case .recognition:
-                return ["recognition", "punctuation", "context", "cleanup", "delay"]
+                return ["recognition", "engine", "punctuation", "context", "cleanup", "delay", "text quality", "speech"]
+            case .models:
+                return ["whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large"]
+            case .corrections:
+                return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
             case .about:
                 return ["about", "permission", "uninstall", "version", "crash logs"]
             }
@@ -933,6 +1123,21 @@ struct SettingsView: View {
     private struct ShortcutBinding: Equatable {
         let keyCode: UInt16
         let modifiersRaw: UInt
+    }
+
+    private struct ShortcutModifierOption: Identifiable {
+        let id: String
+        let label: String
+        let flag: NSEvent.ModifierFlags
+    }
+
+    private struct ShortcutKeyOption: Identifiable {
+        let keyCode: UInt16
+        let label: String
+
+        var id: UInt16 {
+            keyCode
+        }
     }
 
     private struct SettingSearchEntry: Identifiable {
@@ -951,13 +1156,41 @@ struct SettingsView: View {
         static let pasteLastModifiersRaw: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
     }
 
+    private static let manualModifierOnlyKeyCode: UInt16 = UInt16.max
+    private static let shortcutModifierOptions: [ShortcutModifierOption] = [
+        .init(id: "fn", label: "Fn", flag: .function),
+        .init(id: "control", label: "⌃", flag: .control),
+        .init(id: "option", label: "⌥", flag: .option),
+        .init(id: "shift", label: "⇧", flag: .shift),
+        .init(id: "command", label: "⌘", flag: .command)
+    ]
+
     @EnvironmentObject private var settings: SettingsStore
+    @StateObject private var whisperModelManager = WhisperModelManager.shared
+    @StateObject private var adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     @State private var selectedSection: SettingsSection = .general
     @State private var searchQuery = ""
     @State private var isCapturingShortcut = false
     @State private var shortcutCaptureTarget: ShortcutCaptureTarget?
     @State private var shortcutCaptureMessage: String?
+    @State private var showHoldManualMap = false
+    @State private var showContinuousManualMap = false
+    @State private var whisperModelSearchQuery = ""
+    @State private var whisperFamilyFilter = "all"
+    @State private var whisperShowInstalledOnly = false
+    @State private var whisperBrowserModelID = ""
     @State private var showUninstallConfirmation = false
+    @State private var uninstallDeleteDownloadedModels = false
+    @State private var uninstallDeleteLearnedCorrections = false
+    @State private var isCorrectionEditorPresented = false
+    @State private var correctionSourceDraft = ""
+    @State private var correctionReplacementDraft = ""
+    @State private var correctionEditingSource: String?
+    @State private var correctionDialogMessage: String?
+    private let settingsSidebarWidth: CGFloat = 278
+    private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
+        ShortcutKeyOption(keyCode: $0, label: ShortcutValidation.keyName(for: $0))
+    }
 
     var body: some View {
         ZStack {
@@ -971,49 +1204,27 @@ struct SettingsView: View {
             )
             .ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                settingsHeader
+            HStack(spacing: 0) {
+                settingsSidebar
                 Divider()
-                HStack(spacing: 0) {
-                    settingsSidebar
-                    Divider()
-                    settingsDetailPane
-                }
+                settingsDetailPane
             }
             .background(Color(nsColor: .windowBackgroundColor).opacity(0.65))
 
             ShortcutCaptureMonitor(
                 isCapturing: $isCapturingShortcut,
                 onCapture: { keyCode, modifiers in
-                    let filteredModifiers = ShortcutValidation.filteredModifierRawValue(from: modifiers)
-                    guard ShortcutValidation.isValid(keyCode: keyCode, modifiersRaw: filteredModifiers) else {
-                        shortcutCaptureMessage = "Shortcut must use 2 or 3 keys. Try again."
-                        return
-                    }
-
                     guard let target = shortcutCaptureTarget else {
                         return
                     }
 
-                    if let conflictMessage = shortcutConflictMessage(
+                    let didApply = applyShortcutSelection(
                         for: target,
                         keyCode: keyCode,
-                        modifiersRaw: filteredModifiers
-                    ) {
-                        shortcutCaptureMessage = conflictMessage
-                        return
-                    }
-
-                    switch target {
-                    case .holdToTalk:
-                        settings.shortcutKeyCode = keyCode
-                        settings.shortcutModifiers = filteredModifiers
-                    case .continuousToggle:
-                        settings.continuousToggleShortcutKeyCode = keyCode
-                        settings.continuousToggleShortcutModifiers = filteredModifiers
-                    }
-
-                    shortcutCaptureMessage = nil
+                        modifiersRaw: modifiers,
+                        validationMessage: "Shortcut must use 2 to 4 keys. Try again."
+                    )
+                    guard didApply else { return }
                     shortcutCaptureTarget = nil
                     isCapturingShortcut = false
                 },
@@ -1034,6 +1245,9 @@ struct SettingsView: View {
             } else if let firstSection = filteredSections.first {
                 selectedSection = firstSection
             }
+        }
+        .sheet(isPresented: $isCorrectionEditorPresented) {
+            correctionEditorSheet
         }
     }
 
@@ -1063,11 +1277,17 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var settingsSidebar: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            TextField("Search settings…", text: $searchQuery)
-                .textFieldStyle(.roundedBorder)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                TextField("Search settings…", text: $searchQuery)
+                    .textFieldStyle(.roundedBorder)
+            }
+            .padding(.bottom, 4)
 
-            VStack(spacing: 6) {
+            VStack(spacing: 2) {
                 ForEach(filteredSections) { section in
                     Button {
                         selectedSection = section
@@ -1086,8 +1306,10 @@ struct SettingsView: View {
 
             Spacer(minLength: 0)
         }
-        .padding(16)
-        .frame(width: 260, alignment: .topLeading)
+        .padding(14)
+        .frame(width: settingsSidebarWidth, alignment: .topLeading)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
     }
 
     @ViewBuilder
@@ -1097,12 +1319,17 @@ struct SettingsView: View {
 
         HStack(spacing: 10) {
             Image(systemName: section.iconName)
-                .foregroundStyle(isSelected ? section.tint : .secondary)
-                .frame(width: 16)
+                .foregroundStyle(isSelected ? .white : section.tint)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 24, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(isSelected ? section.tint : section.tint.opacity(0.12))
+                )
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(section.title)
-                    .font(.callout.weight(.semibold))
+                    .font(.callout.weight(isSelected ? .semibold : .medium))
                     .foregroundStyle(.primary)
                 Text(section.subtitle)
                     .font(.caption2)
@@ -1114,25 +1341,15 @@ struct SettingsView: View {
 
             if !trimmedSearchQuery.isEmpty && matchCount > 0 {
                 Text("\(matchCount)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(section.tint)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule()
-                            .fill(section.tint.opacity(0.14))
-                    )
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? section.tint.opacity(0.16) : Color.clear)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(isSelected ? section.tint.opacity(0.40) : Color.primary.opacity(0.08), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isSelected ? Color.primary.opacity(0.08) : Color.clear)
         )
     }
 
@@ -1143,25 +1360,19 @@ struct SettingsView: View {
                 if !trimmedSearchQuery.isEmpty {
                     searchHighlightsCard
                 }
-
-                HStack(spacing: 10) {
-                    Image(systemName: selectedSection.iconName)
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(selectedSection.tint)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(selectedSection.title)
-                            .font(.title3.weight(.semibold))
-                        Text(selectedSection.subtitle)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-
                 sectionContent(for: selectedSection)
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    @ViewBuilder
+    private func settingsSectionHeader(for section: SettingsSection) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(section.subtitle)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -1218,6 +1429,10 @@ struct SettingsView: View {
             microphoneSection
         case .recognition:
             recognitionSection
+        case .models:
+            modelsSection
+        case .corrections:
+            correctionsSection
         case .about:
             aboutSection
         }
@@ -1226,12 +1441,54 @@ struct SettingsView: View {
     @ViewBuilder
     private var generalSection: some View {
         VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .general)
             accessibilityCard
 
             settingsCard(title: "Dictation Output") {
                 Toggle("Also copy transcript to system clipboard", isOn: $settings.copyToClipboard)
                     .help("Turn off to keep dictations out of clipboard history. Explicit Copy actions from History still copy as expected.")
             }
+
+                    settingsCard(
+                        title: "Dictation Sounds",
+                        subtitle: "Choose the sounds for each dictation event."
+                    ) {
+                        VStack(alignment: .leading, spacing: 10) {
+                    dictationSoundRow(
+                        title: "Start listening",
+                        selection: $settings.dictationStartSoundName
+                    )
+
+                    dictationSoundRow(
+                        title: "Stop/Finalize",
+                        selection: $settings.dictationStopSoundName
+                    )
+
+                    dictationSoundRow(
+                        title: "Processing (finalize)",
+                        selection: $settings.dictationProcessingSoundName
+                    )
+
+                            dictationSoundRow(
+                                title: "Pasted",
+                                selection: $settings.dictationPastedSoundName
+                            )
+
+                            VStack(spacing: 6) {
+                                HStack {
+                                    Text("Feedback volume")
+                                        .font(.callout.weight(.medium))
+                                    Spacer()
+                                    Text("\(Int(settings.dictationFeedbackVolume * 100))%")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 52, alignment: .trailing)
+                                }
+                                Slider(value: $settings.dictationFeedbackVolume, in: 0...1, step: 0.01)
+                                    .help("Reduce this value to lower all dictation feedback sounds.")
+                            }
+                        }
+                    }
 
             settingsCard(title: "Waveform Appearance") {
                 Picker("Waveform Theme", selection: $settings.waveformThemeRawValue) {
@@ -1256,8 +1513,28 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private func dictationSoundRow(title: String, selection: Binding<String>) -> some View {
+        HStack {
+            Text(title)
+                .font(.callout.weight(.medium))
+            Spacer()
+            Picker("", selection: selection) {
+                ForEach(SettingsStore.dictationStartSoundOptions, id: \.self) { sound in
+                    Text(sound).tag(sound)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(width: 200)
+        }
+        .help(selection.wrappedValue == SettingsStore.noDictationSoundName
+            ? "No sound for this event."
+            : "Play this sound when: \(title.lowercased())")
+    }
+
+    @ViewBuilder
     private var shortcutsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .shortcuts)
             settingsCard(
                 title: "Hold-to-Talk Shortcut",
                 subtitle: "Hold this shortcut while speaking."
@@ -1272,9 +1549,17 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
 
-                    Text("Use 2 or 3 keys, like ⌘+Space or ⌃+⌥+K.")
+                    Text("Use 2 to 4 keys, like ⌘+Space or ⌃+⌥+⌘+Space.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+
+                Toggle("Mute system sounds while this shortcut is held", isOn: $settings.muteSystemSoundsWhileHoldingShortcut)
+                    .help("Suppresses this hold-to-talk key chord in other apps to avoid system alert beeps.")
+
+                DisclosureGroup("Manual map (advanced)", isExpanded: $showHoldManualMap) {
+                    manualShortcutBuilder(for: .holdToTalk)
+                        .padding(.top, 6)
                 }
 
                 if isCapturingShortcut && shortcutCaptureTarget == .holdToTalk {
@@ -1284,7 +1569,7 @@ struct SettingsView: View {
                 }
 
                 if !isHoldToTalkShortcutValid {
-                    Text("Hold-to-talk shortcut must include exactly 2 or 3 keys.")
+                    Text("Hold-to-talk shortcut must include 2 to 4 keys.")
                         .font(.callout)
                         .foregroundStyle(.orange)
                 }
@@ -1304,9 +1589,14 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
 
-                    Text("Use 2 or 3 keys. Keep this different from hold-to-talk.")
+                    Text("Use 2 to 4 keys. Keep this different from hold-to-talk.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+
+                DisclosureGroup("Manual map (advanced)", isExpanded: $showContinuousManualMap) {
+                    manualShortcutBuilder(for: .continuousToggle)
+                        .padding(.top, 6)
                 }
 
                 if isCapturingShortcut && shortcutCaptureTarget == .continuousToggle {
@@ -1316,7 +1606,7 @@ struct SettingsView: View {
                 }
 
                 if !isContinuousToggleShortcutValid {
-                    Text("Continuous toggle shortcut must include 2 or 3 keys.")
+                    Text("Continuous toggle shortcut must include 2 to 4 keys.")
                         .font(.callout)
                         .foregroundStyle(.orange)
                 }
@@ -1338,27 +1628,30 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var microphoneSection: some View {
-        settingsCard(title: "Input Device") {
-            Toggle("Auto-detect microphone", isOn: $settings.autoDetectMicrophone)
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .microphone)
+            settingsCard(title: "Input Device") {
+                Toggle("Auto-detect microphone", isOn: $settings.autoDetectMicrophone)
 
-            HStack {
-                Picker("Microphone", selection: $settings.selectedMicrophoneUID) {
-                    ForEach(settings.availableMicrophones) { mic in
-                        Text(mic.name).tag(mic.uid)
+                HStack {
+                    Picker("Microphone", selection: $settings.selectedMicrophoneUID) {
+                        ForEach(settings.availableMicrophones) { mic in
+                            Text(mic.name).tag(mic.uid)
+                        }
                     }
-                }
-                .disabled(settings.autoDetectMicrophone)
+                    .disabled(settings.autoDetectMicrophone)
 
-                Button("Refresh") {
-                    settings.refreshMicrophones()
+                    Button("Refresh") {
+                        settings.refreshMicrophones()
+                    }
+                    .disabled(settings.autoDetectMicrophone)
                 }
-                .disabled(settings.autoDetectMicrophone)
-            }
 
-            if settings.availableMicrophones.isEmpty {
-                Text("No microphones detected.")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
+                if settings.availableMicrophones.isEmpty {
+                    Text("No microphones detected.")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
             }
         }
     }
@@ -1366,75 +1659,579 @@ struct SettingsView: View {
     @ViewBuilder
     private var recognitionSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsCard(title: "Recognition Behavior") {
-                Toggle("Use contextual language bias", isOn: $settings.enableContextualBias)
-                    .help("Boost likely words/phrases for better recognition.")
-
-                Toggle("Preserve words across short pauses", isOn: $settings.keepTextAcrossPauses)
-                    .help("Helps avoid dropping earlier words when you pause briefly mid-sentence.")
-
+            settingsSectionHeader(for: .recognition)
+            settingsCard(title: "Transcription Engine") {
                 HStack {
-                    Text("Recognition mode")
+                    Text("Engine")
                         .font(.callout.weight(.medium))
                     Spacer()
-                    Picker("", selection: $settings.recognitionModeRawValue) {
-                        ForEach(RecognitionMode.allCases) { mode in
-                            Text(mode.displayName).tag(mode.rawValue)
+                    Picker("", selection: $settings.transcriptionEngineRawValue) {
+                        ForEach(TranscriptionEngineType.allCases) { engine in
+                            Text(engine.displayName).tag(engine.rawValue)
                         }
                     }
                     .pickerStyle(.menu)
-                    .frame(width: 150)
+                    .frame(width: 200)
                 }
-                .help(settings.recognitionMode.helpText)
 
-                Text(settings.recognitionMode.helpText)
+                Text(settings.transcriptionEngine.helpText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-
-                Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
-                    .help("Uses Apple Speech punctuation generation during recognition.")
             }
 
-            settingsCard(title: "Finalize Delay") {
-                Text("Finalize delay: \(Int(settings.finalizeDelaySeconds * 1000)) ms")
-                    .font(.callout.weight(.medium))
-                Slider(value: $settings.finalizeDelaySeconds, in: 0.15...1.2, step: 0.05)
-                Text("Lower = faster paste, higher = fewer cut-offs.")
+            if settings.transcriptionEngine == .appleSpeech {
+                settingsCard(
+                    title: "Apple Speech Behavior",
+                    subtitle: "Tune recognition behavior and punctuation for Apple Speech."
+                ) {
+                    Toggle("Use contextual language bias", isOn: $settings.enableContextualBias)
+                        .help("Boost likely words/phrases for better recognition.")
+
+                    Toggle("Preserve words across short pauses", isOn: $settings.keepTextAcrossPauses)
+                        .help("Helps avoid dropping earlier words when you pause briefly mid-sentence.")
+
+                    HStack {
+                        Text("Recognition mode")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Picker("", selection: $settings.recognitionModeRawValue) {
+                            ForEach(RecognitionMode.allCases) { mode in
+                                Text(mode.displayName).tag(mode.rawValue)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 150)
+                    }
+                    .help(settings.recognitionMode.helpText)
+
+                    Text(settings.recognitionMode.helpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
+                        .help("Uses Apple Speech punctuation generation during recognition.")
+                }
+            } else {
+                settingsCard(
+                    title: "whisper.cpp",
+                    subtitle: "Model install and selection are managed in the Models section."
+                ) {
+                    Text("Open Models to install, delete, and switch whisper models.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+
+                    HStack {
+                        Button("Open Models") {
+                            selectedSection = .models
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Spacer()
+                    }
+                }
+            }
+
+            settingsCard(
+                title: "Text Quality & Timing",
+                subtitle: "Control finalize speed, cleanup, and custom vocabulary."
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Finalize delay: \(Int(settings.finalizeDelaySeconds * 1000)) ms")
+                        .font(.callout.weight(.medium))
+                    Slider(value: $settings.finalizeDelaySeconds, in: 0.15...1.2, step: 0.05)
+                    Text("Lower = faster paste, higher = fewer cut-offs.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Divider()
+
+                    HStack {
+                        Text("Cleanup mode")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Picker("", selection: $settings.textCleanupModeRawValue) {
+                            ForEach(TextCleanupMode.allCases) { mode in
+                                Text(mode.displayName).tag(mode.rawValue)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 170)
+                    }
+                    .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Custom phrases (comma or new line separated)")
+                            .font(.callout.weight(.medium))
+                        TextEditor(text: $settings.customContextPhrases)
+                            .frame(height: 120)
+                            .font(.callout)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                            )
+                        Text("Examples: names, products, acronyms, slang")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            settingsCard(
+                title: "Adaptive Corrections",
+                subtitle: "Learning controls and correction management moved to a dedicated section."
+            ) {
+                Text("Open Corrections to review learned fixes, add custom replacements, and tune correction sound.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Open Corrections") {
+                        selectedSection = .corrections
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var modelsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .models)
+
+            if settings.transcriptionEngine != .whisperCpp {
+                settingsCard(
+                    title: "whisper.cpp Required",
+                    subtitle: "Model install and selection are only used with whisper.cpp."
+                ) {
+                    Text("Switch the transcription engine to whisper.cpp to manage local models.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+
+                    Button("Switch to whisper.cpp") {
+                        settings.transcriptionEngine = .whisperCpp
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            } else {
+                settingsCard(title: "Model Runtime") {
+                    Toggle("Use Core ML encoder when available", isOn: $settings.whisperUseCoreML)
+                        .help("If installed for the selected model, Core ML can improve whisper speed on Apple Silicon.")
+
+                    if settings.selectedWhisperModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("No model selected yet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Current model: \(settings.selectedWhisperModelID)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                settingsCard(
+                    title: "Model Library",
+                    subtitle: "Browse, filter, install, and choose whisper models."
+                ) {
+                    if WhisperModelCatalog.curatedModels.isEmpty {
+                        Text("No curated whisper models are configured.")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                    } else {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 10) {
+                                TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
+                                    .textFieldStyle(.roundedBorder)
+
+                                Toggle("Installed only", isOn: $whisperShowInstalledOnly)
+                                    .toggleStyle(.switch)
+                                    .fixedSize()
+                            }
+
+                            HStack(spacing: 10) {
+                                Picker("Family", selection: $whisperFamilyFilter) {
+                                    ForEach(whisperFamilyFilterOptions, id: \.self) { family in
+                                        Text(family == "all" ? "All families" : family.capitalized)
+                                            .tag(family)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(width: 180)
+
+                                Spacer()
+
+                                Picker("Model", selection: $whisperBrowserModelID) {
+                                    ForEach(filteredWhisperModels) { model in
+                                        Text(model.displayName).tag(model.id)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(width: 290)
+                            }
+
+                            if let browsingModel = activeWhisperBrowserModel {
+                                whisperModelRow(for: browsingModel)
+                            } else {
+                                Text("No models match the current filters.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, 6)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear {
+            refreshWhisperModelBrowserState()
+        }
+        .onChange(of: settings.transcriptionEngineRawValue) { _ in
+            if settings.transcriptionEngine == .whisperCpp {
+                refreshWhisperModelBrowserState()
+            }
+        }
+        .onChange(of: whisperModelSearchQuery) { _ in
+            ensureWhisperBrowserModelSelectionIsValid()
+        }
+        .onChange(of: whisperFamilyFilter) { _ in
+            ensureWhisperBrowserModelSelectionIsValid()
+        }
+        .onChange(of: whisperShowInstalledOnly) { _ in
+            ensureWhisperBrowserModelSelectionIsValid()
+        }
+        .onChange(of: whisperModelManager.installStateByModelID) { _ in
+            ensureSelectedWhisperModelIsValid()
+            ensureWhisperBrowserModelSelectionIsValid()
+        }
+        .onChange(of: settings.selectedWhisperModelID) { newValue in
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            if filteredWhisperModels.contains(where: { $0.id == trimmed }) {
+                whisperBrowserModelID = trimmed
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var correctionsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .corrections)
+
+            settingsCard(
+                title: "Adaptive Corrections",
+                subtitle: "Learn from quick edits and manage learned replacements."
+            ) {
+                Text("Learned corrections are used as recognition hints for Apple Speech and whisper.cpp.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Learn from quick post-insert corrections", isOn: $settings.adaptiveCorrectionsEnabled)
+
+                Toggle("Play sound when a correction is learned", isOn: $settings.playCorrectionLearnedSound)
+                    .disabled(!settings.adaptiveCorrectionsEnabled)
+
+                if settings.playCorrectionLearnedSound {
+                    dictationSoundRow(
+                        title: "Learned correction sound",
+                        selection: $settings.dictationCorrectionLearnedSoundName
+                    )
+                        .disabled(!settings.adaptiveCorrectionsEnabled)
+                } else {
+                    Text("Enable this option to play a custom sound when a correction is learned.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Button("Add Custom Correction…") {
+                        openCreateCorrectionDialog()
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Spacer()
+                }
+
+                if adaptiveCorrectionStore.learnedCorrections.isEmpty {
+                    Text("No learned corrections yet. Fix a mistaken word once and KeyScribe can learn it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(adaptiveCorrectionStore.learnedCorrections.prefix(12)), id: \.id) { correction in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(correction.source)
+                                    .font(.callout.monospaced())
+                                Image(systemName: "arrow.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(correction.replacement)
+                                    .font(.callout.monospaced())
+                                Spacer()
+                                Button("Edit") {
+                                    beginEditingCorrection(correction)
+                                }
+                                .buttonStyle(.borderless)
+                                Button("Remove") {
+                                    adaptiveCorrectionStore.removeCorrection(source: correction.source)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+
+                        if adaptiveCorrectionStore.learnedCorrections.count > 12 {
+                            Text("Showing first 12 corrections.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack {
+                            Spacer()
+                            Button("Clear Learned Corrections", role: .destructive) {
+                                adaptiveCorrectionStore.clearAll()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func refreshWhisperModelBrowserState() {
+        whisperModelManager.refreshInstallStates()
+        ensureSelectedWhisperModelIsValid()
+        ensureWhisperBrowserModelSelectionIsValid()
+    }
+
+    @ViewBuilder
+    private func whisperModelRow(for model: WhisperModelCatalog.Model) -> some View {
+        let installState = whisperModelManager.installStateByModelID[model.id] ?? .notInstalled
+        let isSelected = settings.selectedWhisperModelID == model.id
+
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(model.displayName)
+                    .font(.callout.weight(.semibold))
+
+                if model.isEnglishOnly {
+                    whisperModelBadge("EN")
+                }
+                if model.isQuantized {
+                    whisperModelBadge("Quantized")
+                }
+                if model.isDiarization {
+                    whisperModelBadge("Diarize")
+                }
+
+                if isSelected {
+                    Text("Selected")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.green.opacity(0.14)))
+                }
+                Spacer()
+                Text(model.diskSizeText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Text(model.memoryFootprintText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(model.useCaseDescription)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            switch installState {
+            case .downloading(let progress):
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                Text("Downloading… \(Int(progress * 100))%")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+            case .installing:
+                Text("Installing model…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+            case .failed(let message):
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+
+            case .installed:
+                Text("Installed")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+
+            case .notInstalled:
+                Text("Not installed")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            settingsCard(title: "Cleanup & Vocabulary") {
-                HStack {
-                    Text("Cleanup mode")
-                        .font(.callout.weight(.medium))
-                    Spacer()
-                    Picker("", selection: $settings.textCleanupModeRawValue) {
-                        ForEach(TextCleanupMode.allCases) { mode in
-                            Text(mode.displayName).tag(mode.rawValue)
+            HStack(spacing: 8) {
+                Button(isSelected ? "Using" : "Use Model") {
+                    settings.selectedWhisperModelID = model.id
+                }
+                .buttonStyle(.bordered)
+                .disabled(installState != .installed || isSelected)
+
+                switch installState {
+                case .downloading:
+                    Button("Cancel") {
+                        whisperModelManager.cancelDownload(modelID: model.id)
+                    }
+                    .buttonStyle(.bordered)
+
+                case .installing:
+                    Button("Installing…") {}
+                        .buttonStyle(.bordered)
+                        .disabled(true)
+
+                case .installed:
+                    Button("Delete") {
+                        whisperModelManager.deleteModel(modelID: model.id)
+                        if settings.selectedWhisperModelID == model.id {
+                            settings.selectedWhisperModelID = ""
                         }
                     }
-                    .pickerStyle(.menu)
-                    .frame(width: 170)
-                }
-                .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
+                    .buttonStyle(.bordered)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Custom phrases (comma or new line separated)")
-                        .font(.callout.weight(.medium))
-                    TextEditor(text: $settings.customContextPhrases)
-                        .frame(height: 120)
-                        .font(.callout)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                case .notInstalled, .failed:
+                    Button(installState.installButtonTitle) {
+                        whisperModelManager.installModel(
+                            modelID: model.id,
+                            includeCoreML: settings.whisperUseCoreML
                         )
-                    Text("Examples: names, products, acronyms, slang")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
             }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func whisperModelBadge(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule()
+                    .fill(Color.primary.opacity(0.10))
+            )
+    }
+
+    private var whisperFamilyFilterOptions: [String] {
+        let defaultOrder = ["tiny", "base", "small", "medium", "large"]
+        let availableFamilies = Set(WhisperModelCatalog.curatedModels.map(\.family))
+
+        var options: [String] = ["all"]
+        for family in defaultOrder where availableFamilies.contains(family) {
+            options.append(family)
+        }
+        for family in availableFamilies.sorted() where !defaultOrder.contains(family) {
+            options.append(family)
+        }
+        return options
+    }
+
+    private var filteredWhisperModels: [WhisperModelCatalog.Model] {
+        var models = WhisperModelCatalog.curatedModels
+
+        if whisperFamilyFilter != "all" {
+            models = models.filter { $0.family == whisperFamilyFilter }
+        }
+
+        if whisperShowInstalledOnly {
+            models = models.filter { whisperModelManager.hasInstalledModel(id: $0.id) }
+        }
+
+        let query = whisperModelSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !query.isEmpty {
+            models = models.filter { model in
+                model.id.lowercased().contains(query) ||
+                    model.useCaseDescription.lowercased().contains(query)
+            }
+        }
+
+        return models.sorted { lhs, rhs in
+            let rankByFamily: [String: Int] = [
+                "tiny": 0,
+                "base": 1,
+                "small": 2,
+                "medium": 3,
+                "large": 4
+            ]
+            let lhsRank = rankByFamily[lhs.family] ?? 99
+            let rhsRank = rankByFamily[rhs.family] ?? 99
+            if lhsRank != rhsRank {
+                return lhsRank < rhsRank
+            }
+            return lhs.id < rhs.id
+        }
+    }
+
+    private var activeWhisperBrowserModel: WhisperModelCatalog.Model? {
+        guard !whisperBrowserModelID.isEmpty else { return nil }
+        guard filteredWhisperModels.contains(where: { $0.id == whisperBrowserModelID }) else {
+            return nil
+        }
+        return WhisperModelCatalog.model(withID: whisperBrowserModelID)
+    }
+
+    private func ensureWhisperBrowserModelSelectionIsValid() {
+        guard settings.transcriptionEngine == .whisperCpp else { return }
+
+        if filteredWhisperModels.isEmpty {
+            whisperBrowserModelID = ""
+            return
+        }
+
+        if filteredWhisperModels.contains(where: { $0.id == whisperBrowserModelID }) {
+            return
+        }
+
+        let preferredID = settings.selectedWhisperModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !preferredID.isEmpty,
+           filteredWhisperModels.contains(where: { $0.id == preferredID }) {
+            whisperBrowserModelID = preferredID
+            return
+        }
+
+        whisperBrowserModelID = filteredWhisperModels[0].id
+    }
+
+    private func ensureSelectedWhisperModelIsValid() {
+        if settings.transcriptionEngine != .whisperCpp {
+            return
+        }
+
+        if whisperModelManager.hasInstalledModel(id: settings.selectedWhisperModelID) {
+            return
+        }
+
+        if let firstInstalled = WhisperModelCatalog.curatedModels.first(where: { whisperModelManager.hasInstalledModel(id: $0.id) }) {
+            settings.selectedWhisperModelID = firstInstalled.id
+        } else {
+            settings.selectedWhisperModelID = ""
         }
     }
 
@@ -1445,25 +2242,28 @@ struct SettingsView: View {
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.headline)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
 
-            if let subtitle {
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
             }
 
             content()
         }
         .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.95))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.10), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
         )
     }
 
@@ -1483,6 +2283,85 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private func manualShortcutBuilder(for target: ShortcutCaptureTarget) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Manual map")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                ForEach(Self.shortcutModifierOptions) { option in
+                    Toggle(option.label, isOn: Binding(
+                        get: { manualShortcutHasModifier(option.flag, for: target) },
+                        set: { isEnabled in
+                            setManualShortcutModifier(option.flag, enabled: isEnabled, for: target)
+                        }
+                    ))
+                    .toggleStyle(.button)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Text("Primary key")
+                    .font(.callout.weight(.medium))
+                Picker("Primary key", selection: manualShortcutKeyBinding(for: target)) {
+                    Text("Modifier only")
+                        .tag(Self.manualModifierOnlyKeyCode)
+                    ForEach(manualShortcutKeyOptions) { option in
+                        Text(option.label)
+                            .tag(option.keyCode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 210)
+                .labelsHidden()
+            }
+
+            Text("For modifier-only shortcuts, choose 2 to 4 modifiers and select \"Modifier only\".")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func manualShortcutHasModifier(_ modifier: NSEvent.ModifierFlags, for target: ShortcutCaptureTarget) -> Bool {
+        ShortcutValidation.filteredModifierFlags(from: shortcutModifiersRaw(for: target)).contains(modifier)
+    }
+
+    private func setManualShortcutModifier(
+        _ modifier: NSEvent.ModifierFlags,
+        enabled: Bool,
+        for target: ShortcutCaptureTarget
+    ) {
+        var flags = ShortcutValidation.filteredModifierFlags(from: shortcutModifiersRaw(for: target))
+        if enabled {
+            flags.insert(modifier)
+        } else {
+            flags.remove(modifier)
+        }
+
+        _ = applyShortcutSelection(
+            for: target,
+            keyCode: shortcutKeyCode(for: target),
+            modifiersRaw: flags.rawValue,
+            validationMessage: "Shortcut must use 2 to 4 keys. Use 1-3 modifiers with a key, or 2-4 modifiers with \"Modifier only\"."
+        )
+    }
+
+    private func manualShortcutKeyBinding(for target: ShortcutCaptureTarget) -> Binding<UInt16> {
+        Binding(
+            get: { shortcutKeyCode(for: target) },
+            set: { newKeyCode in
+                _ = applyShortcutSelection(
+                    for: target,
+                    keyCode: newKeyCode,
+                    modifiersRaw: shortcutModifiersRaw(for: target),
+                    validationMessage: "Shortcut must use 2 to 4 keys. Use 1-3 modifiers with a key, or 2-4 modifiers with \"Modifier only\"."
+                )
+            }
+        )
+    }
+
     private var trimmedSearchQuery: String {
         searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
@@ -1491,19 +2370,28 @@ struct SettingsView: View {
         [
             .init(section: .general, title: "Accessibility access", detail: "Grant or verify accessibility permission", keywords: ["accessibility", "permission", "grant"]),
             .init(section: .general, title: "Copy transcript to clipboard", detail: "Automatically copy dictation results", keywords: ["clipboard", "copy", "output"]),
+            .init(section: .general, title: "Dictation sound profile", detail: "Choose tones for start, stop, processing, and pasted cues", keywords: ["sound", "start", "listening", "feedback", "processing", "stop", "pasted"]),
             .init(section: .general, title: "Waveform theme", detail: "Choose visual waveform style", keywords: ["waveform", "theme", "appearance"]),
             .init(section: .shortcuts, title: "Hold-to-talk shortcut", detail: "Set keys for press-and-hold dictation", keywords: ["hold", "shortcut", "keyboard"]),
+            .init(section: .shortcuts, title: "Mute shortcut system sounds", detail: "Optionally suppress beeps while hold-to-talk is pressed", keywords: ["mute", "beep", "sound", "hold", "shortcut"]),
+            .init(section: .shortcuts, title: "Manual shortcut map", detail: "Click modifiers and choose a key manually", keywords: ["manual", "map", "shortcut", "click", "keys"]),
             .init(section: .shortcuts, title: "Continuous toggle shortcut", detail: "Set keys for start/stop dictation mode", keywords: ["continuous", "toggle", "shortcut"]),
             .init(section: .shortcuts, title: "Paste last transcript", detail: "Reserved shortcut: ⌥⌘V", keywords: ["paste", "last transcript", "reserved"]),
             .init(section: .microphone, title: "Auto-detect microphone", detail: "Automatically use best available input", keywords: ["microphone", "input", "auto"]),
             .init(section: .microphone, title: "Microphone device picker", detail: "Choose a specific microphone manually", keywords: ["microphone", "device", "picker"]),
+            .init(section: .recognition, title: "Transcription engine", detail: "Switch between Apple Speech and whisper.cpp", keywords: ["engine", "whisper", "apple", "recognition"]),
             .init(section: .recognition, title: "Contextual language bias", detail: "Improve recognition with likely words", keywords: ["context", "bias", "recognition"]),
             .init(section: .recognition, title: "Preserve words across pauses", detail: "Prevent dropped words in short pauses", keywords: ["pause", "preserve", "recognition"]),
-            .init(section: .recognition, title: "Prefer on-device recognition", detail: "Favor local/private speech processing", keywords: ["on-device", "privacy", "recognition"]),
+            .init(section: .recognition, title: "Recognition mode", detail: "Choose local/cloud behavior for Apple Speech", keywords: ["on-device", "cloud", "privacy", "recognition"]),
             .init(section: .recognition, title: "Automatic punctuation", detail: "Enable punctuation from Apple Speech", keywords: ["punctuation", "speech"]),
             .init(section: .recognition, title: "Finalize delay", detail: "Control speed vs stability before insertion", keywords: ["delay", "finalize", "timing"]),
             .init(section: .recognition, title: "Cleanup mode", detail: "Light or aggressive text cleanup", keywords: ["cleanup", "mode"]),
             .init(section: .recognition, title: "Custom phrases", detail: "Add names, acronyms, and domain language", keywords: ["phrases", "vocabulary", "context"]),
+            .init(section: .models, title: "whisper model install", detail: "Download and manage all whisper.cpp models", keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]),
+            .init(section: .models, title: "whisper Core ML", detail: "Use Core ML encoder when available", keywords: ["core ml", "ane", "whisper", "speed"]),
+            .init(section: .corrections, title: "Adaptive corrections", detail: "Learn from your quick word/phrase fixes", keywords: ["adaptive", "learned", "corrections", "backspace"]),
+            .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
+            .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall KeyScribe", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
@@ -1538,6 +2426,97 @@ struct SettingsView: View {
         return combined
     }
 
+    private var canSubmitCorrectionDraft: Bool {
+        !correctionSourceDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !correctionReplacementDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func openCreateCorrectionDialog() {
+        correctionEditingSource = nil
+        correctionSourceDraft = ""
+        correctionReplacementDraft = ""
+        correctionDialogMessage = nil
+        isCorrectionEditorPresented = true
+    }
+
+    private func beginEditingCorrection(_ correction: AdaptiveCorrectionStore.LearnedCorrection) {
+        correctionEditingSource = correction.source
+        correctionSourceDraft = correction.source
+        correctionReplacementDraft = correction.replacement
+        correctionDialogMessage = nil
+        isCorrectionEditorPresented = true
+    }
+
+    private func closeCorrectionEditorDialog() {
+        isCorrectionEditorPresented = false
+        correctionDialogMessage = nil
+        correctionEditingSource = nil
+        correctionSourceDraft = ""
+        correctionReplacementDraft = ""
+    }
+
+    private func submitCorrectionDraft() {
+        let originalEditingSource = correctionEditingSource
+        guard let saved = adaptiveCorrectionStore.upsertManualCorrection(
+            source: correctionSourceDraft,
+            replacement: correctionReplacementDraft
+        ) else {
+            correctionDialogMessage = "Enter both fields with real words."
+            return
+        }
+
+        if let originalEditingSource, originalEditingSource != saved.source {
+            adaptiveCorrectionStore.removeCorrection(source: originalEditingSource)
+        }
+
+        correctionDialogMessage = nil
+        correctionEditingSource = nil
+        correctionSourceDraft = ""
+        correctionReplacementDraft = ""
+        isCorrectionEditorPresented = false
+    }
+
+    @ViewBuilder
+    private var correctionEditorSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(correctionEditingSource == nil ? "Add Custom Correction" : "Edit Correction")
+                .font(.title3.weight(.semibold))
+
+            Text("When KeyScribe hears")
+                .font(.callout.weight(.medium))
+            TextField("e.g. get ignored", text: $correctionSourceDraft)
+                .textFieldStyle(.roundedBorder)
+
+            Text("Replace with")
+                .font(.callout.weight(.medium))
+            TextField("e.g. gitignored", text: $correctionReplacementDraft)
+                .textFieldStyle(.roundedBorder)
+
+            if let correctionDialogMessage {
+                Text(correctionDialogMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("Cancel") {
+                    closeCorrectionEditorDialog()
+                }
+                .buttonStyle(.bordered)
+
+                Button(correctionEditingSource == nil ? "Add Correction" : "Save Changes") {
+                    submitCorrectionDraft()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSubmitCorrectionDraft)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+    }
+
     private func matchCount(for section: SettingsSection) -> Int {
         filteredSearchEntries.filter { $0.section == section }.count
     }
@@ -1566,8 +2545,7 @@ struct SettingsView: View {
 
                 if !settings.accessibilityTrusted {
                     Button("Grant Accessibility Access…") {
-                        settings.refreshAccessibilityStatus(prompt: true)
-                        openAccessibilitySettings()
+                        PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -1587,9 +2565,12 @@ struct SettingsView: View {
         }
     }
 
-    private func openAccessibilitySettings() {
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
-        NSWorkspace.shared.open(url)
+    private func requestMicrophonePermission() {
+        PermissionCenter.requestMicrophonePermission(openSettingsIfDenied: true)
+    }
+
+    private func requestSpeechRecognitionPermission() {
+        PermissionCenter.requestSpeechRecognitionPermission(openSettingsIfDenied: true)
     }
 
     private var holdToTalkShortcutSegments: [String] {
@@ -1615,6 +2596,59 @@ struct SettingsView: View {
             keyCode: settings.continuousToggleShortcutKeyCode,
             modifiersRaw: settings.continuousToggleShortcutModifiers
         )
+    }
+
+    private func shortcutKeyCode(for target: ShortcutCaptureTarget) -> UInt16 {
+        switch target {
+        case .holdToTalk:
+            settings.shortcutKeyCode
+        case .continuousToggle:
+            settings.continuousToggleShortcutKeyCode
+        }
+    }
+
+    private func shortcutModifiersRaw(for target: ShortcutCaptureTarget) -> UInt {
+        switch target {
+        case .holdToTalk:
+            settings.shortcutModifiers
+        case .continuousToggle:
+            settings.continuousToggleShortcutModifiers
+        }
+    }
+
+    @discardableResult
+    private func applyShortcutSelection(
+        for target: ShortcutCaptureTarget,
+        keyCode: UInt16,
+        modifiersRaw: UInt,
+        validationMessage: String
+    ) -> Bool {
+        let filteredModifiers = ShortcutValidation.filteredModifierRawValue(from: modifiersRaw)
+        guard ShortcutValidation.isValid(keyCode: keyCode, modifiersRaw: filteredModifiers) else {
+            shortcutCaptureMessage = validationMessage
+            return false
+        }
+
+        if let conflictMessage = shortcutConflictMessage(
+            for: target,
+            keyCode: keyCode,
+            modifiersRaw: filteredModifiers
+        ) {
+            shortcutCaptureMessage = conflictMessage
+            return false
+        }
+
+        switch target {
+        case .holdToTalk:
+            settings.shortcutKeyCode = keyCode
+            settings.shortcutModifiers = filteredModifiers
+        case .continuousToggle:
+            settings.continuousToggleShortcutKeyCode = keyCode
+            settings.continuousToggleShortcutModifiers = filteredModifiers
+        }
+
+        shortcutCaptureMessage = nil
+        return true
     }
 
     private func beginShortcutCapture(for target: ShortcutCaptureTarget) {
@@ -1666,6 +2700,8 @@ struct SettingsView: View {
     @ViewBuilder
     private var aboutSection: some View {
         VStack(alignment: .leading, spacing: 16) {
+            settingsSectionHeader(for: .about)
+
             // Version info
             HStack(spacing: 10) {
                 Image(systemName: "app.badge.checkmark.fill")
@@ -1692,8 +2728,7 @@ struct SettingsView: View {
                     granted: settings.accessibilityTrusted,
                     hint: "Required for text insertion and global hotkeys",
                     action: {
-                        settings.refreshAccessibilityStatus(prompt: true)
-                        openAccessibilitySettings()
+                        PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
                     }
                 )
 
@@ -1702,20 +2737,18 @@ struct SettingsView: View {
                     granted: microphoneAuthorized,
                     hint: "Required to capture speech",
                     action: {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
-                            NSWorkspace.shared.open(url)
-                        }
+                        requestMicrophonePermission()
                     }
                 )
 
                 permissionRow(
                     name: "Speech Recognition",
-                    granted: speechRecognitionAuthorized,
-                    hint: "Required to transcribe speech to text",
+                    granted: settings.transcriptionEngine == .appleSpeech ? speechRecognitionAuthorized : true,
+                    hint: settings.transcriptionEngine == .appleSpeech
+                        ? "Required when Apple Speech engine is selected"
+                        : "Not required while whisper.cpp engine is selected",
                     action: {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition") {
-                            NSWorkspace.shared.open(url)
-                        }
+                        requestSpeechRecognitionPermission()
                     }
                 )
             }
@@ -1749,9 +2782,16 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Uninstall")
                     .font(.headline)
-                Text("Remove KeyScribe, reset all permissions (Accessibility, Microphone, Speech Recognition), and delete saved settings.")
+                Text("Remove KeyScribe, reset permissions, and clear local app data. You can optionally keep downloaded whisper models for faster re-testing.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Toggle("Also delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
+                    .toggleStyle(.switch)
+
+                Toggle("Also delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
+                    .toggleStyle(.switch)
+
                 Button(role: .destructive, action: {
                     showUninstallConfirmation = true
                 }) {
@@ -1761,17 +2801,27 @@ struct SettingsView: View {
                 .alert("Uninstall KeyScribe?", isPresented: $showUninstallConfirmation) {
                     Button("Cancel", role: .cancel) { }
                     Button("Uninstall", role: .destructive) {
-                        SettingsStore.resetAndUninstall()
+                        SettingsStore.resetAndUninstall(
+                            deleteDownloadedModels: uninstallDeleteDownloadedModels,
+                            deleteLearnedCorrections: uninstallDeleteLearnedCorrections
+                        )
                     }
                 } message: {
-                    Text("This will reset all permissions, delete your settings, and remove the app. You will be prompted for your admin password.")
+                    Text(uninstallSummaryText)
                 }
             }
 
-            Text("Built with Apple Speech framework · on-device recognition when available")
+            Text("Built with Apple Speech and whisper.cpp")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
+    }
+
+    private var uninstallSummaryText: String {
+        let modelText = uninstallDeleteDownloadedModels ? "delete downloaded whisper models" : "keep downloaded whisper models"
+        let correctionText = uninstallDeleteLearnedCorrections ? "delete learned corrections" : "keep learned corrections"
+
+        return "This will reset permissions, remove settings, \(modelText), \(correctionText), and uninstall the app."
     }
 
     @ViewBuilder
@@ -1810,6 +2860,17 @@ struct SettingsView: View {
         SFSpeechRecognizer.authorizationStatus() == .authorized
     }
 
+}
+
+private extension WhisperModelManager.InstallState {
+    var installButtonTitle: String {
+        switch self {
+        case .failed:
+            return "Retry Install"
+        default:
+            return "Install"
+        }
+    }
 }
 
 
@@ -2059,6 +3120,8 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         private var localKeyMonitor: Any?
         private var globalFlagsMonitor: Any?
         private var localFlagsMonitor: Any?
+        private var pendingModifierCaptureWorkItem: DispatchWorkItem?
+        private var pendingModifierCaptureFlags: NSEvent.ModifierFlags = []
         private var didCapture = false
 
         init(parent: ShortcutCaptureMonitor) {
@@ -2068,6 +3131,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         func start() {
             guard globalKeyMonitor == nil, localKeyMonitor == nil, globalFlagsMonitor == nil, localFlagsMonitor == nil else { return }
             didCapture = false
+            cancelPendingModifierCapture()
 
             let mask = ShortcutValidation.supportedModifierFlags
 
@@ -2095,6 +3159,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         @discardableResult
         private func handleKeyDown(_ event: NSEvent, mask: NSEvent.ModifierFlags) -> Bool {
             guard !didCapture else { return true }
+            cancelPendingModifierCapture()
 
             if event.keyCode == 53 { // Escape
                 didCapture = true
@@ -2126,13 +3191,34 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
 
             let capturedFlags = event.modifierFlags.intersection(mask)
             let count = ShortcutValidation.modifierCount(in: capturedFlags)
-            guard (2...3).contains(count) else { return false }
-
-            didCapture = true
-            DispatchQueue.main.async {
-                self.parent.onCapture(UInt16.max, capturedFlags.rawValue)
+            guard (2...4).contains(count) else {
+                cancelPendingModifierCapture()
+                return false
             }
+
+            scheduleModifierOnlyCapture(with: capturedFlags)
             return true
+        }
+
+        private func scheduleModifierOnlyCapture(with flags: NSEvent.ModifierFlags) {
+            cancelPendingModifierCapture()
+            pendingModifierCaptureFlags = flags
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self, !self.didCapture else { return }
+                let currentFlags = NSEvent.modifierFlags.intersection(ShortcutValidation.supportedModifierFlags)
+                guard currentFlags == self.pendingModifierCaptureFlags else { return }
+                self.didCapture = true
+                self.parent.onCapture(UInt16.max, self.pendingModifierCaptureFlags.rawValue)
+            }
+            pendingModifierCaptureWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+        }
+
+        private func cancelPendingModifierCapture() {
+            pendingModifierCaptureWorkItem?.cancel()
+            pendingModifierCaptureWorkItem = nil
+            pendingModifierCaptureFlags = []
         }
 
         func stop() {
@@ -2152,6 +3238,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
                 NSEvent.removeMonitor(localFlagsMonitor)
                 self.localFlagsMonitor = nil
             }
+            cancelPendingModifierCapture()
             didCapture = false
         }
 

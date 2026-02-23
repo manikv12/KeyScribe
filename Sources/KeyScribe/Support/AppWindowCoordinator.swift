@@ -7,6 +7,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let settingsMinimumSize = NSSize(width: 820, height: 560)
     private let historyDefaultSize = NSSize(width: 620, height: 500)
     private let historyMinimumSize = NSSize(width: 520, height: 360)
+    private let onboardingDefaultSize = NSSize(width: 620, height: 460)
+    private let onboardingMinimumSize = NSSize(width: 560, height: 420)
 
     private let settings: SettingsStore
     private let transcriptHistory: TranscriptHistoryStore
@@ -15,7 +17,9 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
     private var settingsWindowController: NSWindowController?
     private var historyWindowController: NSWindowController?
+    private var onboardingWindowController: NSWindowController?
     private var historyTargetApplication: NSRunningApplication?
+    private var onboardingCompletion: (() -> Void)?
 
     init(
         settings: SettingsStore,
@@ -77,6 +81,63 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         onStatusUpdate(.ready)
     }
 
+    func openPermissionOnboardingWindow(onComplete: @escaping () -> Void) {
+        onboardingCompletion = onComplete
+
+        if onboardingWindowController == nil {
+            let onboardingView = PermissionOnboardingView(onComplete: { [weak self] in
+                guard let self else { return }
+                self.onboardingCompletion?()
+            })
+            .environmentObject(settings)
+
+            let hostingController = NSHostingController(rootView: onboardingView)
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: onboardingDefaultSize),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+
+            window.title = "KeyScribe Permission Setup"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.toolbarStyle = .unifiedCompact
+            window.isMovableByWindowBackground = true
+            window.contentViewController = hostingController
+            window.hidesOnDeactivate = false
+            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.isReleasedWhenClosed = false
+            window.minSize = onboardingMinimumSize
+            centerWindowOnActiveScreen(window)
+            window.delegate = self
+
+            onboardingWindowController = NSWindowController(window: window)
+        }
+
+        guard let window = onboardingWindowController?.window else {
+            onStatusUpdate(.message("Could not open permission setup"))
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        onboardingWindowController?.showWindow(nil)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        if window.frame.width < onboardingMinimumSize.width || window.frame.height < onboardingMinimumSize.height {
+            window.setContentSize(onboardingDefaultSize)
+        }
+        centerWindowOnActiveScreen(window)
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func closePermissionOnboardingWindow() {
+        onboardingWindowController?.close()
+        onboardingWindowController = nil
+    }
+
     func openHistoryWindow() {
         if let frontmost = NSWorkspace.shared.frontmostApplication,
            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
@@ -136,6 +197,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     }
 
     func closeAllWindows() {
+        onboardingWindowController?.close()
+        onboardingWindowController = nil
         settingsWindowController?.close()
         settingsWindowController = nil
         historyWindowController?.close()
@@ -148,6 +211,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
                 settingsWindowController = nil
             } else if closingWindow === historyWindowController?.window {
                 historyWindowController = nil
+            } else if closingWindow === onboardingWindowController?.window {
+                onboardingWindowController = nil
             }
         }
     }

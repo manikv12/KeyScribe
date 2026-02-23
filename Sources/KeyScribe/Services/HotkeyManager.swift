@@ -1,6 +1,124 @@
 import AppKit
 import Foundation
 
+private final class ShortcutEventSuppressor {
+    private static let supportedModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift, .function]
+
+    private let keyCode: UInt16
+    private let modifiers: NSEvent.ModifierFlags
+    private let onSuppressedKeyDown: () -> Void
+    private let onSuppressedKeyUp: () -> Void
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+
+    init(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        onSuppressedKeyDown: @escaping () -> Void,
+        onSuppressedKeyUp: @escaping () -> Void
+    ) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers.intersection(Self.supportedModifiers)
+        self.onSuppressedKeyDown = onSuppressedKeyDown
+        self.onSuppressedKeyUp = onSuppressedKeyUp
+    }
+
+    func start() {
+        stop()
+
+        let eventsOfInterest = (CGEventMask(1) << CGEventType.keyDown.rawValue) | (CGEventMask(1) << CGEventType.keyUp.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            guard let userInfo else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let suppressor = Unmanaged<ShortcutEventSuppressor>.fromOpaque(userInfo).takeUnretainedValue()
+
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = suppressor.eventTap {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            guard type == .keyDown || type == .keyUp else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            guard suppressor.shouldSuppress(event) else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            suppressor.notifySuppressedEvent(type)
+            return nil
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventsOfInterest,
+            callback: callback,
+            userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        ) else {
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        eventTap = tap
+        runLoopSource = source
+
+        if let source {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    func stop() {
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            runLoopSource = nil
+        }
+
+        if let tap = eventTap {
+            CFMachPortInvalidate(tap)
+            eventTap = nil
+        }
+    }
+
+    private func shouldSuppress(_ event: CGEvent) -> Bool {
+        let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        guard eventKeyCode == keyCode else { return false }
+
+        let eventModifiers = normalizedModifiers(from: event.flags)
+        return eventModifiers.isSuperset(of: modifiers)
+    }
+
+    private func notifySuppressedEvent(_ type: CGEventType) {
+        DispatchQueue.main.async {
+            switch type {
+            case .keyDown:
+                self.onSuppressedKeyDown()
+            case .keyUp:
+                self.onSuppressedKeyUp()
+            default:
+                break
+            }
+        }
+    }
+
+    private func normalizedModifiers(from flags: CGEventFlags) -> NSEvent.ModifierFlags {
+        var result: NSEvent.ModifierFlags = []
+        if flags.contains(.maskCommand) { result.insert(.command) }
+        if flags.contains(.maskAlternate) { result.insert(.option) }
+        if flags.contains(.maskControl) { result.insert(.control) }
+        if flags.contains(.maskShift) { result.insert(.shift) }
+        if flags.contains(.maskSecondaryFn) { result.insert(.function) }
+        return result.intersection(Self.supportedModifiers)
+    }
+}
+
 final class HoldToTalkManager {
     typealias Action = () -> Void
 
@@ -8,6 +126,7 @@ final class HoldToTalkManager {
 
     private let keyCode: UInt16
     private let modifiers: NSEvent.ModifierFlags
+    private let suppressSystemShortcutSounds: Bool
     private let onStart: Action
     private let onStop: Action
 
@@ -18,15 +137,23 @@ final class HoldToTalkManager {
     private var localKeyUpMonitor: Any?
     private var localFlagsMonitor: Any?
     private var releaseWatchdog: DispatchSourceTimer?
+    private var shortcutEventSuppressor: ShortcutEventSuppressor?
     private var active = false
 
     private var isModifierOnlyShortcut: Bool {
         keyCode == UInt16.max
     }
 
-    init(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, onStart: @escaping Action, onStop: @escaping Action) {
+    init(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        suppressSystemShortcutSounds: Bool = false,
+        onStart: @escaping Action,
+        onStop: @escaping Action
+    ) {
         self.keyCode = keyCode
         self.modifiers = modifiers.intersection(Self.supportedModifiers)
+        self.suppressSystemShortcutSounds = suppressSystemShortcutSounds
         self.onStart = onStart
         self.onStop = onStop
     }
@@ -69,6 +196,7 @@ final class HoldToTalkManager {
         }
 
         if isModifierOnlyShortcut {
+            stopShortcutEventSuppression()
             return
         }
 
@@ -91,6 +219,8 @@ final class HoldToTalkManager {
             self?.handle(event: event, isDown: false)
             return event
         }
+
+        startShortcutEventSuppressionIfNeeded()
     }
 
     private func stopOnMain() {
@@ -118,6 +248,7 @@ final class HoldToTalkManager {
             NSEvent.removeMonitor(localFlagsMonitor)
             self.localFlagsMonitor = nil
         }
+        stopShortcutEventSuppression()
         stopWatchdog()
         active = false
     }
@@ -193,6 +324,45 @@ final class HoldToTalkManager {
     private func stopWatchdog() {
         releaseWatchdog?.cancel()
         releaseWatchdog = nil
+    }
+
+    private func startShortcutEventSuppressionIfNeeded() {
+        guard suppressSystemShortcutSounds, !isModifierOnlyShortcut else {
+            stopShortcutEventSuppression()
+            return
+        }
+
+        let suppressor = ShortcutEventSuppressor(
+            keyCode: keyCode,
+            modifiers: modifiers,
+            onSuppressedKeyDown: { [weak self] in
+                self?.handleSuppressedShortcutEvent(isDown: true)
+            },
+            onSuppressedKeyUp: { [weak self] in
+                self?.handleSuppressedShortcutEvent(isDown: false)
+            }
+        )
+        suppressor.start()
+        shortcutEventSuppressor = suppressor
+    }
+
+    private func stopShortcutEventSuppression() {
+        shortcutEventSuppressor?.stop()
+        shortcutEventSuppressor = nil
+    }
+
+    private func handleSuppressedShortcutEvent(isDown: Bool) {
+        if isDown {
+            guard !active else { return }
+            active = true
+            startWatchdog()
+            onStart()
+        } else {
+            guard active else { return }
+            active = false
+            stopWatchdog()
+            onStop()
+        }
     }
 
     private func isShortcutPhysicallyHeld() -> Bool {

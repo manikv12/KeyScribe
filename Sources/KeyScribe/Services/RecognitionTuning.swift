@@ -23,13 +23,13 @@ enum RecognitionTuning {
         return scoreTranscript(a) >= scoreTranscript(b) ? a : b
     }
 
-    static func contextualHints(defaults: [String], custom: [String], limit: Int = 80) -> [String] {
+    static func contextualHints(defaults: [String], adaptive: [String] = [], custom: [String], limit: Int = 80) -> [String] {
         guard limit > 0 else { return [] }
 
         var seen = Set<String>()
         var ordered: [String] = []
 
-        for phrase in defaults + custom {
+        for phrase in adaptive + defaults + custom {
             let normalized = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalized.isEmpty else { continue }
             if seen.insert(normalized).inserted {
@@ -41,5 +41,43 @@ enum RecognitionTuning {
         }
 
         return ordered
+    }
+
+    static func whisperBiasPhrases(
+        customContextPhrases: String,
+        adaptiveBiasPhrases: [String],
+        limit: Int = 48
+    ) -> [String] {
+        contextualHints(
+            defaults: [],
+            adaptive: adaptiveBiasPhrases,
+            custom: parseCustomPhrases(customContextPhrases),
+            limit: limit
+        )
+    }
+
+    static func whisperInitialPrompt(from biasPhrases: [String], maxCharacters: Int = 320) -> String? {
+        guard maxCharacters > 0 else { return nil }
+
+        let prefix = "Use these exact terms when spoken: "
+        let suffix = "."
+        var usedLength = prefix.count + suffix.count
+        var selected: [String] = []
+
+        for rawPhrase in biasPhrases {
+            let phrase = rawPhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !phrase.isEmpty else { continue }
+
+            let phraseCost = phrase.count + (selected.isEmpty ? 0 : 2)
+            if usedLength + phraseCost > maxCharacters {
+                break
+            }
+
+            selected.append(phrase)
+            usedLength += phraseCost
+        }
+
+        guard !selected.isEmpty else { return nil }
+        return prefix + selected.joined(separator: ", ") + suffix
     }
 }

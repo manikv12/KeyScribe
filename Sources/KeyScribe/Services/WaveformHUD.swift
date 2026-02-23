@@ -2,8 +2,11 @@ import AppKit
 import SwiftUI
 
 private enum HUDLayout {
-    static let width: CGFloat = 100
-    static let height: CGFloat = 34
+    static let waveformWidth: CGFloat = 100
+    static let waveformHeight: CGFloat = 34
+    static let toastWidth: CGFloat = 360
+    static let toastHeight: CGFloat = 38
+    static let toastVerticalGap: CGFloat = 12
     /// Fixed offset from the bottom of the screen so the HUD always sits
     /// above the Dock region, even on screens that don't host the Dock.
     static let dockReserve: CGFloat = 80
@@ -11,32 +14,60 @@ private enum HUDLayout {
 
 @MainActor
 final class WaveformHUDManager {
-    private var panel: NSPanel?
-    private let model = WaveformModel()
+    private var waveformPanel: NSPanel?
+    private var toastPanel: NSPanel?
+    private let waveformModel = WaveformModel()
+    private let toastModel = HUDToastModel()
+    private var toastHideWorkItem: DispatchWorkItem?
 
     func show() {
-        if panel == nil {
-            createPanel()
+        if waveformPanel == nil {
+            createWaveformPanel()
         }
-        guard let panel else { return }
-        model.reset()
-        model.startAnimating()
-        repositionAtBottom()
-        panel.orderFrontRegardless()
+        guard let waveformPanel else { return }
+        waveformModel.reset()
+        waveformModel.startAnimating()
+        repositionWaveformPanel()
+        waveformPanel.orderFrontRegardless()
     }
 
     func hide() {
-        model.stopAnimating()
-        model.reset()
-        panel?.orderOut(nil)
+        waveformModel.stopAnimating()
+        waveformModel.reset()
+        waveformPanel?.orderOut(nil)
     }
 
     func updateLevel(_ level: Float) {
-        model.updateLevel(level)
+        waveformModel.updateLevel(level)
     }
 
-    private func createPanel() {
-        let frame = NSRect(x: 0, y: 0, width: HUDLayout.width, height: HUDLayout.height)
+    func flashEvent(message: String, symbolName: String = "checkmark.circle.fill", duration: TimeInterval = 1.4) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if toastPanel == nil {
+            createToastPanel()
+        }
+
+        guard let toastPanel else { return }
+
+        toastHideWorkItem?.cancel()
+        toastModel.symbolName = symbolName
+        toastModel.message = trimmed
+        repositionToastPanel()
+        toastPanel.orderFrontRegardless()
+
+        let hideWorkItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.toastPanel?.orderOut(nil)
+            }
+        }
+        toastHideWorkItem = hideWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: hideWorkItem)
+    }
+
+    private func createWaveformPanel() {
+        let frame = NSRect(x: 0, y: 0, width: HUDLayout.waveformWidth, height: HUDLayout.waveformHeight)
         let panel = NSPanel(
             contentRect: frame,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -53,21 +84,55 @@ final class WaveformHUDManager {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.ignoresMouseEvents = true
 
-        let hosting = NSHostingController(rootView: WaveformPanelView(model: model))
+        let hosting = NSHostingController(rootView: WaveformPanelView(model: waveformModel))
         hosting.view.frame = frame
         panel.contentViewController = hosting
-        self.panel = panel
+        self.waveformPanel = panel
     }
 
-    private func repositionAtBottom() {
-        guard let panel else { return }
+    private func createToastPanel() {
+        let frame = NSRect(x: 0, y: 0, width: HUDLayout.toastWidth, height: HUDLayout.toastHeight)
+        let panel = NSPanel(
+            contentRect: frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.ignoresMouseEvents = true
+
+        let hosting = NSHostingController(rootView: HUDToastView(model: toastModel))
+        hosting.view.frame = frame
+        panel.contentViewController = hosting
+        toastPanel = panel
+    }
+
+    private func repositionWaveformPanel() {
+        guard let waveformPanel else { return }
         let screen = NSScreen.main ?? NSScreen.screens.first
         guard let screen else { return }
 
-        let x = screen.frame.midX - (panel.frame.width * 0.5)
+        let x = screen.frame.midX - (waveformPanel.frame.width * 0.5)
         let y = screen.frame.minY + HUDLayout.dockReserve
 
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        waveformPanel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func repositionToastPanel() {
+        guard let toastPanel else { return }
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return }
+
+        let x = screen.frame.midX - (toastPanel.frame.width * 0.5)
+        let y = screen.frame.minY + HUDLayout.dockReserve + HUDLayout.waveformHeight + HUDLayout.toastVerticalGap
+        toastPanel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 }
 
@@ -149,7 +214,50 @@ struct WaveformPanelView: View {
                     .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
             }
         )
-        .frame(width: HUDLayout.width, height: HUDLayout.height, alignment: .center)
+        .frame(width: HUDLayout.waveformWidth, height: HUDLayout.waveformHeight, alignment: .center)
+        .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
+    }
+}
+
+@MainActor
+final class HUDToastModel: ObservableObject {
+    @Published var symbolName: String = "checkmark.circle.fill"
+    @Published var message: String = ""
+}
+
+struct HUDToastView: View {
+    @ObservedObject var model: HUDToastModel
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 7, height: 7)
+
+            Image(systemName: model.symbolName)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.green)
+
+            Text(model.message)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            ZStack {
+                Capsule()
+                    .fill(.ultraThinMaterial)
+                Capsule()
+                    .fill(Color.white.opacity(0.06))
+                Capsule()
+                    .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
+            }
+        )
+        .frame(width: HUDLayout.toastWidth, height: HUDLayout.toastHeight, alignment: .center)
         .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
     }
 }

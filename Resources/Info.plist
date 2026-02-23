@@ -17,7 +17,7 @@
         <key>NSSpeechRecognitionUsageDescription</key>
         <string>KeyScribe uses speech recognition so you can transcribe while holding the shortcut.</string>
         <key>LSMinimumSystemVersion</key>
-        <string>13.0</string>
+        <string>13.3</string>
         <key>CFBundleIconFile</key>
         <string>AppIcon</string>
         <key>NSHighResolutionCapable</key>
