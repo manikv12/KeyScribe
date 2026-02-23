@@ -1,0 +1,182 @@
+import AppKit
+import SwiftUI
+
+struct PermissionOnboardingView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    let onComplete: () -> Void
+
+    @State private var accessibilityGranted = false
+    @State private var microphoneGranted = false
+    @State private var speechRecognitionGranted = false
+    @State private var speechRecognitionRequired = true
+
+    private var allRequiredGranted: Bool {
+        accessibilityGranted && microphoneGranted && (!speechRecognitionRequired || speechRecognitionGranted)
+    }
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(nsColor: .windowBackgroundColor),
+                    Color(nsColor: .underPageBackgroundColor).opacity(0.88)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Finish Permission Setup")
+                        .font(.title2.weight(.semibold))
+                    Text("KeyScribe needs these permissions before dictation and global shortcuts can run.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    permissionRow(
+                        title: "Accessibility",
+                        hint: "Required for global hotkeys and text insertion across apps.",
+                        granted: accessibilityGranted,
+                        required: true,
+                        action: {
+                            PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
+                            refreshPermissionSnapshot()
+                        }
+                    )
+
+                    permissionRow(
+                        title: "Microphone",
+                        hint: "Required to capture speech.",
+                        granted: microphoneGranted,
+                        required: true,
+                        action: {
+                            PermissionCenter.requestMicrophonePermission(openSettingsIfDenied: true)
+                            refreshPermissionSnapshot()
+                        }
+                    )
+
+                    permissionRow(
+                        title: "Speech Recognition",
+                        hint: speechRecognitionRequired
+                            ? "Required while Apple Speech is selected."
+                            : "Optional while whisper.cpp is selected.",
+                        granted: speechRecognitionGranted,
+                        required: speechRecognitionRequired,
+                        action: {
+                            PermissionCenter.requestSpeechRecognitionPermission(openSettingsIfDenied: true)
+                            refreshPermissionSnapshot()
+                        }
+                    )
+                }
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                )
+
+                if !allRequiredGranted {
+                    Text("KeyScribe stays paused until required permissions are granted.")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.orange)
+                }
+
+                HStack(spacing: 10) {
+                    Button("Check Again") {
+                        refreshPermissionSnapshot()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Open Privacy Settings") {
+                        PermissionCenter.openPrivacySettingsPane(query: "Privacy")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Spacer()
+
+                    Button("Continue") {
+                        refreshPermissionSnapshot()
+                        guard allRequiredGranted else { return }
+                        onComplete()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!allRequiredGranted)
+                }
+            }
+            .padding(22)
+            .frame(width: 620, height: 460, alignment: .topLeading)
+        }
+        .onAppear {
+            refreshPermissionSnapshot()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshPermissionSnapshot()
+        }
+        .onReceive(
+            Timer.publish(every: 0.9, on: .main, in: .common).autoconnect()
+        ) { _ in
+            if !allRequiredGranted {
+                refreshPermissionSnapshot()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func permissionRow(
+        title: String,
+        hint: String,
+        granted: Bool,
+        required: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(granted ? .green : .orange)
+                .font(.title3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.callout.weight(.semibold))
+                    if !required {
+                        Text("Optional")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(hint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if granted {
+                Text("Granted")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
+            } else {
+                Button("Grant") {
+                    action()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func refreshPermissionSnapshot() {
+        let snapshot = PermissionCenter.snapshot(using: settings)
+        accessibilityGranted = snapshot.accessibilityGranted
+        microphoneGranted = snapshot.microphoneGranted
+        speechRecognitionGranted = snapshot.speechRecognitionGranted
+        speechRecognitionRequired = snapshot.speechRecognitionRequired
+    }
+}

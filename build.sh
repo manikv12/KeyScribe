@@ -31,6 +31,10 @@ for arg in "$@"; do
 done
 
 echo "Building ${APP_NAME} (Release)..."
+if [ ! -d "Vendor/Whisper/whisper.xcframework" ]; then
+    echo "whisper.xcframework not found, downloading framework..."
+    Scripts/update-whisper-framework.sh
+fi
 swift build -c release
 
 echo "Creating macOS App Bundle at ${APP_DIR}..."
@@ -42,6 +46,14 @@ echo "Copying executable..."
 cp ".build/release/${APP_EXECUTABLE}" "$APP_DIR/Contents/MacOS/"
 chmod +x "$APP_DIR/Contents/MacOS/${APP_EXECUTABLE}"
 
+echo "Embedding whisper framework..."
+WHISPER_MACOS_FRAMEWORK="$(find Vendor/Whisper/whisper.xcframework -maxdepth 2 -type d -name whisper.framework | grep 'macos-' | head -n 1 || true)"
+if [ -z "$WHISPER_MACOS_FRAMEWORK" ]; then
+    echo "Failed to locate macOS whisper.framework inside Vendor/Whisper/whisper.xcframework"
+    exit 1
+fi
+cp -R "$WHISPER_MACOS_FRAMEWORK" "$APP_DIR/Contents/MacOS/"
+
 echo "Copying Info.plist and resources..."
 cp Resources/Info.plist "$APP_DIR/Contents/"
 cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
@@ -49,7 +61,7 @@ cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
 echo "Applying code signature..."
 if [ -n "${DEVELOPER_ID:-}" ]; then
     echo "  Signing with Developer ID: $DEVELOPER_ID"
-    codesign --force --deep --options runtime --sign "Developer ID Application: $DEVELOPER_ID" "$APP_DIR"
+    codesign --force --deep --options runtime --entitlements Resources/KeyScribe.entitlements --sign "Developer ID Application: $DEVELOPER_ID" "$APP_DIR"
 else
     echo "  No DEVELOPER_ID set — using ad-hoc signature."
     echo "  (Set DEVELOPER_ID env var for distribution-ready signing)"

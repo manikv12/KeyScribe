@@ -48,12 +48,19 @@ enum CrashReporter {
     }
 
 
+    /// Log a non-fatal informational event for diagnostics.
+    static func logInfo(_ message: String, file: String = #file, line: Int = #line) {
+        appendStructuredLog(level: "INFO", message: message, file: file, line: line)
+    }
+
+    /// Log a non-fatal warning for diagnostics.
+    static func logWarning(_ message: String, file: String = #file, line: Int = #line) {
+        appendStructuredLog(level: "WARN", message: message, file: file, line: line)
+    }
+
     /// Log a non-fatal error for diagnostics.
     static func logError(_ message: String, file: String = #file, line: Int = #line) {
-        let entry = """
-        [ERROR] \(ISO8601DateFormatter().string(from: Date())) \(URL(fileURLWithPath: file).lastPathComponent):\(line) \(message)
-        """
-        appendToLog(entry)
+        appendStructuredLog(level: "ERROR", message: message, file: file, line: line)
     }
 
     /// Returns the crash log URL, or nil if no logs exist.
@@ -114,5 +121,12 @@ enum CrashReporter {
         } else {
             try? Data(line.utf8).write(to: fileURL, options: .atomic)
         }
+    }
+
+    private static func appendStructuredLog(level: String, message: String, file: String, line: Int) {
+        let entry = """
+        [\(level)] \(ISO8601DateFormatter().string(from: Date())) \(URL(fileURLWithPath: file).lastPathComponent):\(line) \(message)
+        """
+        appendToLog(entry)
     }
 }

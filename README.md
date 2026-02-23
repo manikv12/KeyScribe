@@ -6,11 +6,23 @@ The app runs as a menu bar utility (`LSUIElement`), so it does not show a Dock i
 
 ## What the app does
 
-- Captures speech using Apple Speech (`SFSpeechRecognizer`) and microphone input.
+- Captures speech with a selectable transcription engine:
+  - Apple Speech (`SFSpeechRecognizer`)
+  - whisper.cpp (on-device models)
 - Cleans transcript text before insert (spacing, punctuation, capitalization, duplicate-word cleanup).
 - Inserts text into the active app with reliability fallbacks.
 - Stores the last 20 transcripts in local history.
 - Lets you paste the most recent transcript with `⌥⌘V` without needing to copy from history first.
+
+## Transcription engines
+
+- **Apple Speech**:
+  - Works out of the box once permissions are granted.
+  - Supports local/cloud recognition mode options.
+- **whisper.cpp**:
+  - Runs on-device using downloaded model files (`tiny.en`, `base.en`, `small.en`).
+  - Model downloads are explicit user actions in Settings (no background model downloads).
+  - If whisper is selected and no model is installed, dictation is blocked until a model is installed.
 
 ## How insertion works
 
@@ -40,8 +52,9 @@ KeyScribe is a fully functional macOS transcription assistant ready for daily us
 
 - Default hold-to-talk shortcut: **⌥⌘Space** (customizable in Settings)
 - Default continuous toggle shortcut: **⌃⌥⌘Space** (customizable in Settings)
-- Requires **Accessibility**, **Microphone**, and **Speech Recognition** permissions (prompted on first launch)
-- Tested on macOS 13 (Ventura) and later
+- Requires **Accessibility** and **Microphone** permissions
+- **Speech Recognition** permission is required only when Apple Speech engine is selected
+- Tested on macOS 13.3 and later
 
 ### Reset Accessibility permission (dev/testing)
 
@@ -85,6 +98,8 @@ Build app + drag-and-drop DMG:
 ```bash
 ./build.sh
 ```
+
+`build.sh` will auto-fetch `whisper.xcframework` into `Vendor/Whisper/` if it is missing.
 
 Output artifacts:
 
@@ -139,8 +154,13 @@ Scripts/run-insertion-reliability.sh --regression
 
 - `Package.swift` - Swift package entry
 - `Sources/KeyScribe/App.swift` - app lifecycle, status menu, permission flow, icon state, insertion orchestration
-- `Sources/KeyScribe/Services/SpeechTranscriber.swift` - speech capture + recognition pipeline
+- `Sources/KeyScribe/Services/SpeechTranscriber.swift` - transcription engine router
+- `Sources/KeyScribe/Services/AppleSpeechTranscriber.swift` - Apple Speech capture + recognition pipeline
+- `Sources/KeyScribe/Services/WhisperTranscriber.swift` - whisper.cpp capture + transcription pipeline
+- `Sources/KeyScribe/Services/WhisperModelCatalog.swift` - curated whisper model metadata
+- `Sources/KeyScribe/Services/WhisperModelManager.swift` - model download/install/delete lifecycle
 - `Sources/KeyScribe/Services/TextInserter.swift` - insertion engine and paste/typing fallbacks
 - `Sources/KeyScribe/Services/HotkeyManager.swift` - hold-to-talk and one-shot hotkeys
 - `Sources/KeyScribe/Services/TranscriptHistoryStore.swift` - local transcript history persistence
 - `Resources/Info.plist` - app metadata and permission keys
+- `Scripts/update-whisper-framework.sh` - helper script to fetch/update local whisper XCFramework

@@ -3,3 +3,14 @@
 .DS_Store
 KeyScribe.app/
 dist/
+Vendor/Whisper/
+
+# Local build script (contains signing identity)
+build-local.sh
+
+# Code signing
+*.cer
+*.key
+*.csr
+*.certSigningRequest
+*.p12

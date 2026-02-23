@@ -25,6 +25,26 @@ enum RecognitionMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum TranscriptionEngineType: String, CaseIterable, Identifiable {
+    case appleSpeech = "Apple Speech"
+    case whisperCpp = "whisper.cpp"
+
+    var id: Self { self }
+
+    var displayName: String {
+        rawValue
+    }
+
+    var helpText: String {
+        switch self {
+        case .appleSpeech:
+            return "Uses Apple Speech recognition. Supports on-device and cloud recognition modes."
+        case .whisperCpp:
+            return "Uses local whisper.cpp models downloaded to this Mac. No cloud transcription is used."
+        }
+    }
+}
+
 enum WaveformTheme: String, CaseIterable, Identifiable {
     case vibrantSpectrum = "Vibrant Spectrum"
     case professionalTech = "Professional Tech"
@@ -43,13 +63,37 @@ final class SettingsStore: ObservableObject {
     static let accessibilityTrustDidBecomeGrantedNotification = Notification.Name(
         "KeyScribe.accessibilityTrustDidBecomeGranted"
     )
+    static let noDictationSoundName = "None"
+    static let dictationStartSoundOptions = [
+        noDictationSoundName,
+        "Basso",
+        "Blow",
+        "Bottle",
+        "Frog",
+        "Funk",
+        "Glass",
+        "Hero",
+        "Ping",
+        "Pop",
+        "Purr",
+        "Sosumi",
+        "Submarine",
+        "Tink"
+    ]
+        static let defaultDictationStartSoundName = "Ping"
+        static let defaultDictationStopSoundName = "Glass"
+        static let defaultDictationProcessingSoundName = "Ping"
+        static let defaultDictationPastedSoundName = "Pop"
+        static let defaultDictationCorrectionLearnedSoundName = "Purr"
+        static let defaultDictationFeedbackVolume: Double = 0.10
 
-    private let defaults = UserDefaults.standard
-    private var isApplyingChanges = false
+        private let defaults = UserDefaults.standard
+        private var isApplyingChanges = false
 
     private enum Keys {
         static let shortcutKeyCode = "KeyScribe.shortcutKeyCode"
         static let shortcutModifiers = "KeyScribe.shortcutModifiers"
+        static let muteSystemSoundsWhileHoldingShortcut = "KeyScribe.muteSystemSoundsWhileHoldingShortcut"
         static let continuousMode = "KeyScribe.continuousMode" // legacy key kept for migration safety
         static let continuousToggleShortcutKeyCode = "KeyScribe.continuousToggleShortcutKeyCode"
         static let continuousToggleShortcutModifiers = "KeyScribe.continuousToggleShortcutModifiers"
@@ -66,6 +110,17 @@ final class SettingsStore: ObservableObject {
         static let textCleanupMode = "KeyScribe.textCleanupMode"
         static let autoPunctuation = "KeyScribe.autoPunctuation"
         static let waveformTheme = "KeyScribe.waveformTheme"
+        static let transcriptionEngine = "KeyScribe.transcriptionEngine"
+        static let selectedWhisperModelID = "KeyScribe.selectedWhisperModelID"
+        static let whisperUseCoreML = "KeyScribe.whisperUseCoreML"
+        static let adaptiveCorrectionsEnabled = "KeyScribe.adaptiveCorrectionsEnabled"
+        static let playCorrectionLearnedSound = "KeyScribe.playCorrectionLearnedSound"
+        static let dictationStartSoundName = "KeyScribe.dictationStartSoundName"
+        static let dictationStopSoundName = "KeyScribe.dictationStopSoundName"
+        static let dictationProcessingSoundName = "KeyScribe.dictationProcessingSoundName"
+        static let dictationPastedSoundName = "KeyScribe.dictationPastedSoundName"
+        static let dictationCorrectionLearnedSoundName = "KeyScribe.dictationCorrectionLearnedSoundName"
+        static let dictationFeedbackVolume = "KeyScribe.dictationFeedbackVolume"
     }
 
     private enum ContinuousToggleDefaults {
@@ -97,6 +152,12 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var continuousToggleShortcutModifiers: UInt {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var muteSystemSoundsWhileHoldingShortcut: Bool {
         didSet {
             save()
         }
@@ -179,6 +240,73 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var transcriptionEngineRawValue: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var selectedWhisperModelID: String {
+        didSet {
+            guard oldValue != selectedWhisperModelID else { return }
+            save()
+        }
+    }
+
+    @Published var whisperUseCoreML: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var adaptiveCorrectionsEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var playCorrectionLearnedSound: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var dictationStartSoundName: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var dictationStopSoundName: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var dictationProcessingSoundName: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var dictationPastedSoundName: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var dictationCorrectionLearnedSoundName: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var dictationFeedbackVolume: Double {
+        didSet {
+            save()
+        }
+    }
+
     @Published var availableMicrophones: [MicrophoneOption] = []
     @Published var accessibilityTrusted: Bool = AXIsProcessTrusted()
 
@@ -229,6 +357,12 @@ final class SettingsStore: ObservableObject {
         )
         continuousToggleShortcutKeyCode = resolvedContinuousToggle.keyCode
         continuousToggleShortcutModifiers = resolvedContinuousToggle.modifiersRaw
+
+        if defaults.object(forKey: Keys.muteSystemSoundsWhileHoldingShortcut) == nil {
+            muteSystemSoundsWhileHoldingShortcut = false
+        } else {
+            muteSystemSoundsWhileHoldingShortcut = defaults.bool(forKey: Keys.muteSystemSoundsWhileHoldingShortcut)
+        }
 
         if defaults.object(forKey: Keys.autoDetectMicrophone) == nil {
             autoDetectMicrophone = true
@@ -298,6 +432,62 @@ final class SettingsStore: ObservableObject {
             waveformThemeRawValue = storedTheme
         }
 
+        let storedEngine = defaults.string(forKey: Keys.transcriptionEngine) ?? TranscriptionEngineType.appleSpeech.rawValue
+        if TranscriptionEngineType(rawValue: storedEngine) == nil {
+            transcriptionEngineRawValue = TranscriptionEngineType.appleSpeech.rawValue
+        } else {
+            transcriptionEngineRawValue = storedEngine
+        }
+
+        selectedWhisperModelID = defaults.string(forKey: Keys.selectedWhisperModelID) ?? ""
+
+        if defaults.object(forKey: Keys.whisperUseCoreML) == nil {
+            whisperUseCoreML = true
+        } else {
+            whisperUseCoreML = defaults.bool(forKey: Keys.whisperUseCoreML)
+        }
+
+        if defaults.object(forKey: Keys.adaptiveCorrectionsEnabled) == nil {
+            adaptiveCorrectionsEnabled = true
+        } else {
+            adaptiveCorrectionsEnabled = defaults.bool(forKey: Keys.adaptiveCorrectionsEnabled)
+        }
+
+        if defaults.object(forKey: Keys.playCorrectionLearnedSound) == nil {
+            playCorrectionLearnedSound = true
+        } else {
+            playCorrectionLearnedSound = defaults.bool(forKey: Keys.playCorrectionLearnedSound)
+        }
+
+        let storedStartSoundName = defaults.string(forKey: Keys.dictationStartSoundName)
+            ?? Self.defaultDictationStartSoundName
+        dictationStartSoundName = Self.dictationStartSoundOptions.contains(storedStartSoundName)
+            ? storedStartSoundName
+            : Self.defaultDictationStartSoundName
+        let storedStopSoundName = defaults.string(forKey: Keys.dictationStopSoundName)
+            ?? Self.defaultDictationStopSoundName
+        dictationStopSoundName = Self.dictationStartSoundOptions.contains(storedStopSoundName)
+            ? storedStopSoundName
+            : Self.defaultDictationStopSoundName
+        let storedProcessingSoundName = defaults.string(forKey: Keys.dictationProcessingSoundName)
+            ?? Self.defaultDictationProcessingSoundName
+        dictationProcessingSoundName = Self.dictationStartSoundOptions.contains(storedProcessingSoundName)
+            ? storedProcessingSoundName
+            : Self.defaultDictationProcessingSoundName
+        let storedPastedSoundName = defaults.string(forKey: Keys.dictationPastedSoundName)
+            ?? Self.defaultDictationPastedSoundName
+        dictationPastedSoundName = Self.dictationStartSoundOptions.contains(storedPastedSoundName)
+            ? storedPastedSoundName
+            : Self.defaultDictationPastedSoundName
+        let storedCorrectionSoundName = defaults.string(forKey: Keys.dictationCorrectionLearnedSoundName)
+            ?? Self.defaultDictationCorrectionLearnedSoundName
+        dictationCorrectionLearnedSoundName = Self.dictationStartSoundOptions.contains(storedCorrectionSoundName)
+            ? storedCorrectionSoundName
+            : Self.defaultDictationCorrectionLearnedSoundName
+        dictationFeedbackVolume = defaults.object(forKey: Keys.dictationFeedbackVolume) == nil
+            ? Self.defaultDictationFeedbackVolume
+            : min(1, max(0, defaults.double(forKey: Keys.dictationFeedbackVolume)))
+
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
         refreshMicrophones(notifyChange: false)
@@ -355,6 +545,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: shortcutModifiers)), forKey: Keys.shortcutModifiers)
         defaults.set(Int(continuousToggleShortcutKeyCode), forKey: Keys.continuousToggleShortcutKeyCode)
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: continuousToggleShortcutModifiers)), forKey: Keys.continuousToggleShortcutModifiers)
+        defaults.set(muteSystemSoundsWhileHoldingShortcut, forKey: Keys.muteSystemSoundsWhileHoldingShortcut)
         defaults.set(autoDetectMicrophone, forKey: Keys.autoDetectMicrophone)
         defaults.set(selectedMicrophoneUID, forKey: Keys.selectedMicrophoneUID)
         defaults.set(copyToClipboard, forKey: Keys.copyToClipboard)
@@ -367,6 +558,17 @@ final class SettingsStore: ObservableObject {
         defaults.set(textCleanupModeRawValue, forKey: Keys.textCleanupMode)
         defaults.set(autoPunctuation, forKey: Keys.autoPunctuation)
         defaults.set(waveformThemeRawValue, forKey: Keys.waveformTheme)
+        defaults.set(transcriptionEngineRawValue, forKey: Keys.transcriptionEngine)
+        defaults.set(selectedWhisperModelID, forKey: Keys.selectedWhisperModelID)
+        defaults.set(whisperUseCoreML, forKey: Keys.whisperUseCoreML)
+        defaults.set(adaptiveCorrectionsEnabled, forKey: Keys.adaptiveCorrectionsEnabled)
+        defaults.set(playCorrectionLearnedSound, forKey: Keys.playCorrectionLearnedSound)
+        defaults.set(dictationStartSoundName, forKey: Keys.dictationStartSoundName)
+        defaults.set(dictationStopSoundName, forKey: Keys.dictationStopSoundName)
+        defaults.set(dictationProcessingSoundName, forKey: Keys.dictationProcessingSoundName)
+        defaults.set(dictationPastedSoundName, forKey: Keys.dictationPastedSoundName)
+        defaults.set(dictationCorrectionLearnedSoundName, forKey: Keys.dictationCorrectionLearnedSoundName)
+        defaults.set(dictationFeedbackVolume, forKey: Keys.dictationFeedbackVolume)
 
         guard !isApplyingChanges else { return }
         onChange?()
@@ -395,10 +597,19 @@ final class SettingsStore: ObservableObject {
         set { waveformThemeRawValue = newValue.rawValue }
     }
 
-    /// Resets all permissions, deletes UserDefaults, and removes the app bundle.
+    var transcriptionEngine: TranscriptionEngineType {
+        get { TranscriptionEngineType(rawValue: transcriptionEngineRawValue) ?? .appleSpeech }
+        set { transcriptionEngineRawValue = newValue.rawValue }
+    }
+
+    /// Resets all permissions, deletes local app data, and removes the app bundle.
     /// Requires admin privileges for tccutil and rm of /Applications bundle.
-    static func resetAndUninstall() {
+    static func resetAndUninstall(
+        deleteDownloadedModels: Bool = false,
+        deleteLearnedCorrections: Bool = false
+    ) {
         let currentBundleID = Bundle.main.bundleIdentifier ?? "com.keyscribe.KeyScribe"
+        let appName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "KeyScribe"
         // Include legacy IDs so old TCC rows are cleaned up during uninstall.
         let bundleIDs = Array(
             Set([
@@ -407,37 +618,71 @@ final class SettingsStore: ObservableObject {
                 "com.manikvashith.KeyScribe"
             ])
         )
-        let appPath = Bundle.main.bundlePath
+        let appRemovalPaths = Array(
+            Set([
+                Bundle.main.bundlePath,
+                "/Applications/\(appName).app",
+                "\(NSHomeDirectory())/Applications/\(appName).app"
+            ])
+        )
 
         // Build a shell script that:
         // 1. Resets TCC permissions (Accessibility, Microphone, Speech Recognition)
-        // 2. Removes UserDefaults plist
-        // 3. Removes the .app bundle from /Applications
+        // 2. Removes UserDefaults + caches + app data (optionally preserving downloaded whisper models)
+        // 3. Removes app logs and saved state
+        // 4. Removes the .app bundle from /Applications
         let resetCommands = bundleIDs.flatMap { bundleID in
             [
-                "tccutil reset Accessibility \(bundleID) 2>/dev/null || true",
-                "tccutil reset Microphone \(bundleID) 2>/dev/null || true",
-                "tccutil reset SpeechRecognition \(bundleID) 2>/dev/null || true"
+                "tccutil reset Accessibility \(shellSingleQuoted(bundleID)) 2>/dev/null || true",
+                "tccutil reset Microphone \(shellSingleQuoted(bundleID)) 2>/dev/null || true",
+                "tccutil reset SpeechRecognition \(shellSingleQuoted(bundleID)) 2>/dev/null || true"
             ]
         }.joined(separator: "; ")
 
         let prefsCleanupCommands = bundleIDs.map { bundleID in
-            "rm -f '\(NSHomeDirectory())/Library/Preferences/\(bundleID).plist'"
+            "rm -f \(shellSingleQuoted("\(NSHomeDirectory())/Library/Preferences/\(bundleID).plist"))"
         }.joined(separator: "; ")
 
         let cacheCleanupCommands = bundleIDs.map { bundleID in
-            "rm -rf '\(NSHomeDirectory())/Library/Caches/\(bundleID)'"
+            "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Caches/\(bundleID)"))"
         }.joined(separator: "; ")
+
+        let savedStateCleanupCommands = bundleIDs.map { bundleID in
+            "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Saved Application State/\(bundleID).savedState"))"
+        }.joined(separator: "; ")
+
+        let appSupportCleanupCommand: String
+        let learnedCorrectionsCleanupCommand = deleteLearnedCorrections && !deleteDownloadedModels
+            ? "rm -f \(shellSingleQuoted(AdaptiveCorrectionStore.storageFilePath()))"
+            : nil
+
+        if deleteDownloadedModels {
+            appSupportCleanupCommand = "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Application Support/KeyScribe"))"
+        } else {
+            let appSupportPath = "\(NSHomeDirectory())/Library/Application Support/KeyScribe"
+            appSupportCleanupCommand = "mkdir -p \(shellSingleQuoted(appSupportPath)) && find \(shellSingleQuoted(appSupportPath)) -mindepth 1 -maxdepth 1 ! -name 'Models' -exec rm -rf {} +"
+        }
+        let appSupportCleanupSection = [appSupportCleanupCommand, learnedCorrectionsCleanupCommand]
+            .compactMap { $0 }
+            .joined(separator: "; ")
+        let logsCleanupCommand = "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Logs/KeyScribe"))"
+        let appRemovalCommands = appRemovalPaths
+            .map { "rm -rf \(shellSingleQuoted($0))" }
+            .joined(separator: "; ")
 
         let script = """
         \(resetCommands); \
         \(prefsCleanupCommands); \
         \(cacheCleanupCommands); \
-        rm -rf '\(appPath)'
+        \(savedStateCleanupCommands); \
+        \(appSupportCleanupSection); \
+        \(logsCleanupCommand); \
+        \(appRemovalCommands)
         """
 
+        let escapedScript = appleScriptEscaped(script)
         let appleScript = """
-        do shell script "\(script)" with administrator privileges
+        do shell script "\(escapedScript)" with administrator privileges
         """
 
         var error: NSDictionary?
@@ -446,8 +691,26 @@ final class SettingsStore: ObservableObject {
             if error == nil {
                 // Successfully uninstalled — quit the app
                 NSApplication.shared.terminate(nil)
+            } else {
+                CrashReporter.logError("Uninstall failed: \(String(describing: error))")
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Uninstall Failed"
+                alert.informativeText = "KeyScribe could not remove the app automatically. Remove KeyScribe.app manually from Applications."
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
             }
         }
+    }
+
+    private static func shellSingleQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     func hasModifier(_ modifier: NSEvent.ModifierFlags) -> Bool {
