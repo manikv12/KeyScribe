@@ -68,6 +68,39 @@ struct MemoryIndexingSmokeTests {
                 "Expected rewrite suggestion to include teh -> the correction"
             )
 
+            try write(
+                """
+                {"type":"rewrite","title":"Fix locale spelling","content":"colour -> color","original":"colour","suggested":"color","timestamp":"2026-02-01T10:10:00Z"}
+                """,
+                to: sandboxRoot.appendingPathComponent(".codex/archived_sessions/session-1.jsonl")
+            )
+
+            let reindexReport = await indexingService.indexSources(discovery.sources, store: store)
+            check(reindexReport.indexedFiles > 0, "Expected reindex to process modified files")
+
+            let staleSuggestions = try store.fetchRewriteSuggestions(
+                query: "teh",
+                provider: .codex,
+                limit: 10
+            )
+            check(
+                staleSuggestions.isEmpty,
+                "Expected stale rewrite suggestions to be removed after file changes"
+            )
+
+            let updatedSuggestions = try store.fetchRewriteSuggestions(
+                query: "colour",
+                provider: .codex,
+                limit: 10
+            )
+            check(
+                updatedSuggestions.contains(where: {
+                    $0.originalText.localizedCaseInsensitiveContains("colour")
+                        && $0.suggestedText.localizedCaseInsensitiveContains("color")
+                }),
+                "Expected updated rewrite suggestion after reindex"
+            )
+
             print("PASS: Memory indexing smoke tests passed")
         } catch {
             fputs("FAIL: Memory indexing smoke test threw error: \(error)\n", stderr)

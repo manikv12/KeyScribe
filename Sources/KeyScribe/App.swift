@@ -699,9 +699,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let rewriteResolved = await resolvePromptRewriteInsertionText(for: cleaned) else {
-            setUIStatus(.ready)
-            return
+        let rewriteResolved: String
+        if settings.memoryIndexingEnabled {
+            guard let resolved = await resolvePromptRewriteInsertionText(for: cleaned) else {
+                setUIStatus(.ready)
+                return
+            }
+            rewriteResolved = resolved
+        } else {
+            rewriteResolved = cleaned
         }
 
         let readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolved)
@@ -711,6 +717,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func resolvePromptRewriteInsertionText(for cleanedTranscript: String) async -> String? {
+        guard settings.memoryIndexingEnabled else {
+            return cleanedTranscript
+        }
+
         while true {
             do {
                 guard let suggestion = try await promptRewriteService.retrieveSuggestion(for: cleanedTranscript) else {

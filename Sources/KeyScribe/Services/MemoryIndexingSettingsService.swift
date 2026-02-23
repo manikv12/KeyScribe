@@ -66,13 +66,14 @@ final class MemoryIndexingSettingsService {
         enabledSourceFolderIDs: [String] = [],
         runIndexing: Bool
     ) -> ScanResult {
-        let discovery = discoveryService.discover(
-            enabledProviders: Set(enabledProviderIDs),
-            enabledSourceFolders: Set(enabledSourceFolderIDs)
-        )
+        let discovery = discoveryService.discover()
 
         if runIndexing {
-            queueIndexing(sources: discovery.sources, rebuild: false)
+            let filteredDiscovery = discoveryService.discover(
+                enabledProviders: Set(enabledProviderIDs),
+                enabledSourceFolders: Set(enabledSourceFolderIDs)
+            )
+            queueIndexing(sources: filteredDiscovery.sources, rebuild: false)
         }
 
         return ScanResult(

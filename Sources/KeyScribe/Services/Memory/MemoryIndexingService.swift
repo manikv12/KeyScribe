@@ -141,14 +141,20 @@ actor MemoryIndexingService {
         )
 
         do {
-            if let existing = try store.fetchSourceFile(
+            let existing = try store.fetchSourceFile(
                 sourceID: sourceID,
                 relativePath: relativePath
-            ),
+            )
+            if let existing,
                existing.fileHash == sourceFileRecord.fileHash,
                existing.parseError == nil {
                 report.skippedFiles += 1
                 return
+            }
+
+            if let existing,
+               existing.fileHash != sourceFileRecord.fileHash || existing.parseError != nil {
+                try store.clearIndexedContent(forSourceFileID: fileID)
             }
 
             try store.upsertSourceFile(sourceFileRecord)

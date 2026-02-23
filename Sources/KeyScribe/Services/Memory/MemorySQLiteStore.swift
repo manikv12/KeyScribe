@@ -505,6 +505,12 @@ final class MemorySQLiteStore {
         try execute(sql: "DELETE FROM memory_events WHERE is_plan_content = 0;")
     }
 
+    func clearIndexedContent(forSourceFileID sourceFileID: UUID) throws {
+        try execute(sql: "DELETE FROM memory_events WHERE source_file_id = ?;", bind: { statement in
+            self.bind(sourceFileID.uuidString, at: 1, in: statement)
+        })
+    }
+
     func clearAllIndexedData() throws {
         try execute(sql: "DELETE FROM rewrite_suggestions;")
         try execute(sql: "DELETE FROM memory_cards;")
