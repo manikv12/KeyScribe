@@ -175,20 +175,25 @@ actor MemoryRewriteRetrievalService {
         lessons: [MemoryRewriteLesson],
         limit: Int
     ) throws -> [MemoryCard] {
-        let cards = try store.fetchCardsForRewrite(
-            query: normalizedTranscript,
-            options: MemoryRewriteLookupOptions(
-                provider: nil,
-                includePlanContent: false,
-                limit: max(20, limit * 4)
+        let queries = cardSearchQueries(for: normalizedTranscript)
+        var candidates: [MemoryCard] = []
+        for query in queries {
+            let cards = try store.fetchCardsForRewrite(
+                query: query,
+                options: MemoryRewriteLookupOptions(
+                    provider: nil,
+                    includePlanContent: false,
+                    limit: max(20, limit * 4)
+                )
             )
-        )
+            candidates.append(contentsOf: cards)
+        }
 
         var seen = Set<String>()
         var filtered: [MemoryCard] = []
         filtered.reserveCapacity(limit)
 
-        for card in cards {
+        for card in candidates {
             guard isHighSignalCard(card) else { continue }
             if !lessons.isEmpty && isWeakGenericCard(card) {
                 continue
@@ -208,6 +213,29 @@ actor MemoryRewriteRetrievalService {
         }
 
         return filtered
+    }
+
+    private func cardSearchQueries(for transcript: String) -> [String] {
+        let normalized = MemoryTextNormalizer.collapsedWhitespace(transcript)
+        guard !normalized.isEmpty else { return [""] }
+
+        var queries: [String] = [normalized]
+        let keywords = MemoryTextNormalizer.keywords(from: normalized, limit: 8)
+        if !keywords.isEmpty {
+            queries.append(keywords.joined(separator: " "))
+            queries.append(contentsOf: keywords)
+        }
+
+        var seen = Set<String>()
+        var unique: [String] = []
+        for value in queries {
+            let collapsed = MemoryTextNormalizer.collapsedWhitespace(value)
+            guard !collapsed.isEmpty else { continue }
+            if seen.insert(collapsed).inserted {
+                unique.append(collapsed)
+            }
+        }
+        return unique.isEmpty ? [normalized] : unique
     }
 
     private func shouldAttemptRewrite(for transcript: String) -> Bool {

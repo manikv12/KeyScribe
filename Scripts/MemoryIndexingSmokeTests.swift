@@ -65,6 +65,27 @@ struct MemoryIndexingSmokeTests {
             )
             check(!cards.isEmpty, "Expected codex memory card query to return results")
 
+            let conversationCards = try store.fetchCardsForRewrite(
+                query: "acceptance criteria",
+                options: MemoryRewriteLookupOptions(provider: .codex, includePlanContent: false, limit: 10)
+            )
+            check(
+                conversationCards.contains(where: { $0.detail.localizedCaseInsensitiveContains("acceptance criteria") }),
+                "Expected chat/session memory content to be indexed"
+            )
+
+            let noisyCards = try store.fetchCardsForRewrite(
+                query: "internal reasoning",
+                options: MemoryRewriteLookupOptions(provider: .codex, includePlanContent: false, limit: 10)
+            )
+            check(noisyCards.isEmpty, "Expected tool/thought artifacts to be excluded from indexing")
+
+            let nestedSessionCards = try store.fetchCardsForRewrite(
+                query: "repro steps",
+                options: MemoryRewriteLookupOptions(provider: .cursor, includePlanContent: false, limit: 10)
+            )
+            check(!nestedSessionCards.isEmpty, "Expected nested chat-session payloads to be ingested")
+
             let rewriteSuggestions = try store.fetchRewriteSuggestions(
                 query: "teh",
                 provider: .codex,
@@ -133,6 +154,8 @@ struct MemoryIndexingSmokeTests {
             """
             {"type":"rewrite","title":"Fix typo","content":"teh -> the","original":"teh","suggested":"the","timestamp":"2026-02-01T10:00:00Z"}
             {"type":"conversation","title":"Chat","content":"Remember to ask for acceptance criteria","timestamp":"2026-02-01T10:01:00Z"}
+            {"type":"tool","role":"tool","content":"tool_call: grep -R TODO","timestamp":"2026-02-01T10:02:00Z"}
+            {"type":"analysis","role":"thinking","content":"internal reasoning: maybe this","timestamp":"2026-02-01T10:03:00Z"}
             """,
             to: root.appendingPathComponent(".codex/archived_sessions/session-1.jsonl")
         )
@@ -149,6 +172,13 @@ struct MemoryIndexingSmokeTests {
             {"type":"message","title":"Claude Note","message":"Do not skip edge-case tests","timestamp":"2026-02-01T11:05:00Z"}
             """,
             to: root.appendingPathComponent(".claude/projects/sample/chat.jsonl")
+        )
+
+        try write(
+            """
+            {"title":"Bug triage","conversation":[{"role":"user","content":"Please include repro steps and expected behavior"},{"role":"assistant","content":"Absolutely—capture logs and compare expected behavior."},{"role":"tool","content":"tool result: 80 files scanned"}]}
+            """,
+            to: root.appendingPathComponent(".cursor/chats/session-2.jsonl")
         )
 
         return root

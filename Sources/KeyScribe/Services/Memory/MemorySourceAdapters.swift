@@ -277,12 +277,16 @@ private enum MemoryAdapterEventParser {
             )]
         }
 
-        if let messages = dictionary["messages"] as? [Any], !messages.isEmpty {
+        if let messages = firstMessageArray(in: dictionary), !messages.isEmpty {
             return messages.enumerated().compactMap { index, messageNode in
                 guard let message = messageNode as? [String: Any] else { return nil }
-                let role = readString(from: message, keys: ["role", "author", "speaker"])
-                let body = readString(from: message, keys: ["content", "text", "message", "body", "value"])
+                let role = readString(from: message, keys: ["role", "author", "speaker", "type"])
+                let body = extractMessageBody(from: message)
                 guard let body else { return nil }
+                if shouldSkipMessage(role: role, body: body, metadata: message) {
+                    return nil
+                }
+
                 let titlePrefix = role?.capitalized ?? "Message"
                 let title = "\(titlePrefix) \(index + 1)"
                 let timestamp = readDate(from: message, keys: ["timestamp", "created_at", "createdAt", "time", "date"]) ?? Date()
@@ -307,13 +311,16 @@ private enum MemoryAdapterEventParser {
         let explicitBody = readString(
             from: dictionary,
             keys: ["content", "text", "message", "body", "prompt", "response", "completion", "output", "input"]
-        )
+        ) ?? extractNestedText(from: dictionary)
         if explicitBody == nil && shouldSkipLowSignalDictionary(dictionary) {
             return []
         }
         let body = explicitBody ?? serializeJSON(dictionary: dictionary)
         let timestamp = readDate(from: dictionary, keys: ["timestamp", "created_at", "createdAt", "time", "date"]) ?? Date()
         let kindHint = readString(from: dictionary, keys: ["kind", "type", "event", "category", "role"])
+        if shouldSkipMessage(role: kindHint, body: body, metadata: dictionary) {
+            return []
+        }
         let kind = inferKind(from: relativePath, valueHint: kindHint)
         let summary = readString(from: dictionary, keys: ["summary", "native_summary", "abstract"])
 
@@ -363,21 +370,25 @@ private enum MemoryAdapterEventParser {
             .map { MemoryTextNormalizer.normalizedBody($0) }
             .filter { !$0.isEmpty }
 
-        if !paragraphs.isEmpty && paragraphs.count <= 32 {
-            return paragraphs.map { paragraph in
-                let title = MemoryTextNormalizer.normalizedTitle(String(paragraph.prefix(72)))
-                let kind = inferKind(from: relativePath, valueHint: title)
-                return makeDraft(
-                    provider: provider,
-                    relativePath: relativePath,
-                    title: title,
-                    body: paragraph,
-                    kind: kind,
-                    timestamp: Date(),
-                    nativeSummary: nil,
-                    metadata: [:],
-                    rawPayload: nil
-                )
+        if !paragraphs.isEmpty {
+            let chunkedParagraphs = paragraphs.flatMap { chunkText($0, maxCharacters: 900) }
+            if chunkedParagraphs.count <= 64 {
+                return chunkedParagraphs.enumerated().map { index, paragraph in
+                    let prefix = chunkedParagraphs.count > 1 ? "Part \(index + 1): " : ""
+                    let title = MemoryTextNormalizer.normalizedTitle(prefix + String(paragraph.prefix(72)))
+                    let kind = inferKind(from: relativePath, valueHint: title)
+                    return makeDraft(
+                        provider: provider,
+                        relativePath: relativePath,
+                        title: title,
+                        body: paragraph,
+                        kind: kind,
+                        timestamp: Date(),
+                        nativeSummary: nil,
+                        metadata: ["chunk_index": "\(index + 1)", "chunk_total": "\(chunkedParagraphs.count)"],
+                        rawPayload: nil
+                    )
+                }
             }
         }
 
@@ -416,6 +427,10 @@ private enum MemoryAdapterEventParser {
         let summary = nativeSummary.map { MemoryTextNormalizer.normalizedSummary($0) }
         let inferredPlan = MemoryTextNormalizer.inferPlanContent(path: relativePath, kind: kind, body: normalizedBody)
 
+        var enrichedMetadata = metadata
+        enrichedMetadata["relative_path"] = relativePath
+        enrichedMetadata["event_kind"] = kind.rawValue
+
         return MemoryEventDraft(
             kind: kind,
             title: normalizedTitle,
@@ -424,9 +439,134 @@ private enum MemoryAdapterEventParser {
             nativeSummary: summary,
             keywords: allKeywords,
             isPlanContent: inferredPlan,
-            metadata: metadata,
+            metadata: enrichedMetadata,
             rawPayload: rawPayload
         )
+    }
+
+    private static func firstMessageArray(in dictionary: [String: Any]) -> [Any]? {
+        let candidateKeys = ["messages", "chat_messages", "conversation", "turns", "items", "entries"]
+        for key in candidateKeys {
+            if let messages = dictionary[key] as? [Any], !messages.isEmpty {
+                return messages
+            }
+        }
+        if let payload = dictionary["data"] as? [String: Any] {
+            return firstMessageArray(in: payload)
+        }
+        return nil
+    }
+
+    private static func extractMessageBody(from message: [String: Any]) -> String? {
+        if let direct = readString(from: message, keys: ["content", "text", "message", "body", "value", "prompt", "response"]) {
+            return direct
+        }
+        if let contentDictionary = message["content"] as? [String: Any],
+           let nested = extractNestedText(from: contentDictionary) {
+            return nested
+        }
+        if let parts = message["parts"] as? [Any] {
+            let combined = parts.compactMap { part -> String? in
+                if let value = part as? String {
+                    let normalized = MemoryTextNormalizer.normalizedBody(value)
+                    return normalized.isEmpty ? nil : normalized
+                }
+                if let dictionary = part as? [String: Any] {
+                    return extractNestedText(from: dictionary)
+                }
+                return nil
+            }.joined(separator: "\n")
+            let normalized = MemoryTextNormalizer.normalizedBody(combined)
+            if !normalized.isEmpty {
+                return normalized
+            }
+        }
+        return extractNestedText(from: message)
+    }
+
+    private static func shouldSkipMessage(role: String?, body: String, metadata: [String: Any]) -> Bool {
+        let normalizedRole = MemoryTextNormalizer.collapsedWhitespace(role ?? "").lowercased()
+        if ["tool", "system", "analysis", "thinking", "reasoning", "trace"].contains(normalizedRole) {
+            return true
+        }
+
+        let normalizedBody = MemoryTextNormalizer.collapsedWhitespace(body).lowercased()
+        if normalizedBody.isEmpty { return true }
+        if normalizedBody.hasPrefix("{") && normalizedBody.hasSuffix("}") && normalizedBody.count > 240 {
+            return true
+        }
+        let noisyPhrases = ["tool_call", "tool result", "internal reasoning", "chain-of-thought", "thinking:"]
+        if noisyPhrases.contains(where: normalizedBody.contains) {
+            return true
+        }
+        if let messageType = metadata["type"] as? String,
+           ["tool", "trace", "thinking", "meta"].contains(messageType.lowercased()) {
+            return true
+        }
+        return false
+    }
+
+    private static func extractNestedText(from dictionary: [String: Any]) -> String? {
+        let candidateKeys = ["content", "text", "body", "message", "value", "prompt", "response", "input", "output"]
+        for key in candidateKeys {
+            guard let value = dictionary[key] else { continue }
+            if let stringValue = value as? String {
+                let normalized = MemoryTextNormalizer.normalizedBody(stringValue)
+                if !normalized.isEmpty {
+                    return normalized
+                }
+            }
+            if let nested = value as? [String: Any],
+               let extracted = extractNestedText(from: nested) {
+                return extracted
+            }
+            if let list = value as? [Any] {
+                let joined = list.compactMap { item -> String? in
+                    if let stringItem = item as? String {
+                        let normalized = MemoryTextNormalizer.normalizedBody(stringItem)
+                        return normalized.isEmpty ? nil : normalized
+                    }
+                    if let dictionaryItem = item as? [String: Any] {
+                        return extractNestedText(from: dictionaryItem)
+                    }
+                    return nil
+                }.joined(separator: "\n")
+                let normalized = MemoryTextNormalizer.normalizedBody(joined)
+                if !normalized.isEmpty {
+                    return normalized
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func chunkText(_ value: String, maxCharacters: Int) -> [String] {
+        let normalized = MemoryTextNormalizer.normalizedBody(value)
+        guard normalized.count > maxCharacters else { return [normalized] }
+
+        let sentences = normalized.components(separatedBy: "\n")
+        var chunks: [String] = []
+        var current = ""
+
+        for sentence in sentences {
+            let trimmed = MemoryTextNormalizer.normalizedBody(sentence)
+            guard !trimmed.isEmpty else { continue }
+            if current.isEmpty {
+                current = trimmed
+                continue
+            }
+            if current.count + trimmed.count + 1 <= maxCharacters {
+                current += "\n" + trimmed
+            } else {
+                chunks.append(current)
+                current = trimmed
+            }
+        }
+
+        if !current.isEmpty {
+            chunks.append(current)
+        }
+        return chunks.isEmpty ? [normalized] : chunks
     }
 
     private static func readString(from dictionary: [String: Any], keys: [String]) -> String? {
