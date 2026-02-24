@@ -182,7 +182,7 @@ final class WhisperTranscriber: NSObject {
 
         guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
         else {
-            updateStatus("Audio converter setup failed")
+            updateStatus("Whisper target audio format setup failed")
             CrashReporter.logError("Whisper target audio format setup failed")
             restoreMicSelection()
             isRecording = false
@@ -193,6 +193,8 @@ final class WhisperTranscriber: NSObject {
         // Build converter lazily from the first buffer's real format.
         // This avoids tap install crashes if the active hardware format changes.
         var converter: AVAudioConverter?
+        var converterInputSignature: String?
+        var converterFailureHandled = false
 
         audioEngine.stop()
         audioEngine.reset()
@@ -205,11 +207,28 @@ final class WhisperTranscriber: NSObject {
                 self.onAudioLevel?(level)
             }
 
-            if converter == nil {
+            let inputSignature = "\(buffer.format.sampleRate)-\(buffer.format.channelCount)-\(buffer.format.commonFormat.rawValue)-\(buffer.format.isInterleaved)"
+            if converter == nil || converterInputSignature != inputSignature {
                 converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+                converterInputSignature = inputSignature
+
                 if converter == nil {
-                    CrashReporter.logError("Whisper audio converter setup failed at runtime from format=\(buffer.format)")
+                    if !converterFailureHandled {
+                        converterFailureHandled = true
+                        DispatchQueue.global(qos: .background).async {
+                            CrashReporter.logError("Whisper audio converter setup failed at runtime from format=\(buffer.format)")
+                        }
+                        DispatchQueue.main.async {
+                            self.updateStatus("Audio converter setup failed")
+                            self.stopRecordingOnMain(emitFinalText: false)
+                        }
+                    }
                     return
+                }
+
+                // Input format changed; clear any pre-converted accumulation to avoid mixing formats.
+                self.sampleQueue.async {
+                    self.pcmSamples = []
                 }
             }
 
