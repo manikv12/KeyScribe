@@ -18,6 +18,15 @@ protocol MemoryRewriteExtractionProviding {
         card: MemoryCard,
         provider: MemoryProviderKind
     ) async -> MemoryLessonDraft?
+
+    func hasAIBackedIndexingAccess(for provider: MemoryProviderKind) async -> Bool
+}
+
+extension MemoryRewriteExtractionProviding {
+    func hasAIBackedIndexingAccess(for provider: MemoryProviderKind) async -> Bool {
+        _ = provider
+        return false
+    }
 }
 
 final class StubMemoryRewriteExtractionProvider: MemoryRewriteExtractionProviding {
@@ -82,6 +91,11 @@ final class StubMemoryRewriteExtractionProvider: MemoryRewriteExtractionProvidin
             )
         }
         return nil
+    }
+
+    func hasAIBackedIndexingAccess(for provider: MemoryProviderKind) async -> Bool {
+        _ = provider
+        return await aiLessonProvider.hasLiveSynthesisConfiguration()
     }
 
     private func sourceMetadata(
@@ -192,6 +206,25 @@ private actor MemoryAILessonSynthesisProvider {
 
     init(session: URLSession = .shared) {
         self.session = session
+    }
+
+    func hasLiveSynthesisConfiguration() async -> Bool {
+        guard let configuration = liveConfiguration() else { return false }
+        guard configuration.hasCredentials else { return false }
+
+        let credential: ProviderCredential
+        do {
+            credential = try await resolveCredential(for: configuration)
+        } catch {
+            return false
+        }
+
+        if configuration.providerMode.requiresAPIKey {
+            if case .none = credential {
+                return false
+            }
+        }
+        return true
     }
 
     func synthesizeLesson(

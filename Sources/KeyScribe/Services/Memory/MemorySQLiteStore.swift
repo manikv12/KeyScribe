@@ -866,6 +866,23 @@ final class MemorySQLiteStore {
         return rows.first
     }
 
+    func hasIndexedEvents(forSourceFileID sourceFileID: UUID) throws -> Bool {
+        let sql = """
+        SELECT 1
+        FROM memory_events
+        WHERE source_file_id = ?
+        LIMIT 1;
+        """
+
+        let rows: [Int64] = try query(sql: sql, bind: { statement in
+            self.bind(sourceFileID.uuidString, at: 1, in: statement)
+        }, mapRow: { statement in
+            sqlite3_column_int64(statement, 0)
+        })
+
+        return !rows.isEmpty
+    }
+
     func clearIndexedMemories() throws {
         try execute(sql: """
         DELETE FROM rewrite_suggestions

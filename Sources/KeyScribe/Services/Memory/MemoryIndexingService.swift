@@ -19,6 +19,8 @@ actor MemoryIndexingService {
     static let shared = MemoryIndexingService()
     typealias ProgressHandler = @Sendable (_ report: MemoryIndexingReport, _ currentSource: MemoryDiscoveredSource?, _ currentFilePath: String?) async -> Void
 
+    private static let aiNoIndexedOutputMarker = "__ai_no_indexed_output__"
+
     private let fileManager: FileManager
     private let adapterRegistry: MemorySourceAdapterRegistry
     private let rewriteProvider: MemoryRewriteExtractionProviding
@@ -133,6 +135,7 @@ actor MemoryIndexingService {
             fileManager: fileManager,
             maxFiles: maxFilesPerSource
         )
+        let aiBackedIndexingAvailable = await rewriteProvider.hasAIBackedIndexingAccess(for: source.provider)
 
         for fileURL in candidateFiles {
             if Task.isCancelled {
@@ -143,6 +146,7 @@ actor MemoryIndexingService {
                 source: source,
                 sourceID: sourceID,
                 adapter: adapter,
+                aiBackedIndexingAvailable: aiBackedIndexingAvailable,
                 store: store,
                 progress: progress,
                 report: &report
@@ -159,6 +163,7 @@ actor MemoryIndexingService {
         source: MemoryDiscoveredSource,
         sourceID: UUID,
         adapter: any MemorySourceAdapter,
+        aiBackedIndexingAvailable: Bool,
         store: MemorySQLiteStore,
         progress: ProgressHandler?,
         report: inout MemoryIndexingReport
@@ -180,19 +185,25 @@ actor MemoryIndexingService {
                 sourceID: sourceID,
                 relativePath: relativePath
             )
-            if let existing,
-               existing.fileHash == sourceFileRecord.fileHash,
-               existing.parseError == nil {
-                report.skippedFiles += 1
-                if let progress {
-                    await progress(report, source, fileURL.path)
-                }
-                return
-            }
+            if let existing {
+                let hasNoOutputMarker = existing.parseError == Self.aiNoIndexedOutputMarker
+                let unchanged = existing.fileHash == sourceFileRecord.fileHash
+                    && (existing.parseError == nil || hasNoOutputMarker)
 
-            if let existing,
-               existing.fileHash != sourceFileRecord.fileHash || existing.parseError != nil {
-                try store.clearIndexedContent(forSourceFileID: fileID)
+                if unchanged {
+                    let hasIndexedEvents = try store.hasIndexedEvents(forSourceFileID: fileID)
+                    if hasIndexedEvents || hasNoOutputMarker || !aiBackedIndexingAvailable {
+                        report.skippedFiles += 1
+                        if let progress {
+                            await progress(report, source, fileURL.path)
+                        }
+                        return
+                    }
+                }
+
+                if !unchanged || aiBackedIndexingAvailable {
+                    try store.clearIndexedContent(forSourceFileID: fileID)
+                }
             }
 
             try store.upsertSourceFile(sourceFileRecord)
@@ -211,6 +222,13 @@ actor MemoryIndexingService {
                 fileManager: fileManager
             )
             if drafts.isEmpty {
+                if aiBackedIndexingAvailable {
+                    var noOutputFile = sourceFileRecord
+                    noOutputFile.parseError = Self.aiNoIndexedOutputMarker
+                    noOutputFile.indexedAt = Date()
+                    try store.upsertSourceFile(noOutputFile)
+                }
+
                 report.skippedFiles += 1
                 if let progress {
                     await progress(report, source, fileURL.path)
@@ -220,10 +238,12 @@ actor MemoryIndexingService {
 
             report.indexedFiles += 1
             let limitedDrafts = Array(drafts.prefix(maxEventsPerFile))
+            var persistedIndexedOutput = false
             for (index, draft) in limitedDrafts.enumerated() {
                 if Task.isCancelled {
                     break
                 }
+
                 let eventID = MemoryIdentifier.stableUUID(
                     for: "event|\(fileID.uuidString)|\(index)|\(draft.kind.rawValue)|\(draft.title)|\(draft.body)"
                 )
@@ -242,8 +262,6 @@ actor MemoryIndexingService {
                     metadata: draft.metadata,
                     rawPayload: draft.rawPayload
                 )
-                try store.upsertEvent(event)
-                report.indexedEvents += 1
 
                 let summary = await rewriteProvider.summary(for: draft, provider: source.provider)
                 let card = makeMemoryCard(
@@ -254,15 +272,32 @@ actor MemoryIndexingService {
                     draft: draft,
                     summary: summary
                 )
+
+                let lessonDraft = await rewriteProvider.lesson(
+                    for: draft,
+                    card: card,
+                    provider: source.provider
+                )
+                let rewriteSuggestion = await rewriteProvider.rewriteSuggestion(
+                    for: draft,
+                    card: card,
+                    provider: source.provider
+                )
+
+                // Guardrail: local/non-AI parsing should not persist memory cards/events by default.
+                // We only persist indexed content when AI-backed extraction produced rewrite signal.
+                guard lessonDraft != nil || rewriteSuggestion != nil else {
+                    continue
+                }
+
+                persistedIndexedOutput = true
+                try store.upsertEvent(event)
+                report.indexedEvents += 1
                 try store.upsertCard(card)
                 report.indexedCards += 1
 
                 var lessonRewriteSuggestion: RewriteSuggestion?
-                if let lessonDraft = await rewriteProvider.lesson(
-                    for: draft,
-                    card: card,
-                    provider: source.provider
-                ) {
+                if let lessonDraft {
                     let lesson = makeMemoryLesson(
                         sourceID: sourceID,
                         sourceFileID: fileID,
@@ -292,11 +327,7 @@ actor MemoryIndexingService {
                     }
                 }
 
-                if let rewriteSuggestion = await rewriteProvider.rewriteSuggestion(
-                    for: draft,
-                    card: card,
-                    provider: source.provider
-                ) {
+                if let rewriteSuggestion {
                     try store.insertRewriteSuggestion(rewriteSuggestion)
                     if lessonRewriteSuggestion?.id != rewriteSuggestion.id {
                         report.indexedRewriteSuggestions += 1
@@ -307,6 +338,14 @@ actor MemoryIndexingService {
                     try await Task.sleep(nanoseconds: UInt64(apiThrottleDelay * 1_000_000_000))
                 }
             }
+
+            if aiBackedIndexingAvailable && !persistedIndexedOutput {
+                var noOutputFile = sourceFileRecord
+                noOutputFile.parseError = Self.aiNoIndexedOutputMarker
+                noOutputFile.indexedAt = Date()
+                try store.upsertSourceFile(noOutputFile)
+            }
+
             if let progress {
                 await progress(report, source, fileURL.path)
             }
