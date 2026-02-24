@@ -179,21 +179,25 @@ final class WhisperTranscriber: NSObject {
         onRecordingStateChange?(true)
 
         let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
 
-        guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-              let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
         else {
             updateStatus("Audio converter setup failed")
-            CrashReporter.logError("Whisper audio converter setup failed")
+            CrashReporter.logError("Whisper target audio format setup failed")
             restoreMicSelection()
             isRecording = false
             onRecordingStateChange?(false)
             return false
         }
 
+        // Build converter lazily from the first buffer's real format.
+        // This avoids tap install crashes if the active hardware format changes.
+        var converter: AVAudioConverter?
+
+        audioEngine.stop()
+        audioEngine.reset()
         inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
 
             let level = self.normalizedAudioLevel(from: buffer)
@@ -201,7 +205,17 @@ final class WhisperTranscriber: NSObject {
                 self.onAudioLevel?(level)
             }
 
-            guard let convertedBuffer = self.convert(buffer: buffer, converter: converter, outputFormat: targetFormat) else {
+            if converter == nil {
+                converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+                if converter == nil {
+                    CrashReporter.logError("Whisper audio converter setup failed at runtime from format=\(buffer.format)")
+                    return
+                }
+            }
+
+            guard let activeConverter = converter,
+                  let convertedBuffer = self.convert(buffer: buffer, converter: activeConverter, outputFormat: targetFormat)
+            else {
                 return
             }
 
