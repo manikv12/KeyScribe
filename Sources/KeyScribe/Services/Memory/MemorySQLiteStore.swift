@@ -30,7 +30,7 @@ enum MemorySQLiteStoreError: LocalizedError {
 }
 
 final class MemorySQLiteStore {
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
 
     let databaseURL: URL
     private var database: OpaquePointer?
@@ -182,6 +182,30 @@ final class MemorySQLiteStore {
         try execute(sql: """
         CREATE INDEX IF NOT EXISTS idx_memory_cards_rewrite
             ON memory_cards(provider, is_plan_content, score DESC, updated_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS memory_lessons (
+            id TEXT PRIMARY KEY NOT NULL,
+            source_id TEXT NOT NULL REFERENCES memory_sources(id) ON DELETE CASCADE,
+            source_file_id TEXT NOT NULL REFERENCES memory_files(id) ON DELETE CASCADE,
+            event_id TEXT NOT NULL REFERENCES memory_events(id) ON DELETE CASCADE,
+            card_id TEXT NOT NULL REFERENCES memory_cards(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            mistake_pattern TEXT NOT NULL,
+            improved_prompt TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            validation_confidence REAL NOT NULL DEFAULT 0,
+            source_metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(card_id)
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_memory_lessons_lookup
+            ON memory_lessons(provider, validation_confidence DESC, updated_at DESC);
         """)
 
         try execute(sql: """
@@ -340,6 +364,43 @@ final class MemorySQLiteStore {
         })
     }
 
+    func upsertLesson(_ lesson: MemoryLesson) throws {
+        let sql = """
+        INSERT INTO memory_lessons (
+            id, source_id, source_file_id, event_id, card_id, provider, mistake_pattern, improved_prompt,
+            rationale, validation_confidence, source_metadata_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(card_id) DO UPDATE SET
+            id = excluded.id,
+            source_id = excluded.source_id,
+            source_file_id = excluded.source_file_id,
+            event_id = excluded.event_id,
+            provider = excluded.provider,
+            mistake_pattern = excluded.mistake_pattern,
+            improved_prompt = excluded.improved_prompt,
+            rationale = excluded.rationale,
+            validation_confidence = excluded.validation_confidence,
+            source_metadata_json = excluded.source_metadata_json,
+            updated_at = excluded.updated_at;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(lesson.id.uuidString, at: 1, in: statement)
+            self.bind(lesson.sourceID.uuidString, at: 2, in: statement)
+            self.bind(lesson.sourceFileID.uuidString, at: 3, in: statement)
+            self.bind(lesson.eventID.uuidString, at: 4, in: statement)
+            self.bind(lesson.cardID.uuidString, at: 5, in: statement)
+            self.bind(lesson.provider.rawValue, at: 6, in: statement)
+            self.bind(lesson.mistakePattern, at: 7, in: statement)
+            self.bind(lesson.improvedPrompt, at: 8, in: statement)
+            self.bind(lesson.rationale, at: 9, in: statement)
+            self.bind(lesson.validationConfidence, at: 10, in: statement)
+            self.bind(self.encodeJSON(lesson.sourceMetadata, fallback: "{}"), at: 11, in: statement)
+            self.bind(lesson.createdAt.timeIntervalSince1970, at: 12, in: statement)
+            self.bind(lesson.updatedAt.timeIntervalSince1970, at: 13, in: statement)
+        })
+    }
+
     func insertRewriteSuggestion(_ suggestion: RewriteSuggestion) throws {
         let sql = """
         INSERT INTO rewrite_suggestions (
@@ -365,6 +426,143 @@ final class MemorySQLiteStore {
             self.bind(suggestion.confidence, at: 7, in: statement)
             self.bind(suggestion.createdAt.timeIntervalSince1970, at: 8, in: statement)
         })
+    }
+
+    func upsertFeedbackRewriteMemory(
+        originalText: String,
+        rewrittenText: String,
+        rationale: String,
+        confidence: Double,
+        timestamp: Date = Date()
+    ) throws {
+        let normalizedOriginal = MemoryTextNormalizer.collapsedWhitespace(originalText)
+        let normalizedRewritten = MemoryTextNormalizer.collapsedWhitespace(rewrittenText)
+        guard !normalizedOriginal.isEmpty, !normalizedRewritten.isEmpty else {
+            return
+        }
+
+        let sourceID = MemoryIdentifier.stableUUID(for: "source|feedback-rewrites")
+        let sourceFileID = MemoryIdentifier.stableUUID(for: "file|\(sourceID.uuidString)|feedback-rewrites")
+        let eventID = MemoryIdentifier.stableUUID(
+            for: "event|\(sourceFileID.uuidString)|\(normalizedOriginal)|\(normalizedRewritten)"
+        )
+        let cardID = MemoryIdentifier.stableUUID(
+            for: "card|\(eventID.uuidString)|\(normalizedOriginal)|\(normalizedRewritten)"
+        )
+        let suggestionID = MemoryIdentifier.stableUUID(
+            for: "rewrite|\(cardID.uuidString)|\(normalizedOriginal)|\(normalizedRewritten)"
+        )
+
+        let source = MemorySource(
+            id: sourceID,
+            provider: .unknown,
+            rootPath: "internal://prompt-rewrite-feedback",
+            displayName: "KeyScribe Learned Rewrites",
+            discoveredAt: timestamp,
+            metadata: [
+                "origin": "user-feedback"
+            ]
+        )
+        try upsertSource(source)
+
+        let pseudoPath = "feedback/rewrite-feedback.jsonl"
+        let sourceFile = MemorySourceFile(
+            id: sourceFileID,
+            sourceID: sourceID,
+            absolutePath: pseudoPath,
+            relativePath: pseudoPath,
+            fileHash: MemoryIdentifier.stableHexDigest(for: "\(normalizedOriginal)|\(normalizedRewritten)"),
+            fileSizeBytes: Int64((normalizedOriginal + normalizedRewritten).utf8.count),
+            modifiedAt: timestamp,
+            indexedAt: timestamp,
+            parseError: nil
+        )
+        try upsertSourceFile(sourceFile)
+
+        let summary = MemoryTextNormalizer.normalizedSummary("User-confirmed prompt fix: \(normalizedOriginal) -> \(normalizedRewritten)")
+        let event = MemoryEvent(
+            id: eventID,
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            provider: .unknown,
+            kind: .rewrite,
+            title: "User Confirmed Prompt Fix",
+            body: "\(normalizedOriginal) -> \(normalizedRewritten)",
+            timestamp: timestamp,
+            nativeSummary: summary,
+            keywords: MemoryTextNormalizer.keywords(from: "\(normalizedOriginal) \(normalizedRewritten)", limit: 16),
+            isPlanContent: false,
+            metadata: [
+                "original_text": normalizedOriginal,
+                "suggested_text": normalizedRewritten,
+                "rationale": rationale,
+                "origin": "prompt-rewrite-feedback"
+            ],
+            rawPayload: nil
+        )
+        try upsertEvent(event)
+
+        let card = MemoryCard(
+            id: cardID,
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            eventID: eventID,
+            provider: .unknown,
+            title: MemoryTextNormalizer.normalizedTitle(normalizedOriginal, fallback: "Prompt rewrite"),
+            summary: summary,
+            detail: "\(normalizedOriginal)\n->\n\(normalizedRewritten)",
+            keywords: MemoryTextNormalizer.keywords(from: "\(normalizedOriginal) \(normalizedRewritten)", limit: 16),
+            score: 0.96,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            isPlanContent: false,
+            metadata: [
+                "origin": "prompt-rewrite-feedback",
+                "rationale": rationale
+            ]
+        )
+        try upsertCard(card)
+
+        let normalizedConfidence = min(1.0, max(0.05, confidence))
+        let suggestion = RewriteSuggestion(
+            id: suggestionID,
+            cardID: cardID,
+            provider: .unknown,
+            originalText: normalizedOriginal,
+            suggestedText: normalizedRewritten,
+            rationale: rationale,
+            confidence: normalizedConfidence,
+            createdAt: timestamp
+        )
+        try insertRewriteSuggestion(suggestion)
+
+        let lesson = MemoryLesson(
+            id: MemoryIdentifier.stableUUID(
+                for: "lesson|\(cardID.uuidString)|\(normalizedOriginal)|\(normalizedRewritten)"
+            ),
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            eventID: eventID,
+            cardID: cardID,
+            provider: .unknown,
+            mistakePattern: normalizedOriginal,
+            improvedPrompt: normalizedRewritten,
+            rationale: rationale,
+            validationConfidence: max(0.95, normalizedConfidence),
+            sourceMetadata: [
+                "origin": "prompt-rewrite-feedback",
+                "validation_state": "user-confirmed",
+                "extraction_method": "user-feedback"
+            ],
+            createdAt: timestamp,
+            updatedAt: timestamp
+        )
+        try upsertLesson(lesson)
+        try supersedeCompetingLessons(
+            with: lesson,
+            reason: "Superseded by a newer user-confirmed correction.",
+            timestamp: timestamp
+        )
     }
 
     func fetchRewriteSuggestions(
@@ -406,6 +604,109 @@ final class MemorySQLiteStore {
                 createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
             )
         })
+    }
+
+    func fetchLessonsForRewrite(
+        query searchQuery: String,
+        provider: MemoryProviderKind? = nil,
+        limit: Int = 20
+    ) throws -> [MemoryLesson] {
+        let normalizedQuery = MemoryTextNormalizer.collapsedWhitespace(searchQuery)
+        let hasSearchTerm = !normalizedQuery.isEmpty
+        let likeValue = "%\(escapedLike(normalizedQuery))%"
+        let providerRawValue = provider?.rawValue
+        let normalizedLimit = max(1, min(limit, 300))
+
+        let sql = """
+        SELECT
+            id, source_id, source_file_id, event_id, card_id, provider, mistake_pattern, improved_prompt,
+            rationale, validation_confidence, source_metadata_json, created_at, updated_at
+        FROM memory_lessons
+        WHERE (? IS NULL OR provider = ?)
+            AND (
+                ? = 0
+                OR mistake_pattern LIKE ? ESCAPE '\\'
+                OR improved_prompt LIKE ? ESCAPE '\\'
+                OR rationale LIKE ? ESCAPE '\\'
+            )
+        ORDER BY validation_confidence DESC, updated_at DESC
+        LIMIT ?;
+        """
+
+        return try self.query(sql: sql, bind: { statement in
+            self.bind(providerRawValue, at: 1, in: statement)
+            self.bind(providerRawValue, at: 2, in: statement)
+            self.bind(hasSearchTerm ? 1 : 0, at: 3, in: statement)
+            self.bind(likeValue, at: 4, in: statement)
+            self.bind(likeValue, at: 5, in: statement)
+            self.bind(likeValue, at: 6, in: statement)
+            self.bind(Int64(normalizedLimit), at: 7, in: statement)
+        }, mapRow: { statement in
+            MemoryLesson(
+                id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),
+                sourceID: UUID(uuidString: self.readString(at: 1, in: statement) ?? "") ?? UUID(),
+                sourceFileID: UUID(uuidString: self.readString(at: 2, in: statement) ?? "") ?? UUID(),
+                eventID: UUID(uuidString: self.readString(at: 3, in: statement) ?? "") ?? UUID(),
+                cardID: UUID(uuidString: self.readString(at: 4, in: statement) ?? "") ?? UUID(),
+                provider: MemoryProviderKind(rawValue: self.readString(at: 5, in: statement) ?? "") ?? .unknown,
+                mistakePattern: self.readString(at: 6, in: statement) ?? "",
+                improvedPrompt: self.readString(at: 7, in: statement) ?? "",
+                rationale: self.readString(at: 8, in: statement) ?? "",
+                validationConfidence: sqlite3_column_double(statement, 9),
+                sourceMetadata: self.decodeStringDictionary(from: self.readString(at: 10, in: statement) ?? "{}"),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 11)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 12))
+            )
+        })
+    }
+
+    func supersedeCompetingLessons(
+        with betterLesson: MemoryLesson,
+        reason: String,
+        timestamp: Date = Date()
+    ) throws {
+        let normalizedMistake = MemoryTextNormalizer.collapsedWhitespace(betterLesson.mistakePattern)
+        let normalizedCorrection = MemoryTextNormalizer.collapsedWhitespace(betterLesson.improvedPrompt)
+        guard !normalizedMistake.isEmpty, !normalizedCorrection.isEmpty else { return }
+
+        let candidates = try fetchLessonsForRewrite(
+            query: "",
+            provider: nil,
+            limit: 1200
+        )
+
+        for lesson in candidates {
+            if lesson.id == betterLesson.id {
+                continue
+            }
+            let lessonMistake = MemoryTextNormalizer.collapsedWhitespace(lesson.mistakePattern)
+            let lessonCorrection = MemoryTextNormalizer.collapsedWhitespace(lesson.improvedPrompt)
+            guard isSameScenario(lessonMistake, normalizedMistake) else { continue }
+            guard !isEquivalentCorrection(lessonCorrection, normalizedCorrection) else { continue }
+
+            if lessonValidationState(from: lesson) == .invalidated {
+                continue
+            }
+
+            guard shouldInvalidateExistingLesson(lesson, replacement: betterLesson) else { continue }
+            let betterScore = lessonSelectionScore(for: betterLesson)
+            let existingScore = lessonSelectionScore(for: lesson)
+
+            var updated = lesson
+            updated.validationConfidence = min(updated.validationConfidence, 0.05)
+            updated.updatedAt = timestamp
+
+            var metadata = updated.sourceMetadata
+            metadata["validation_state"] = MemoryRewriteLessonValidationState.invalidated.rawValue
+            metadata["invalidated_by_lesson_id"] = betterLesson.id.uuidString
+            metadata["invalidated_at"] = iso8601Timestamp(timestamp)
+            metadata["invalidation_reason"] = MemoryTextNormalizer.normalizedSummary(reason, limit: 240)
+            metadata["invalidation_existing_score"] = String(format: "%.3f", existingScore)
+            metadata["invalidation_replacement_score"] = String(format: "%.3f", betterScore)
+            updated.sourceMetadata = metadata
+
+            try upsertLesson(updated)
+        }
     }
 
     func fetchCardsForRewrite(
@@ -472,6 +773,66 @@ final class MemorySQLiteStore {
         })
     }
 
+    func fetchIndexedEntries(
+        query searchQuery: String,
+        provider: MemoryProviderKind? = nil,
+        sourceRootPath: String? = nil,
+        includePlanContent: Bool = false,
+        limit: Int = 80
+    ) throws -> [MemoryIndexedEntry] {
+        let normalizedQuery = MemoryTextNormalizer.collapsedWhitespace(searchQuery)
+        let hasSearchTerm = !normalizedQuery.isEmpty
+        let likeValue = "%\(escapedLike(normalizedQuery))%"
+        let providerRawValue = provider?.rawValue
+        let normalizedSourceRootPath = sourceRootPath?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedLimit = max(1, min(limit, 400))
+
+        let sql = """
+        SELECT
+            c.id,
+            c.provider,
+            s.root_path,
+            c.title,
+            c.summary,
+            c.detail,
+            c.updated_at,
+            c.is_plan_content
+        FROM memory_cards c
+        JOIN memory_sources s ON s.id = c.source_id
+        WHERE (? IS NULL OR c.provider = ?)
+            AND (? = 1 OR c.is_plan_content = 0)
+            AND (? IS NULL OR s.root_path = ?)
+            AND (? = 0 OR c.title LIKE ? ESCAPE '\\' OR c.summary LIKE ? ESCAPE '\\' OR c.detail LIKE ? ESCAPE '\\')
+        ORDER BY c.updated_at DESC, c.score DESC
+        LIMIT ?;
+        """
+
+        return try self.query(sql: sql, bind: { statement in
+            self.bind(providerRawValue, at: 1, in: statement)
+            self.bind(providerRawValue, at: 2, in: statement)
+            self.bind(includePlanContent ? 1 : 0, at: 3, in: statement)
+            self.bind(normalizedSourceRootPath, at: 4, in: statement)
+            self.bind(normalizedSourceRootPath, at: 5, in: statement)
+            self.bind(hasSearchTerm ? 1 : 0, at: 6, in: statement)
+            self.bind(likeValue, at: 7, in: statement)
+            self.bind(likeValue, at: 8, in: statement)
+            self.bind(likeValue, at: 9, in: statement)
+            self.bind(Int64(normalizedLimit), at: 10, in: statement)
+        }, mapRow: { statement in
+            MemoryIndexedEntry(
+                id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),
+                provider: MemoryProviderKind(rawValue: self.readString(at: 1, in: statement) ?? "") ?? .unknown,
+                sourceRootPath: self.readString(at: 2, in: statement) ?? "",
+                title: self.readString(at: 3, in: statement) ?? "",
+                summary: self.readString(at: 4, in: statement) ?? "",
+                detail: self.readString(at: 5, in: statement) ?? "",
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 6)),
+                isPlanContent: sqlite3_column_int(statement, 7) == 1
+            )
+        })
+    }
+
     func fetchSourceFile(
         sourceID: UUID,
         relativePath: String
@@ -524,6 +885,7 @@ final class MemorySQLiteStore {
 
     func clearAllIndexedData() throws {
         try execute(sql: "DELETE FROM rewrite_suggestions;")
+        try execute(sql: "DELETE FROM memory_lessons;")
         try execute(sql: "DELETE FROM memory_cards;")
         try execute(sql: "DELETE FROM memory_events;")
         try execute(sql: "DELETE FROM memory_files;")
@@ -553,6 +915,130 @@ final class MemorySQLiteStore {
 
         guard let first = rows.first else { return nil }
         return Int(first)
+    }
+
+    private func lessonValidationState(from lesson: MemoryLesson) -> MemoryRewriteLessonValidationState {
+        let metadata = lesson.sourceMetadata
+        if let rawState = metadata["validation_state"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            switch rawState {
+            case "invalidated":
+                return .invalidated
+            case "user-confirmed":
+                return .userConfirmed
+            case "indexed-validated":
+                return .indexedValidated
+            case "unvalidated":
+                return .unvalidated
+            default:
+                break
+            }
+        }
+
+        let origin = metadata["origin"]?.lowercased() ?? ""
+        if origin.contains("prompt-rewrite-feedback") || origin.contains("user-feedback") {
+            return .userConfirmed
+        }
+        if lesson.validationConfidence >= 0.80 {
+            return .indexedValidated
+        }
+        return .unvalidated
+    }
+
+    private func lessonSelectionScore(for lesson: MemoryLesson) -> Double {
+        let state = lessonValidationState(from: lesson)
+        let stateBoost: Double
+        switch state {
+        case .userConfirmed:
+            stateBoost = 0.50
+        case .indexedValidated:
+            stateBoost = 0.28
+        case .unvalidated:
+            stateBoost = 0.0
+        case .invalidated:
+            stateBoost = -1.0
+        }
+        return lesson.validationConfidence + stateBoost
+    }
+
+    private func shouldInvalidateExistingLesson(_ existingLesson: MemoryLesson, replacement: MemoryLesson) -> Bool {
+        let replacementState = lessonValidationState(from: replacement)
+        guard replacementState != .invalidated else { return false }
+
+        let replacementScore = lessonSelectionScore(for: replacement)
+        let existingScore = lessonSelectionScore(for: existingLesson)
+
+        switch replacementState {
+        case .userConfirmed:
+            if replacementScore + 0.02 < existingScore {
+                return false
+            }
+            if replacementScore > existingScore + 0.04 {
+                return true
+            }
+            return replacement.updatedAt >= existingLesson.updatedAt
+        case .indexedValidated:
+            return replacementScore > existingScore + 0.05
+        case .unvalidated:
+            return replacementScore > existingScore + 0.08
+        case .invalidated:
+            return false
+        }
+    }
+
+    private func isSameScenario(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs.caseInsensitiveCompare(rhs) == .orderedSame {
+            return true
+        }
+
+        let lhsLower = lhs.lowercased()
+        let rhsLower = rhs.lowercased()
+        let shorterLength = min(lhsLower.count, rhsLower.count)
+        if shorterLength >= 20,
+           lhsLower.contains(rhsLower) || rhsLower.contains(lhsLower) {
+            return true
+        }
+
+        let lhsTokens = tokenSet(for: lhsLower)
+        let rhsTokens = tokenSet(for: rhsLower)
+        guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else { return false }
+
+        let shared = lhsTokens.intersection(rhsTokens).count
+        guard shared >= 3 else { return false }
+        let minCount = min(lhsTokens.count, rhsTokens.count)
+        let containment = Double(shared) / Double(max(1, minCount))
+        return containment >= 0.68
+    }
+
+    private func isEquivalentCorrection(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs.caseInsensitiveCompare(rhs) == .orderedSame {
+            return true
+        }
+
+        let lhsTokens = tokenSet(for: lhs)
+        let rhsTokens = tokenSet(for: rhs)
+        guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else { return false }
+
+        let shared = lhsTokens.intersection(rhsTokens).count
+        let minCount = min(lhsTokens.count, rhsTokens.count)
+        if minCount <= 3 {
+            return shared == minCount
+        }
+
+        let containment = Double(shared) / Double(max(1, minCount))
+        return shared >= 3 && containment >= 0.84
+    }
+
+    private func tokenSet(for value: String, minTokenLength: Int = 3, limit: Int = 24) -> Set<String> {
+        let tokens = MemoryTextNormalizer.keywords(from: value, limit: limit)
+            .filter { $0.count >= minTokenLength }
+            .map { $0.lowercased() }
+        return Set(tokens)
+    }
+
+    private func iso8601Timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     private func open() throws {

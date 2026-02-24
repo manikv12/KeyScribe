@@ -37,12 +37,21 @@ swiftc \
   Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
   Sources/KeyScribe/Services/CrashReporter.swift \
   Sources/KeyScribe/Services/SettingsStore.swift \
+  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
   Scripts/SettingsStoreWhisperSmokeTests.swift \
   -o /tmp/keyscribe-settings-whisper-smoke-tests
 
 /tmp/keyscribe-settings-whisper-smoke-tests
 
 swiftc \
+  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
+  Sources/KeyScribe/Support/ShortcutValidation.swift \
+  Sources/KeyScribe/Services/MicrophoneManager.swift \
+  Sources/KeyScribe/Services/TextCleanup.swift \
+  Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
+  Sources/KeyScribe/Services/CrashReporter.swift \
+  Sources/KeyScribe/Services/SettingsStore.swift \
+  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
   Sources/KeyScribe/Services/Memory/MemoryModels.swift \
   Sources/KeyScribe/Services/Memory/MemorySQLiteStore.swift \
   Sources/KeyScribe/Services/Memory/MemoryRewriteRetrievalService.swift \
@@ -53,9 +62,32 @@ swiftc \
 /tmp/keyscribe-prompt-rewrite-smoke-tests
 
 swiftc \
+  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
+  Sources/KeyScribe/Support/ShortcutValidation.swift \
+  Sources/KeyScribe/Services/MicrophoneManager.swift \
+  Sources/KeyScribe/Services/TextCleanup.swift \
+  Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
+  Sources/KeyScribe/Services/CrashReporter.swift \
+  Sources/KeyScribe/Services/SettingsStore.swift \
+  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
+  Sources/KeyScribe/Services/PromptRewriteModelCatalogService.swift \
+  Scripts/PromptRewriteModelCatalogSmokeTests.swift \
+  -o /tmp/keyscribe-prompt-rewrite-model-catalog-smoke-tests
+
+/tmp/keyscribe-prompt-rewrite-model-catalog-smoke-tests
+
+swiftc \
   Sources/KeyScribe/Services/Memory/MemoryModels.swift \
   Sources/KeyScribe/Services/Memory/MemoryProviderDiscoveryService.swift \
   Sources/KeyScribe/Services/Memory/MemorySourceAdapters.swift \
+  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
+  Sources/KeyScribe/Support/ShortcutValidation.swift \
+  Sources/KeyScribe/Services/MicrophoneManager.swift \
+  Sources/KeyScribe/Services/TextCleanup.swift \
+  Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
+  Sources/KeyScribe/Services/CrashReporter.swift \
+  Sources/KeyScribe/Services/SettingsStore.swift \
+  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
   Sources/KeyScribe/Services/Memory/MemoryRewriteExtractionProvider.swift \
   Sources/KeyScribe/Services/Memory/MemorySQLiteStore.swift \
   Sources/KeyScribe/Services/Memory/MemoryIndexingService.swift \

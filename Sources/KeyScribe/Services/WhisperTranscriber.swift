@@ -33,6 +33,20 @@ final class WhisperTranscriber: NSObject {
     private var activeFinalizeRunID: String?
 
     private let modelManager = WhisperModelManager.shared
+    private let whisperSampleRate: Float = 16_000
+    private let minimumSpeechDurationSeconds: TimeInterval = 0.16
+    private let minimumSpeechActiveFrameRatio: Float = 0.03
+    private let minimumSpeechPeakAmplitude: Float = 0.003
+
+    private struct SpeechGateAnalysis {
+        let hasLikelySpeech: Bool
+        let reason: String
+    }
+
+    private struct DecodedSegment {
+        let text: String
+        let noSpeechProbability: Float
+    }
 
     override init() {
         super.init()
@@ -310,6 +324,17 @@ final class WhisperTranscriber: NSObject {
             return
         }
 
+        let speechGate = analyzeSpeechLikelihood(in: samplesToTranscribe, sampleRate: whisperSampleRate)
+        guard speechGate.hasLikelySpeech else {
+            isTranscribing = false
+            restoreMicSelection()
+            updateStatus("Ready")
+            CrashReporter.logInfo(
+                "Whisper finalize skipped: speech gate rejected audio model=\(selectedModelID) reason=\(speechGate.reason) samples=\(samplesToTranscribe.count)"
+            )
+            return
+        }
+
         isTranscribing = true
         if shouldForceCPUForStability {
             updateStatus("Finalizing… (small/medium can take up to ~2 minutes on CPU)")
@@ -435,6 +460,8 @@ final class WhisperTranscriber: NSObject {
         params.single_segment = false
         params.n_threads = Int32(max(1, threadCount))
         params.offset_ms = 0
+        params.suppress_nst = true
+        params.no_speech_thold = max(params.no_speech_thold, 0.65)
 
         let runResult: Int32 = language.withCString { languageCString in
             params.language = languageCString
@@ -462,14 +489,22 @@ final class WhisperTranscriber: NSObject {
         }
 
         let segmentCount = whisper_full_n_segments(ctx)
-        var transcript = ""
-        transcript.reserveCapacity(512)
+        var segments: [DecodedSegment] = []
+        segments.reserveCapacity(Int(segmentCount))
 
         for i in 0..<segmentCount {
             guard let raw = whisper_full_get_segment_text(ctx, i) else { continue }
-            transcript += String(cString: raw)
+            let text = String(cString: raw)
+            let noSpeechProbability = whisper_full_get_segment_no_speech_prob(ctx, i)
+            segments.append(
+                DecodedSegment(
+                    text: text,
+                    noSpeechProbability: noSpeechProbability
+                )
+            )
         }
 
+        let transcript = filteredTranscript(from: segments)
         return .success(transcript)
     }
 
@@ -505,6 +540,152 @@ final class WhisperTranscriber: NSObject {
         }
 
         return outputBuffer
+    }
+
+    private func analyzeSpeechLikelihood(in samples: [Float], sampleRate: Float) -> SpeechGateAnalysis {
+        guard !samples.isEmpty else {
+            return SpeechGateAnalysis(hasLikelySpeech: false, reason: "empty-samples")
+        }
+
+        guard sampleRate > 0 else {
+            return SpeechGateAnalysis(hasLikelySpeech: true, reason: "no-sample-rate")
+        }
+
+        let peakAmplitude = samples.reduce(Float(0)) { max($0, abs($1)) }
+        guard peakAmplitude >= minimumSpeechPeakAmplitude else {
+            return SpeechGateAnalysis(
+                hasLikelySpeech: false,
+                reason: String(format: "low-peak=%.4f", peakAmplitude)
+            )
+        }
+
+        let frameLength = 320 // 20 ms @ 16 kHz
+        let hopLength = 160 // 10 ms @ 16 kHz
+
+        guard samples.count >= frameLength else {
+            return SpeechGateAnalysis(
+                hasLikelySpeech: false,
+                reason: "too-short=\(samples.count)"
+            )
+        }
+
+        var frameRMS: [Float] = []
+        frameRMS.reserveCapacity(max(1, samples.count / hopLength))
+
+        var frameStart = 0
+        while frameStart + frameLength <= samples.count {
+            var sumSquares: Float = 0
+            for i in frameStart..<(frameStart + frameLength) {
+                let sample = samples[i]
+                sumSquares += sample * sample
+            }
+            let rms = sqrtf(max(sumSquares / Float(frameLength), 1e-12))
+            frameRMS.append(rms)
+            frameStart += hopLength
+        }
+
+        guard !frameRMS.isEmpty else {
+            return SpeechGateAnalysis(hasLikelySpeech: false, reason: "no-frames")
+        }
+
+        let sortedRMS = frameRMS.sorted()
+        let noiseFloorIndex = max(0, Int(Float(sortedRMS.count - 1) * 0.20))
+        let noiseFloor = sortedRMS[noiseFloorIndex]
+        let activeThreshold = max(noiseFloor * 2.2, 0.0025)
+        let activeFrameCount = frameRMS.reduce(0) { partialResult, value in
+            partialResult + (value >= activeThreshold ? 1 : 0)
+        }
+
+        let activeRatio = Float(activeFrameCount) / Float(frameRMS.count)
+        let activeDurationSeconds = TimeInterval(activeFrameCount * hopLength) / TimeInterval(sampleRate)
+
+        guard activeRatio >= minimumSpeechActiveFrameRatio else {
+            return SpeechGateAnalysis(
+                hasLikelySpeech: false,
+                reason: String(format: "low-active-ratio=%.3f", activeRatio)
+            )
+        }
+
+        guard activeDurationSeconds >= minimumSpeechDurationSeconds else {
+            return SpeechGateAnalysis(
+                hasLikelySpeech: false,
+                reason: String(format: "short-active=%.3fs", activeDurationSeconds)
+            )
+        }
+
+        return SpeechGateAnalysis(
+            hasLikelySpeech: true,
+            reason: String(
+                format: "ok peak=%.4f active=%.3f dur=%.3fs",
+                peakAmplitude,
+                activeRatio,
+                activeDurationSeconds
+            )
+        )
+    }
+
+    private func filteredTranscript(from segments: [DecodedSegment]) -> String {
+        struct CandidateSegment {
+            let text: String
+            let noSpeechProbability: Float
+            let wordCount: Int
+        }
+
+        let candidates = segments.compactMap { segment -> CandidateSegment? in
+            let trimmed = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+
+            return CandidateSegment(
+                text: trimmed,
+                noSpeechProbability: max(0, min(1, segment.noSpeechProbability)),
+                wordCount: trimmed.split { $0.isWhitespace || $0.isNewline }.count
+            )
+        }
+
+        guard !candidates.isEmpty else { return "" }
+
+        let averageNoSpeechProbability =
+            candidates.reduce(Float(0)) { $0 + $1.noSpeechProbability } / Float(candidates.count)
+        let strongSpeechSegmentCount = candidates.reduce(0) { partialResult, candidate in
+            partialResult + (candidate.noSpeechProbability < 0.55 ? 1 : 0)
+        }
+        let totalWordCount = candidates.reduce(0) { $0 + $1.wordCount }
+        let totalCharacterCount = candidates.reduce(0) { $0 + $1.text.count }
+
+        if strongSpeechSegmentCount == 0,
+           averageNoSpeechProbability >= 0.78,
+           (totalWordCount <= 8 || totalCharacterCount <= 48) {
+            CrashReporter.logInfo(
+                String(
+                    format: "Whisper output dropped: no-speech gate avg=%.3f words=%d chars=%d",
+                    averageNoSpeechProbability,
+                    totalWordCount,
+                    totalCharacterCount
+                )
+            )
+            return ""
+        }
+
+        let keptSegments = candidates.filter { candidate in
+            !(candidate.noSpeechProbability > 0.92 && candidate.wordCount <= 2 && candidate.text.count <= 12)
+        }
+
+        let transcript = keptSegments
+            .map(\.text)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if transcript.isEmpty {
+            CrashReporter.logInfo(
+                String(
+                    format: "Whisper output dropped: segment filter removed all content avg=%.3f segments=%d",
+                    averageNoSpeechProbability,
+                    candidates.count
+                )
+            )
+        }
+
+        return transcript
     }
 
     private func updateStatus(_ message: String) {

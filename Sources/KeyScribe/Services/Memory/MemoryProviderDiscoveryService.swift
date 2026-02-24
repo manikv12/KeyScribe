@@ -224,6 +224,7 @@ final class MemoryProviderDiscoveryService {
                 guard name.hasPrefix(".") else { continue }
 
                 let kind = inferredKind(forHiddenFolder: name)
+                guard kind != .unknown else { continue }
                 let providerID = kind.rawValue
                 if !normalizedProviderFilter.isEmpty && !normalizedProviderFilter.contains(providerID) {
                     continue

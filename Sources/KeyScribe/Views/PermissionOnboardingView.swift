@@ -27,12 +27,22 @@ struct PermissionOnboardingView: View {
             .ignoresSafeArea()
 
             VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Finish Permission Setup")
-                        .font(.title2.weight(.semibold))
-                    Text("KeyScribe needs these permissions before dictation and global shortcuts can run.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    if let icon = NSApplication.shared.applicationIconImage {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 56, height: 56)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Finish Permission Setup")
+                            .font(.title2.weight(.semibold))
+                        Text("KeyScribe needs these permissions before dictation and global shortcuts can run.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 10) {

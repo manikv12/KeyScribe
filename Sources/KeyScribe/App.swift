@@ -4,6 +4,10 @@ import Combine
 import Speech
 import SwiftUI
 
+extension Notification.Name {
+    static let keyScribeOpenAIMemoryStudio = Notification.Name("KeyScribe.openAIMemoryStudio")
+}
+
 @main
 struct KeyScribeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
@@ -38,11 +42,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowCoordinator: AppWindowCoordinator?
 
     private var statusItem: NSStatusItem?
-    private var statusLabelItem: NSMenuItem?
-    private var startStopMenuItem: NSMenuItem?
-    private var permissionSetupMenuItem: NSMenuItem?
+    private let statusBarViewModel = StatusBarViewModel()
+    private var popover: NSPopover?
     private var accessibilityTrustObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
+    private var aiStudioRequestObserver: NSObjectProtocol?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var permissionsReady = false
     private var didRequestStartupPermissionPrompt = false
@@ -266,6 +270,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        aiStudioRequestObserver = NotificationCenter.default.addObserver(
+            forName: .keyScribeOpenAIMemoryStudio,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.windowCoordinator?.openAIMemoryStudioWindow()
+            }
+        }
+
         updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
     }
 
@@ -277,6 +291,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let workspaceActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
             self.workspaceActivationObserver = nil
+        }
+        if let aiStudioRequestObserver {
+            NotificationCenter.default.removeObserver(aiStudioRequestObserver)
+            self.aiStudioRequestObserver = nil
         }
         adaptiveCorrectionObserver?.cancel()
         adaptiveCorrectionObserver = nil
@@ -393,51 +411,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.button?.imagePosition = .imageOnly
         statusItem?.button?.image = makeStatusIcon(isRecording: false, level: 0)
         statusItem?.button?.toolTip = "KeyScribe"
+        statusItem?.button?.target = self
+        statusItem?.button?.action = #selector(togglePopover)
+        statusItem?.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
-        let menu = NSMenu()
-        statusItem?.menu = menu
-
-        menu.addItem(NSMenuItem(title: "KeyScribe", action: nil, keyEquivalent: ""))
-
-        statusLabelItem = NSMenuItem(title: DictationUIStatus.ready.menuText, action: nil, keyEquivalent: "")
-        menu.addItem(statusLabelItem!)
-
-        menu.addItem(NSMenuItem.separator())
-
-        startStopMenuItem = NSMenuItem(title: "Start Continuous Dictation", action: #selector(toggleDictation), keyEquivalent: "")
-        startStopMenuItem?.target = self
-        menu.addItem(startStopMenuItem!)
-
-        let pasteLastItem = NSMenuItem(title: "Paste Last Transcript", action: #selector(pasteLastTranscriptMenuItem(_:)), keyEquivalent: "v")
-        pasteLastItem.keyEquivalentModifierMask = [.command, .option]
-        pasteLastItem.target = self
-        menu.addItem(pasteLastItem)
-
-        let historyItem = NSMenuItem(title: "History…", action: #selector(openHistoryMenuItem(_:)), keyEquivalent: "h")
-        historyItem.target = self
-        menu.addItem(historyItem)
-
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsMenuItem(_:)), keyEquivalent: ",")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
-
-        let permissionItem = NSMenuItem(title: "Complete Permission Setup…", action: #selector(requestAccessibilityMenuItem(_:)), keyEquivalent: "")
-        permissionItem.target = self
-        permissionItem.isHidden = permissionsReady
-        menu.addItem(permissionItem)
-        self.permissionSetupMenuItem = permissionItem
-
-        if CrashReporter.hasLogs {
-            let crashLogsItem = NSMenuItem(title: "View Crash Logs…", action: #selector(viewCrashLogs(_:)), keyEquivalent: "")
-            crashLogsItem.target = self
-            menu.addItem(crashLogsItem)
+        // Wire view model actions
+        statusBarViewModel.onToggleDictation = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.toggleContinuousDictation()
+        }
+        statusBarViewModel.onPasteLastTranscript = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.pasteLastTranscriptFromHistory()
+        }
+        statusBarViewModel.onOpenHistory = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.windowCoordinator?.openHistoryWindow()
+        }
+        statusBarViewModel.onOpenAIMemoryStudio = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.windowCoordinator?.openAIMemoryStudioWindow()
+        }
+        statusBarViewModel.onOpenSettings = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.windowCoordinator?.openSettingsWindow()
+        }
+        statusBarViewModel.onQuit = {
+            NSApplication.shared.terminate(nil)
         }
 
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let popover = NSPopover()
+        popover.contentSize = NSSize(width: 260, height: 10)
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentViewController = NSHostingController(
+            rootView: StatusBarPopoverView(viewModel: statusBarViewModel)
+        )
+        self.popover = popover
+    }
 
-        if statusItem?.button != nil {
-            statusItem?.button?.appearsDisabled = false
+    @objc private func togglePopover() {
+        guard let button = statusItem?.button else { return }
+        if let popover, popover.isShown {
+            popover.performClose(nil)
+        } else {
+            popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
     }
 
@@ -567,29 +585,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteLastTranscriptHotkeyManager?.start()
     }
 
-    @objc private func openSettingsMenuItem(_ sender: Any?) {
-        windowCoordinator?.openSettingsWindow()
-    }
-
-    @objc private func openHistoryMenuItem(_ sender: Any?) {
-        windowCoordinator?.openHistoryWindow()
-    }
-
-    @objc private func viewCrashLogs(_ sender: Any?) {
-        CrashReporter.revealInFinder()
-    }
-
-    @objc private func requestAccessibilityMenuItem(_ sender: Any?) {
-        updatePermissionGate(openOnboardingIfNeeded: true)
-    }
-
-    @objc private func pasteLastTranscriptMenuItem(_ sender: Any?) {
-        pasteLastTranscriptFromHistory()
-    }
-
-    @objc private func toggleDictation() {
-        toggleContinuousDictation()
-    }
 
     private func startHoldToTalkDictation() {
         guard DictationInputModeStateMachine.onHoldStart(dictationInputMode) == .holdToTalk else {
@@ -1212,7 +1207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setUIStatus(_ status: DictationUIStatus) {
-        statusLabelItem?.title = status.menuText
+        statusBarViewModel.uiStatus = status
 
         if status.resetsDictationIndicators {
             isDictating = false
@@ -1235,11 +1230,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateMenuState() {
-        startStopMenuItem?.title = dictationInputMode == .continuous
-            ? "Stop Continuous Dictation"
-            : "Start Continuous Dictation"
-        startStopMenuItem?.isEnabled = permissionsReady
-        permissionSetupMenuItem?.isHidden = permissionsReady
+        statusBarViewModel.isContinuousMode = (dictationInputMode == .continuous)
+        statusBarViewModel.permissionsReady = permissionsReady
+        statusBarViewModel.isDictating = isDictating
+        statusBarViewModel.currentAudioLevel = currentAudioLevel
         statusItem?.button?.image = makeStatusIcon(isRecording: isDictating, level: currentAudioLevel)
         statusItem?.button?.contentTintColor = nil
     }
@@ -1282,27 +1276,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let symbol: NSImage?
         if #available(macOS 13.3, *) {
-            let variableValue = isRecording ? max(0.30, Double(animatedLevel)) : 0
-            symbol = NSImage(systemSymbolName: "waveform", variableValue: variableValue, accessibilityDescription: "KeyScribe")
+            let variableValue = isRecording ? max(0.30, Double(animatedLevel)) : 0.45
+            symbol = NSImage(systemSymbolName: "waveform.circle", variableValue: variableValue, accessibilityDescription: "KeyScribe")
         } else {
-            symbol = NSImage(systemSymbolName: "waveform", accessibilityDescription: "KeyScribe")
+            symbol = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "KeyScribe")
         }
 
         guard let symbol else {
             return nil
         }
 
-        if isRecording {
-            let recordingConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .heavy)
-            let configured = symbol.withSymbolConfiguration(recordingConfig)
-            configured?.isTemplate = true
-            return configured
-        }
+        let pointSize: CGFloat = 18
+        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .light)
+        guard let configured = symbol.withSymbolConfiguration(config) else { return nil }
+        configured.isTemplate = true
 
-        let idleConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .heavy)
-        let configured = symbol.withSymbolConfiguration(idleConfig)
-        configured?.isTemplate = true
-        return configured
+        // Flip horizontally so the variable fill runs left-to-right
+        let size = configured.size
+        let flipped = NSImage(size: size, flipped: false) { rect in
+            let transform = NSAffineTransform()
+            transform.translateX(by: size.width, yBy: 0)
+            transform.scaleX(by: -1, yBy: 1)
+            transform.concat()
+            configured.draw(in: rect)
+            return true
+        }
+        flipped.isTemplate = true
+        return flipped
     }
 }
 
@@ -1340,7 +1340,7 @@ struct SettingsView: View {
             case .recognition: return "Speech behavior and text quality"
             case .models: return "Install and select whisper models"
             case .corrections: return "Learn from and manage text fixes"
-            case .memorySources: return "Indexing controls and source selection"
+            case .memorySources: return "AI memory toggle and provider status"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
         }
@@ -1386,7 +1386,7 @@ struct SettingsView: View {
             case .corrections:
                 return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
             case .memorySources:
-                return ["memory", "index", "provider", "source", "folder", "archive", "rescan", "rebuild", "clear"]
+                return ["memory", "ai", "provider", "oauth", "status", "studio", "enable"]
             case .about:
                 return ["about", "permission", "uninstall", "version", "crash logs"]
             }
@@ -1457,9 +1457,12 @@ struct SettingsView: View {
     @State private var whisperFamilyFilter = "all"
     @State private var whisperShowInstalledOnly = false
     @State private var whisperBrowserModelID = ""
+    @State private var showUninstallSheet = false
     @State private var showUninstallConfirmation = false
     @State private var uninstallDeleteDownloadedModels = false
     @State private var uninstallDeleteLearnedCorrections = false
+    @State private var uninstallDeleteMemories = false
+    @State private var uninstallDeleteProviderCredentials = false
     @State private var isCorrectionEditorPresented = false
     @State private var correctionSourceDraft = ""
     @State private var correctionReplacementDraft = ""
@@ -1467,7 +1470,21 @@ struct SettingsView: View {
     @State private var correctionDialogMessage: String?
     @State private var detectedMemoryProviders: [MemoryIndexingSettingsService.Provider] = []
     @State private var detectedMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] = []
+    @State private var memoryProviderFilterQuery = ""
+    @State private var memoryFolderFilterQuery = ""
+    @State private var memoryShowSelectedProvidersOnly = false
+    @State private var memoryShowSelectedFoldersOnly = false
+    @State private var memoryFoldersOnlyEnabledProviders = true
+    @State private var memoryBrowserQuery = ""
+    @State private var memoryBrowserSelectedProviderID = "all"
+    @State private var memoryBrowserSelectedFolderID = "all"
+    @State private var memoryBrowserIncludePlanContent = false
+    @State private var memoryBrowserHighSignalOnly = true
+    @State private var memoryBrowserEntries: [MemoryIndexedEntry] = []
+    @State private var promptRewriteOpenAIKeyVisible = false
     @State private var memoryActionMessage: String?
+    @State private var showingProvidersSheet = false
+    @State private var showingSourceFoldersSheet = false
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let settingsSidebarWidth: CGFloat = 278
     private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
@@ -1497,7 +1514,7 @@ struct SettingsView: View {
                 isCapturing: $isCapturingShortcut,
                 onCapture: { keyCode, modifiers in
                     guard let target = shortcutCaptureTarget else {
-                        return
+                        return false
                     }
 
                     let didApply = applyShortcutSelection(
@@ -1506,9 +1523,10 @@ struct SettingsView: View {
                         modifiersRaw: modifiers,
                         validationMessage: "Shortcut must use 2 to 4 keys. Try again."
                     )
-                    guard didApply else { return }
+                    guard didApply else { return false }
                     shortcutCaptureTarget = nil
                     isCapturingShortcut = false
+                    return true
                 },
                 onCancel: {
                     shortcutCaptureMessage = nil
@@ -1527,6 +1545,9 @@ struct SettingsView: View {
             } else if let firstSection = filteredSections.first {
                 selectedSection = firstSection
             }
+        }
+        .onChange(of: selectedSection) { _ in
+            cancelShortcutCapture()
         }
         .sheet(isPresented: $isCorrectionEditorPresented) {
             correctionEditorSheet
@@ -1577,6 +1598,8 @@ struct SettingsView: View {
                         sidebarSectionRow(for: section)
                     }
                     .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
             }
 
@@ -1629,6 +1652,8 @@ struct SettingsView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(isSelected ? Color.primary.opacity(0.08) : Color.clear)
@@ -2290,123 +2315,207 @@ struct SettingsView: View {
             settingsSectionHeader(for: .memorySources)
 
             settingsCard(
-                title: "Memory Indexing",
-                subtitle: "Choose if KeyScribe should build and use local memory context."
+                title: "AI Memory Assistant",
+                subtitle: "Use this toggle to enable or disable AI memory-based prompt rewriting."
             ) {
-                Toggle("Enable memory indexing", isOn: $settings.memoryIndexingEnabled)
-                Toggle("Auto-refresh detected providers and folders", isOn: $settings.memoryProviderCatalogAutoUpdate)
-                Text("Turn this off if you only want to refresh manually with Rescan.")
+                Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
+                Text("Current rewrite provider: \(settings.promptRewriteProviderMode.displayName)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             settingsCard(
-                title: "Detected Providers",
-                subtitle: "Choose which providers can add memory context."
+                title: "Provider Connection Status",
+                subtitle: "Open AI Memory Studio for full provider setup, indexing controls, and memory browser."
             ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("OpenAI")
+                        Spacer()
+                        Text(settings.hasPromptRewriteOAuthSession(for: .openAI) ? "Connected" : "Not connected")
+                            .foregroundStyle(settings.hasPromptRewriteOAuthSession(for: .openAI) ? .green : .secondary)
+                    }
+                    HStack {
+                        Text("Anthropic")
+                        Spacer()
+                        Text(settings.hasPromptRewriteOAuthSession(for: .anthropic) ? "Connected" : "Not connected")
+                            .foregroundStyle(settings.hasPromptRewriteOAuthSession(for: .anthropic) ? .green : .secondary)
+                    }
+                    HStack {
+                        Spacer()
+                        Button("Open AI Memory Studio…") {
+                            cancelShortcutCapture()
+                            NotificationCenter.default.post(name: .keyScribeOpenAIMemoryStudio, object: nil)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var providersSelectionSheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Manage Detected Providers")
+                    .font(.headline)
+                Spacer()
+                Button("Done") {
+                    showingProvidersSheet = false
+                }
+            }
+            .padding()
+            Divider()
+            
+            VStack(alignment: .leading, spacing: 14) {
                 if detectedMemoryProviders.isEmpty {
                     Text("No providers detected yet. Click Rescan to detect providers.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    Spacer()
                 } else {
-                    ForEach(detectedMemoryProviders) { provider in
-                        Toggle(isOn: Binding(
-                            get: { settings.isMemoryProviderEnabled(provider.id) },
-                            set: { isEnabled in
-                                settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(provider.name)
-                                    .font(.callout.weight(.medium))
-                                Text(provider.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                    HStack(spacing: 8) {
+                        TextField("Filter providers", text: $memoryProviderFilterQuery)
+                            .textFieldStyle(.roundedBorder)
+                        Toggle("Selected only", isOn: $memoryShowSelectedProvidersOnly)
+                            .toggleStyle(.checkbox)
+                            .fixedSize()
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Select All Visible") {
+                            setMemoryProvidersEnabled(filteredMemoryProviders, enabled: true)
                         }
-                        .disabled(!settings.memoryIndexingEnabled)
+                        .buttonStyle(.bordered)
+                        .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+
+                        Button("Clear Visible") {
+                            setMemoryProvidersEnabled(filteredMemoryProviders, enabled: false)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+                    }
+
+                    if filteredMemoryProviders.isEmpty {
+                        Text("No providers match the current filters.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(filteredMemoryProviders) { provider in
+                                    Toggle(isOn: Binding(
+                                        get: { settings.isMemoryProviderEnabled(provider.id) },
+                                        set: { isEnabled in
+                                            settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
+                                        }
+                                    )) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(provider.name)
+                                                .font(.callout.weight(.medium))
+                                            Text(provider.detail)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .disabled(!settings.memoryIndexingEnabled)
+                                }
+                            }
+                            .padding(.trailing)
+                        }
                     }
                 }
             }
+            .padding()
+        }
+        .frame(width: 450, height: 500)
+    }
 
-            settingsCard(
-                title: "Detected Source Folders",
-                subtitle: "Choose folders that can be indexed for memory context."
-            ) {
+    @ViewBuilder
+    private var sourceFoldersSelectionSheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Manage Detected Source Folders")
+                    .font(.headline)
+                Spacer()
+                Button("Done") {
+                    showingSourceFoldersSheet = false
+                }
+            }
+            .padding()
+            Divider()
+            
+            VStack(alignment: .leading, spacing: 14) {
                 if detectedMemorySourceFolders.isEmpty {
                     Text("No source folders detected yet. Click Rescan to find folders.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    Spacer()
                 } else {
-                    ForEach(detectedMemorySourceFolders) { folder in
-                        Toggle(isOn: Binding(
-                            get: { settings.isMemorySourceFolderEnabled(folder.id) },
-                            set: { isEnabled in
-                                settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(folder.name)
-                                    .font(.callout.weight(.medium))
-                                Text(folder.path)
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
+                    HStack(spacing: 8) {
+                        TextField("Filter source folders", text: $memoryFolderFilterQuery)
+                            .textFieldStyle(.roundedBorder)
+                        Toggle("Selected only", isOn: $memoryShowSelectedFoldersOnly)
+                            .toggleStyle(.checkbox)
+                            .fixedSize()
+                        Toggle("Only", isOn: $memoryFoldersOnlyEnabledProviders)
+                            .toggleStyle(.checkbox)
+                            .fixedSize()
+                            .help("Only enabled providers")
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Select All Visible") {
+                            setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: true)
                         }
-                        .disabled(!settings.memoryIndexingEnabled)
+                        .buttonStyle(.bordered)
+                        .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+
+                        Button("Clear Visible") {
+                            setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: false)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+                    }
+
+                    if filteredMemorySourceFolders.isEmpty {
+                        Text("No source folders match the current filters.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(filteredMemorySourceFolders) { folder in
+                                    Toggle(isOn: Binding(
+                                        get: { settings.isMemorySourceFolderEnabled(folder.id) },
+                                        set: { isEnabled in
+                                            settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
+                                        }
+                                    )) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(folder.name)
+                                                .font(.callout.weight(.medium))
+                                            Text(folder.path)
+                                                .font(.caption2.monospaced())
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                        }
+                                    }
+                                    .disabled(!settings.memoryIndexingEnabled)
+                                }
+                            }
+                            .padding(.trailing)
+                        }
                     }
                 }
             }
-
-            settingsCard(
-                title: "Memory Actions",
-                subtitle: "Rescan sources, rebuild the index, or clear local data."
-            ) {
-                HStack(spacing: 8) {
-                    Button("Rescan") {
-                        rescanMemorySources(showMessage: true)
-                    }
-                    .buttonStyle(.borderedProminent)
-
-                    Button("Rebuild Index") {
-                        memoryIndexingSettingsService.rebuildIndex(
-                            enabledProviderIDs: settings.memoryEnabledProviderIDs,
-                            enabledSourceFolderIDs: settings.memoryEnabledSourceFolderIDs
-                        )
-                        memoryActionMessage = "Started rebuilding the memory index."
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.memoryIndexingEnabled)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Clear Memories", role: .destructive) {
-                        memoryIndexingSettingsService.clearMemories()
-                        memoryActionMessage = "Cleared indexed memories."
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.memoryIndexingEnabled)
-
-                    Button("Clear Archive", role: .destructive) {
-                        memoryIndexingSettingsService.clearArchive()
-                        memoryActionMessage = "Cleared archived memory entries."
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.memoryIndexingEnabled)
-                }
-
-                if let memoryActionMessage {
-                    Text(memoryActionMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            .padding()
         }
-        .onAppear {
-            prepareMemorySourcesSection()
-        }
+        .frame(width: 550, height: 500)
     }
 
     private func prepareMemorySourcesSection() {
@@ -2421,6 +2530,8 @@ struct SettingsView: View {
         }
 
         hydrateMemorySourcesFromSavedSettings()
+        normalizeMemoryBrowserSelections()
+        refreshMemoryBrowser()
     }
 
     private func hydrateMemorySourcesFromSavedSettings() {
@@ -2486,6 +2597,169 @@ struct SettingsView: View {
             .joined(separator: " ")
     }
 
+    private var filteredMemoryProviders: [MemoryIndexingSettingsService.Provider] {
+        var providers = detectedMemoryProviders
+
+        if memoryShowSelectedProvidersOnly {
+            providers = providers.filter { provider in
+                settings.isMemoryProviderEnabled(provider.id)
+            }
+        }
+
+        let query = normalizedMemoryFilter(memoryProviderFilterQuery)
+        guard !query.isEmpty else { return providers }
+
+        return providers.filter { provider in
+            matchesMemoryFilter(query, in: provider.name)
+                || matchesMemoryFilter(query, in: provider.detail)
+                || matchesMemoryFilter(query, in: provider.id)
+        }
+    }
+
+    private var filteredMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] {
+        var folders = detectedMemorySourceFolders
+
+        if memoryFoldersOnlyEnabledProviders {
+            folders = folders.filter { folder in
+                settings.isMemoryProviderEnabled(folder.providerID)
+            }
+        }
+
+        if memoryShowSelectedFoldersOnly {
+            folders = folders.filter { folder in
+                settings.isMemorySourceFolderEnabled(folder.id)
+            }
+        }
+
+        let query = normalizedMemoryFilter(memoryFolderFilterQuery)
+        guard !query.isEmpty else { return folders }
+
+        return folders.filter { folder in
+            matchesMemoryFilter(query, in: folder.name)
+                || matchesMemoryFilter(query, in: folder.path)
+                || matchesMemoryFilter(query, in: providerDisplayName(from: folder.providerID))
+                || matchesMemoryFilter(query, in: folder.providerID)
+        }
+    }
+
+    private var memoryBrowserProviderOptions: [MemoryIndexingSettingsService.Provider] {
+        detectedMemoryProviders.sorted { lhs, rhs in
+            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private var memoryBrowserFolderOptions: [MemoryIndexingSettingsService.SourceFolder] {
+        let providerID = normalizedMemoryBrowserProviderID
+        return detectedMemorySourceFolders
+            .filter { folder in
+                guard let providerID else { return true }
+                return folder.providerID == providerID
+            }
+            .sorted { lhs, rhs in
+                if lhs.providerID != rhs.providerID {
+                    return lhs.providerID.localizedCaseInsensitiveCompare(rhs.providerID) == .orderedAscending
+                }
+                if lhs.name != rhs.name {
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                }
+                return lhs.path.localizedCaseInsensitiveCompare(rhs.path) == .orderedAscending
+            }
+    }
+
+    private var normalizedMemoryBrowserProviderID: String? {
+        let trimmedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedProviderID.isEmpty, trimmedProviderID != "all" else {
+            return nil
+        }
+        return trimmedProviderID
+    }
+
+    private var normalizedMemoryBrowserFolderID: String? {
+        let trimmedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedFolderID.isEmpty, trimmedFolderID != "all" else {
+            return nil
+        }
+        return trimmedFolderID
+    }
+
+    private func normalizeMemoryBrowserSelections() {
+        let providerIDs = Set(memoryBrowserProviderOptions.map(\.id))
+        let selectedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedProviderID != "all", !providerIDs.contains(selectedProviderID) {
+            memoryBrowserSelectedProviderID = "all"
+        }
+
+        let folderIDs = Set(memoryBrowserFolderOptions.map(\.id))
+        let selectedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedFolderID != "all", !folderIDs.contains(selectedFolderID) {
+            memoryBrowserSelectedFolderID = "all"
+        }
+    }
+
+    private func refreshMemoryBrowser() {
+        let entries = memoryIndexingSettingsService.browseIndexedMemories(
+            query: memoryBrowserQuery,
+            providerID: normalizedMemoryBrowserProviderID,
+            sourceFolderID: normalizedMemoryBrowserFolderID,
+            includePlanContent: memoryBrowserIncludePlanContent,
+            limit: 200
+        )
+        if memoryBrowserHighSignalOnly {
+            memoryBrowserEntries = entries.filter(isHighSignalMemoryEntry)
+        } else {
+            memoryBrowserEntries = entries
+        }
+    }
+
+    private func isHighSignalMemoryEntry(_ entry: MemoryIndexedEntry) -> Bool {
+        let title = entry.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if title == "workspace" || title == "storage" || title == "state" {
+            return false
+        }
+
+        let detail = entry.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.hasPrefix("{") && detail.hasSuffix("}") {
+            if !detail.contains("->"),
+               !detail.localizedCaseInsensitiveContains("prompt"),
+               !detail.localizedCaseInsensitiveContains("rewrite"),
+               !detail.localizedCaseInsensitiveContains("response") {
+                return false
+            }
+        }
+
+        let combined = "\(entry.summary) \(entry.detail)"
+        let alphaWords = combined.split(whereSeparator: \.isWhitespace).filter { token in
+            token.contains(where: \.isLetter)
+        }
+        return alphaWords.count >= 5
+    }
+
+    private func setMemoryProvidersEnabled(
+        _ providers: [MemoryIndexingSettingsService.Provider],
+        enabled: Bool
+    ) {
+        for provider in providers {
+            settings.setMemoryProviderEnabled(provider.id, enabled: enabled)
+        }
+    }
+
+    private func setMemorySourceFoldersEnabled(
+        _ folders: [MemoryIndexingSettingsService.SourceFolder],
+        enabled: Bool
+    ) {
+        for folder in folders {
+            settings.setMemorySourceFolderEnabled(folder.id, enabled: enabled)
+        }
+    }
+
+    private func normalizedMemoryFilter(_ query: String) -> String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func matchesMemoryFilter(_ normalizedQuery: String, in value: String) -> Bool {
+        value.lowercased().contains(normalizedQuery)
+    }
+
     private func rescanMemorySources(showMessage: Bool) {
         let result = memoryIndexingSettingsService.rescan(
             enabledProviderIDs: settings.memoryEnabledProviderIDs,
@@ -2497,6 +2771,8 @@ struct SettingsView: View {
 
         settings.updateDetectedMemoryProviders(result.providers.map(\.id))
         settings.updateDetectedMemorySourceFolders(result.sourceFolders.map(\.id))
+        normalizeMemoryBrowserSelections()
+        refreshMemoryBrowser()
 
         guard showMessage else { return }
         if result.indexQueued {
@@ -2504,6 +2780,34 @@ struct SettingsView: View {
         } else {
             memoryActionMessage = "Rescan finished. Found \(result.providers.count) providers and \(result.sourceFolders.count) folders."
         }
+    }
+
+    private func handleMemoryIndexingCompletion(_ notification: Notification) {
+        let userInfo = notification.userInfo ?? [:]
+        let isRebuild = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.rebuild] as? Bool ?? false
+        let indexedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedFiles] as? Int ?? 0
+        let skippedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.skippedFiles] as? Int ?? 0
+        let indexedCards = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedCards] as? Int ?? 0
+        let indexedRewrites = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedRewriteSuggestions] as? Int ?? 0
+        let failureCount = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.failureCount] as? Int ?? 0
+        let firstFailure = (
+            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.firstFailure] as? String
+        )?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let actionLabel = isRebuild ? "Rebuild" : "Indexing"
+        if failureCount > 0 {
+            if let firstFailure, !firstFailure.isEmpty {
+                memoryActionMessage = "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards. First issue: \(firstFailure)"
+            } else {
+                memoryActionMessage = "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards."
+            }
+            refreshMemoryBrowser()
+            return
+        }
+
+        memoryActionMessage = "\(actionLabel) finished. Indexed \(indexedFiles) files, skipped \(skippedFiles), produced \(indexedCards) cards, and generated \(indexedRewrites) rewrite suggestion(s)."
+        refreshMemoryBrowser()
     }
 
     private func refreshWhisperModelBrowserState() {
@@ -2898,10 +3202,9 @@ struct SettingsView: View {
             .init(section: .corrections, title: "Adaptive corrections", detail: "Learn from your quick word/phrase fixes", keywords: ["adaptive", "learned", "corrections", "backspace"]),
             .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
             .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
-            .init(section: .memorySources, title: "Memory indexing toggle", detail: "Turn local memory indexing on or off", keywords: ["memory", "indexing", "toggle", "enable"]),
-            .init(section: .memorySources, title: "Provider toggles", detail: "Choose which providers can feed memory context", keywords: ["provider", "source", "memory", "context"]),
-            .init(section: .memorySources, title: "Source folder toggles", detail: "Choose folders that are included in memory indexing", keywords: ["folder", "source", "path", "memory", "index"]),
-            .init(section: .memorySources, title: "Memory actions", detail: "Rescan, rebuild index, clear memories, and clear archive", keywords: ["rescan", "rebuild", "clear memories", "clear archive", "memory"]),
+            .init(section: .memorySources, title: "AI memory assistant toggle", detail: "Enable or disable memory-based prompt rewrite", keywords: ["memory", "indexing", "toggle", "enable", "ai"]),
+            .init(section: .memorySources, title: "Provider connection status", detail: "See OAuth connection status for OpenAI and Anthropic", keywords: ["provider", "oauth", "openai", "anthropic", "connection"]),
+            .init(section: .memorySources, title: "Open AI Memory Studio", detail: "Launch dedicated AI page for full provider and memory controls", keywords: ["ai", "memory studio", "providers", "browser", "rescan", "rebuild"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall KeyScribe", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
@@ -3167,6 +3470,12 @@ struct SettingsView: View {
         isCapturingShortcut = true
     }
 
+    private func cancelShortcutCapture() {
+        shortcutCaptureTarget = nil
+        shortcutCaptureMessage = nil
+        isCapturingShortcut = false
+    }
+
     private func shortcutConflictMessage(
         for target: ShortcutCaptureTarget,
         keyCode: UInt16,
@@ -3208,15 +3517,29 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private func appLogoImage(size: CGFloat) -> some View {
+        if let icon = NSApplication.shared.applicationIconImage {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.2, style: .continuous))
+        } else {
+            Image(systemName: "app.fill")
+                .font(.system(size: size * 0.6))
+                .frame(width: size, height: size)
+        }
+    }
+
+    @ViewBuilder
     private var aboutSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             settingsSectionHeader(for: .about)
 
             // Version info
-            HStack(spacing: 10) {
-                Image(systemName: "app.badge.checkmark.fill")
-                    .font(.title2)
-                    .foregroundStyle(.blue)
+            HStack(spacing: 12) {
+                appLogoImage(size: 48)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("KeyScribe")
                         .font(.headline)
@@ -3292,32 +3615,70 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Uninstall")
                     .font(.headline)
-                Text("Remove KeyScribe, reset permissions, and clear local app data. You can optionally keep downloaded whisper models for faster re-testing.")
+                Text("Remove KeyScribe, reset permissions, and clear local app data.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Toggle("Also delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
-                    .toggleStyle(.switch)
-
-                Toggle("Also delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
-                    .toggleStyle(.switch)
-
                 Button(role: .destructive, action: {
-                    showUninstallConfirmation = true
+                    // Reset all options to off each time the sheet opens
+                    uninstallDeleteDownloadedModels = false
+                    uninstallDeleteLearnedCorrections = false
+                    uninstallDeleteMemories = false
+                    uninstallDeleteProviderCredentials = false
+                    showUninstallSheet = true
                 }) {
                     Label("Uninstall KeyScribe…", systemImage: "trash")
                 }
                 .buttonStyle(.bordered)
-                .alert("Uninstall KeyScribe?", isPresented: $showUninstallConfirmation) {
-                    Button("Cancel", role: .cancel) { }
-                    Button("Uninstall", role: .destructive) {
-                        SettingsStore.resetAndUninstall(
-                            deleteDownloadedModels: uninstallDeleteDownloadedModels,
-                            deleteLearnedCorrections: uninstallDeleteLearnedCorrections
-                        )
+                .sheet(isPresented: $showUninstallSheet) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Uninstall KeyScribe")
+                            .font(.title2.bold())
+
+                        Text("This will reset permissions, remove settings, and uninstall the app. Enable any options below to also remove additional data.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Toggle("Delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
+                                .toggleStyle(.switch)
+                            Toggle("Delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
+                                .toggleStyle(.switch)
+                            Toggle("Delete indexed memories", isOn: $uninstallDeleteMemories)
+                                .toggleStyle(.switch)
+                            Toggle("Delete provider credentials (API keys & OAuth sessions)", isOn: $uninstallDeleteProviderCredentials)
+                                .toggleStyle(.switch)
+                        }
+
+                        Divider()
+
+                        Text(uninstallSummaryText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        HStack {
+                            Spacer()
+                            Button("Cancel") {
+                                showUninstallSheet = false
+                            }
+                            .keyboardShortcut(.cancelAction)
+
+                            Button("Uninstall", role: .destructive) {
+                                showUninstallSheet = false
+                                SettingsStore.resetAndUninstall(
+                                    deleteDownloadedModels: uninstallDeleteDownloadedModels,
+                                    deleteLearnedCorrections: uninstallDeleteLearnedCorrections,
+                                    deleteMemories: uninstallDeleteMemories,
+                                    deleteProviderCredentials: uninstallDeleteProviderCredentials
+                                )
+                            }
+                            .keyboardShortcut(.defaultAction)
+                        }
                     }
-                } message: {
-                    Text(uninstallSummaryText)
+                    .padding(24)
+                    .frame(width: 420)
                 }
             }
 
@@ -3330,8 +3691,10 @@ struct SettingsView: View {
     private var uninstallSummaryText: String {
         let modelText = uninstallDeleteDownloadedModels ? "delete downloaded whisper models" : "keep downloaded whisper models"
         let correctionText = uninstallDeleteLearnedCorrections ? "delete learned corrections" : "keep learned corrections"
+        let memoryText = uninstallDeleteMemories ? "delete indexed memories" : "keep indexed memories"
+        let credentialText = uninstallDeleteProviderCredentials ? "delete provider credentials" : "keep provider credentials"
 
-        return "This will reset permissions, remove settings, \(modelText), \(correctionText), and uninstall the app."
+        return "This will reset permissions, remove settings, \(modelText), \(correctionText), \(memoryText), \(credentialText), and uninstall the app."
     }
 
     @ViewBuilder
@@ -3601,7 +3964,7 @@ private struct TranscriptHistoryEntryCard: View {
 
 struct ShortcutCaptureMonitor: NSViewRepresentable {
     @Binding var isCapturing: Bool
-    let onCapture: (UInt16, UInt) -> Void
+    let onCapture: (UInt16, UInt) -> Bool
     let onCancel: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -3625,13 +3988,12 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
     }
 
     final class Coordinator {
+        private static let manualModifierOnlyKeyCode: UInt16 = UInt16.max
         private var parent: ShortcutCaptureMonitor
         private var globalKeyMonitor: Any?
         private var localKeyMonitor: Any?
         private var globalFlagsMonitor: Any?
         private var localFlagsMonitor: Any?
-        private var pendingModifierCaptureWorkItem: DispatchWorkItem?
-        private var pendingModifierCaptureFlags: NSEvent.ModifierFlags = []
         private var didCapture = false
 
         init(parent: ShortcutCaptureMonitor) {
@@ -3641,7 +4003,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         func start() {
             guard globalKeyMonitor == nil, localKeyMonitor == nil, globalFlagsMonitor == nil, localFlagsMonitor == nil else { return }
             didCapture = false
-            cancelPendingModifierCapture()
 
             let mask = ShortcutValidation.supportedModifierFlags
 
@@ -3669,7 +4030,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         @discardableResult
         private func handleKeyDown(_ event: NSEvent, mask: NSEvent.ModifierFlags) -> Bool {
             guard !didCapture else { return true }
-            cancelPendingModifierCapture()
 
             if event.keyCode == 53 { // Escape
                 didCapture = true
@@ -3688,9 +4048,12 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
 
             let capturedMods = ShortcutValidation.filteredModifierRawValue(from: event.modifierFlags.intersection(mask).rawValue)
             guard capturedMods != 0 else { return false }
+            let didCaptureShortcut = parent.onCapture(capturedCode, capturedMods)
+            guard didCaptureShortcut else { return false }
             didCapture = true
+            stop()
             DispatchQueue.main.async {
-                self.parent.onCapture(capturedCode, capturedMods)
+                self.parent.isCapturing = false
             }
             return true
         }
@@ -3701,34 +4064,19 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
 
             let capturedFlags = event.modifierFlags.intersection(mask)
             let count = ShortcutValidation.modifierCount(in: capturedFlags)
-            guard (2...4).contains(count) else {
-                cancelPendingModifierCapture()
-                return false
-            }
+            guard (2...4).contains(count) else { return false }
 
-            scheduleModifierOnlyCapture(with: capturedFlags)
+            let didCaptureShortcut = parent.onCapture(
+                Self.manualModifierOnlyKeyCode,
+                capturedFlags.rawValue
+            )
+            guard didCaptureShortcut else { return false }
+            didCapture = true
+            stop()
+            DispatchQueue.main.async {
+                self.parent.isCapturing = false
+            }
             return true
-        }
-
-        private func scheduleModifierOnlyCapture(with flags: NSEvent.ModifierFlags) {
-            cancelPendingModifierCapture()
-            pendingModifierCaptureFlags = flags
-
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self, !self.didCapture else { return }
-                let currentFlags = NSEvent.modifierFlags.intersection(ShortcutValidation.supportedModifierFlags)
-                guard currentFlags == self.pendingModifierCaptureFlags else { return }
-                self.didCapture = true
-                self.parent.onCapture(UInt16.max, self.pendingModifierCaptureFlags.rawValue)
-            }
-            pendingModifierCaptureWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
-        }
-
-        private func cancelPendingModifierCapture() {
-            pendingModifierCaptureWorkItem?.cancel()
-            pendingModifierCaptureWorkItem = nil
-            pendingModifierCaptureFlags = []
         }
 
         func stop() {
@@ -3748,7 +4096,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
                 NSEvent.removeMonitor(localFlagsMonitor)
                 self.localFlagsMonitor = nil
             }
-            cancelPendingModifierCapture()
             didCapture = false
         }
 

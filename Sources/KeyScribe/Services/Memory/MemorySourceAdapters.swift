@@ -304,8 +304,14 @@ private enum MemoryAdapterEventParser {
 
         let title = readString(from: dictionary, keys: ["title", "subject", "name", "label"])
             ?? MemoryTextNormalizer.normalizedTitle(fileStem(from: relativePath))
-        let body = readString(from: dictionary, keys: ["content", "text", "message", "body", "prompt", "response", "completion", "output"])
-            ?? serializeJSON(dictionary: dictionary)
+        let explicitBody = readString(
+            from: dictionary,
+            keys: ["content", "text", "message", "body", "prompt", "response", "completion", "output", "input"]
+        )
+        if explicitBody == nil && shouldSkipLowSignalDictionary(dictionary) {
+            return []
+        }
+        let body = explicitBody ?? serializeJSON(dictionary: dictionary)
         let timestamp = readDate(from: dictionary, keys: ["timestamp", "created_at", "createdAt", "time", "date"]) ?? Date()
         let kindHint = readString(from: dictionary, keys: ["kind", "type", "event", "category", "role"])
         let kind = inferKind(from: relativePath, valueHint: kindHint)
@@ -536,6 +542,42 @@ private enum MemoryAdapterEventParser {
             }
         }
         return flattened
+    }
+
+    private static func shouldSkipLowSignalDictionary(_ dictionary: [String: Any]) -> Bool {
+        guard !dictionary.isEmpty else { return true }
+
+        let keySet = Set(dictionary.keys.map { $0.lowercased() })
+        let lowSignalKeys: Set<String> = [
+            "workspace", "workspaceid", "folder", "path", "uri", "id", "hash",
+            "updatedat", "createdat", "timestamp", "version", "windowid",
+            "machineid", "state", "storage", "lastopened", "mtime", "ctime",
+            "project", "repository", "repo", "branch", "language"
+        ]
+        let hasMostlyLowSignalKeys = !keySet.isEmpty && keySet.subtracting(lowSignalKeys).count <= 2
+
+        var longTextFieldCount = 0
+        for value in dictionary.values {
+            if let text = value as? String {
+                let normalized = MemoryTextNormalizer.normalizedBody(text)
+                if normalized.count >= 28 && normalized.contains(where: \.isWhitespace) {
+                    longTextFieldCount += 1
+                }
+            }
+        }
+
+        if hasMostlyLowSignalKeys && longTextFieldCount == 0 {
+            return true
+        }
+
+        if longTextFieldCount == 0,
+           dictionary.values.allSatisfy({ value in
+               value is NSNumber || value is Bool || value is NSNull || (value as? String)?.count ?? 0 < 24
+           }) {
+            return true
+        }
+
+        return false
     }
 
     private static func serializeJSON(dictionary: [String: Any]) -> String {

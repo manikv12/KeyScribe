@@ -39,7 +39,7 @@ struct MemoryIndexingSmokeTests {
             let indexingService = MemoryIndexingService(
                 fileManager: .default,
                 adapterRegistry: MemorySourceAdapterRegistry(),
-                rewriteProvider: StubMemoryRewriteExtractionProvider.shared,
+                rewriteProvider: MockAILessonRewriteProvider(),
                 maxFilesPerSource: 100,
                 maxEventsPerFile: 50
             )
@@ -48,6 +48,16 @@ struct MemoryIndexingSmokeTests {
             check(report.indexedFiles > 0, "Expected at least one indexed source file")
             check(report.indexedEvents > 0, "Expected at least one indexed event")
             check(report.indexedCards > 0, "Expected at least one indexed memory card")
+
+            let unchangedReindexReport = await indexingService.rebuildIndex(from: discovery.sources, store: store)
+            check(
+                unchangedReindexReport.indexedFiles == 0,
+                "Expected unchanged rebuild to skip file re-indexing"
+            )
+            check(
+                unchangedReindexReport.skippedFiles > 0,
+                "Expected unchanged rebuild to report skipped files"
+            )
 
             let cards = try store.fetchCardsForRewrite(
                 query: "teh",
@@ -101,6 +111,12 @@ struct MemoryIndexingSmokeTests {
                 "Expected updated rewrite suggestion after reindex"
             )
 
+            let fullRebuildReport = await indexingService.rebuildFromScratch(from: discovery.sources, store: store)
+            check(
+                fullRebuildReport.indexedFiles > 0,
+                "Expected clear + rebuild from scratch to re-index files"
+            )
+
             print("PASS: Memory indexing smoke tests passed")
         } catch {
             fputs("FAIL: Memory indexing smoke test threw error: \(error)\n", stderr)
@@ -142,5 +158,98 @@ struct MemoryIndexingSmokeTests {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try value.data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
+    private struct MockAILessonRewriteProvider: MemoryRewriteExtractionProviding {
+        func summary(
+            for draft: MemoryEventDraft,
+            provider: MemoryProviderKind
+        ) async -> String? {
+            _ = provider
+            if let nativeSummary = draft.nativeSummary, !nativeSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return MemoryTextNormalizer.normalizedSummary(nativeSummary)
+            }
+            return MemoryTextNormalizer.normalizedSummary(draft.body, limit: 200)
+        }
+
+        func rewriteSuggestion(
+            for draft: MemoryEventDraft,
+            card: MemoryCard,
+            provider: MemoryProviderKind
+        ) async -> RewriteSuggestion? {
+            _ = draft
+            _ = card
+            _ = provider
+            return nil
+        }
+
+        func lesson(
+            for draft: MemoryEventDraft,
+            card: MemoryCard,
+            provider: MemoryProviderKind
+        ) async -> MemoryLessonDraft? {
+            _ = card
+            _ = provider
+            guard !draft.isPlanContent else { return nil }
+            guard let pair = rewritePair(for: draft) else { return nil }
+            guard pair.original.caseInsensitiveCompare(pair.suggested) != .orderedSame else { return nil }
+
+            return MemoryLessonDraft(
+                mistakePattern: pair.original,
+                improvedPrompt: pair.suggested,
+                rationale: "AI synthesized lesson (smoke-test mock)",
+                validationConfidence: 0.92,
+                sourceMetadata: [
+                    "extraction_method": "ai",
+                    "provider_mode": "openai",
+                    "test_provider": "mock-ai"
+                ]
+            )
+        }
+
+        private func rewritePair(for draft: MemoryEventDraft) -> (original: String, suggested: String)? {
+            let metadata = draft.metadata
+            if let original = firstNonEmpty(
+                metadata["original_text"],
+                metadata["original"],
+                metadata["input"],
+                metadata["prompt"]
+            ),
+               let suggested = firstNonEmpty(
+                metadata["suggested_text"],
+                metadata["suggested"],
+                metadata["rewrite"],
+                metadata["response"],
+                metadata["completion"],
+                metadata["output"]
+               ) {
+                return (original, suggested)
+            }
+
+            return splitArrowRewrite(MemoryTextNormalizer.normalizedBody(draft.body))
+        }
+
+        private func splitArrowRewrite(_ body: String) -> (original: String, suggested: String)? {
+            for marker in ["->", "=>", "→"] {
+                let parts = body.components(separatedBy: marker)
+                guard parts.count == 2 else { continue }
+                let lhs = MemoryTextNormalizer.normalizedBody(parts[0])
+                let rhs = MemoryTextNormalizer.normalizedBody(parts[1])
+                guard !lhs.isEmpty, !rhs.isEmpty else { continue }
+                return (lhs, rhs)
+            }
+            return nil
+        }
+
+        private func firstNonEmpty(_ values: String?...) -> String? {
+            for value in values {
+                guard let value else { continue }
+                let normalized = MemoryTextNormalizer.normalizedBody(value)
+                if !normalized.isEmpty {
+                    return normalized
+                }
+            }
+            return nil
+        }
     }
 }

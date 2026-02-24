@@ -6,6 +6,7 @@ struct MemoryIndexingReport: Sendable {
     var skippedFiles = 0
     var indexedEvents = 0
     var indexedCards = 0
+    var indexedLessons = 0
     var indexedRewriteSuggestions = 0
     var failures: [String] = []
 
@@ -16,30 +17,44 @@ struct MemoryIndexingReport: Sendable {
 
 actor MemoryIndexingService {
     static let shared = MemoryIndexingService()
+    typealias ProgressHandler = @Sendable (_ report: MemoryIndexingReport, _ currentSource: MemoryDiscoveredSource?, _ currentFilePath: String?) async -> Void
 
     private let fileManager: FileManager
     private let adapterRegistry: MemorySourceAdapterRegistry
     private let rewriteProvider: MemoryRewriteExtractionProviding
     private let maxFilesPerSource: Int
     private let maxEventsPerFile: Int
+    private let apiThrottleDelay: TimeInterval
 
     init(
         fileManager: FileManager = .default,
         adapterRegistry: MemorySourceAdapterRegistry = MemorySourceAdapterRegistry(),
         rewriteProvider: MemoryRewriteExtractionProviding = StubMemoryRewriteExtractionProvider.shared,
         maxFilesPerSource: Int = 350,
-        maxEventsPerFile: Int = 80
+        maxEventsPerFile: Int = 80,
+        apiThrottleDelay: TimeInterval = 1.0
     ) {
         self.fileManager = fileManager
         self.adapterRegistry = adapterRegistry
         self.rewriteProvider = rewriteProvider
         self.maxFilesPerSource = max(1, maxFilesPerSource)
         self.maxEventsPerFile = max(1, maxEventsPerFile)
+        self.apiThrottleDelay = apiThrottleDelay
     }
 
     func rebuildIndex(
         from sources: [MemoryDiscoveredSource],
-        store: MemorySQLiteStore
+        store: MemorySQLiteStore,
+        progress: ProgressHandler? = nil
+    ) async -> MemoryIndexingReport {
+        // Incremental rebuild: preserve stored file hashes and only re-index changed/new files.
+        await indexSources(sources, store: store, progress: progress)
+    }
+
+    func rebuildFromScratch(
+        from sources: [MemoryDiscoveredSource],
+        store: MemorySQLiteStore,
+        progress: ProgressHandler? = nil
     ) async -> MemoryIndexingReport {
         do {
             try store.clearAllIndexedData()
@@ -48,21 +63,28 @@ actor MemoryIndexingService {
                 failures: ["Failed to clear existing index data before rebuild: \(error.localizedDescription)"]
             )
         }
-        return await indexSources(sources, store: store)
+        return await indexSources(sources, store: store, progress: progress)
     }
 
     func indexSources(
         _ sources: [MemoryDiscoveredSource],
-        store: MemorySQLiteStore
+        store: MemorySQLiteStore,
+        progress: ProgressHandler? = nil
     ) async -> MemoryIndexingReport {
         var report = MemoryIndexingReport()
+        if let progress {
+            await progress(report, nil, nil)
+        }
 
         for source in sources {
             if Task.isCancelled {
                 break
             }
             report.discoveredSources += 1
-            await index(source: source, store: store, report: &report)
+            if let progress {
+                await progress(report, source, nil)
+            }
+            await index(source: source, store: store, progress: progress, report: &report)
         }
 
         return report
@@ -71,10 +93,14 @@ actor MemoryIndexingService {
     private func index(
         source: MemoryDiscoveredSource,
         store: MemorySQLiteStore,
+        progress: ProgressHandler?,
         report: inout MemoryIndexingReport
     ) async {
         guard let adapter = adapterRegistry.adapter(for: source.provider) else {
             report.failures.append("No source adapter found for provider \(source.provider.rawValue)")
+            if let progress {
+                await progress(report, source, nil)
+            }
             return
         }
 
@@ -96,6 +122,9 @@ actor MemoryIndexingService {
             try store.upsertSource(sourceRecord)
         } catch {
             report.failures.append("Failed to upsert source \(source.rootURL.path): \(error.localizedDescription)")
+            if let progress {
+                await progress(report, source, nil)
+            }
             return
         }
 
@@ -115,8 +144,13 @@ actor MemoryIndexingService {
                 sourceID: sourceID,
                 adapter: adapter,
                 store: store,
+                progress: progress,
                 report: &report
             )
+        }
+
+        if let progress {
+            await progress(report, source, nil)
         }
     }
 
@@ -126,6 +160,7 @@ actor MemoryIndexingService {
         sourceID: UUID,
         adapter: any MemorySourceAdapter,
         store: MemorySQLiteStore,
+        progress: ProgressHandler?,
         report: inout MemoryIndexingReport
     ) async {
         let relativePath = Self.relativePath(of: fileURL, to: source.rootURL)
@@ -149,6 +184,9 @@ actor MemoryIndexingService {
                existing.fileHash == sourceFileRecord.fileHash,
                existing.parseError == nil {
                 report.skippedFiles += 1
+                if let progress {
+                    await progress(report, source, fileURL.path)
+                }
                 return
             }
 
@@ -160,6 +198,9 @@ actor MemoryIndexingService {
             try store.upsertSourceFile(sourceFileRecord)
         } catch {
             report.failures.append("Failed to stage source file \(fileURL.path): \(error.localizedDescription)")
+            if let progress {
+                await progress(report, source, fileURL.path)
+            }
             return
         }
 
@@ -171,6 +212,9 @@ actor MemoryIndexingService {
             )
             if drafts.isEmpty {
                 report.skippedFiles += 1
+                if let progress {
+                    await progress(report, source, fileURL.path)
+                }
                 return
             }
 
@@ -213,14 +257,58 @@ actor MemoryIndexingService {
                 try store.upsertCard(card)
                 report.indexedCards += 1
 
+                var lessonRewriteSuggestion: RewriteSuggestion?
+                if let lessonDraft = await rewriteProvider.lesson(
+                    for: draft,
+                    card: card,
+                    provider: source.provider
+                ) {
+                    let lesson = makeMemoryLesson(
+                        sourceID: sourceID,
+                        sourceFileID: fileID,
+                        eventID: eventID,
+                        cardID: card.id,
+                        provider: source.provider,
+                        lessonDraft: lessonDraft
+                    )
+                    try store.upsertLesson(lesson)
+                    try store.supersedeCompetingLessons(
+                        with: lesson,
+                        reason: "Superseded by a newer higher-confidence indexed lesson."
+                    )
+                    report.indexedLessons += 1
+
+                    lessonRewriteSuggestion = makeRewriteSuggestion(
+                        cardID: card.id,
+                        provider: source.provider,
+                        mistakePattern: lessonDraft.mistakePattern,
+                        improvedPrompt: lessonDraft.improvedPrompt,
+                        rationale: lessonDraft.rationale,
+                        confidence: lessonDraft.validationConfidence
+                    )
+                    if let lessonRewriteSuggestion {
+                        try store.insertRewriteSuggestion(lessonRewriteSuggestion)
+                        report.indexedRewriteSuggestions += 1
+                    }
+                }
+
                 if let rewriteSuggestion = await rewriteProvider.rewriteSuggestion(
                     for: draft,
                     card: card,
                     provider: source.provider
                 ) {
                     try store.insertRewriteSuggestion(rewriteSuggestion)
-                    report.indexedRewriteSuggestions += 1
+                    if lessonRewriteSuggestion?.id != rewriteSuggestion.id {
+                        report.indexedRewriteSuggestions += 1
+                    }
                 }
+
+                if apiThrottleDelay > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(apiThrottleDelay * 1_000_000_000))
+                }
+            }
+            if let progress {
+                await progress(report, source, fileURL.path)
             }
         } catch {
             report.failures.append("Failed to index file \(fileURL.path): \(error.localizedDescription)")
@@ -231,6 +319,9 @@ actor MemoryIndexingService {
                 try store.upsertSourceFile(erroredFile)
             } catch {
                 report.failures.append("Failed to save parse error for \(fileURL.path): \(error.localizedDescription)")
+            }
+            if let progress {
+                await progress(report, source, fileURL.path)
             }
         }
     }
@@ -295,6 +386,68 @@ actor MemoryIndexingService {
             updatedAt: createdAt,
             isPlanContent: draft.isPlanContent,
             metadata: draft.metadata
+        )
+    }
+
+    private func makeMemoryLesson(
+        sourceID: UUID,
+        sourceFileID: UUID,
+        eventID: UUID,
+        cardID: UUID,
+        provider: MemoryProviderKind,
+        lessonDraft: MemoryLessonDraft
+    ) -> MemoryLesson {
+        let mistakePattern = MemoryTextNormalizer.normalizedBody(lessonDraft.mistakePattern)
+        let improvedPrompt = MemoryTextNormalizer.normalizedBody(lessonDraft.improvedPrompt)
+        let rationale = MemoryTextNormalizer.normalizedSummary(lessonDraft.rationale, limit: 400)
+        let normalizedConfidence = min(1, max(0, lessonDraft.validationConfidence))
+        let createdAt = Date()
+
+        let lessonID = MemoryIdentifier.stableUUID(
+            for: "lesson|\(cardID.uuidString)|\(mistakePattern)|\(improvedPrompt)"
+        )
+
+        return MemoryLesson(
+            id: lessonID,
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            eventID: eventID,
+            cardID: cardID,
+            provider: provider,
+            mistakePattern: mistakePattern,
+            improvedPrompt: improvedPrompt,
+            rationale: rationale,
+            validationConfidence: normalizedConfidence,
+            sourceMetadata: lessonDraft.sourceMetadata,
+            createdAt: createdAt,
+            updatedAt: createdAt
+        )
+    }
+
+    private func makeRewriteSuggestion(
+        cardID: UUID,
+        provider: MemoryProviderKind,
+        mistakePattern: String,
+        improvedPrompt: String,
+        rationale: String,
+        confidence: Double
+    ) -> RewriteSuggestion? {
+        let original = MemoryTextNormalizer.collapsedWhitespace(mistakePattern)
+        let suggested = MemoryTextNormalizer.collapsedWhitespace(improvedPrompt)
+        guard !original.isEmpty, !suggested.isEmpty else { return nil }
+        guard original.caseInsensitiveCompare(suggested) != .orderedSame else { return nil }
+
+        return RewriteSuggestion(
+            id: MemoryIdentifier.stableUUID(
+                for: "\(cardID.uuidString)|rewrite|\(original)|\(suggested)"
+            ),
+            cardID: cardID,
+            provider: provider,
+            originalText: original,
+            suggestedText: suggested,
+            rationale: MemoryTextNormalizer.normalizedSummary(rationale, limit: 320),
+            confidence: min(1.0, max(0.05, confidence)),
+            createdAt: Date()
         )
     }
 

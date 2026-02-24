@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 import SwiftUI
 
 enum RecognitionMode: String, CaseIterable, Identifiable {
@@ -41,6 +42,74 @@ enum TranscriptionEngineType: String, CaseIterable, Identifiable {
             return "Uses Apple Speech recognition. Supports on-device and cloud recognition modes."
         case .whisperCpp:
             return "Uses local whisper.cpp models downloaded to this Mac. No cloud transcription is used."
+        }
+    }
+}
+
+enum PromptRewriteProviderMode: String, CaseIterable, Identifiable {
+    case openAI = "OpenAI"
+    case openRouter = "OpenRouter"
+    case groq = "Groq"
+    case anthropic = "Anthropic"
+    case ollama = "Ollama (Local)"
+
+    var id: Self { self }
+
+    var displayName: String {
+        rawValue
+    }
+
+    var defaultModel: String {
+        switch self {
+        case .openAI:
+            return "gpt-4.1-mini"
+        case .openRouter:
+            return "openai/gpt-4.1-mini"
+        case .groq:
+            return "llama-3.3-70b-versatile"
+        case .anthropic:
+            return "claude-3-5-sonnet-latest"
+        case .ollama:
+            return "llama3.1"
+        }
+    }
+
+    var defaultBaseURL: String {
+        switch self {
+        case .openAI:
+            return "https://api.openai.com/v1"
+        case .openRouter:
+            return "https://openrouter.ai/api/v1"
+        case .groq:
+            return "https://api.groq.com/openai/v1"
+        case .anthropic:
+            return "https://api.anthropic.com/v1"
+        case .ollama:
+            return "http://localhost:11434/v1"
+        }
+    }
+
+    var requiresAPIKey: Bool {
+        switch self {
+        case .ollama:
+            return false
+        case .openAI, .openRouter, .groq, .anthropic:
+            return true
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .openAI:
+            return "Uses OpenAI to analyze memory context and suggest improved prompts. Supports OAuth sign-in."
+        case .openRouter:
+            return "Uses OpenRouter-compatible models for memory-aware prompt rewrites."
+        case .groq:
+            return "Uses Groq-hosted models through OpenAI-compatible API."
+        case .anthropic:
+            return "Uses Anthropic Messages API for memory-aware prompt rewrites. Supports OAuth sign-in."
+        case .ollama:
+            return "Uses local Ollama server via OpenAI-compatible endpoint."
         }
     }
 }
@@ -127,6 +196,9 @@ final class SettingsStore: ObservableObject {
         static let memoryEnabledProviderIDs = "KeyScribe.memoryEnabledProviderIDs"
         static let memoryDetectedSourceFolderIDs = "KeyScribe.memoryDetectedSourceFolderIDs"
         static let memoryEnabledSourceFolderIDs = "KeyScribe.memoryEnabledSourceFolderIDs"
+        static let promptRewriteProviderMode = "KeyScribe.promptRewriteProviderMode"
+        static let promptRewriteOpenAIModel = "KeyScribe.promptRewriteOpenAIModel"
+        static let promptRewriteOpenAIBaseURL = "KeyScribe.promptRewriteOpenAIBaseURL"
     }
 
     private enum ContinuousToggleDefaults {
@@ -369,6 +441,38 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var promptRewriteProviderModeRawValue: String {
+        didSet {
+            if oldValue != promptRewriteProviderModeRawValue {
+                applyPromptRewriteProviderDefaultsIfNeeded(force: false)
+                promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: promptRewriteProviderMode)
+            }
+            save()
+        }
+    }
+
+    @Published var promptRewriteOpenAIModel: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var promptRewriteOpenAIBaseURL: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var promptRewriteOpenAIAPIKey: String {
+        didSet {
+            Self.storePromptRewriteProviderAPIKey(
+                promptRewriteOpenAIAPIKey,
+                for: promptRewriteProviderMode
+            )
+            save()
+        }
+    }
+
     @Published var availableMicrophones: [MicrophoneOption] = []
     @Published var accessibilityTrusted: Bool = AXIsProcessTrusted()
 
@@ -569,7 +673,7 @@ final class SettingsStore: ObservableObject {
         if let storedEnabledProviderIDs = defaults.stringArray(forKey: Keys.memoryEnabledProviderIDs) {
             memoryEnabledProviderIDs = Self.normalizedStringList(storedEnabledProviderIDs)
         } else {
-            memoryEnabledProviderIDs = initialDetectedProviderIDs
+            memoryEnabledProviderIDs = []
         }
 
         let initialDetectedSourceFolderIDs = Self.normalizedStringList(
@@ -579,8 +683,37 @@ final class SettingsStore: ObservableObject {
         if let storedEnabledSourceFolderIDs = defaults.stringArray(forKey: Keys.memoryEnabledSourceFolderIDs) {
             memoryEnabledSourceFolderIDs = Self.normalizedStringList(storedEnabledSourceFolderIDs)
         } else {
-            memoryEnabledSourceFolderIDs = initialDetectedSourceFolderIDs
+            memoryEnabledSourceFolderIDs = []
         }
+
+        let storedPromptRewriteProviderMode = defaults.string(forKey: Keys.promptRewriteProviderMode)
+            ?? PromptRewriteProviderMode.openAI.rawValue
+        let resolvedPromptRewriteProviderModeRaw: String
+        if PromptRewriteProviderMode(rawValue: storedPromptRewriteProviderMode) == nil {
+            resolvedPromptRewriteProviderModeRaw = PromptRewriteProviderMode.openAI.rawValue
+        } else {
+            resolvedPromptRewriteProviderModeRaw = storedPromptRewriteProviderMode
+        }
+        promptRewriteProviderModeRawValue = resolvedPromptRewriteProviderModeRaw
+        let selectedPromptProvider = PromptRewriteProviderMode(rawValue: resolvedPromptRewriteProviderModeRaw) ?? .openAI
+
+        let storedOpenAIModel = defaults.string(forKey: Keys.promptRewriteOpenAIModel)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let storedOpenAIModel, !storedOpenAIModel.isEmpty {
+            promptRewriteOpenAIModel = storedOpenAIModel
+        } else {
+            promptRewriteOpenAIModel = selectedPromptProvider.defaultModel
+        }
+
+        let storedOpenAIBaseURL = defaults.string(forKey: Keys.promptRewriteOpenAIBaseURL)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let storedOpenAIBaseURL, !storedOpenAIBaseURL.isEmpty {
+            promptRewriteOpenAIBaseURL = storedOpenAIBaseURL
+        } else {
+            promptRewriteOpenAIBaseURL = selectedPromptProvider.defaultBaseURL
+        }
+
+        promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: selectedPromptProvider)
 
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
@@ -669,6 +802,9 @@ final class SettingsStore: ObservableObject {
         defaults.set(Self.normalizedStringList(memoryEnabledProviderIDs), forKey: Keys.memoryEnabledProviderIDs)
         defaults.set(Self.normalizedStringList(memoryDetectedSourceFolderIDs), forKey: Keys.memoryDetectedSourceFolderIDs)
         defaults.set(Self.normalizedStringList(memoryEnabledSourceFolderIDs), forKey: Keys.memoryEnabledSourceFolderIDs)
+        defaults.set(promptRewriteProviderModeRawValue, forKey: Keys.promptRewriteProviderMode)
+        defaults.set(promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIModel)
+        defaults.set(promptRewriteOpenAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIBaseURL)
 
         guard !isApplyingChanges else { return }
         onChange?()
@@ -700,6 +836,33 @@ final class SettingsStore: ObservableObject {
     var transcriptionEngine: TranscriptionEngineType {
         get { TranscriptionEngineType(rawValue: transcriptionEngineRawValue) ?? .appleSpeech }
         set { transcriptionEngineRawValue = newValue.rawValue }
+    }
+
+    var promptRewriteProviderMode: PromptRewriteProviderMode {
+        get { PromptRewriteProviderMode(rawValue: promptRewriteProviderModeRawValue) ?? .openAI }
+        set { promptRewriteProviderModeRawValue = newValue.rawValue }
+    }
+
+    func hasPromptRewriteOAuthSession(for providerMode: PromptRewriteProviderMode) -> Bool {
+        PromptRewriteOAuthCredentialStore.loadSession(for: providerMode) != nil
+    }
+
+    func clearPromptRewriteOAuthSession(for providerMode: PromptRewriteProviderMode) {
+        PromptRewriteOAuthCredentialStore.deleteSession(for: providerMode)
+    }
+
+    func applyPromptRewriteProviderDefaultsIfNeeded(force: Bool) {
+        let mode = promptRewriteProviderMode
+
+        let normalizedModel = promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if force || normalizedModel.isEmpty {
+            promptRewriteOpenAIModel = mode.defaultModel
+        }
+
+        let normalizedBaseURL = promptRewriteOpenAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if force || normalizedBaseURL.isEmpty {
+            promptRewriteOpenAIBaseURL = mode.defaultBaseURL
+        }
     }
 
     func isMemoryProviderEnabled(_ providerID: String) -> Bool {
@@ -747,7 +910,7 @@ final class SettingsStore: ObservableObject {
 
         memoryDetectedProviderIDs = normalizedProviders
         memoryEnabledProviderIDs = normalizedProviders.filter { providerID in
-            previousEnabled.contains(providerID) || !previousDetected.contains(providerID)
+            previousEnabled.contains(providerID)
         }
     }
 
@@ -758,7 +921,7 @@ final class SettingsStore: ObservableObject {
 
         memoryDetectedSourceFolderIDs = normalizedFolders
         memoryEnabledSourceFolderIDs = normalizedFolders.filter { folderID in
-            previousEnabled.contains(folderID) || !previousDetected.contains(folderID)
+            previousEnabled.contains(folderID)
         }
     }
 
@@ -784,12 +947,141 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    private static let promptRewriteProviderAPIKeychainService = "com.keyscribe.KeyScribe"
+    private static let promptRewriteProviderAPIKeychainAccountPrefix = "prompt-rewrite-provider-api-key"
+    private static let legacyPromptRewriteOpenAIAPIKeychainAccount = "prompt-rewrite-openai-api-key"
+
+    private static func keychainAccount(for providerMode: PromptRewriteProviderMode) -> String {
+        let normalized = providerMode.rawValue
+            .lowercased()
+            .replacingOccurrences(of: "(", with: "")
+            .replacingOccurrences(of: ")", with: "")
+            .replacingOccurrences(of: " ", with: "-")
+        return "\(promptRewriteProviderAPIKeychainAccountPrefix).\(normalized)"
+    }
+
+    private static func loadPromptRewriteProviderAPIKey(for providerMode: PromptRewriteProviderMode) -> String {
+        guard providerMode.requiresAPIKey else { return "" }
+        let account = keychainAccount(for: providerMode)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status != errSecSuccess {
+            if providerMode == .openAI {
+                let legacyQuery: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+                    kSecAttrAccount as String: legacyPromptRewriteOpenAIAPIKeychainAccount,
+                    kSecReturnData as String: true,
+                    kSecMatchLimit as String: kSecMatchLimitOne
+                ]
+                var legacyItem: CFTypeRef?
+                let legacyStatus = SecItemCopyMatching(legacyQuery as CFDictionary, &legacyItem)
+                guard legacyStatus == errSecSuccess,
+                      let legacyData = legacyItem as? Data,
+                      let legacyValue = String(data: legacyData, encoding: .utf8) else {
+                    return ""
+                }
+                storePromptRewriteProviderAPIKey(legacyValue, for: providerMode)
+                return legacyValue
+            }
+            return ""
+        }
+        guard let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return value
+    }
+
+    private static func storePromptRewriteProviderAPIKey(
+        _ rawValue: String,
+        for providerMode: PromptRewriteProviderMode
+    ) {
+        guard providerMode.requiresAPIKey else {
+            deletePromptRewriteProviderAPIKey(for: providerMode)
+            return
+        }
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            deletePromptRewriteProviderAPIKey(for: providerMode)
+            return
+        }
+
+        let data = Data(value.utf8)
+        let account = keychainAccount(for: providerMode)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+            kSecAttrAccount as String: account
+        ]
+
+        let updateStatus = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus == errSecItemNotFound {
+            var create = query
+            create[kSecValueData as String] = data
+            _ = SecItemAdd(create as CFDictionary, nil)
+        }
+
+        if providerMode == .openAI {
+            let legacyQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+                kSecAttrAccount as String: legacyPromptRewriteOpenAIAPIKeychainAccount
+            ]
+            _ = SecItemDelete(legacyQuery as CFDictionary)
+        }
+    }
+
+    private static func deletePromptRewriteProviderAPIKey(for providerMode: PromptRewriteProviderMode) {
+        let account = keychainAccount(for: providerMode)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+            kSecAttrAccount as String: account
+        ]
+        _ = SecItemDelete(query as CFDictionary)
+    }
+
+    private static func deleteAllPromptRewriteProviderAPIKeys() {
+        for providerMode in PromptRewriteProviderMode.allCases {
+            deletePromptRewriteProviderAPIKey(for: providerMode)
+        }
+        let legacyQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+            kSecAttrAccount as String: legacyPromptRewriteOpenAIAPIKeychainAccount
+        ]
+        _ = SecItemDelete(legacyQuery as CFDictionary)
+    }
+
     /// Resets all permissions, deletes local app data, and removes the app bundle.
     /// Requires admin privileges for tccutil and rm of /Applications bundle.
     static func resetAndUninstall(
         deleteDownloadedModels: Bool = false,
-        deleteLearnedCorrections: Bool = false
+        deleteLearnedCorrections: Bool = false,
+        deleteMemories: Bool = false,
+        deleteProviderCredentials: Bool = false
     ) {
+        if deleteProviderCredentials {
+            deleteAllPromptRewriteProviderAPIKeys()
+            PromptRewriteOAuthCredentialStore.deleteAllSessions()
+        }
+
         let currentBundleID = Bundle.main.bundleIdentifier ?? "com.keyscribe.KeyScribe"
         let appName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "KeyScribe"
         // Include legacy IDs so old TCC rows are cleaned up during uninstall.
@@ -833,20 +1125,39 @@ final class SettingsStore: ObservableObject {
             "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Saved Application State/\(bundleID).savedState"))"
         }.joined(separator: "; ")
 
-        let appSupportCleanupCommand: String
-        let learnedCorrectionsCleanupCommand = deleteLearnedCorrections && !deleteDownloadedModels
-            ? "rm -f \(shellSingleQuoted(AdaptiveCorrectionStore.storageFilePath()))"
-            : nil
+        let appSupportPath = "\(NSHomeDirectory())/Library/Application Support/KeyScribe"
+        var appSupportCleanupCommands: [String] = []
+        appSupportCleanupCommands.append("mkdir -p \(shellSingleQuoted(appSupportPath))")
+
+        var findPreserveClauses: [String] = []
+        if !deleteDownloadedModels {
+            findPreserveClauses.append("! -name 'Models'")
+        }
+        if !deleteMemories {
+            findPreserveClauses.append("! -name 'Memory'")
+        }
+        let preserveExpression = findPreserveClauses.joined(separator: " ")
+        appSupportCleanupCommands.append(
+            "find \(shellSingleQuoted(appSupportPath)) -mindepth 1 -maxdepth 1 \(preserveExpression) -exec rm -rf {} +"
+        )
 
         if deleteDownloadedModels {
-            appSupportCleanupCommand = "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Application Support/KeyScribe"))"
-        } else {
-            let appSupportPath = "\(NSHomeDirectory())/Library/Application Support/KeyScribe"
-            appSupportCleanupCommand = "mkdir -p \(shellSingleQuoted(appSupportPath)) && find \(shellSingleQuoted(appSupportPath)) -mindepth 1 -maxdepth 1 ! -name 'Models' -exec rm -rf {} +"
+            appSupportCleanupCommands.append(
+                "rm -rf \(shellSingleQuoted("\(appSupportPath)/Models"))"
+            )
+        } else if deleteLearnedCorrections {
+            appSupportCleanupCommands.append(
+                "rm -f \(shellSingleQuoted(AdaptiveCorrectionStore.storageFilePath()))"
+            )
         }
-        let appSupportCleanupSection = [appSupportCleanupCommand, learnedCorrectionsCleanupCommand]
-            .compactMap { $0 }
-            .joined(separator: "; ")
+
+        if deleteMemories {
+            appSupportCleanupCommands.append(
+                "rm -rf \(shellSingleQuoted("\(appSupportPath)/Memory"))"
+            )
+        }
+
+        let appSupportCleanupSection = appSupportCleanupCommands.joined(separator: "; ")
         let logsCleanupCommand = "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Logs/KeyScribe"))"
         let appRemovalCommands = appRemovalPaths
             .map { "rm -rf \(shellSingleQuoted($0))" }

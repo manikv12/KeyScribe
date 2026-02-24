@@ -88,7 +88,7 @@ enum ShortcutValidation {
     ]
 
     static let defaultKeyCode: UInt16 = 49
-    static let defaultModifiers: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
+    static let defaultModifiers: UInt = NSEvent.ModifierFlags([.control, .shift]).rawValue
 
     static func filteredModifierFlags(from rawValue: UInt) -> NSEvent.ModifierFlags {
         NSEvent.ModifierFlags(rawValue: rawValue).intersection(supportedModifierFlags)

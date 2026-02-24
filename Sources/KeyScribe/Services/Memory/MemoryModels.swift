@@ -154,6 +154,55 @@ struct MemoryCard: Codable, Hashable, Identifiable {
     var metadata: [String: String]
 }
 
+struct MemoryLessonDraft: Codable, Hashable {
+    var mistakePattern: String
+    var improvedPrompt: String
+    var rationale: String
+    var validationConfidence: Double
+    var sourceMetadata: [String: String]
+
+    init(
+        mistakePattern: String,
+        improvedPrompt: String,
+        rationale: String,
+        validationConfidence: Double,
+        sourceMetadata: [String: String] = [:]
+    ) {
+        self.mistakePattern = MemoryTextNormalizer.normalizedBody(mistakePattern)
+        self.improvedPrompt = MemoryTextNormalizer.normalizedBody(improvedPrompt)
+        self.rationale = MemoryTextNormalizer.normalizedSummary(rationale, limit: 320)
+        self.validationConfidence = min(1, max(0, validationConfidence))
+        self.sourceMetadata = sourceMetadata
+    }
+}
+
+struct MemoryLesson: Codable, Hashable, Identifiable {
+    let id: UUID
+    let sourceID: UUID
+    let sourceFileID: UUID
+    let eventID: UUID
+    let cardID: UUID
+    let provider: MemoryProviderKind
+    var mistakePattern: String
+    var improvedPrompt: String
+    var rationale: String
+    var validationConfidence: Double
+    var sourceMetadata: [String: String]
+    var createdAt: Date
+    var updatedAt: Date
+}
+
+struct MemoryIndexedEntry: Hashable, Identifiable {
+    let id: UUID
+    let provider: MemoryProviderKind
+    let sourceRootPath: String
+    let title: String
+    let summary: String
+    let detail: String
+    let updatedAt: Date
+    let isPlanContent: Bool
+}
+
 struct RewriteSuggestion: Codable, Hashable, Identifiable {
     let id: UUID
     let cardID: UUID
@@ -163,6 +212,56 @@ struct RewriteSuggestion: Codable, Hashable, Identifiable {
     let rationale: String
     let confidence: Double
     let createdAt: Date
+}
+
+enum MemoryRewriteLessonValidationState: String, Codable, Hashable {
+    case userConfirmed = "user-confirmed"
+    case indexedValidated = "indexed-validated"
+    case unvalidated = "unvalidated"
+    case invalidated = "invalidated"
+
+    var isValidated: Bool {
+        switch self {
+        case .userConfirmed, .indexedValidated:
+            return true
+        case .unvalidated, .invalidated:
+            return false
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .userConfirmed:
+            return "User Confirmed"
+        case .indexedValidated:
+            return "Indexed Validated"
+        case .unvalidated:
+            return "Unvalidated"
+        case .invalidated:
+            return "Invalidated"
+        }
+    }
+}
+
+struct MemoryRewriteLesson: Hashable, Identifiable {
+    let id: UUID
+    let provider: MemoryProviderKind
+    let mistakeText: String
+    let correctionText: String
+    let rationale: String
+    let confidence: Double
+    let createdAt: Date
+    let provenance: String
+    let validationState: MemoryRewriteLessonValidationState
+}
+
+struct MemoryRewritePromptContext: Hashable {
+    let lessons: [MemoryRewriteLesson]
+    let supportingCards: [MemoryCard]
+
+    var isEmpty: Bool {
+        lessons.isEmpty && supportingCards.isEmpty
+    }
 }
 
 struct MemoryRewriteLookupOptions: Hashable {

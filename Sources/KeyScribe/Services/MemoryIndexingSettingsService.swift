@@ -23,6 +23,24 @@ final class MemoryIndexingSettingsService {
     }
 
     static let shared = MemoryIndexingSettingsService()
+    static let indexingDidProgressNotification = Notification.Name("KeyScribe.memoryIndexingDidProgress")
+    static let indexingDidFinishNotification = Notification.Name("KeyScribe.memoryIndexingDidFinish")
+
+    enum IndexingNotificationUserInfoKey {
+        static let rebuild = "rebuild"
+        static let totalSources = "totalSources"
+        static let discoveredSources = "discoveredSources"
+        static let currentSourceDisplayName = "currentSourceDisplayName"
+        static let currentFilePath = "currentFilePath"
+        static let indexedFiles = "indexedFiles"
+        static let skippedFiles = "skippedFiles"
+        static let indexedEvents = "indexedEvents"
+        static let indexedCards = "indexedCards"
+        static let indexedLessons = "indexedLessons"
+        static let indexedRewriteSuggestions = "indexedRewriteSuggestions"
+        static let failureCount = "failureCount"
+        static let firstFailure = "firstFailure"
+    }
 
     private let discoveryService: MemoryProviderDiscoveryService
     private let indexingService: MemoryIndexingService
@@ -73,7 +91,7 @@ final class MemoryIndexingSettingsService {
                 enabledProviders: Set(enabledProviderIDs),
                 enabledSourceFolders: Set(enabledSourceFolderIDs)
             )
-            queueIndexing(sources: filteredDiscovery.sources, rebuild: false)
+            queueIndexing(sources: filteredDiscovery.sources, rebuild: false, clearBeforeIndexing: false)
         }
 
         return ScanResult(
@@ -91,7 +109,18 @@ final class MemoryIndexingSettingsService {
             enabledProviders: Set(enabledProviderIDs),
             enabledSourceFolders: Set(enabledSourceFolderIDs)
         )
-        queueIndexing(sources: discovery.sources, rebuild: true)
+        queueIndexing(sources: discovery.sources, rebuild: true, clearBeforeIndexing: false)
+    }
+
+    func rebuildIndexFromScratch(
+        enabledProviderIDs: [String] = [],
+        enabledSourceFolderIDs: [String] = []
+    ) {
+        let discovery = discoveryService.discover(
+            enabledProviders: Set(enabledProviderIDs),
+            enabledSourceFolders: Set(enabledSourceFolderIDs)
+        )
+        queueIndexing(sources: discovery.sources, rebuild: true, clearBeforeIndexing: true)
     }
 
     func clearMemories() {
@@ -112,20 +141,136 @@ final class MemoryIndexingSettingsService {
         }
     }
 
-    private func queueIndexing(sources: [MemoryDiscoveredSource], rebuild: Bool) {
+    func browseIndexedMemories(
+        query: String,
+        providerID: String?,
+        sourceFolderID: String?,
+        includePlanContent: Bool = false,
+        limit: Int = 80
+    ) -> [MemoryIndexedEntry] {
+        do {
+            let store = try storeFactory()
+            let normalizedProviderID = providerID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedSourceFolderID = sourceFolderID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let provider = normalizedProviderID.flatMap { rawValue in
+                MemoryProviderKind(rawValue: rawValue.lowercased())
+            }
+
+            return try store.fetchIndexedEntries(
+                query: query,
+                provider: provider,
+                sourceRootPath: normalizedSourceFolderID,
+                includePlanContent: includePlanContent,
+                limit: limit
+            )
+        } catch {
+            return []
+        }
+    }
+
+    private func queueIndexing(sources: [MemoryDiscoveredSource], rebuild: Bool, clearBeforeIndexing: Bool) {
         activeIndexTask?.cancel()
         let indexingService = self.indexingService
         let storeFactory = self.storeFactory
+        let totalSources = sources.count
 
         activeIndexTask = Task.detached(priority: .utility) {
+            let emitProgress: MemoryIndexingService.ProgressHandler = { report, currentSource, currentFilePath in
+                if Task.isCancelled {
+                    return
+                }
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: Self.indexingDidProgressNotification,
+                        object: nil,
+                        userInfo: [
+                            IndexingNotificationUserInfoKey.rebuild: rebuild,
+                            IndexingNotificationUserInfoKey.totalSources: totalSources,
+                            IndexingNotificationUserInfoKey.discoveredSources: report.discoveredSources,
+                            IndexingNotificationUserInfoKey.currentSourceDisplayName: currentSource?.displayName ?? "",
+                            IndexingNotificationUserInfoKey.currentFilePath: currentFilePath ?? "",
+                            IndexingNotificationUserInfoKey.indexedFiles: report.indexedFiles,
+                            IndexingNotificationUserInfoKey.skippedFiles: report.skippedFiles,
+                            IndexingNotificationUserInfoKey.indexedEvents: report.indexedEvents,
+                            IndexingNotificationUserInfoKey.indexedCards: report.indexedCards,
+                            IndexingNotificationUserInfoKey.indexedLessons: report.indexedLessons,
+                            IndexingNotificationUserInfoKey.indexedRewriteSuggestions: report.indexedRewriteSuggestions,
+                            IndexingNotificationUserInfoKey.failureCount: report.failures.count,
+                            IndexingNotificationUserInfoKey.firstFailure: report.failures.first ?? ""
+                        ]
+                    )
+                }
+            }
+
+            await emitProgress(MemoryIndexingReport(), nil, nil)
             do {
                 let store = try storeFactory()
-                if rebuild {
-                    _ = await indexingService.rebuildIndex(from: sources, store: store)
+                let report: MemoryIndexingReport
+                if clearBeforeIndexing {
+                    report = await indexingService.rebuildFromScratch(
+                        from: sources,
+                        store: store,
+                        progress: emitProgress
+                    )
+                } else if rebuild {
+                    report = await indexingService.rebuildIndex(
+                        from: sources,
+                        store: store,
+                        progress: emitProgress
+                    )
                 } else {
-                    _ = await indexingService.indexSources(sources, store: store)
+                    report = await indexingService.indexSources(
+                        sources,
+                        store: store,
+                        progress: emitProgress
+                    )
+                }
+                if Task.isCancelled {
+                    return
+                }
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: Self.indexingDidFinishNotification,
+                        object: nil,
+                        userInfo: [
+                            IndexingNotificationUserInfoKey.rebuild: rebuild,
+                            IndexingNotificationUserInfoKey.discoveredSources: report.discoveredSources,
+                            IndexingNotificationUserInfoKey.indexedFiles: report.indexedFiles,
+                            IndexingNotificationUserInfoKey.skippedFiles: report.skippedFiles,
+                            IndexingNotificationUserInfoKey.indexedEvents: report.indexedEvents,
+                            IndexingNotificationUserInfoKey.indexedCards: report.indexedCards,
+                            IndexingNotificationUserInfoKey.indexedLessons: report.indexedLessons,
+                            IndexingNotificationUserInfoKey.indexedRewriteSuggestions: report.indexedRewriteSuggestions,
+                            IndexingNotificationUserInfoKey.failureCount: report.failures.count,
+                            IndexingNotificationUserInfoKey.firstFailure: report.failures.first ?? ""
+                        ]
+                    )
                 }
             } catch {
+                if Task.isCancelled {
+                    return
+                }
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: Self.indexingDidFinishNotification,
+                        object: nil,
+                        userInfo: [
+                            IndexingNotificationUserInfoKey.rebuild: rebuild,
+                            IndexingNotificationUserInfoKey.discoveredSources: 0,
+                            IndexingNotificationUserInfoKey.indexedFiles: 0,
+                            IndexingNotificationUserInfoKey.skippedFiles: 0,
+                            IndexingNotificationUserInfoKey.indexedEvents: 0,
+                            IndexingNotificationUserInfoKey.indexedCards: 0,
+                            IndexingNotificationUserInfoKey.indexedLessons: 0,
+                            IndexingNotificationUserInfoKey.indexedRewriteSuggestions: 0,
+                            IndexingNotificationUserInfoKey.failureCount: 1,
+                            IndexingNotificationUserInfoKey.firstFailure: error.localizedDescription
+                        ]
+                    )
+                }
                 return
             }
         }
