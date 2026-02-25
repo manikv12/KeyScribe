@@ -57,11 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var dictationInputMode: DictationInputMode = .idle
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
-    private enum PromptRewritePreviewChoice {
-        case useSuggested
-        case editThenInsert
-        case insertOriginal
-    }
+    private var hasScheduledPermissionRestart = false
+
     private enum PromptRewriteFailureChoice {
         case retry
         case insertOriginal
@@ -74,16 +71,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case pasted
         case correctionLearned
 
+        // Keep nonisolated defaults local so this enum can be used from non-main contexts
+        // without reading @MainActor-isolated state from SettingsStore.
+        private static let defaultStartSoundName = "Ping"
+        private static let defaultStopSoundName = "Glass"
+        private static let defaultProcessingSoundName = "Ping"
+        private static let defaultPastedSoundName = "Pop"
+        private static let defaultCorrectionLearnedSoundName = "Purr"
+
         var systemSoundName: String {
             switch self {
             case .startListening, .processing:
-                return SettingsStore.defaultDictationStartSoundName
+                return Self.defaultStartSoundName
             case .stopListening:
-                return SettingsStore.defaultDictationStopSoundName
+                return Self.defaultStopSoundName
             case .pasted:
-                return SettingsStore.defaultDictationPastedSoundName
+                return Self.defaultPastedSoundName
             case .correctionLearned:
-                return SettingsStore.defaultDictationCorrectionLearnedSoundName
+                return Self.defaultCorrectionLearnedSoundName
             }
         }
 
@@ -112,23 +117,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         private static var startingFallback: String {
-            SettingsStore.defaultDictationStartSoundName
+            Self.defaultStartSoundName
         }
 
         private static var stopFallback: String {
-            SettingsStore.defaultDictationStopSoundName
+            Self.defaultStopSoundName
         }
 
         private static var processingFallback: String {
-            SettingsStore.defaultDictationProcessingSoundName
+            Self.defaultProcessingSoundName
         }
 
         private static var pastedFallback: String {
-            SettingsStore.defaultDictationPastedSoundName
+            Self.defaultPastedSoundName
         }
 
         private static var correctionLearnedFallback: String {
-            SettingsStore.defaultDictationCorrectionLearnedSoundName
+            Self.defaultCorrectionLearnedSoundName
         }
 
         var volumeMultiplier: Float {
@@ -266,6 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.schedulePermissionRestartIfNeeded()
                 self?.updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
             }
         }
@@ -323,12 +329,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updatePermissionGate(openOnboardingIfNeeded: Bool, reconfigureHotkeysIfReady: Bool = false) {
+        let hadAccessibilityPermission = settings.accessibilityTrusted
         let snapshot = currentPermissionSnapshot()
         let wasReady = permissionsReady
         permissionsReady = snapshot.allRequiredGranted
 
         if permissionsReady {
             transcriber.requestPermissions(promptIfNeeded: false)
+            if !hadAccessibilityPermission && snapshot.accessibilityGranted {
+                schedulePermissionRestartIfNeeded()
+            }
             windowCoordinator?.closePermissionOnboardingWindow()
             if !wasReady || reconfigureHotkeysIfReady {
                 applyHotkeyMode()
@@ -351,6 +361,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updateMenuState()
+    }
+
+    private func schedulePermissionRestartIfNeeded() {
+        guard !hasScheduledPermissionRestart else { return }
+        hasScheduledPermissionRestart = true
+
+        let appURL = Bundle.main.bundleURL
+
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        config.promptsUserIfNeeded = false
+
+        NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, error in
+            if let error {
+                CrashReporter.logError("Restart after permission grant failed: \(error)")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                NSApplication.shared.terminate(nil)
+            }
+        }
     }
 
     private func stopPermissionDependentFeatures() {
@@ -718,12 +748,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         while true {
             do {
-                guard let suggestion = try await promptRewriteService.retrieveSuggestion(for: cleanedTranscript) else {
+                guard let rawSuggestion = try await promptRewriteService.retrieveSuggestion(for: cleanedTranscript) else {
                     return cleanedTranscript
                 }
+                let suggestion = formatPromptRewriteSuggestion(rawSuggestion, originalText: cleanedTranscript)
 
                 while true {
-                    switch presentPromptRewritePreviewDialog(
+                    switch await presentPromptRewritePreviewDialog(
                         originalText: cleanedTranscript,
                         suggestion: suggestion
                     ) {
@@ -739,13 +770,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         guard let edited = presentPromptRewriteEditDialog(initialText: suggestion.suggestedText) else {
                             continue
                         }
+                        let normalizedEdited = PromptRewriteFormatting.prepareEditedTextForInsertion(
+                            edited,
+                            forceMarkdown: settings.promptRewriteAlwaysConvertToMarkdown
+                        )
+                        let finalEdited = normalizedEdited.isEmpty ? edited : normalizedEdited
                         await recordPromptRewriteFeedback(
                             action: .editedThenInserted,
                             originalText: cleanedTranscript,
                             suggestedText: suggestion.suggestedText,
-                            finalInsertedText: edited
+                            finalInsertedText: finalEdited
                         )
-                        return edited
+                        return finalEdited
                     case .insertOriginal:
                         await recordPromptRewriteFeedback(
                             action: .insertedOriginal,
@@ -818,23 +854,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func presentPromptRewritePreviewDialog(
         originalText: String,
         suggestion: PromptRewriteSuggestion
-    ) -> PromptRewritePreviewChoice {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Review Suggested Rewrite"
-        alert.informativeText = promptRewritePreviewBody(originalText: originalText, suggestion: suggestion)
-        alert.addButton(withTitle: "Use Suggested")
-        alert.addButton(withTitle: "Edit Then Insert")
-        alert.addButton(withTitle: "Insert Original")
-
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return .useSuggested
-        case .alertSecondButtonReturn:
-            return .editThenInsert
-        default:
-            return .insertOriginal
-        }
+    ) async -> PromptRewritePreviewChoice {
+        await PromptRewriteHUDManager.shared.present(originalText: originalText, suggestion: suggestion)
     }
 
     private func presentPromptRewriteEditDialog(initialText: String) -> String? {
@@ -957,6 +978,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return "unknown-provider-error"
         }
         return raw
+    }
+
+    private func formatPromptRewriteSuggestion(
+        _ suggestion: PromptRewriteSuggestion,
+        originalText: String
+    ) -> PromptRewriteSuggestion {
+        let formatted = PromptRewriteFormatting.prepareSuggestedTextForInsertion(
+            suggestion.suggestedText,
+            originalText: originalText,
+            forceMarkdown: settings.promptRewriteAlwaysConvertToMarkdown
+        )
+        let resolvedText = formatted.isEmpty ? suggestion.suggestedText : formatted
+        return PromptRewriteSuggestion(
+            suggestedText: resolvedText,
+            memoryContext: suggestion.memoryContext
+        )
     }
 
     private func recordPromptRewriteFeedback(
@@ -1125,17 +1162,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleLearnedCorrection(from originalText: String, correctedText: String, insertedText: String) {
         guard settings.adaptiveCorrectionsEnabled else { return }
 
-        let learningEvents = adaptiveCorrectionStore.learn(
+        guard let proposedEvent = adaptiveCorrectionStore.proposedLearningEvent(
             from: originalText,
             correctedText: correctedText,
             insertionHint: insertedText
-        )
-        guard !learningEvents.isEmpty else { return }
+        ) else { return }
 
-        let event = learningEvents[0]
-        let source = event.source
-        let replacement = event.replacement
-        let hudMessage = "Learned correction: \(source) -> \(replacement)"
+        let source = proposedEvent.source
+        let replacement = proposedEvent.replacement
+        waveform.presentCorrectionDecision(
+            source: source,
+            replacement: replacement,
+            onAccept: { [weak self] in
+                self?.acceptLearnedCorrection(source: source, replacement: replacement)
+            },
+            onReject: { [weak self] in
+                self?.setUIStatus(.message("Skipped correction: \(source) -> \(replacement)"))
+            }
+        )
+    }
+
+    private func acceptLearnedCorrection(source: String, replacement: String) {
+        guard let event = adaptiveCorrectionStore.acceptProposedLearning(
+            source: source,
+            replacement: replacement
+        ) else {
+            return
+        }
+
+        let hudMessage = "Learned correction: \(event.source) -> \(event.replacement)"
 
         waveform.flashEvent(
             message: hudMessage,
@@ -1453,6 +1508,8 @@ struct SettingsView: View {
     @State private var shortcutCaptureMessage: String?
     @State private var showHoldManualMap = false
     @State private var showContinuousManualMap = false
+    @State private var showDictationOutputSettings = false
+    @State private var showDictationSoundSettings = false
     @State private var whisperModelSearchQuery = ""
     @State private var whisperFamilyFilter = "all"
     @State private var whisperShowInstalledOnly = false
@@ -1485,6 +1542,8 @@ struct SettingsView: View {
     @State private var memoryActionMessage: String?
     @State private var showingProvidersSheet = false
     @State private var showingSourceFoldersSheet = false
+    @State private var showingCorrectionsListSheet = false
+    @State private var correctionsSearchQuery = ""
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let settingsSidebarWidth: CGFloat = 278
     private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
@@ -1493,22 +1552,16 @@ struct SettingsView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .underPageBackgroundColor).opacity(0.80)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            AppChromeBackground()
 
             HStack(spacing: 0) {
                 settingsSidebar
                 Divider()
                 settingsDetailPane
             }
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.65))
+            .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.18)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .padding(10)
 
             ShortcutCaptureMonitor(
                 isCapturing: $isCapturingShortcut,
@@ -1537,6 +1590,7 @@ struct SettingsView: View {
             .frame(width: 1, height: 1)
             .opacity(0.001)
         }
+        .appScrollbars()
         .frame(minWidth: 860, idealWidth: 900, minHeight: 620, idealHeight: 680)
         .onChange(of: searchQuery) { _ in
             guard !trimmedSearchQuery.isEmpty else { return }
@@ -1551,6 +1605,9 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $isCorrectionEditorPresented) {
             correctionEditorSheet
+        }
+        .sheet(isPresented: $showingCorrectionsListSheet) {
+            correctionsListSheet
         }
     }
 
@@ -1611,10 +1668,19 @@ struct SettingsView: View {
 
             Spacer(minLength: 0)
         }
-        .padding(14)
+        .padding(.top, 34)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 14)
         .frame(width: settingsSidebarWidth, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.primary.opacity(0.10), lineWidth: 0.5)
+                )
+        )
     }
 
     @ViewBuilder
@@ -1669,7 +1735,9 @@ struct SettingsView: View {
                 }
                 sectionContent(for: selectedSection)
             }
-            .padding(20)
+            .padding(.top, 34)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
@@ -1716,7 +1784,15 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(entry.section.tint.opacity(0.12))
+                                .fill(.regularMaterial)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(entry.section.tint.opacity(0.15))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .stroke(entry.section.tint.opacity(0.25), lineWidth: 0.6)
+                                )
                         )
                     }
                     .buttonStyle(.plain)
@@ -1753,16 +1829,20 @@ struct SettingsView: View {
             settingsSectionHeader(for: .general)
             accessibilityCard
 
-            settingsCard(title: "Dictation Output") {
+            settingsDisclosureCard(
+                title: "Dictation Output",
+                isExpanded: $showDictationOutputSettings
+            ) {
                 Toggle("Also copy transcript to system clipboard", isOn: $settings.copyToClipboard)
                     .help("Turn off to keep dictations out of clipboard history. Explicit Copy actions from History still copy as expected.")
             }
 
-                    settingsCard(
-                        title: "Dictation Sounds",
-                        subtitle: "Choose the sounds for each dictation event."
-                    ) {
-                        VStack(alignment: .leading, spacing: 10) {
+            settingsDisclosureCard(
+                title: "Dictation Sounds",
+                subtitle: "Choose the sounds for each dictation event.",
+                isExpanded: $showDictationSoundSettings
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
                     dictationSoundRow(
                         title: "Start listening",
                         selection: $settings.dictationStartSoundName
@@ -1778,26 +1858,26 @@ struct SettingsView: View {
                         selection: $settings.dictationProcessingSoundName
                     )
 
-                            dictationSoundRow(
-                                title: "Pasted",
-                                selection: $settings.dictationPastedSoundName
-                            )
+                    dictationSoundRow(
+                        title: "Pasted",
+                        selection: $settings.dictationPastedSoundName
+                    )
 
-                            VStack(spacing: 6) {
-                                HStack {
-                                    Text("Feedback volume")
-                                        .font(.callout.weight(.medium))
-                                    Spacer()
-                                    Text("\(Int(settings.dictationFeedbackVolume * 100))%")
-                                        .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 52, alignment: .trailing)
-                                }
-                                Slider(value: $settings.dictationFeedbackVolume, in: 0...1, step: 0.01)
-                                    .help("Reduce this value to lower all dictation feedback sounds.")
-                            }
+                    VStack(spacing: 6) {
+                        HStack {
+                            Text("Feedback volume")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            Text("\(Int(settings.dictationFeedbackVolume * 100))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 52, alignment: .trailing)
                         }
+                        Slider(value: $settings.dictationFeedbackVolume, in: 0...1, step: 0.01)
+                            .help("Reduce this value to lower all dictation feedback sounds.")
                     }
+                }
+            }
 
             settingsCard(title: "Waveform Appearance") {
                 Picker("Waveform Theme", selection: $settings.waveformThemeRawValue) {
@@ -1807,6 +1887,15 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.menu)
                 .help("Choose the color scheme for the recording waveform.")
+
+                Divider()
+                    .padding(.vertical, 6)
+
+                Text("Preview")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                WaveformThemePreview(theme: settings.waveformTheme)
             }
 
             settingsCard(title: "Quick Reference") {
@@ -1818,6 +1907,10 @@ struct SettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
+        }
+        .onAppear {
+            showDictationOutputSettings = false
+            showDictationSoundSettings = false
         }
     }
 
@@ -2292,9 +2385,14 @@ struct SettingsView: View {
                         }
 
                         if adaptiveCorrectionStore.learnedCorrections.count > 12 {
-                            Text("Showing first 12 corrections.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            HStack {
+                                Button("View All \\(adaptiveCorrectionStore.learnedCorrections.count) Corrections...") {
+                                    showingCorrectionsListSheet = true
+                                }
+                                .buttonStyle(.bordered)
+                                Spacer()
+                            }
+                            .padding(.top, 4)
                         }
 
                         HStack {
@@ -2309,6 +2407,85 @@ struct SettingsView: View {
         }
     }
 
+    private var filteredCorrections: [AdaptiveCorrectionStore.LearnedCorrection] {
+        let all = adaptiveCorrectionStore.learnedCorrections
+        let query = correctionsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if query.isEmpty { return all }
+        return all.filter {
+            $0.source.lowercased().contains(query) || $0.replacement.lowercased().contains(query)
+        }
+    }
+
+    @ViewBuilder
+    private var correctionsListSheet: some View {
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Learned Corrections")
+                        .font(.headline)
+                    Spacer()
+                    Button("Done") {
+                        showingCorrectionsListSheet = false
+                    }
+                }
+                .padding()
+                Divider()
+
+                VStack(alignment: .leading, spacing: 14) {
+                    if adaptiveCorrectionStore.learnedCorrections.isEmpty {
+                        Text("No learned corrections yet. Fix a mistaken word once and KeyScribe can learn it.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    } else {
+                        TextField("Search corrections", text: $correctionsSearchQuery)
+                            .textFieldStyle(.roundedBorder)
+
+                        if filteredCorrections.isEmpty {
+                            Text("No corrections match \"\\(correctionsSearchQuery)\".")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredCorrections, id: \.id) { correction in
+                                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                            Text(correction.source)
+                                                .font(.callout.monospaced())
+                                            Image(systemName: "arrow.right")
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+                                            Text(correction.replacement)
+                                                .font(.callout.monospaced())
+                                            Spacer()
+                                            Button("Edit") {
+                                                beginEditingCorrection(correction)
+                                            }
+                                            .buttonStyle(.borderless)
+                                            Button("Remove") {
+                                                adaptiveCorrectionStore.removeCorrection(source: correction.source)
+                                            }
+                                            .buttonStyle(.borderless)
+                                        }
+                                    }
+                                }
+                                .padding(.trailing)
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
+        }
+        .frame(width: 500, height: 500)
+    }
+
     @ViewBuilder
     private var memorySourcesSection: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -2319,8 +2496,13 @@ struct SettingsView: View {
                 subtitle: "Use this toggle to enable or disable AI memory-based prompt rewriting."
             ) {
                 Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
+                Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
+                    .disabled(!settings.memoryIndexingEnabled)
                 Text("Current rewrite provider: \(settings.promptRewriteProviderMode.displayName)")
                     .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Structured suggestions keep their formatting when inserted, including bullets and question lists.")
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
@@ -2356,164 +2538,178 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var providersSelectionSheet: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Manage Detected Providers")
-                    .font(.headline)
-                Spacer()
-                Button("Done") {
-                    showingProvidersSheet = false
-                }
-            }
-            .padding()
-            Divider()
-            
-            VStack(alignment: .leading, spacing: 14) {
-                if detectedMemoryProviders.isEmpty {
-                    Text("No providers detected yet. Click Rescan to detect providers.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Manage Detected Providers")
+                        .font(.headline)
                     Spacer()
-                } else {
-                    HStack(spacing: 8) {
-                        TextField("Filter providers", text: $memoryProviderFilterQuery)
-                            .textFieldStyle(.roundedBorder)
-                        Toggle("Selected only", isOn: $memoryShowSelectedProvidersOnly)
-                            .toggleStyle(.checkbox)
-                            .fixedSize()
+                    Button("Done") {
+                        showingProvidersSheet = false
                     }
+                }
+                .padding()
+                Divider()
 
-                    HStack(spacing: 8) {
-                        Button("Select All Visible") {
-                            setMemoryProvidersEnabled(filteredMemoryProviders, enabled: true)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
-
-                        Button("Clear Visible") {
-                            setMemoryProvidersEnabled(filteredMemoryProviders, enabled: false)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
-                    }
-
-                    if filteredMemoryProviders.isEmpty {
-                        Text("No providers match the current filters.")
-                            .font(.caption)
+                VStack(alignment: .leading, spacing: 14) {
+                    if detectedMemoryProviders.isEmpty {
+                        Text("No providers detected yet. Click Rescan to detect providers.")
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                         Spacer()
                     } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 10) {
-                                ForEach(filteredMemoryProviders) { provider in
-                                    Toggle(isOn: Binding(
-                                        get: { settings.isMemoryProviderEnabled(provider.id) },
-                                        set: { isEnabled in
-                                            settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
-                                        }
-                                    )) {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(provider.name)
-                                                .font(.callout.weight(.medium))
-                                            Text(provider.detail)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                    .disabled(!settings.memoryIndexingEnabled)
-                                }
+                        HStack(spacing: 8) {
+                            TextField("Filter providers", text: $memoryProviderFilterQuery)
+                                .textFieldStyle(.roundedBorder)
+                            Toggle("Selected only", isOn: $memoryShowSelectedProvidersOnly)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Select All Visible") {
+                                setMemoryProvidersEnabled(filteredMemoryProviders, enabled: true)
                             }
-                            .padding(.trailing)
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+
+                            Button("Clear Visible") {
+                                setMemoryProvidersEnabled(filteredMemoryProviders, enabled: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+                        }
+
+                        if filteredMemoryProviders.isEmpty {
+                            Text("No providers match the current filters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredMemoryProviders) { provider in
+                                        Toggle(isOn: Binding(
+                                            get: { settings.isMemoryProviderEnabled(provider.id) },
+                                            set: { isEnabled in
+                                                settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
+                                            }
+                                        )) {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(provider.name)
+                                                    .font(.callout.weight(.medium))
+                                                Text(provider.detail)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .disabled(!settings.memoryIndexingEnabled)
+                                    }
+                                }
+                                .padding(.trailing)
+                            }
                         }
                     }
                 }
+                .padding()
             }
-            .padding()
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
         }
         .frame(width: 450, height: 500)
     }
 
     @ViewBuilder
     private var sourceFoldersSelectionSheet: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Manage Detected Source Folders")
-                    .font(.headline)
-                Spacer()
-                Button("Done") {
-                    showingSourceFoldersSheet = false
-                }
-            }
-            .padding()
-            Divider()
-            
-            VStack(alignment: .leading, spacing: 14) {
-                if detectedMemorySourceFolders.isEmpty {
-                    Text("No source folders detected yet. Click Rescan to find folders.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Manage Detected Source Folders")
+                        .font(.headline)
                     Spacer()
-                } else {
-                    HStack(spacing: 8) {
-                        TextField("Filter source folders", text: $memoryFolderFilterQuery)
-                            .textFieldStyle(.roundedBorder)
-                        Toggle("Selected only", isOn: $memoryShowSelectedFoldersOnly)
-                            .toggleStyle(.checkbox)
-                            .fixedSize()
-                        Toggle("Only", isOn: $memoryFoldersOnlyEnabledProviders)
-                            .toggleStyle(.checkbox)
-                            .fixedSize()
-                            .help("Only enabled providers")
+                    Button("Done") {
+                        showingSourceFoldersSheet = false
                     }
+                }
+                .padding()
+                Divider()
 
-                    HStack(spacing: 8) {
-                        Button("Select All Visible") {
-                            setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: true)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
-
-                        Button("Clear Visible") {
-                            setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: false)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
-                    }
-
-                    if filteredMemorySourceFolders.isEmpty {
-                        Text("No source folders match the current filters.")
-                            .font(.caption)
+                VStack(alignment: .leading, spacing: 14) {
+                    if detectedMemorySourceFolders.isEmpty {
+                        Text("No source folders detected yet. Click Rescan to find folders.")
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                         Spacer()
                     } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 10) {
-                                ForEach(filteredMemorySourceFolders) { folder in
-                                    Toggle(isOn: Binding(
-                                        get: { settings.isMemorySourceFolderEnabled(folder.id) },
-                                        set: { isEnabled in
-                                            settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
-                                        }
-                                    )) {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(folder.name)
-                                                .font(.callout.weight(.medium))
-                                            Text(folder.path)
-                                                .font(.caption2.monospaced())
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                                .truncationMode(.middle)
-                                        }
-                                    }
-                                    .disabled(!settings.memoryIndexingEnabled)
-                                }
+                        HStack(spacing: 8) {
+                            TextField("Filter source folders", text: $memoryFolderFilterQuery)
+                                .textFieldStyle(.roundedBorder)
+                            Toggle("Selected only", isOn: $memoryShowSelectedFoldersOnly)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                            Toggle("Only", isOn: $memoryFoldersOnlyEnabledProviders)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                                .help("Only enabled source providers")
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Select All Visible") {
+                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: true)
                             }
-                            .padding(.trailing)
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+
+                            Button("Clear Visible") {
+                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+                        }
+
+                        if filteredMemorySourceFolders.isEmpty {
+                            Text("No source folders match the current filters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredMemorySourceFolders) { folder in
+                                        Toggle(isOn: Binding(
+                                            get: { settings.isMemorySourceFolderEnabled(folder.id) },
+                                            set: { isEnabled in
+                                                settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
+                                            }
+                                        )) {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(folder.name)
+                                                    .font(.callout.weight(.medium))
+                                                Text(folder.path)
+                                                    .font(.caption2.monospaced())
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                            }
+                                        }
+                                        .disabled(!settings.memoryIndexingEnabled)
+                                    }
+                                }
+                                .padding(.trailing)
+                            }
                         }
                     }
                 }
+                .padding()
             }
-            .padding()
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
         }
         .frame(width: 550, height: 500)
     }
@@ -2776,9 +2972,9 @@ struct SettingsView: View {
 
         guard showMessage else { return }
         if result.indexQueued {
-            memoryActionMessage = "Rescan finished. Found \(result.providers.count) providers and \(result.sourceFolders.count) folders. Indexing started in background."
+            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued \(result.queuedSourceCount) selected source(s) for indexing in the background."
         } else {
-            memoryActionMessage = "Rescan finished. Found \(result.providers.count) providers and \(result.sourceFolders.count) folders."
+            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued 0 selected sources for indexing."
         }
     }
 
@@ -3067,14 +3263,38 @@ struct SettingsView: View {
             content()
         }
         .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
-        )
+        .appThemedSurface(cornerRadius: 10, strokeOpacity: 0.17)
+    }
+
+    @ViewBuilder
+    private func settingsDisclosureCard<Content: View>(
+        title: String,
+        subtitle: String? = nil,
+        isExpanded: Binding<Bool>,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            DisclosureGroup(isExpanded: isExpanded) {
+                VStack(alignment: .leading, spacing: 10) {
+                    content()
+                }
+                .padding(.top, 6)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .appThemedSurface(cornerRadius: 10, strokeOpacity: 0.17)
     }
 
     @ViewBuilder
@@ -3203,6 +3423,7 @@ struct SettingsView: View {
             .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
             .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
             .init(section: .memorySources, title: "AI memory assistant toggle", detail: "Enable or disable memory-based prompt rewrite", keywords: ["memory", "indexing", "toggle", "enable", "ai"]),
+            .init(section: .memorySources, title: "Markdown suggestion conversion", detail: "Always convert AI suggestions to Markdown before insertion", keywords: ["markdown", "format", "rewrite", "insert", "assistant"]),
             .init(section: .memorySources, title: "Provider connection status", detail: "See OAuth connection status for OpenAI and Anthropic", keywords: ["provider", "oauth", "openai", "anthropic", "connection"]),
             .init(section: .memorySources, title: "Open AI Memory Studio", detail: "Launch dedicated AI page for full provider and memory controls", keywords: ["ai", "memory studio", "providers", "browser", "rescan", "rebuild"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
@@ -3327,6 +3548,9 @@ struct SettingsView: View {
             }
         }
         .padding(20)
+        .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+        .padding(10)
+        .background(AppChromeBackground())
         .frame(width: 460)
     }
 
@@ -3358,7 +3582,11 @@ struct SettingsView: View {
 
                 if !settings.accessibilityTrusted {
                     Button("Grant Accessibility Access…") {
-                        PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
+                        PermissionCenter.requestAccessibilityPermission(
+                            using: settings,
+                            promptIfNeeded: true,
+                            openSettingsIfDenied: false
+                        )
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -3561,7 +3789,11 @@ struct SettingsView: View {
                     granted: settings.accessibilityTrusted,
                     hint: "Required for text insertion and global hotkeys",
                     action: {
-                        PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
+                        PermissionCenter.requestAccessibilityPermission(
+                            using: settings,
+                            promptIfNeeded: true,
+                            openSettingsIfDenied: false
+                        )
                     }
                 )
 
@@ -3631,53 +3863,59 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.bordered)
                 .sheet(isPresented: $showUninstallSheet) {
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("Uninstall KeyScribe")
-                            .font(.title2.bold())
+                    ZStack {
+                        AppChromeBackground()
 
-                        Text("This will reset permissions, remove settings, and uninstall the app. Enable any options below to also remove additional data.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text("Uninstall KeyScribe")
+                                .font(.title2.bold())
 
-                        Divider()
+                            Text("This will reset permissions, remove settings, and uninstall the app. Enable any options below to also remove additional data.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
 
-                        VStack(alignment: .leading, spacing: 10) {
-                            Toggle("Delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
-                                .toggleStyle(.switch)
-                            Toggle("Delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
-                                .toggleStyle(.switch)
-                            Toggle("Delete indexed memories", isOn: $uninstallDeleteMemories)
-                                .toggleStyle(.switch)
-                            Toggle("Delete provider credentials (API keys & OAuth sessions)", isOn: $uninstallDeleteProviderCredentials)
-                                .toggleStyle(.switch)
-                        }
+                            Divider()
 
-                        Divider()
-
-                        Text(uninstallSummaryText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        HStack {
-                            Spacer()
-                            Button("Cancel") {
-                                showUninstallSheet = false
+                            VStack(alignment: .leading, spacing: 10) {
+                                Toggle("Delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
+                                    .toggleStyle(.switch)
+                                Toggle("Delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
+                                    .toggleStyle(.switch)
+                                Toggle("Delete indexed memories", isOn: $uninstallDeleteMemories)
+                                    .toggleStyle(.switch)
+                                Toggle("Delete provider credentials (API keys & OAuth sessions)", isOn: $uninstallDeleteProviderCredentials)
+                                    .toggleStyle(.switch)
                             }
-                            .keyboardShortcut(.cancelAction)
 
-                            Button("Uninstall", role: .destructive) {
-                                showUninstallSheet = false
-                                SettingsStore.resetAndUninstall(
-                                    deleteDownloadedModels: uninstallDeleteDownloadedModels,
-                                    deleteLearnedCorrections: uninstallDeleteLearnedCorrections,
-                                    deleteMemories: uninstallDeleteMemories,
-                                    deleteProviderCredentials: uninstallDeleteProviderCredentials
-                                )
+                            Divider()
+
+                            Text(uninstallSummaryText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            HStack {
+                                Spacer()
+                                Button("Cancel") {
+                                    showUninstallSheet = false
+                                }
+                                .keyboardShortcut(.cancelAction)
+
+                                Button("Uninstall", role: .destructive) {
+                                    showUninstallSheet = false
+                                    SettingsStore.resetAndUninstall(
+                                        deleteDownloadedModels: uninstallDeleteDownloadedModels,
+                                        deleteLearnedCorrections: uninstallDeleteLearnedCorrections,
+                                        deleteMemories: uninstallDeleteMemories,
+                                        deleteProviderCredentials: uninstallDeleteProviderCredentials
+                                    )
+                                }
+                                .keyboardShortcut(.defaultAction)
                             }
-                            .keyboardShortcut(.defaultAction)
                         }
+                        .padding(24)
+                        .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+                        .padding(10)
                     }
-                    .padding(24)
                     .frame(width: 420)
                 }
             }
@@ -3775,15 +4013,7 @@ struct TranscriptHistoryView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .underPageBackgroundColor)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            AppChromeBackground()
 
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .firstTextBaseline) {
@@ -3852,8 +4082,14 @@ struct TranscriptHistoryView: View {
                     }
                 }
             }
-            .padding(18)
+            .padding(.top, 34)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 18)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.18)
+            .padding(10)
         }
+        .appScrollbars()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -3871,14 +4107,7 @@ struct TranscriptHistoryView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.thinMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-        )
+        .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.16)
     }
 }
 
@@ -3951,14 +4180,7 @@ private struct TranscriptHistoryEntryCard: View {
             }
         }
         .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.thinMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-        )
+        .appThemedSurface(cornerRadius: 12, strokeOpacity: 0.16)
     }
 }
 

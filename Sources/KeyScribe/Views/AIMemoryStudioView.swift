@@ -18,7 +18,9 @@ struct AIMemoryStudioView: View {
     @State private var memoryBrowserSelectedFolderID = "all"
     @State private var memoryBrowserIncludePlanContent = false
     @State private var memoryBrowserHighSignalOnly = true
+    @State private var memoryDetailShowLowSignal = false
     @State private var memoryBrowserEntries: [MemoryIndexedEntry] = []
+    @State private var memoryBrowserUnfilteredEntryCount = 0
 
     @State private var promptRewriteOpenAIKeyVisible = false
     @State private var promptRewriteShowManualAPIKey = false
@@ -37,10 +39,23 @@ struct AIMemoryStudioView: View {
     @State private var memoryIndexingProgressSummary: String?
     @State private var memoryIndexingProgressDetail: String?
     @State private var selectedMemoryBrowserEntry: MemoryIndexedEntry?
+    @State private var relatedMemoryEntries: [MemoryIndexedEntry] = []
+    @State private var relatedMemoryEntriesHiddenCount = 0
+    @State private var issueTimelineEntries: [MemoryIndexedEntry] = []
+    @State private var issueTimelineEntriesHiddenCount = 0
     @State private var memoryInspectionExplanation: String?
     @State private var memoryInspectionStatusMessage: String?
     @State private var isMemoryInspectionBusy = false
     @State private var showMemoryDetailSheet = false
+    @State private var memoryAnalytics = MemoryIndexingSettingsService.MemoryAnalyticsSnapshot(
+        overview: MemoryIndexingSettingsService.MemoryAnalyticsOverview(
+            repeatedMistakesAvoided: 0,
+            invalidationRate: 0,
+            fixSuccessRate: 0,
+            totalTrackedAttempts: 0
+        ),
+        rows: []
+    )
     @State private var showingProvidersSheet = false
     @State private var showingSourceFoldersSheet = false
     @State private var selectedStudioPage: StudioPage = .dashboard
@@ -114,22 +129,7 @@ struct AIMemoryStudioView: View {
         }
 
         var tint: Color {
-            switch self {
-            case .dashboard:
-                return .purple
-            case .connection:
-                return .green
-            case .models:
-                return .cyan
-            case .memorySources:
-                return .blue
-            case .sourceFolders:
-                return .orange
-            case .browser:
-                return .teal
-            case .actions:
-                return .pink
-            }
+            AppVisualTheme.accentTint
         }
     }
 
@@ -156,16 +156,24 @@ struct AIMemoryStudioView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Color(nsColor: .controlBackgroundColor).opacity(0.4))
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(.regularMaterial)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(AppVisualTheme.baseTint.opacity(0.05))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(Color.primary.opacity(0.20), lineWidth: 0.7)
+                        )
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.primary.opacity(0.06), lineWidth: 0.6)
-                )
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
-            .padding(16)
+            .padding(.top, 34)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 12)
         }
+        .appScrollbars()
         .sheet(isPresented: $showingProvidersSheet) {
             providersSelectionSheet
         }
@@ -192,35 +200,14 @@ struct AIMemoryStudioView: View {
         ) { notification in
             handleMemoryIndexingCompletion(notification)
         }
+        .onChange(of: memoryDetailShowLowSignal) { _ in
+            guard let selectedMemoryBrowserEntry else { return }
+            refreshMemoryDetailContext(for: selectedMemoryBrowserEntry)
+        }
     }
 
     private var studioBackground: some View {
-        LinearGradient(
-            colors: [
-                Color(nsColor: .windowBackgroundColor),
-                Color(nsColor: .windowBackgroundColor),
-                Color(nsColor: .underPageBackgroundColor).opacity(0.68)
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-        .overlay(alignment: .topTrailing) {
-            Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color.teal.opacity(0.15),
-                            Color.blue.opacity(0.05),
-                            Color.clear
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                .frame(width: 300, height: 300)
-                .offset(x: 80, y: -150)
-        }
-        .ignoresSafeArea()
+        AppChromeBackground()
     }
 
     private var studioHeader: some View {
@@ -240,41 +227,31 @@ struct AIMemoryStudioView: View {
             HStack(spacing: 8) {
                 metricPill(
                     label: "Providers",
-                    value: "\(enabledProviderCount)/\(detectedMemoryProviders.count)",
-                    tint: .blue
+                    value: "\(connectedModelProviderCount)/\(PromptRewriteProviderMode.allCases.count)",
+                    tint: AppVisualTheme.accentTint
                 )
                 metricPill(
                     label: "Folders",
-                    value: "\(enabledSourceFolderCount)/\(detectedMemorySourceFolders.count)",
-                    tint: .orange
+                    value: "\(enabledSourceFolderCount)/\(totalSourceFoldersForEnabledProvidersCount)",
+                    tint: AppVisualTheme.accentTint
                 )
                 metricPill(
                     label: "Visible",
                     value: "\(memoryBrowserVisibleCount)",
-                    tint: .teal
+                    tint: AppVisualTheme.accentTint
                 )
             }
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color(nsColor: .controlBackgroundColor).opacity(0.9),
-                            Color(nsColor: .windowBackgroundColor).opacity(0.8)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.regularMaterial)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.primary.opacity(0.1), lineWidth: 0.8)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.18), lineWidth: 0.7)
         )
-        .shadow(color: Color.black.opacity(0.06), radius: 12, x: 0, y: 8)
     }
 
     private var studioSidebar: some View {
@@ -303,8 +280,12 @@ struct AIMemoryStudioView: View {
         .frame(width: studioSidebarWidth)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.36))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.16), lineWidth: 0.6)
+                )
         )
     }
 
@@ -335,7 +316,11 @@ struct AIMemoryStudioView: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? Color.primary.opacity(0.08) : Color.clear)
+                .fill(isSelected ? page.tint.opacity(0.20) : Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(isSelected ? page.tint.opacity(0.62) : Color.clear, lineWidth: 0.8)
+                )
         )
     }
 
@@ -370,9 +355,86 @@ struct AIMemoryStudioView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
                     Toggle("Auto-refresh detected providers and folders", isOn: $settings.memoryProviderCatalogAutoUpdate)
+                    Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
+                        .disabled(!settings.memoryIndexingEnabled)
                     Text("Turn this off if you only want manual control via maintenance actions.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+            }
+
+            settingsCard(
+                title: "Memory Analytics",
+                subtitle: "Repeated mistakes avoided, invalidation rate, and fix success by provider/project.",
+                symbol: "chart.line.uptrend.xyaxis",
+                tint: AppVisualTheme.accentTint
+            ) {
+                HStack(spacing: 8) {
+                    metricPill(
+                        label: "Avoided",
+                        value: "\(memoryAnalytics.overview.repeatedMistakesAvoided)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Invalidation",
+                        value: percentLabel(memoryAnalytics.overview.invalidationRate),
+                        tint: .orange
+                    )
+                    metricPill(
+                        label: "Fix Success",
+                        value: percentLabel(memoryAnalytics.overview.fixSuccessRate),
+                        tint: .green
+                    )
+                    metricPill(
+                        label: "Tracked",
+                        value: "\(memoryAnalytics.overview.totalTrackedAttempts)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                }
+
+                if memoryAnalytics.rows.isEmpty {
+                    Text("No tracked issue attempts yet. Memories with issue_key/outcome metadata will appear here.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("Provider / Project")
+                                .font(.caption2.weight(.semibold))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text("Attempts")
+                                .font(.caption2.weight(.semibold))
+                                .frame(width: 58, alignment: .trailing)
+                            Text("Invalid")
+                                .font(.caption2.weight(.semibold))
+                                .frame(width: 48, alignment: .trailing)
+                            Text("Success")
+                                .font(.caption2.weight(.semibold))
+                                .frame(width: 56, alignment: .trailing)
+                        }
+                        .foregroundStyle(.tertiary)
+
+                        ForEach(memoryAnalytics.rows.prefix(8)) { row in
+                            HStack(spacing: 8) {
+                                Text("\(row.providerName) / \(row.projectName)")
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Text("\(row.totalAttempts)")
+                                    .font(.caption.monospacedDigit())
+                                    .frame(width: 58, alignment: .trailing)
+                                Text("\(row.invalidatedCount)")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(row.invalidatedCount > 0 ? .orange : .secondary)
+                                    .frame(width: 48, alignment: .trailing)
+                                Text(percentLabel(row.successRate))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(row.successRate >= 0.6 ? .green : .secondary)
+                                    .frame(width: 56, alignment: .trailing)
+                            }
+                        }
+                    }
                 }
             }
 
@@ -410,11 +472,15 @@ struct AIMemoryStudioView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(Color.primary.opacity(0.04))
+                                .fill(.regularMaterial)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(page.tint.opacity(0.14))
+                                )
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(Color.primary.opacity(0.06), lineWidth: 0.6)
+                                .stroke(page.tint.opacity(0.3), lineWidth: 0.8)
                         )
                     }
                     .buttonStyle(.plain)
@@ -446,20 +512,20 @@ struct AIMemoryStudioView: View {
     private var studioProvidersPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsCard(
-                title: "Detected Providers",
-                subtitle: "Choose which providers can add memory context.",
+                title: "Detected Source Providers",
+                subtitle: "Choose which source apps/folders can feed the memory index.",
                 symbol: "square.stack.3d.up",
-                tint: .blue
+                tint: AppVisualTheme.accentTint
             ) {
                 if detectedMemoryProviders.isEmpty {
                     emptyStateRow(
-                        title: "No providers detected",
-                        message: "Open settings sources or run a rescan to discover providers.",
+                        title: "No source providers detected",
+                        message: "Run a rescan to discover source providers.",
                         systemImage: "tray"
                     )
                 } else {
                     HStack {
-                        Text("\(enabledProviderCount) of \(detectedMemoryProviders.count) providers enabled")
+                        Text("\(enabledSourceProviderCount) of \(detectedMemoryProviders.count) source providers enabled")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -481,7 +547,7 @@ struct AIMemoryStudioView: View {
                             Text("Tip")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
-                            Text("Use \"Manage Providers…\" to enable or disable multiple sources.")
+                            Text("Use \"Manage Providers…\" to enable or disable source providers in bulk.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -505,7 +571,6 @@ struct AIMemoryStudioView: View {
                                                 .foregroundStyle(.secondary)
                                         }
                                     }
-                                    .disabled(!settings.memoryIndexingEnabled)
                                 }
                             }
                             .padding(.trailing, 4)
@@ -523,7 +588,7 @@ struct AIMemoryStudioView: View {
                 title: "Detected Source Folders",
                 subtitle: "Tune which folders are used to build memory index.",
                 symbol: "folder.badge.gearshape",
-                tint: .orange
+                tint: AppVisualTheme.accentTint
             ) {
                 if detectedMemorySourceFolders.isEmpty {
                     emptyStateRow(
@@ -533,7 +598,7 @@ struct AIMemoryStudioView: View {
                     )
                 } else {
                     HStack {
-                        Text("\(enabledSourceFolderCount) of \(detectedMemorySourceFolders.count) folders enabled")
+                        Text("\(enabledSourceFolderCount) of \(totalSourceFoldersForEnabledProvidersCount) folders selected for enabled source providers")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -550,10 +615,10 @@ struct AIMemoryStudioView: View {
                             Toggle("Selected only", isOn: $memoryShowSelectedFoldersOnly)
                                 .toggleStyle(.checkbox)
                                 .fixedSize()
-                            Toggle("Only enabled providers", isOn: $memoryFoldersOnlyEnabledProviders)
+                            Toggle("Only enabled source providers", isOn: $memoryFoldersOnlyEnabledProviders)
                                 .toggleStyle(.checkbox)
                                 .fixedSize()
-                                .help("Only enabled providers")
+                                .help("Only enabled source providers")
                         }
                     }
 
@@ -576,7 +641,6 @@ struct AIMemoryStudioView: View {
                                             .truncationMode(.middle)
                                     }
                                 }
-                                .disabled(!settings.memoryIndexingEnabled)
                             }
                         }
                         .padding(.trailing, 4)
@@ -604,7 +668,7 @@ struct AIMemoryStudioView: View {
             title: "Memory Browser",
             subtitle: "List and search indexed memories by provider and folder.",
             symbol: "magnifyingglass.circle",
-            tint: .teal
+            tint: AppVisualTheme.accentTint
         ) {
             HStack(spacing: 8) {
                 TextField("Search indexed memories", text: $memoryBrowserQuery)
@@ -662,11 +726,19 @@ struct AIMemoryStudioView: View {
             }
 
             if memoryBrowserEntries.isEmpty {
-                emptyStateRow(
-                    title: "No indexed memories matched",
-                    message: "Try broadening your search, toggling filters, or rebuilding the index.",
-                    systemImage: "tray"
-                )
+                if memoryBrowserHighSignalOnly, memoryBrowserUnfilteredEntryCount > 0 {
+                    emptyStateRow(
+                        title: "All matches hidden by High-signal filter",
+                        message: "\(memoryBrowserUnfilteredEntryCount) indexed memories matched. Disable “High-signal only” to view them.",
+                        systemImage: "line.3.horizontal.decrease.circle"
+                    )
+                } else {
+                    emptyStateRow(
+                        title: "No indexed memories matched",
+                        message: "Try broadening your search, toggling filters, or rebuilding the index.",
+                        systemImage: "tray"
+                    )
+                }
             } else {
                 HStack {
                     Text("Showing \(memoryBrowserVisibleCount) of \(memoryBrowserEntries.count) memory cards")
@@ -713,8 +785,18 @@ struct AIMemoryStudioView: View {
                 .padding(10)
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.primary.opacity(0.03))
+                        .fill(.regularMaterial)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(Color.primary.opacity(0.18), lineWidth: 0.6)
+                        )
                 )
+
+                if memoryBrowserHighSignalOnly, memoryBrowserUnfilteredEntryCount > memoryBrowserEntries.count {
+                    Text("High-signal filter is hiding \(memoryBrowserUnfilteredEntryCount - memoryBrowserEntries.count) entry(ies).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -725,16 +807,20 @@ struct AIMemoryStudioView: View {
                 title: "Indexing",
                 subtitle: "Rescan sources or rebuild the memory index.",
                 symbol: "arrow.triangle.2.circlepath",
-                tint: .blue
+                tint: AppVisualTheme.accentTint
             ) {
                 HStack(spacing: 8) {
                     Button("Rescan") {
                         rescanMemorySources(showMessage: true)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!settings.memoryIndexingEnabled || isMemoryIndexingInProgress)
+                    .disabled(isMemoryIndexingInProgress)
 
                     Button("Rebuild Index") {
+                        guard !settings.memoryEnabledProviderIDs.isEmpty else {
+                            memoryActionMessage = "Enable at least one source provider before rebuilding the index."
+                            return
+                        }
                         isMemoryIndexingInProgress = true
                         memoryIndexingProgressSummary = "Preparing incremental rebuild..."
                         memoryIndexingProgressDetail = nil
@@ -746,6 +832,18 @@ struct AIMemoryStudioView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(!settings.memoryIndexingEnabled || isMemoryIndexingInProgress)
+
+                    Button("Run Quality Cleanup") {
+                        runQualityMaintenance()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isMemoryIndexingInProgress)
+
+                    Button("Stop", role: .destructive) {
+                        stopMemoryIndexing()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!isMemoryIndexingInProgress)
                 }
 
                 if isMemoryIndexingInProgress {
@@ -788,6 +886,10 @@ struct AIMemoryStudioView: View {
             ) {
                 HStack(spacing: 8) {
                     Button("Clear + Rebuild From Start", role: .destructive) {
+                        guard !settings.memoryEnabledProviderIDs.isEmpty else {
+                            memoryActionMessage = "Enable at least one source provider before rebuilding from scratch."
+                            return
+                        }
                         isMemoryIndexingInProgress = true
                         memoryIndexingProgressSummary = "Clearing indexed memory data..."
                         memoryIndexingProgressDetail = nil
@@ -805,25 +907,45 @@ struct AIMemoryStudioView: View {
                         memoryActionMessage = "Cleared indexed memories."
                     }
                     .buttonStyle(.bordered)
-                    .disabled(!settings.memoryIndexingEnabled)
 
                     Button("Clear Archive", role: .destructive) {
                         memoryIndexingSettingsService.clearArchive()
                         memoryActionMessage = "Cleared archived memory entries."
                     }
                     .buttonStyle(.bordered)
-                    .disabled(!settings.memoryIndexingEnabled)
                 }
             }
         }
     }
 
-    private var enabledProviderCount: Int {
+    private var connectedModelProviderCount: Int {
+        PromptRewriteProviderMode.allCases.filter { mode in
+            settings.isPromptRewriteProviderConnected(mode)
+        }.count
+    }
+
+    private var enabledSourceProviderCount: Int {
         detectedMemoryProviders.filter { settings.isMemoryProviderEnabled($0.id) }.count
     }
 
+    private var sourceFoldersForEnabledProviders: [MemoryIndexingSettingsService.SourceFolder] {
+        let enabledProviderIDs = Set(
+            settings.memoryEnabledProviderIDs.map { providerID in
+                providerID.lowercased()
+            }
+        )
+        guard !enabledProviderIDs.isEmpty else { return [] }
+        return detectedMemorySourceFolders.filter { folder in
+            enabledProviderIDs.contains(folder.providerID.lowercased())
+        }
+    }
+
+    private var totalSourceFoldersForEnabledProvidersCount: Int {
+        sourceFoldersForEnabledProviders.count
+    }
+
     private var enabledSourceFolderCount: Int {
-        detectedMemorySourceFolders.filter { settings.isMemorySourceFolderEnabled($0.id) }.count
+        sourceFoldersForEnabledProviders.filter { settings.isMemorySourceFolderEnabled($0.id) }.count
     }
 
     private var memoryAssistantStateLabel: String {
@@ -852,11 +974,15 @@ struct AIMemoryStudioView: View {
         .padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(tint.opacity(0.12))
+                .fill(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(tint.opacity(0.14))
+                )
         )
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(tint.opacity(0.24), lineWidth: 0.8)
+                .stroke(tint.opacity(0.3), lineWidth: 0.7)
         )
     }
 
@@ -884,7 +1010,15 @@ struct AIMemoryStudioView: View {
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.primary.opacity(0.05))
+                .fill(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.22), lineWidth: 0.7)
+                )
         )
     }
 
@@ -902,13 +1036,45 @@ struct AIMemoryStudioView: View {
                 if entry.isPlanContent {
                     memoryEntryBadge("Plan", tint: .orange)
                 }
-                memoryEntryBadge(entry.provider.displayName, tint: .teal)
+                memoryEntryBadge(entry.provider.displayName, tint: AppVisualTheme.accentTint)
             }
 
             Text(entry.summary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+
+            if entry.projectName != nil || entry.repositoryName != nil {
+                HStack(spacing: 8) {
+                    if let projectName = entry.projectName,
+                       !projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        HStack(spacing: 4) {
+                            Image(systemName: "folder.badge.gearshape")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            Text(projectName)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    if let repositoryName = entry.repositoryName,
+                       !repositoryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        HStack(spacing: 4) {
+                            Image(systemName: "shippingbox")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            Text(repositoryName)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
 
             HStack(spacing: 6) {
                 Image(systemName: "folder")
@@ -920,7 +1086,7 @@ struct AIMemoryStudioView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 0)
-                Text(entry.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                Text(entry.eventTimestamp.formatted(date: .abbreviated, time: .shortened))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .monospacedDigit()
@@ -930,7 +1096,11 @@ struct AIMemoryStudioView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05))
+                .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(.regularMaterial)
+                )
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -943,108 +1113,285 @@ struct AIMemoryStudioView: View {
 
     @ViewBuilder
     private var memoryDetailSheet: some View {
-        VStack(spacing: 0) {
-            if let entry = selectedMemoryBrowserEntry {
-                HStack {
-                    Text("Memory Detail")
-                        .font(.headline)
-                    Spacer()
-                    memoryEntryBadge(entry.provider.displayName, tint: .teal)
-                    if entry.isPlanContent {
-                        memoryEntryBadge("Plan", tint: .orange)
-                    }
-                    Button("Done") {
-                        showMemoryDetailSheet = false
-                    }
-                }
-                .padding()
-                Divider()
+        ZStack {
+            AppChromeBackground()
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text(entry.title.isEmpty ? "Untitled memory" : entry.title)
-                            .font(.title3.weight(.semibold))
-
-                        Text(entry.summary)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-
-                        Divider()
-
-                        Text("What this memory stores")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
-                        Text(entry.detail)
-                            .font(.caption.monospaced())
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color.primary.opacity(0.04))
-                            )
-
-                        HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: "folder")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                            Text(entry.sourceRootPath)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.tertiary)
-                                .textSelection(.enabled)
+            VStack(spacing: 0) {
+                if let entry = selectedMemoryBrowserEntry {
+                    HStack {
+                        Text("Memory Detail")
+                            .font(.headline)
+                        Spacer()
+                        memoryEntryBadge(entry.provider.displayName, tint: AppVisualTheme.accentTint)
+                        if entry.isPlanContent {
+                            memoryEntryBadge("Plan", tint: .orange)
                         }
-
-                        Text("Updated: \(entry.updatedAt.formatted(date: .abbreviated, time: .shortened))")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                            .monospacedDigit()
-
-                        Divider()
-
-                        HStack(spacing: 8) {
-                            Button("Ask AI About This Memory") {
-                                explainMemoryEntryWithAI(entry)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(isMemoryInspectionBusy)
-
-                            if isMemoryInspectionBusy {
-                                ProgressView()
-                                    .scaleEffect(0.8)
-                            }
+                        Button("Done") {
+                            showMemoryDetailSheet = false
                         }
+                    }
+                    .padding()
+                    Divider()
 
-                        if let memoryInspectionStatusMessage {
-                            Text(memoryInspectionStatusMessage)
-                                .font(.caption)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text(entry.title.isEmpty ? "Untitled memory" : entry.title)
+                                .font(.title3.weight(.semibold))
+
+                            Text(entry.summary)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
-                        }
 
-                        if let memoryInspectionExplanation {
-                            Text("AI Explanation")
+                            Toggle("Show lower-signal related entries", isOn: $memoryDetailShowLowSignal)
+                                .toggleStyle(.checkbox)
+                                .font(.caption)
+
+                            Divider()
+
+                            Text("What this memory stores")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(.secondary)
 
-                            Text(memoryInspectionExplanation)
-                                .font(.callout)
+                            Text(presentableMemoryText(entry.detail))
+                                .font(.caption.monospaced())
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(10)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(.regularMaterial)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(Color.primary.opacity(0.06))
+                                    )
+                            )
+
+                            if entry.outcomeStatus != nil || entry.attemptNumber != nil || entry.issueKey != nil {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if let status = entry.outcomeStatus,
+                                       !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Text("Outcome: \(status.replacingOccurrences(of: "_", with: " ").capitalized)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if let attemptNumber = entry.attemptNumber {
+                                        if let attemptCount = entry.attemptCount, attemptCount > 0 {
+                                            Text("Attempts: \(attemptNumber)/\(attemptCount)")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        } else {
+                                            Text("Attempt: \(attemptNumber)")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    if let evidence = entry.outcomeEvidence,
+                                       !evidence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Text("Evidence: \(evidence)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    }
+                                    if let fixSummary = entry.fixSummary,
+                                       !fixSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Text("Fix summary: \(fixSummary)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    }
+                                    if let validationState = entry.validationState,
+                                       !validationState.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Text("Validation: \(validationState.replacingOccurrences(of: "_", with: " ").capitalized)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if let invalidatedByAttempt = entry.invalidatedByAttempt {
+                                        Text("Invalidated by attempt: \(invalidatedByAttempt)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if let issueKey = entry.issueKey,
+                                       !issueKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Text("Issue key: \(issueKey)")
+                                            .font(.caption2.monospaced())
+                                            .foregroundStyle(.tertiary)
+                                            .textSelection(.enabled)
+                                    }
+                                }
+                            }
+
+                            if !relatedMemoryEntries.isEmpty {
+                                Divider()
+                                Text("Related Memories")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(relatedMemoryEntries.prefix(6)) { related in
+                                        Button {
+                                            selectMemoryBrowserEntry(related)
+                                        } label: {
+                                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                                Text(related.title.isEmpty ? "Untitled memory" : related.title)
+                                                    .font(.caption.weight(.semibold))
+                                                    .lineLimit(1)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                if let relationType = related.relationType,
+                                                   !relationType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                                    Text(relationType.replacingOccurrences(of: "_", with: " "))
+                                                        .font(.caption2)
+                                                        .foregroundStyle(.tertiary)
+                                                }
+                                                if let confidence = related.relationConfidence {
+                                                    Text("\(Int((confidence * 100).rounded()))%")
+                                                        .font(.caption2.monospacedDigit())
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                            }
+                                        }
+                                        .buttonStyle(.plain)
+                                        .padding(.vertical, 2)
+                                    }
+                                }
+                                if !memoryDetailShowLowSignal, relatedMemoryEntriesHiddenCount > 0 {
+                                    Text("\(relatedMemoryEntriesHiddenCount) related entr\(relatedMemoryEntriesHiddenCount == 1 ? "y is" : "ies are") hidden by high-signal filtering.")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+
+                            if !issueTimelineEntries.isEmpty {
+                                Divider()
+                                Text("Issue Timeline")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(issueTimelineEntries.prefix(10)) { timelineEntry in
+                                        Button {
+                                            selectMemoryBrowserEntry(timelineEntry)
+                                        } label: {
+                                            HStack(spacing: 8) {
+                                                Text("Attempt \(timelineEntry.attemptNumber ?? 0)")
+                                                    .font(.caption2.monospacedDigit())
+                                                    .foregroundStyle(.tertiary)
+                                                    .frame(width: 68, alignment: .leading)
+                                                Text(timelineEntry.outcomeStatus?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Unknown")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .frame(width: 92, alignment: .leading)
+                                                Text(timelineEntry.summary)
+                                                    .font(.caption)
+                                                    .lineLimit(1)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                            }
+                                        }
+                                        .buttonStyle(.plain)
+                                        .padding(.vertical, 2)
+                                    }
+                                }
+                                if !memoryDetailShowLowSignal, issueTimelineEntriesHiddenCount > 0 {
+                                    Text("\(issueTimelineEntriesHiddenCount) timeline entr\(issueTimelineEntriesHiddenCount == 1 ? "y is" : "ies are") hidden by high-signal filtering.")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: "folder")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                Text(entry.sourceRootPath)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.tertiary)
+                                    .textSelection(.enabled)
+                            }
+
+                            if entry.projectName != nil || entry.repositoryName != nil {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if let projectName = entry.projectName,
+                                       !projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Text("Project: \(projectName)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if let repositoryName = entry.repositoryName,
+                                       !repositoryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Text("Repository: \(repositoryName)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+
+                            if !entry.sourceFileRelativePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                HStack(alignment: .top, spacing: 6) {
+                                    Image(systemName: "doc.text")
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                    Text(entry.sourceFileRelativePath)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.tertiary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+
+                            Text("Occurred: \(entry.eventTimestamp.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                                .monospacedDigit()
+
+                            Divider()
+
+                            HStack(spacing: 8) {
+                                Button("Ask AI About This Memory") {
+                                    explainMemoryEntryWithAI(entry)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(isMemoryInspectionBusy)
+
+                                if isMemoryInspectionBusy {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                }
+                            }
+
+                            if let memoryInspectionStatusMessage {
+                                Text(memoryInspectionStatusMessage)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let memoryInspectionExplanation {
+                                Text("AI Explanation")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+
+                                Text(memoryInspectionExplanation)
+                                    .font(.callout)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(10)
                                 .background(
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(Color.accentColor.opacity(0.06))
+                                        .fill(.regularMaterial)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .fill(Color.accentColor.opacity(0.08))
+                                        )
                                 )
+                            }
                         }
+                        .padding()
                     }
-                    .padding()
+                } else {
+                    Text("No memory selected.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding()
                 }
-            } else {
-                Text("No memory selected.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding()
             }
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
         }
         .frame(width: 540, height: 520)
     }
@@ -1068,7 +1415,7 @@ struct AIMemoryStudioView: View {
             title: "Provider Authentication",
             subtitle: "Connect each provider securely before configuring models.",
             symbol: "bolt.badge.a",
-            tint: .green
+            tint: AppVisualTheme.accentTint
         ) {
             let mode = settings.promptRewriteProviderMode
 
@@ -1098,7 +1445,7 @@ struct AIMemoryStudioView: View {
             title: "Prompt Model",
             subtitle: "Choose model and endpoint used by prompt rewrite.",
             symbol: "cpu.fill",
-            tint: .green
+            tint: AppVisualTheme.accentTint
         ) {
             HStack(spacing: 8) {
                 Text("Model Catalog")
@@ -1134,6 +1481,9 @@ struct AIMemoryStudioView: View {
 
             TextField("Base URL", text: $settings.promptRewriteOpenAIBaseURL)
                 .textFieldStyle(.roundedBorder)
+
+            Toggle("Always convert generated suggestions to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
+                .disabled(!settings.memoryIndexingEnabled)
 
             Button("Use \(mode.displayName) Defaults") {
                 settings.applyPromptRewriteProviderDefaultsIfNeeded(force: true)
@@ -1276,7 +1626,11 @@ struct AIMemoryStudioView: View {
                 .padding(8)
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.primary.opacity(0.05))
+                        .fill(.regularMaterial)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.primary.opacity(0.05))
+                        )
                 )
             }
 
@@ -1352,164 +1706,176 @@ struct AIMemoryStudioView: View {
 
     @ViewBuilder
     private var providersSelectionSheet: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Manage Detected Providers")
-                    .font(.headline)
-                Spacer()
-                Button("Done") {
-                    showingProvidersSheet = false
-                }
-            }
-            .padding()
-            Divider()
+        ZStack {
+            AppChromeBackground()
 
-            VStack(alignment: .leading, spacing: 14) {
-                if detectedMemoryProviders.isEmpty {
-                    Text("No providers detected yet. Click Rescan to detect providers.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Manage Detected Source Providers")
+                        .font(.headline)
                     Spacer()
-                } else {
-                    HStack(spacing: 8) {
-                        TextField("Filter providers", text: $memoryProviderFilterQuery)
-                            .textFieldStyle(.roundedBorder)
-                        Toggle("Selected only", isOn: $memoryShowSelectedProvidersOnly)
-                            .toggleStyle(.checkbox)
-                            .fixedSize()
+                    Button("Done") {
+                        showingProvidersSheet = false
                     }
+                }
+                .padding()
+                Divider()
 
-                    HStack(spacing: 8) {
-                        Button("Select All Visible") {
-                            setMemoryProvidersEnabled(filteredMemoryProviders, enabled: true)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
-
-                        Button("Clear Visible") {
-                            setMemoryProvidersEnabled(filteredMemoryProviders, enabled: false)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
-                    }
-
-                    if filteredMemoryProviders.isEmpty {
-                        Text("No providers match the current filters.")
-                            .font(.caption)
+                VStack(alignment: .leading, spacing: 14) {
+                    if detectedMemoryProviders.isEmpty {
+                        Text("No source providers detected yet. Click Rescan to detect source providers.")
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                         Spacer()
                     } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 10) {
-                                ForEach(filteredMemoryProviders) { provider in
-                                    Toggle(isOn: Binding(
-                                        get: { settings.isMemoryProviderEnabled(provider.id) },
-                                        set: { isEnabled in
-                                            settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
-                                        }
-                                    )) {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(provider.name)
-                                                .font(.callout.weight(.medium))
-                                            Text(provider.detail)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            TextField("Filter providers", text: $memoryProviderFilterQuery)
+                                .textFieldStyle(.roundedBorder)
+                            Toggle("Selected only", isOn: $memoryShowSelectedProvidersOnly)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Select All Visible") {
+                                setMemoryProvidersEnabled(filteredMemoryProviders, enabled: true)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(filteredMemoryProviders.isEmpty)
+
+                            Button("Clear Visible") {
+                                setMemoryProvidersEnabled(filteredMemoryProviders, enabled: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(filteredMemoryProviders.isEmpty)
+                        }
+
+                        if filteredMemoryProviders.isEmpty {
+                            Text("No source providers match the current filters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredMemoryProviders) { provider in
+                                        Toggle(isOn: Binding(
+                                            get: { settings.isMemoryProviderEnabled(provider.id) },
+                                            set: { isEnabled in
+                                                settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
+                                            }
+                                        )) {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(provider.name)
+                                                    .font(.callout.weight(.medium))
+                                                Text(provider.detail)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
                                         }
                                     }
-                                    .disabled(!settings.memoryIndexingEnabled)
                                 }
+                                .padding(.trailing)
                             }
-                            .padding(.trailing)
                         }
                     }
                 }
+                .padding()
             }
-            .padding()
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
         }
         .frame(width: 450, height: 500)
     }
 
     @ViewBuilder
     private var sourceFoldersSelectionSheet: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Manage Detected Source Folders")
-                    .font(.headline)
-                Spacer()
-                Button("Done") {
-                    showingSourceFoldersSheet = false
-                }
-            }
-            .padding()
-            Divider()
+        ZStack {
+            AppChromeBackground()
 
-            VStack(alignment: .leading, spacing: 14) {
-                if detectedMemorySourceFolders.isEmpty {
-                    Text("No source folders detected yet. Click Rescan to find folders.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Manage Detected Source Folders")
+                        .font(.headline)
                     Spacer()
-                } else {
-                    HStack(spacing: 8) {
-                        TextField("Filter source folders", text: $memoryFolderFilterQuery)
-                            .textFieldStyle(.roundedBorder)
-                        Toggle("Selected only", isOn: $memoryShowSelectedFoldersOnly)
-                            .toggleStyle(.checkbox)
-                            .fixedSize()
-                        Toggle("Only", isOn: $memoryFoldersOnlyEnabledProviders)
-                            .toggleStyle(.checkbox)
-                            .fixedSize()
-                            .help("Only enabled providers")
+                    Button("Done") {
+                        showingSourceFoldersSheet = false
                     }
+                }
+                .padding()
+                Divider()
 
-                    HStack(spacing: 8) {
-                        Button("Select All Visible") {
-                            setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: true)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
-
-                        Button("Clear Visible") {
-                            setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: false)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
-                    }
-
-                    if filteredMemorySourceFolders.isEmpty {
-                        Text("No source folders match the current filters.")
-                            .font(.caption)
+                VStack(alignment: .leading, spacing: 14) {
+                    if detectedMemorySourceFolders.isEmpty {
+                        Text("No source folders detected yet. Click Rescan to find folders.")
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                         Spacer()
                     } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 10) {
-                                ForEach(filteredMemorySourceFolders) { folder in
-                                    Toggle(isOn: Binding(
-                                        get: { settings.isMemorySourceFolderEnabled(folder.id) },
-                                        set: { isEnabled in
-                                            settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
-                                        }
-                                    )) {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(folder.name)
-                                                .font(.callout.weight(.medium))
-                                            Text(folder.path)
-                                                .font(.caption2.monospaced())
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                                .truncationMode(.middle)
+                        HStack(spacing: 8) {
+                            TextField("Filter source folders", text: $memoryFolderFilterQuery)
+                                .textFieldStyle(.roundedBorder)
+                            Toggle("Selected only", isOn: $memoryShowSelectedFoldersOnly)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                            Toggle("Only enabled source providers", isOn: $memoryFoldersOnlyEnabledProviders)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                                .help("Only enabled source providers")
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Select All Visible") {
+                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: true)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(filteredMemorySourceFolders.isEmpty)
+
+                            Button("Clear Visible") {
+                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(filteredMemorySourceFolders.isEmpty)
+                        }
+
+                        if filteredMemorySourceFolders.isEmpty {
+                            Text("No source folders match the current filters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredMemorySourceFolders) { folder in
+                                        Toggle(isOn: Binding(
+                                            get: { settings.isMemorySourceFolderEnabled(folder.id) },
+                                            set: { isEnabled in
+                                                settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
+                                            }
+                                        )) {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(folder.name)
+                                                    .font(.callout.weight(.medium))
+                                                Text(folder.path)
+                                                    .font(.caption2.monospaced())
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                            }
                                         }
                                     }
-                                    .disabled(!settings.memoryIndexingEnabled)
                                 }
+                                .padding(.trailing)
                             }
-                            .padding(.trailing)
                         }
                     }
                 }
+                .padding()
             }
-            .padding()
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
         }
         .frame(width: 550, height: 500)
     }
@@ -1517,6 +1883,7 @@ struct AIMemoryStudioView: View {
     private func prepare() {
         refreshOAuthConnectionState()
         refreshPromptRewriteModels(showMessage: false)
+        refreshMemoryAnalytics()
         if settings.memoryProviderCatalogAutoUpdate {
             rescanMemorySources(showMessage: false)
             return
@@ -1866,6 +2233,7 @@ struct AIMemoryStudioView: View {
             includePlanContent: memoryBrowserIncludePlanContent,
             limit: 200
         )
+        memoryBrowserUnfilteredEntryCount = entries.count
         if memoryBrowserHighSignalOnly {
             memoryBrowserEntries = entries.filter(isHighSignalMemoryEntry)
         } else {
@@ -1875,15 +2243,60 @@ struct AIMemoryStudioView: View {
         if let selectedMemoryBrowserEntry,
            let updatedSelection = memoryBrowserEntries.first(where: { $0.id == selectedMemoryBrowserEntry.id }) {
             self.selectedMemoryBrowserEntry = updatedSelection
+            refreshMemoryDetailContext(for: updatedSelection)
         } else {
             selectedMemoryBrowserEntry = memoryBrowserEntries.first
+            if let first = memoryBrowserEntries.first {
+                refreshMemoryDetailContext(for: first)
+            } else {
+                relatedMemoryEntries = []
+                relatedMemoryEntriesHiddenCount = 0
+                issueTimelineEntries = []
+                issueTimelineEntriesHiddenCount = 0
+            }
         }
+        refreshMemoryAnalytics()
     }
 
     private func selectMemoryBrowserEntry(_ entry: MemoryIndexedEntry) {
         selectedMemoryBrowserEntry = entry
         memoryInspectionExplanation = nil
         memoryInspectionStatusMessage = nil
+        refreshMemoryDetailContext(for: entry)
+    }
+
+    private func refreshMemoryDetailContext(for entry: MemoryIndexedEntry) {
+        let relatedEntries = memoryIndexingSettingsService.browseRelatedMemories(
+            forCardID: entry.id,
+            includePlanContent: memoryBrowserIncludePlanContent,
+            limit: 8
+        )
+        if memoryDetailShowLowSignal {
+            relatedMemoryEntries = relatedEntries
+            relatedMemoryEntriesHiddenCount = 0
+        } else {
+            relatedMemoryEntries = relatedEntries.filter(isHighSignalMemoryEntry)
+            relatedMemoryEntriesHiddenCount = max(0, relatedEntries.count - relatedMemoryEntries.count)
+        }
+
+        if let issueKey = entry.issueKey, !issueKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let timelineEntries = memoryIndexingSettingsService.browseIssueTimeline(
+                issueKey: issueKey,
+                providerID: entry.provider.rawValue,
+                includePlanContent: memoryBrowserIncludePlanContent,
+                limit: 24
+            )
+            if memoryDetailShowLowSignal {
+                issueTimelineEntries = timelineEntries
+                issueTimelineEntriesHiddenCount = 0
+            } else {
+                issueTimelineEntries = timelineEntries.filter(isHighSignalMemoryEntry)
+                issueTimelineEntriesHiddenCount = max(0, timelineEntries.count - issueTimelineEntries.count)
+            }
+        } else {
+            issueTimelineEntries = []
+            issueTimelineEntriesHiddenCount = 0
+        }
     }
 
     private func explainMemoryEntryWithAI(_ entry: MemoryIndexedEntry) {
@@ -1915,6 +2328,39 @@ struct AIMemoryStudioView: View {
         }
 
         let detail = entry.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let combinedLower = "\(entry.title) \(entry.summary) \(entry.detail)".lowercased()
+        if containsRewriteSignal(combinedLower) {
+            return true
+        }
+        let rewriteNeedles = ["rewrite", "prompt fix", "corrected prompt", "suggested", "improved prompt", "correction"]
+        if rewriteNeedles.contains(where: combinedLower.contains) {
+            return true
+        }
+        let outcomeStatus = entry.outcomeStatus?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        let validationState = entry.validationState?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        let outcomeEvidence = entry.outcomeEvidence?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let fixSummary = entry.fixSummary?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let issueKey = entry.issueKey?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let hasEvidence = !outcomeEvidence.isEmpty || !fixSummary.isEmpty
+        let hasIssueContext = hasMeaningfulIssueKey(issueKey)
+
+        if (outcomeStatus == "responded" || outcomeStatus == "attempted"),
+           validationState == "unvalidated",
+           !hasEvidence,
+           !hasIssueContext {
+            return false
+        }
+        if validationState == "unvalidated",
+           !hasEvidence,
+           !hasIssueContext,
+           (entry.attemptNumber ?? 0) <= 1 {
+            return false
+        }
+
         if detail.hasPrefix("{") && detail.hasSuffix("}") {
             if !detail.contains("->"),
                !detail.localizedCaseInsensitiveContains("prompt"),
@@ -1931,6 +2377,28 @@ struct AIMemoryStudioView: View {
         return alphaWords.count >= 5
     }
 
+    private func containsRewriteSignal(_ value: String) -> Bool {
+        let lower = value.lowercased()
+        let rewriteSignals = ["->", "=>", "→", "rewrite", "prompt fix", "correction", "suggested"]
+        return rewriteSignals.contains(where: lower.contains)
+    }
+
+    private func hasMeaningfulIssueKey(_ issueKey: String) -> Bool {
+        let normalized = issueKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+        return normalized != "issue-hi"
+            && normalized != "issue-hello"
+            && normalized != "issue-hey"
+    }
+
+    private func runQualityMaintenance() {
+        let result = memoryIndexingSettingsService.runQualityMaintenance()
+        memoryActionMessage = result.message
+        if result.didRun {
+            refreshMemoryBrowser()
+        }
+    }
+
     private func setMemoryProvidersEnabled(_ providers: [MemoryIndexingSettingsService.Provider], enabled: Bool) {
         for provider in providers {
             settings.setMemoryProviderEnabled(provider.id, enabled: enabled)
@@ -1945,6 +2413,22 @@ struct AIMemoryStudioView: View {
 
     private func normalizedMemoryFilter(_ query: String) -> String {
         query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func refreshMemoryAnalytics() {
+        memoryAnalytics = memoryIndexingSettingsService.fetchMemoryAnalytics(limit: 2000)
+    }
+
+    private func percentLabel(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
+    }
+
+    private func presentableMemoryText(_ raw: String) -> String {
+        var value = raw
+        value = value.replacingOccurrences(of: "\\r\\n", with: "\n")
+        value = value.replacingOccurrences(of: "\\n", with: "\n")
+        value = value.replacingOccurrences(of: "\\t", with: "\t")
+        return value
     }
 
     private func matchesMemoryFilter(_ normalizedQuery: String, in value: String) -> Bool {
@@ -1970,12 +2454,28 @@ struct AIMemoryStudioView: View {
             memoryIndexingProgressSummary = "Preparing indexing run..."
             memoryIndexingProgressDetail = nil
             guard showMessage else { return }
-            memoryActionMessage = "Rescan finished. Found \(result.providers.count) providers and \(result.sourceFolders.count) folders. Indexing started in background."
+            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued \(result.queuedSourceCount) selected source(s) for indexing in the background."
         } else if showMessage {
             memoryIndexingProgressSummary = nil
             memoryIndexingProgressDetail = nil
-            memoryActionMessage = "Rescan finished. Found \(result.providers.count) providers and \(result.sourceFolders.count) folders."
+            if !settings.memoryIndexingEnabled {
+                memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Assistant is paused, so no sources were queued."
+            } else if settings.memoryEnabledProviderIDs.isEmpty {
+                memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Enable at least one source provider to queue indexing."
+            } else if !settings.memoryEnabledSourceFolderIDs.isEmpty && totalSourceFoldersForEnabledProvidersCount == 0 {
+                memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. No selected source folders matched enabled providers, so nothing was queued."
+            } else {
+                memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued 0 selected sources for indexing."
+            }
         }
+    }
+
+    private func stopMemoryIndexing() {
+        guard memoryIndexingSettingsService.cancelIndexing() else { return }
+        isMemoryIndexingInProgress = false
+        memoryIndexingProgressSummary = nil
+        memoryIndexingProgressDetail = nil
+        memoryActionMessage = "Indexing cancelled."
     }
 
     private func handleMemoryIndexingProgress(_ notification: Notification) {
@@ -2034,6 +2534,7 @@ struct AIMemoryStudioView: View {
         memoryIndexingProgressDetail = nil
         let userInfo = notification.userInfo ?? [:]
         let isRebuild = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.rebuild] as? Bool ?? false
+        let wasCancelled = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.cancelled] as? Bool ?? false
         let indexedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedFiles] as? Int ?? 0
         let skippedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.skippedFiles] as? Int ?? 0
         let indexedCards = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedCards] as? Int ?? 0
@@ -2045,6 +2546,12 @@ struct AIMemoryStudioView: View {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         let actionLabel = isRebuild ? "Rebuild" : "Indexing"
+        if wasCancelled {
+            memoryActionMessage = "\(actionLabel) cancelled. Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards before stopping."
+            refreshMemoryBrowser()
+            return
+        }
+
         if failureCount > 0 {
             if let firstFailure, !firstFailure.isEmpty {
                 let truncatedFailure = firstFailure.count > 120 ? String(firstFailure.prefix(120)) + "..." : firstFailure
@@ -2052,6 +2559,12 @@ struct AIMemoryStudioView: View {
             } else {
                 memoryActionMessage = "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards."
             }
+            refreshMemoryBrowser()
+            return
+        }
+
+        if indexedFiles > 0 && indexedCards == 0 {
+            memoryActionMessage = "\(actionLabel) finished. Indexed \(indexedFiles) files but produced 0 memory cards. This usually means the scanned files did not contain parseable memory events."
             refreshMemoryBrowser()
             return
         }
@@ -2098,22 +2611,16 @@ struct AIMemoryStudioView: View {
         }
         .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color(nsColor: .controlBackgroundColor).opacity(0.86),
-                            Color(nsColor: .windowBackgroundColor).opacity(0.76)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(tint.opacity(0.08))
                 )
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.18), lineWidth: 0.7)
         )
-        .shadow(color: tint.opacity(0.08), radius: 10, x: 0, y: 8)
     }
 }

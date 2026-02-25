@@ -212,7 +212,34 @@ actor MemoryRewriteRetrievalService {
             }
         }
 
-        return filtered
+        var output = filtered
+        if output.count < limit {
+            var seenIDs = Set(output.map(\.id))
+            for anchor in output.prefix(3) {
+                let related = try store.fetchRelatedCards(
+                    forCardID: anchor.id,
+                    minConfidence: 0.4,
+                    limit: min(6, max(1, limit - output.count))
+                )
+                for relatedCard in related {
+                    guard isHighSignalCard(relatedCard) else { continue }
+                    guard !seenIDs.contains(relatedCard.id) else { continue }
+                    if lessons.contains(where: { lesson in cardLikelyRepresentsLesson(relatedCard, lesson: lesson) }) {
+                        continue
+                    }
+                    output.append(relatedCard)
+                    seenIDs.insert(relatedCard.id)
+                    if output.count >= limit {
+                        break
+                    }
+                }
+                if output.count >= limit {
+                    break
+                }
+            }
+        }
+
+        return Array(output.prefix(limit))
     }
 
     private func cardSearchQueries(for transcript: String) -> [String] {
@@ -408,17 +435,31 @@ actor MemoryRewriteRetrievalService {
         for storedLesson in storedLessons {
             guard isEligibleStoredLesson(storedLesson) else { continue }
             guard let pair = normalizedPair(for: storedLesson) else { continue }
-            let lesson = makeLesson(from: storedLesson, pair: pair)
-            if lesson.validationState == .invalidated {
+            let validation = validationState(for: storedLesson)
+            if validation == .invalidated {
                 continue
             }
             let relevance = relevanceScore(
                 originalText: pair.original,
                 normalizedTranscript: normalizedTranscript
             )
+            // Prevent unrelated prior prompt-fix lessons from leaking into a new rewrite.
+            // Lessons must have at least token/substring overlap with the current transcript.
+            if relevance == 0 {
+                continue
+            }
             if !includeLowRelevance && relevance == 0 {
                 continue
             }
+            if shouldSkipUnvalidatedLesson(
+                storedLesson,
+                pair: pair,
+                relevance: relevance,
+                includeLowRelevance: includeLowRelevance
+            ) {
+                continue
+            }
+            let lesson = makeLesson(from: storedLesson, pair: pair)
 
             let dedupeKey = "\(pair.original.lowercased())|\(pair.correction.lowercased())"
             if let existing = bestByPair[dedupeKey] {
@@ -664,6 +705,47 @@ actor MemoryRewriteRetrievalService {
         if !providerMode.isEmpty {
             return true
         }
+        return false
+    }
+
+    private func shouldSkipUnvalidatedLesson(
+        _ lesson: MemoryLesson,
+        pair: (original: String, correction: String),
+        relevance: Int,
+        includeLowRelevance: Bool
+    ) -> Bool {
+        guard validationState(for: lesson) == .unvalidated else { return false }
+
+        let metadata = lesson.sourceMetadata
+        let outcomeStatus = normalizedMetadataValue("outcome_status", metadata: metadata)
+        let issueKey = normalizedMetadataValue("issue_key", metadata: metadata)
+        let outcomeEvidence = normalizedMetadataValue("outcome_evidence", metadata: metadata)
+        let fixSummary = normalizedMetadataValue("fix_summary", metadata: metadata)
+        let combined = "\(pair.original) \(pair.correction) \(lesson.rationale)"
+        let hasRewriteSignal = containsRewriteSignal(combined)
+        let hasEvidence = !outcomeEvidence.isEmpty || !fixSummary.isEmpty
+        let hasIssueContext = hasMeaningfulIssueKey(issueKey)
+        let confidence = min(1.0, max(0.0, lesson.validationConfidence))
+
+        if (outcomeStatus == "responded" || outcomeStatus == "attempted"),
+           !hasEvidence,
+           !hasIssueContext,
+           !hasRewriteSignal {
+            return true
+        }
+
+        if looksLikeGreetingNoise(pair: pair), !hasEvidence, confidence < 0.94 {
+            return true
+        }
+
+        if !includeLowRelevance, relevance <= 1, confidence < 0.8, !hasRewriteSignal {
+            return true
+        }
+
+        if includeLowRelevance, relevance == 0, confidence < 0.7, !hasEvidence {
+            return true
+        }
+
         return false
     }
 
@@ -996,8 +1078,39 @@ actor MemoryRewriteRetrievalService {
         let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let summary = card.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         let detail = card.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let outcomeStatus = (card.metadata["outcome_status"] ?? "").lowercased()
+        let issueKey = (card.metadata["issue_key"] ?? "").lowercased()
+        let validationState = (card.metadata["validation_state"] ?? "").lowercased()
+        let outcomeEvidence = (card.metadata["outcome_evidence"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let fixSummary = (card.metadata["fix_summary"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
         if title == "workspace" || title == "storage" || title == "state" {
+            return false
+        }
+        if title == "q&a: hi" || title == "q&a: hello" || title == "q&a: hey" {
+            return false
+        }
+        if issueKey == "issue-hi" || issueKey == "issue-hello" || issueKey == "issue-hey" {
+            return false
+        }
+        let combinedLower = "\(title) \(summary) \(detail)".lowercased()
+        let hasRewriteSignal = containsRewriteSignal(combinedLower)
+        let hasEvidence = !outcomeEvidence.isEmpty || !fixSummary.isEmpty
+        let hasIssueContext = hasMeaningfulIssueKey(issueKey)
+
+        if (outcomeStatus == "responded" || outcomeStatus == "attempted") && validationState == "unvalidated" {
+            let lowerSummary = summary.lowercased()
+            let lowerDetail = detail.lowercased()
+            if lowerSummary.hasPrefix("q: hi")
+                || lowerSummary.hasPrefix("q: hello")
+                || lowerSummary.hasPrefix("q: hey")
+                || lowerDetail.contains("how can i help")
+                || lowerDetail.contains("how can i assist")
+                || (!hasEvidence && !hasIssueContext && !hasRewriteSignal) {
+                return false
+            }
+        }
+        if validationState == "unvalidated", card.score < 0.72, !hasRewriteSignal, !hasEvidence {
             return false
         }
         if detail.hasPrefix("{") && detail.hasSuffix("}") {
@@ -1017,5 +1130,43 @@ actor MemoryRewriteRetrievalService {
             return false
         }
         return true
+    }
+
+    private func normalizedMetadataValue(_ key: String, metadata: [String: String]) -> String {
+        metadata[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+    }
+
+    private func containsRewriteSignal(_ value: String) -> Bool {
+        let lower = value.lowercased()
+        let needles = [
+            "->", "=>", "→", "rewrite", "prompt fix", "fix summary",
+            "suggested", "improved prompt", "correction", "mistake"
+        ]
+        return needles.contains { lower.contains($0) }
+    }
+
+    private func hasMeaningfulIssueKey(_ issueKey: String) -> Bool {
+        let normalized = issueKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+        return normalized != "issue-hi"
+            && normalized != "issue-hello"
+            && normalized != "issue-hey"
+    }
+
+    private func looksLikeGreetingNoise(pair: (original: String, correction: String)) -> Bool {
+        let combined = "\(pair.original) \(pair.correction)".lowercased()
+        let tokens = combined.split(whereSeparator: \.isWhitespace)
+        if tokens.count <= 6,
+           (combined.contains(" hi")
+                || combined.hasPrefix("hi")
+                || combined.contains(" hello")
+                || combined.hasPrefix("hello")
+                || combined.contains(" hey")
+                || combined.hasPrefix("hey")) {
+            return true
+        }
+        return false
     }
 }

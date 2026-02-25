@@ -25,9 +25,13 @@ enum PermissionCenter {
         )
     }
 
-    static func requestAccessibilityPermission(using settings: SettingsStore, promptIfNeeded: Bool = true) {
+    static func requestAccessibilityPermission(
+        using settings: SettingsStore,
+        promptIfNeeded: Bool = true,
+        openSettingsIfDenied: Bool = true
+    ) {
         settings.refreshAccessibilityStatus(prompt: promptIfNeeded)
-        if !settings.accessibilityTrusted {
+        if !settings.accessibilityTrusted, openSettingsIfDenied {
             openPrivacySettingsPane(query: "Privacy_Accessibility")
         }
     }

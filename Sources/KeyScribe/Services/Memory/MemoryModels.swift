@@ -196,11 +196,25 @@ struct MemoryIndexedEntry: Hashable, Identifiable {
     let id: UUID
     let provider: MemoryProviderKind
     let sourceRootPath: String
+    let sourceFileRelativePath: String
+    let projectName: String?
+    let repositoryName: String?
     let title: String
     let summary: String
     let detail: String
+    let eventTimestamp: Date
     let updatedAt: Date
     let isPlanContent: Bool
+    let issueKey: String?
+    let attemptNumber: Int?
+    let attemptCount: Int?
+    let outcomeStatus: String?
+    let outcomeEvidence: String?
+    let fixSummary: String?
+    let validationState: String?
+    let invalidatedByAttempt: Int?
+    let relationConfidence: Double?
+    let relationType: String?
 }
 
 struct RewriteSuggestion: Codable, Hashable, Identifiable {

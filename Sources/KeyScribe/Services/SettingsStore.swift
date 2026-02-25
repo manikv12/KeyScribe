@@ -199,6 +199,7 @@ final class SettingsStore: ObservableObject {
         static let promptRewriteProviderMode = "KeyScribe.promptRewriteProviderMode"
         static let promptRewriteOpenAIModel = "KeyScribe.promptRewriteOpenAIModel"
         static let promptRewriteOpenAIBaseURL = "KeyScribe.promptRewriteOpenAIBaseURL"
+        static let promptRewriteAlwaysConvertToMarkdown = "KeyScribe.promptRewriteAlwaysConvertToMarkdown"
     }
 
     private enum ContinuousToggleDefaults {
@@ -463,6 +464,12 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var promptRewriteAlwaysConvertToMarkdown: Bool {
+        didSet {
+            save()
+        }
+    }
+
     @Published var promptRewriteOpenAIAPIKey: String {
         didSet {
             Self.storePromptRewriteProviderAPIKey(
@@ -713,6 +720,12 @@ final class SettingsStore: ObservableObject {
             promptRewriteOpenAIBaseURL = selectedPromptProvider.defaultBaseURL
         }
 
+        if defaults.object(forKey: Keys.promptRewriteAlwaysConvertToMarkdown) == nil {
+            promptRewriteAlwaysConvertToMarkdown = false
+        } else {
+            promptRewriteAlwaysConvertToMarkdown = defaults.bool(forKey: Keys.promptRewriteAlwaysConvertToMarkdown)
+        }
+
         promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: selectedPromptProvider)
 
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
@@ -805,6 +818,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(promptRewriteProviderModeRawValue, forKey: Keys.promptRewriteProviderMode)
         defaults.set(promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIModel)
         defaults.set(promptRewriteOpenAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIBaseURL)
+        defaults.set(promptRewriteAlwaysConvertToMarkdown, forKey: Keys.promptRewriteAlwaysConvertToMarkdown)
 
         guard !isApplyingChanges else { return }
         onChange?()
@@ -845,6 +859,22 @@ final class SettingsStore: ObservableObject {
 
     func hasPromptRewriteOAuthSession(for providerMode: PromptRewriteProviderMode) -> Bool {
         PromptRewriteOAuthCredentialStore.loadSession(for: providerMode) != nil
+    }
+
+    func hasPromptRewriteAPIKey(for providerMode: PromptRewriteProviderMode) -> Bool {
+        guard providerMode.requiresAPIKey else { return true }
+        let key = Self.loadPromptRewriteProviderAPIKey(for: providerMode)
+        return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func isPromptRewriteProviderConnected(_ providerMode: PromptRewriteProviderMode) -> Bool {
+        if providerMode.supportsOAuthSignIn, hasPromptRewriteOAuthSession(for: providerMode) {
+            return true
+        }
+        if providerMode.requiresAPIKey {
+            return hasPromptRewriteAPIKey(for: providerMode)
+        }
+        return true
     }
 
     func clearPromptRewriteOAuthSession(for providerMode: PromptRewriteProviderMode) {
@@ -907,10 +937,20 @@ final class SettingsStore: ObservableObject {
         let normalizedProviders = Self.normalizedStringList(providerIDs)
         let previousDetected = Set(memoryDetectedProviderIDs)
         let previousEnabled = Set(memoryEnabledProviderIDs)
+        let removedProviders = previousDetected.subtracting(normalizedProviders)
 
         memoryDetectedProviderIDs = normalizedProviders
+        if !removedProviders.isEmpty {
+            // Discovery catalog changed (providers disappeared). Seed currently detected providers as enabled
+            // so stale disabled state from an older catalog does not suppress newly detected indexing sources.
+            memoryEnabledProviderIDs = normalizedProviders
+            return
+        }
         memoryEnabledProviderIDs = normalizedProviders.filter { providerID in
-            previousEnabled.contains(providerID)
+            if previousDetected.contains(providerID) {
+                return previousEnabled.contains(providerID)
+            }
+            return true
         }
     }
 
@@ -918,10 +958,20 @@ final class SettingsStore: ObservableObject {
         let normalizedFolders = Self.normalizedStringList(sourceFolderIDs)
         let previousDetected = Set(memoryDetectedSourceFolderIDs)
         let previousEnabled = Set(memoryEnabledSourceFolderIDs)
+        let removedFolders = previousDetected.subtracting(normalizedFolders)
 
         memoryDetectedSourceFolderIDs = normalizedFolders
+        if !removedFolders.isEmpty {
+            // Same recovery behavior as providers: when the folder catalog changes shape, reseed enabled
+            // state from current detections so stale disabled data cannot leave every folder unselected.
+            memoryEnabledSourceFolderIDs = normalizedFolders
+            return
+        }
         memoryEnabledSourceFolderIDs = normalizedFolders.filter { folderID in
-            previousEnabled.contains(folderID)
+            if previousDetected.contains(folderID) {
+                return previousEnabled.contains(folderID)
+            }
+            return true
         }
     }
 
@@ -1069,8 +1119,7 @@ final class SettingsStore: ObservableObject {
         _ = SecItemDelete(legacyQuery as CFDictionary)
     }
 
-    /// Resets all permissions, deletes local app data, and removes the app bundle.
-    /// Requires admin privileges for tccutil and rm of /Applications bundle.
+    /// Resets all permissions, deletes local app data, and removes the app bundle when possible.
     static func resetAndUninstall(
         deleteDownloadedModels: Bool = false,
         deleteLearnedCorrections: Bool = false,
@@ -1104,7 +1153,6 @@ final class SettingsStore: ObservableObject {
         // 1. Resets TCC permissions (Accessibility, Microphone, Speech Recognition)
         // 2. Removes UserDefaults + caches + app data (optionally preserving downloaded whisper models)
         // 3. Removes app logs and saved state
-        // 4. Removes the .app bundle from /Applications
         let resetCommands = bundleIDs.flatMap { bundleID in
             [
                 "tccutil reset Accessibility \(shellSingleQuoted(bundleID)) 2>/dev/null || true",
@@ -1159,9 +1207,6 @@ final class SettingsStore: ObservableObject {
 
         let appSupportCleanupSection = appSupportCleanupCommands.joined(separator: "; ")
         let logsCleanupCommand = "rm -rf \(shellSingleQuoted("\(NSHomeDirectory())/Library/Logs/KeyScribe"))"
-        let appRemovalCommands = appRemovalPaths
-            .map { "rm -rf \(shellSingleQuoted($0))" }
-            .joined(separator: "; ")
 
         let script = """
         \(resetCommands); \
@@ -1169,41 +1214,66 @@ final class SettingsStore: ObservableObject {
         \(cacheCleanupCommands); \
         \(savedStateCleanupCommands); \
         \(appSupportCleanupSection); \
-        \(logsCleanupCommand); \
-        \(appRemovalCommands)
+        \(logsCleanupCommand)
         """
 
-        let escapedScript = appleScriptEscaped(script)
-        let appleScript = """
-        do shell script "\(escapedScript)" with administrator privileges
-        """
+        executeShellCommand(script)
 
-        var error: NSDictionary?
-        if let scriptObject = NSAppleScript(source: appleScript) {
-            scriptObject.executeAndReturnError(&error)
-            if error == nil {
-                // Successfully uninstalled — quit the app
-                NSApplication.shared.terminate(nil)
-            } else {
-                CrashReporter.logError("Uninstall failed: \(String(describing: error))")
-                let alert = NSAlert()
-                alert.alertStyle = .warning
-                alert.messageText = "Uninstall Failed"
-                alert.informativeText = "KeyScribe could not remove the app automatically. Remove KeyScribe.app manually from Applications."
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
+        var removalIssues: [String] = []
+        for path in appRemovalPaths {
+            if let message = removeItemAtPath(path) {
+                removalIssues.append(message)
             }
         }
+
+        guard removalIssues.isEmpty else {
+            CrashReporter.logError("Uninstall app bundle removal issue(s): \(removalIssues.joined(separator: "; "))")
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Uninstall completed with manual cleanup"
+            alert.informativeText = "Permissions and app data were reset, but KeyScribe.app could not be removed automatically from all locations. Move it to Trash manually from Applications."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        // Successfully uninstalled — quit the app
+        NSApplication.shared.terminate(nil)
     }
 
     private static func shellSingleQuoted(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
-    private static func appleScriptEscaped(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+    private static func executeShellCommand(_ command: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", command]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            CrashReporter.logError("Uninstall shell command failed: \(error)")
+        }
+    }
+
+    private static func removeItemAtPath(_ path: String) -> String? {
+        let url = URL(fileURLWithPath: path)
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: path) else { return nil }
+
+        do {
+            try fileManager.trashItem(at: url, resultingItemURL: nil)
+            return nil
+        } catch {
+            do {
+                try fileManager.removeItem(at: url)
+                return nil
+            } catch {
+                return "\(path): \(error.localizedDescription)"
+            }
+        }
     }
 
     func hasModifier(_ modifier: NSEvent.ModifierFlags) -> Bool {

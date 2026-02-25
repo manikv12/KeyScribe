@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 struct MemoryIndexingReport: Sendable {
     var discoveredSources = 0
@@ -27,6 +28,7 @@ actor MemoryIndexingService {
     private let maxFilesPerSource: Int
     private let maxEventsPerFile: Int
     private let apiThrottleDelay: TimeInterval
+    private let logger = Logger(subsystem: "com.keyscribe.KeyScribe", category: "MemoryIndexing")
 
     init(
         fileManager: FileManager = .default,
@@ -74,8 +76,13 @@ actor MemoryIndexingService {
         progress: ProgressHandler? = nil
     ) async -> MemoryIndexingReport {
         var report = MemoryIndexingReport()
+        logger.info("Starting memory indexing for \(sources.count, privacy: .public) source(s).")
         if let progress {
             await progress(report, nil, nil)
+        }
+
+        if sources.isEmpty {
+            logger.notice("Memory indexing received zero sources to process.")
         }
 
         for source in sources {
@@ -89,6 +96,9 @@ actor MemoryIndexingService {
             await index(source: source, store: store, progress: progress, report: &report)
         }
 
+        logger.info(
+            "Memory indexing finished: indexedFiles=\(report.indexedFiles, privacy: .public) skippedFiles=\(report.skippedFiles, privacy: .public) indexedCards=\(report.indexedCards, privacy: .public) failures=\(report.failures.count, privacy: .public)"
+        )
         return report
     }
 
@@ -136,6 +146,15 @@ actor MemoryIndexingService {
             maxFiles: maxFilesPerSource
         )
         let aiBackedIndexingAvailable = await rewriteProvider.hasAIBackedIndexingAccess(for: source.provider)
+        logger.debug(
+            "Source \(source.provider.rawValue, privacy: .public) at \(source.rootURL.path, privacy: .public) has \(candidateFiles.count, privacy: .public) candidate file(s); aiBacked=\(aiBackedIndexingAvailable, privacy: .public)"
+        )
+
+        if candidateFiles.isEmpty {
+            logger.notice(
+                "Source \(source.provider.rawValue, privacy: .public) at \(source.rootURL.path, privacy: .public) had no parseable session JSONL files."
+            )
+        }
 
         for fileURL in candidateFiles {
             if Task.isCancelled {
@@ -191,8 +210,18 @@ actor MemoryIndexingService {
                     && (existing.parseError == nil || hasNoOutputMarker)
 
                 if unchanged {
+                    if !aiBackedIndexingAvailable {
+                        report.skippedFiles += 1
+                        if let progress {
+                            await progress(report, source, fileURL.path)
+                        }
+                        return
+                    }
+
                     let hasIndexedEvents = try store.hasIndexedEvents(forSourceFileID: fileID)
-                    if hasIndexedEvents || hasNoOutputMarker || !aiBackedIndexingAvailable {
+                    // Re-try files that previously produced no parse output so parser improvements
+                    // can recover memories without requiring a destructive full reset.
+                    if hasIndexedEvents {
                         report.skippedFiles += 1
                         if let progress {
                             await progress(report, source, fileURL.path)
@@ -238,6 +267,16 @@ actor MemoryIndexingService {
 
             report.indexedFiles += 1
             let limitedDrafts = Array(drafts.prefix(maxEventsPerFile))
+
+            // AI mode controls memory persistence. Without AI-backed indexing access,
+            // we still count parsed files but intentionally skip writing events/cards.
+            if !aiBackedIndexingAvailable {
+                if let progress {
+                    await progress(report, source, fileURL.path)
+                }
+                return
+            }
+
             var persistedIndexedOutput = false
             for (index, draft) in limitedDrafts.enumerated() {
                 if Task.isCancelled {
@@ -284,17 +323,12 @@ actor MemoryIndexingService {
                     provider: source.provider
                 )
 
-                // Guardrail: local/non-AI parsing should not persist memory cards/events by default.
-                // We only persist indexed content when AI-backed extraction produced rewrite signal.
-                guard lessonDraft != nil || rewriteSuggestion != nil else {
-                    continue
-                }
-
-                persistedIndexedOutput = true
+                // Persist core memory for every parsed draft; lesson/rewrite are optional enrichments.
                 try store.upsertEvent(event)
                 report.indexedEvents += 1
                 try store.upsertCard(card)
                 report.indexedCards += 1
+                persistedIndexedOutput = true
 
                 var lessonRewriteSuggestion: RewriteSuggestion?
                 if let lessonDraft {
@@ -405,7 +439,7 @@ actor MemoryIndexingService {
         let cardSummary = MemoryTextNormalizer.normalizedSummary(summary ?? draft.title)
         let detail = MemoryTextNormalizer.normalizedBody(draft.body)
         let score = baseScore(for: draft.kind, hasRewriteHint: draft.kind == .rewrite)
-        let createdAt = Date()
+        let createdAt = draft.timestamp
         let cardID = MemoryIdentifier.stableUUID(
             for: "card|\(eventID.uuidString)|\(cardSummary)|\(detail)"
         )

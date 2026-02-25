@@ -53,6 +53,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.title = "KeyScribe Settings"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = true
             window.contentViewController = hostingController
@@ -107,6 +109,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.title = "KeyScribe Permission Setup"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = true
             window.contentViewController = hostingController
@@ -153,6 +157,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.title = "AI Memory Studio"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = true
             window.contentViewController = hostingController
@@ -221,6 +227,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             panel.title = "Transcript History"
             panel.titleVisibility = .hidden
             panel.titlebarAppearsTransparent = true
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
             panel.isMovableByWindowBackground = true
             panel.toolbarStyle = .unifiedCompact
             panel.contentViewController = hostingController

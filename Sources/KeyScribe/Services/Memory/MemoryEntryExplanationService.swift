@@ -122,6 +122,9 @@ actor MemoryEntryExplanationService {
         - detail: \(snippet(entry.detail, limit: 3000))
         - provider: \(entry.provider.displayName)
         - source: \(snippet(entry.sourceRootPath, limit: 260))
+        - source_file: \(snippet(entry.sourceFileRelativePath, limit: 260))
+        - project: \(snippet(entry.projectName ?? "", limit: 160))
+        - repository: \(snippet(entry.repositoryName ?? "", limit: 160))
         - updated_at: \(entry.updatedAt.formatted(date: .abbreviated, time: .standard))
         - is_plan_content: \(entry.isPlanContent ? "true" : "false")
         """

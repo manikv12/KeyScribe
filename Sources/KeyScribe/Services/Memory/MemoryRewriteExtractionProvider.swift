@@ -261,7 +261,10 @@ private actor MemoryAILessonSynthesisProvider {
         - improved_prompt is the corrected wording preserving user intent.
         - rationale should explain why the improvement is better in one or two sentences.
         - validation_confidence must be 0.0 to 1.0.
-        - If signal is weak, still return your best concise guess with lower confidence.
+        - If signal is weak, conversational, or non-actionable, return:
+          {"mistake_pattern":"","improved_prompt":"","rationale":"NO_SIGNAL","validation_confidence":0.0}
+        - Treat greetings/chitchat as NO_SIGNAL (examples: "hi", "hello", "hey", "thanks", "how are you").
+        - Do not create lessons from assistant pleasantries ("How can I help?", "anything else?").
         """
 
         let userPrompt = """
@@ -344,7 +347,6 @@ private actor MemoryAILessonSynthesisProvider {
             endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")
             payload = [
                 "model": configuration.model,
-                "temperature": 0.2,
                 "input": [
                     [
                         "role": "system",

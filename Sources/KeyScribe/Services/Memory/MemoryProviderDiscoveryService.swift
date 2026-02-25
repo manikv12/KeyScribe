@@ -38,13 +38,14 @@ final class MemoryProviderDiscoveryService {
         let candidateRelativePaths: [String]
     }
 
-    private static let parseableExtensions: Set<String> = [
-        "json", "jsonl", "md", "markdown", "txt", "yaml", "yml", "log"
+    // Session indexing intentionally focuses on provider transcript artifacts only.
+    private static let sessionFileExtensions: Set<String> = [
+        "jsonl", "ndjson", "json", "db", "sqlite", "sqlite3", "vscdb"
     ]
 
-    private static let parseableFilenameNeedles: [String] = [
-        "conversation", "conversations", "chat", "history", "session", "prompt",
-        "rewrite", "transcript", "memory", "messages"
+    private static let sessionFilenameNeedles: [String] = [
+        "conversation", "conversations", "chat", "history", "session", "sessions",
+        "prompt", "message", "messages", "rollout", "thread", "store", "composer"
     ]
 
     private static let excludedDirectoryNames: Set<String> = [
@@ -57,20 +58,19 @@ final class MemoryProviderDiscoveryService {
             kind: .codex,
             detail: "Local Codex sessions and conversation artifacts.",
             candidateRelativePaths: [
-                ".codex",
                 ".codex/sessions",
                 ".codex/archived_sessions",
-                "Library/Application Support/Codex"
+                "Library/Application Support/Codex/sessions",
+                "Library/Application Support/Codex/archived_sessions"
             ]
         ),
         ProviderSpec(
             kind: .opencode,
             detail: "OpenCode local sessions and indexing files.",
             candidateRelativePaths: [
-                ".opencode",
                 ".local/state/opencode",
-                ".local/share/opencode/storage",
-                "Library/Application Support/OpenCode"
+                ".opencode",
+                "Library/Application Support/OpenCode/sessions"
             ]
         ),
         ProviderSpec(
@@ -79,17 +79,14 @@ final class MemoryProviderDiscoveryService {
             candidateRelativePaths: [
                 ".claude",
                 ".claude/projects",
-                "Library/Application Support/Claude"
+                ".claude/tasks"
             ]
         ),
         ProviderSpec(
             kind: .copilot,
             detail: "GitHub Copilot and Copilot Chat local data stores.",
             candidateRelativePaths: [
-                ".copilot",
-                ".config/github-copilot",
-                ".config/copilot",
-                "Library/Application Support/GitHub Copilot",
+                ".config/github-copilot/sessions",
                 "Library/Application Support/Code/User/globalStorage/github.copilot-chat"
             ]
         ),
@@ -97,49 +94,41 @@ final class MemoryProviderDiscoveryService {
             kind: .cursor,
             detail: "Cursor editor conversation and workspace memory data.",
             candidateRelativePaths: [
-                ".cursor",
                 ".cursor/chats",
-                ".cursor/projects",
-                "Library/Application Support/Cursor/User/workspaceStorage",
-                "Library/Application Support/Cursor/User/globalStorage"
+                "Library/Application Support/Cursor/User/workspaceStorage"
             ]
         ),
         ProviderSpec(
             kind: .kimi,
             detail: "Kimi local app conversation and cache exports.",
             candidateRelativePaths: [
-                ".kimi",
-                ".kimi/user-history",
                 ".kimi/sessions",
-                "Library/Application Support/Kimi"
+                ".kimi/history"
             ]
         ),
         ProviderSpec(
             kind: .gemini,
             detail: "Gemini local app history and workspace exports.",
             candidateRelativePaths: [
-                ".gemini",
-                ".gemini/tmp",
-                "Library/Application Support/Gemini"
+                ".gemini/sessions",
+                ".gemini/history"
             ]
         ),
         ProviderSpec(
             kind: .windsurf,
             detail: "Windsurf editor workspace and chat history data.",
             candidateRelativePaths: [
-                ".windsurf",
+                ".windsurf/chats",
                 ".windsurf/User/workspaceStorage",
-                "Library/Application Support/Windsurf/User/workspaceStorage",
-                "Library/Application Support/Windsurf/User/globalStorage"
+                "Library/Application Support/Windsurf/User/workspaceStorage"
             ]
         ),
         ProviderSpec(
             kind: .codeium,
             detail: "Codeium local extension storage and metadata.",
             candidateRelativePaths: [
-                ".codeium",
                 ".codeium/windsurf",
-                "Library/Application Support/Codeium",
+                ".codeium/sessions",
                 "Library/Application Support/Code/User/globalStorage/codeium.codeium"
             ]
         )
@@ -166,15 +155,15 @@ final class MemoryProviderDiscoveryService {
         enabledProviders: Set<String>? = nil,
         enabledSourceFolders: Set<String>? = nil
     ) -> MemoryProviderDiscoveryResult {
-        let normalizedProviderFilter = Set((enabledProviders ?? []).map(normalizeIdentifier))
-        let normalizedFolderFilter = Set((enabledSourceFolders ?? []).map(normalizePath))
+        let normalizedProviderFilter: Set<String>? = enabledProviders.map { Set($0.map(normalizeIdentifier)) }
+        let normalizedFolderFilter: Set<String>? = enabledSourceFolders.map { Set($0.map(normalizePath)) }
 
         var sourcesByProvider: [MemoryProviderKind: [MemoryDiscoveredSource]] = [:]
         var seenPaths = Set<String>()
 
         for spec in Self.providerSpecs {
             let providerID = spec.kind.rawValue
-            if !normalizedProviderFilter.isEmpty && !normalizedProviderFilter.contains(providerID) {
+            if let filter = normalizedProviderFilter, !filter.contains(providerID) {
                 continue
             }
 
@@ -189,7 +178,7 @@ final class MemoryProviderDiscoveryService {
                 guard seenPaths.insert("\(providerID)|\(rootPath)").inserted else { continue }
                 guard fileManager.directoryExists(atPath: rootPath) else { continue }
                 guard containsParseableArtifacts(in: rootURL) else { continue }
-                if !normalizedFolderFilter.isEmpty && !normalizedFolderFilter.contains(rootPath) {
+                if let filter = normalizedFolderFilter, !filter.contains(rootPath) {
                     continue
                 }
 
@@ -206,46 +195,6 @@ final class MemoryProviderDiscoveryService {
 
             if !providerSources.isEmpty {
                 sourcesByProvider[spec.kind] = providerSources
-            }
-        }
-
-        // Fallback discovery for hidden folders in the user home directory.
-        // This keeps support flexible for renamed/new provider folders (e.g. .claw, .gmini).
-        if let homeEnumerator = fileManager.enumerator(
-            at: homeURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .nameKey],
-            options: [.skipsSubdirectoryDescendants, .skipsPackageDescendants],
-            errorHandler: { _, _ in true }
-        ) {
-            for case let folderURL as URL in homeEnumerator {
-                guard let values = try? folderURL.resourceValues(forKeys: [.isDirectoryKey, .nameKey]) else { continue }
-                guard values.isDirectory == true else { continue }
-                let name = (values.name ?? folderURL.lastPathComponent).lowercased()
-                guard name.hasPrefix(".") else { continue }
-
-                let kind = inferredKind(forHiddenFolder: name)
-                guard kind != .unknown else { continue }
-                let providerID = kind.rawValue
-                if !normalizedProviderFilter.isEmpty && !normalizedProviderFilter.contains(providerID) {
-                    continue
-                }
-
-                let rootPath = normalizePath(folderURL.path)
-                guard !rootPath.isEmpty else { continue }
-                guard seenPaths.insert("\(providerID)|\(rootPath)").inserted else { continue }
-                guard containsParseableArtifacts(in: folderURL) else { continue }
-                if !normalizedFolderFilter.isEmpty && !normalizedFolderFilter.contains(rootPath) {
-                    continue
-                }
-
-                let source = MemoryDiscoveredSource(
-                    id: "\(providerID):\(rootPath)",
-                    provider: kind,
-                    rootURL: folderURL.standardizedFileURL,
-                    displayName: kind.displayName,
-                    detail: "Auto-detected hidden folder source."
-                )
-                sourcesByProvider[kind, default: []].append(source)
             }
         }
 
@@ -303,38 +252,6 @@ final class MemoryProviderDiscoveryService {
         URL(fileURLWithPath: value, isDirectory: true).standardizedFileURL.path
     }
 
-    private func inferredKind(forHiddenFolder name: String) -> MemoryProviderKind {
-        let normalized = name.lowercased()
-        if normalized.contains("codex") {
-            return .codex
-        }
-        if normalized.contains("opencode") || normalized.contains("open-code") {
-            return .opencode
-        }
-        if normalized.contains("claude") || normalized.contains("claw") {
-            return .claude
-        }
-        if normalized.contains("copilot") {
-            return .copilot
-        }
-        if normalized.contains("cursor") {
-            return .cursor
-        }
-        if normalized.contains("kimi") {
-            return .kimi
-        }
-        if normalized.contains("gemini") || normalized.contains("gmini") {
-            return .gemini
-        }
-        if normalized.contains("windsurf") {
-            return .windsurf
-        }
-        if normalized.contains("codeium") {
-            return .codeium
-        }
-        return .unknown
-    }
-
     private func containsParseableArtifacts(in rootURL: URL) -> Bool {
         let rootPath = rootURL.path
         let rootDepth = rootPath.split(separator: "/").count
@@ -372,7 +289,7 @@ final class MemoryProviderDiscoveryService {
 
             guard values.isRegularFile == true else { continue }
             guard let fileName = values.name?.lowercased() else { continue }
-            guard isParseableFile(named: fileName) else { continue }
+            guard isSessionFile(named: fileName, path: candidateURL.path.lowercased()) else { continue }
 
             if let size = values.fileSize, size > 10_000_000 {
                 continue
@@ -382,17 +299,29 @@ final class MemoryProviderDiscoveryService {
         return false
     }
 
-    private func isParseableFile(named fileName: String) -> Bool {
-        if let ext = fileName.split(separator: ".").last {
-            if Self.parseableExtensions.contains(String(ext)) {
-                return true
-            }
+    private func isSessionFile(named fileName: String, path: String) -> Bool {
+        let ext = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        guard Self.sessionFileExtensions.contains(ext) else {
+            return false
         }
 
-        for needle in Self.parseableFilenameNeedles where fileName.contains(needle) {
+        if fileName.hasPrefix("rollout-") {
             return true
         }
-        return false
+
+        if Self.sessionFilenameNeedles.contains(where: { fileName.contains($0) }) {
+            return true
+        }
+
+        let sessionPathNeedles = [
+            "/sessions/",
+            "/archived_sessions/",
+            "/chats/",
+            "/conversations/",
+            "/projects/",
+            "/workspacestorage/"
+        ]
+        return sessionPathNeedles.contains(where: { path.contains($0) })
     }
 }
 

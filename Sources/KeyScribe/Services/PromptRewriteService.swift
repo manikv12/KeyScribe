@@ -64,7 +64,7 @@ final class PromptRewriteService {
 
     init(
         backend: PromptRewriteBackendServing = BackendPromptRewriteService.shared,
-        timeoutSeconds: TimeInterval = 5
+        timeoutSeconds: TimeInterval = 3
     ) {
         self.backend = backend
         self.timeoutSeconds = min(
@@ -247,7 +247,9 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                     lessonLimit: 8,
                     cardLimit: 8
                 )
-                guard !rewriteContext.isEmpty else { return nil }
+                // Do not pay a provider round-trip unless we have an actual rewrite lesson match.
+                // Supporting cards alone are too weak and can add latency without improving quality.
+                guard !rewriteContext.lessons.isEmpty else { return nil }
 
                 return try await openAIProvider.retrieveSuggestion(
                     for: cleanedTranscript,
@@ -437,6 +439,12 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
             // OpenAI OAuth sessions in OpenCode-compatible flow map to Codex models.
             resolvedModel = "gpt-5.3-codex"
         }
+        if providerMode == .openAI,
+           oauthSession == nil,
+           resolvedModel.lowercased().contains("codex") {
+            // Codex models are for OAuth/Codex flow and often fail on plain OpenAI API-key chat-completions.
+            resolvedModel = PromptRewriteLiveProviderMode.openAI.defaultModel
+        }
         let resolvedBaseURL = (baseURL?.isEmpty == false) ? baseURL! : providerMode.defaultBaseURL
         return PromptRewriteLiveConfiguration(
             providerMode: providerMode,
@@ -552,6 +560,9 @@ private actor OpenAIPromptRewriteProvider {
         - Apply mistake->correction lessons only when the mistake is actually present or strongly implied.
         - Use supporting cards only as secondary context after lesson matching.
         - memory_context should mention lesson provenance and validation status when relevant.
+        - suggested_text must be a fully formatted final response ready to paste.
+        - Preserve structural formatting from the original prompt when present (questions, bullet points, numbered lists, markdown sections).
+        - Do not collapse list/question formatting into a single paragraph.
         """
 
         let userPrompt = """
@@ -572,11 +583,13 @@ private actor OpenAIPromptRewriteProvider {
             systemPrompt: systemPrompt,
             userPrompt: userPrompt
         )
+        let isStreamingCodex = configuration.providerMode == .openAI && isOAuth(credential)
 
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            CrashReporter.logError("Prompt rewrite provider request transport failure: \(error.localizedDescription)")
             throw PromptRewriteBackendError.providerFailure(
                 reason: "Provider request failed: \(error.localizedDescription)"
             )
@@ -588,6 +601,7 @@ private actor OpenAIPromptRewriteProvider {
 
         if !(200...299).contains(http.statusCode) {
             let detail = providerErrorDetail(from: data) ?? "HTTP \(http.statusCode)"
+            CrashReporter.logError("Prompt rewrite provider request failed status=\(http.statusCode) detail=\(detail)")
             throw PromptRewriteBackendError.providerFailure(
                 reason: "Provider request failed (\(http.statusCode)): \(detail)"
             )
@@ -596,7 +610,8 @@ private actor OpenAIPromptRewriteProvider {
         guard let responsePayload = decodeModelResponse(
             data: data,
             originalPrompt: cleanedTranscript,
-            providerMode: configuration.providerMode
+            providerMode: configuration.providerMode,
+            isStreamingCodex: isStreamingCodex
         ) else {
             return nil
         }
@@ -630,7 +645,9 @@ private actor OpenAIPromptRewriteProvider {
             endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")
             payload = [
                 "model": configuration.openAIModel,
-                "temperature": 0.2,
+                "store": false,
+                "stream": true,
+                "instructions": systemPrompt,
                 "input": [
                     [
                         "role": "system",
@@ -790,15 +807,206 @@ private actor OpenAIPromptRewriteProvider {
         guard !cards.isEmpty else { return "[]" }
 
         let payload = cards.map { card in
-            [
+            var item: [String: Any] = [
                 "provider": card.provider.displayName,
                 "title": snippet(card.title, limit: 120),
                 "summary": snippet(card.summary, limit: 180),
                 "detail": snippet(card.detail, limit: 220),
                 "score": Double(String(format: "%.2f", card.score)) ?? card.score
-            ] as [String: Any]
+            ]
+            let projectContext = supportingCardProjectContext(for: card)
+            if let projectName = projectContext.projectName {
+                item["project"] = projectName
+            }
+            if let repositoryName = projectContext.repositoryName {
+                item["repository"] = repositoryName
+            }
+            return item
         }
         return jsonString(for: payload)
+    }
+
+    private func supportingCardProjectContext(
+        for card: MemoryCard
+    ) -> (projectName: String?, repositoryName: String?) {
+        let normalizedMetadata = Dictionary(
+            uniqueKeysWithValues: card.metadata.map { key, value in
+                (key.lowercased(), value)
+            }
+        )
+
+        let projectKeys = ["project", "project_name", "workspace", "workspace_name", "folder", "cwd", "path", "uri"]
+        let repositoryKeys = ["repository", "repository_name", "repo", "repo_name", "git_repository", "git_repo"]
+
+        var projectName = normalizeContextValue(
+            firstMetadataValue(keys: projectKeys, metadata: normalizedMetadata)
+        )
+        var repositoryName = normalizeContextValue(
+            firstMetadataValue(keys: repositoryKeys, metadata: normalizedMetadata)
+        )
+
+        if projectName == nil || repositoryName == nil {
+            let textPath = extractPathLikeValue(from: [card.detail, card.summary, card.title])
+            if projectName == nil {
+                projectName = derivePathLabel(from: textPath ?? "")
+            }
+            if repositoryName == nil {
+                repositoryName = derivePathLabel(from: textPath ?? "")
+            }
+        }
+
+        if let projectName,
+           let repositoryName,
+           projectName.caseInsensitiveCompare(repositoryName) == .orderedSame {
+            return (projectName, nil)
+        }
+
+        return (projectName, repositoryName)
+    }
+
+    private func firstMetadataValue(keys: [String], metadata: [String: String]) -> String? {
+        for key in keys {
+            let normalizedKey = key.lowercased()
+            if let value = metadata[normalizedKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func normalizeContextValue(_ rawValue: String?) -> String? {
+        guard var value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+
+        value = value.replacingOccurrences(of: "\\", with: "/")
+        if value.hasPrefix("file://"),
+           let url = URL(string: value) {
+            value = url.path
+        }
+        if let decoded = value.removingPercentEncoding,
+           !decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            value = decoded
+        }
+
+        if value.contains("/") {
+            return derivePathLabel(from: value)
+        }
+
+        let collapsed = MemoryTextNormalizer.collapsedWhitespace(value)
+        guard !collapsed.isEmpty else { return nil }
+        let generic: Set<String> = ["workspace", "project", "repository", "repo", "unknown", "state", "storage", "clipboard"]
+        guard !generic.contains(collapsed.lowercased()) else { return nil }
+        return collapsed
+    }
+
+    private func extractPathLikeValue(from texts: [String]) -> String? {
+        let patterns = [
+            #"file://[^\s"'<>\]\[)\(,;]+"#,
+            #"/(?:Users|Volumes|private)/[^\s"'<>\]\[)\(,;]{3,}"#,
+            #"[A-Za-z]:\\[^\s"'<>\]\[)\(,;]{3,}"#
+        ]
+
+        for text in texts {
+            let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else { continue }
+            for pattern in patterns {
+                guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+                    continue
+                }
+                let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+                guard let match = regex.firstMatch(in: normalized, options: [], range: range),
+                      let matchRange = Range(match.range(at: 0), in: normalized) else {
+                    continue
+                }
+                let token = String(normalized[matchRange])
+                let cleaned = token.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`()[]{}<>,;"))
+                if !cleaned.isEmpty {
+                    return cleaned
+                }
+            }
+        }
+        return nil
+    }
+
+    private func derivePathLabel(from rawPath: String) -> String? {
+        let normalized = rawPath
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        guard !normalized.isEmpty else { return nil }
+
+        let components = normalized
+            .split(separator: "/")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !components.isEmpty else { return nil }
+
+        let genericComponents: Set<String> = [
+            "users", "user", "library", "application support", "workspace", "workspacestorage",
+            "globalstorage", "storage", "state", "session", "sessions", "chat", "history",
+            "archives", "archived_sessions", "projects", "repos", "repositories", "repo",
+            "memory", "index", "unknown", "tmp", "temp", "active", "default", "clipboard", "worktrees", "worktree",
+            ".codex", ".claude", ".opencode",
+            "codex", "claude", "opencode", "cursor", "copilot", "windsurf", "codeium", "gemini", "kimi"
+        ]
+
+        for component in components.reversed() {
+            var candidate = component.removingPercentEncoding ?? component
+            candidate = stripTrackerHashSuffix(from: candidate)
+            let lowered = candidate.lowercased()
+            if isLikelyFilenameComponent(candidate) { continue }
+            if genericComponents.contains(lowered) { continue }
+            if looksLikeOpaqueIdentifier(candidate) { continue }
+            if candidate.count > 96 { continue }
+            return candidate
+        }
+        return nil
+    }
+
+    private func stripTrackerHashSuffix(from value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        if trimmed.lowercased() == "no_repo" {
+            return ""
+        }
+
+        let parts = trimmed.split(separator: "_")
+        guard parts.count >= 2, let last = parts.last else {
+            return trimmed
+        }
+
+        let lastPart = String(last)
+        if lastPart.range(of: "^[0-9a-f]{8,}$", options: .regularExpression) != nil {
+            return parts.dropLast().map(String.init).joined(separator: "_")
+        }
+        return trimmed
+    }
+
+    private func isLikelyFilenameComponent(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.hasPrefix(".") {
+            return false
+        }
+        return trimmed.range(of: "\\.[A-Za-z]{1,8}$", options: .regularExpression) != nil
+    }
+
+    private func looksLikeOpaqueIdentifier(_ value: String) -> Bool {
+        let normalized = value.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count >= 12 else { return false }
+        if normalized.range(of: "^[0-9a-f]{12,}$", options: .regularExpression) != nil {
+            return true
+        }
+        if normalized.range(of: "^[0-9a-f-]{20,}$", options: .regularExpression) != nil {
+            return true
+        }
+        if normalized.range(of: "^[0-9a-z_-]{24,}$", options: .regularExpression) != nil,
+           normalized.rangeOfCharacter(from: CharacterSet.letters) == nil {
+            return true
+        }
+        return false
     }
 
     private func jsonString(for object: Any) -> String {
@@ -852,10 +1060,13 @@ private actor OpenAIPromptRewriteProvider {
     private func decodeModelResponse(
         data: Data,
         originalPrompt: String,
-        providerMode: PromptRewriteLiveProviderMode
+        providerMode: PromptRewriteLiveProviderMode,
+        isStreamingCodex: Bool
     ) -> ResponsePayload? {
         let content: String
-        if providerMode.usesAnthropicMessagesAPI {
+        if isStreamingCodex {
+            content = decodeSSEContent(data: data)
+        } else if providerMode.usesAnthropicMessagesAPI {
             content = decodeAnthropicContent(data: data)
         } else {
             content = decodeOpenAICompatibleContent(data: data)
@@ -944,6 +1155,51 @@ private actor OpenAIPromptRewriteProvider {
         }.joined(separator: "\n")
     }
 
+    private func decodeSSEContent(data: Data) -> String {
+        guard let raw = String(data: data, encoding: .utf8) else { return "" }
+        var textParts: [String] = []
+        for line in raw.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("data: ") else { continue }
+            let jsonString = String(trimmed.dropFirst(6))
+            if jsonString == "[DONE]" { continue }
+            guard let jsonData = jsonString.data(using: .utf8),
+                  let event = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any] else {
+                continue
+            }
+            // Responses API streaming: look for output_text.delta
+            if let delta = event["delta"] as? String {
+                textParts.append(delta)
+                continue
+            }
+            // Also check nested content delta
+            if let delta = event["delta"] as? [String: Any],
+               let text = delta["text"] as? String {
+                textParts.append(text)
+                continue
+            }
+            // Completed event with output_text
+            if let outputText = event["output_text"] as? String,
+               !outputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return outputText
+            }
+            // Check for response.completed with full output
+            if let output = event["output"] as? [[String: Any]] {
+                let texts = output.compactMap { item -> String? in
+                    if let content = item["content"] as? [[String: Any]] {
+                        return content.compactMap { $0["text"] as? String }.joined()
+                    }
+                    return nil
+                }
+                let joined = texts.joined()
+                if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return joined
+                }
+            }
+        }
+        return textParts.joined()
+    }
+
     private func sanitizeModelJSONText(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("```"), trimmed.hasSuffix("```") {
@@ -995,9 +1251,25 @@ private actor OpenAIPromptRewriteProvider {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
+        if let detail = dictionary["detail"] as? String {
+            let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        if let message = dictionary["message"] as? String {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        if let errorString = dictionary["error"] as? String {
+            let trimmed = errorString.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
         if let error = dictionary["error"] as? [String: Any] {
             if let message = error["message"] as? String {
                 let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+            if let detail = error["detail"] as? String {
+                let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { return trimmed }
             }
             if let code = error["code"] as? String {

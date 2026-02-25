@@ -24,39 +24,49 @@ struct StatusBarPopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
             headerSection
                 .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 10)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
 
-            // Recording indicator
             if viewModel.isDictating {
                 RecordingIndicatorView(audioLevel: viewModel.currentAudioLevel)
                     .padding(.horizontal, 16)
-                    .padding(.bottom, 10)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                    .padding(.bottom, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
 
             Divider()
-                .opacity(0.5)
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 16)
+                .opacity(0.6)
 
-            // Menu items
-            VStack(spacing: 2) {
+            VStack(spacing: 4) {
                 PopoverMenuRow(
-                    icon: viewModel.isContinuousMode ? "stop.fill" : "mic.fill",
+                    icon: viewModel.isContinuousMode ? "stop.circle.fill" : "mic.circle.fill",
                     label: viewModel.isContinuousMode ? "Stop Dictation" : "Start Dictation",
-                    tint: viewModel.isContinuousMode ? .red : .accentColor,
+                    shortcut: nil,
+                    iconTint: viewModel.isContinuousMode ? .red : .accentColor,
                     isDisabled: !viewModel.permissionsReady
                 ) {
                     viewModel.onToggleDictation?()
                 }
 
-                PopoverMenuRow(icon: "doc.on.clipboard", label: "Paste Last Transcript", shortcut: "⌘⌥V") {
+                PopoverMenuRow(
+                    icon: "doc.on.clipboard",
+                    label: "Paste Last Transcript",
+                    shortcut: "⌘⌥V"
+                ) {
                     viewModel.onPasteLastTranscript?()
                 }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
 
+            Divider()
+                .padding(.horizontal, 16)
+                .opacity(0.6)
+
+            VStack(spacing: 4) {
                 PopoverMenuRow(icon: "clock.arrow.circlepath", label: "History") {
                     viewModel.onOpenHistory?()
                 }
@@ -65,77 +75,82 @@ struct StatusBarPopoverView: View {
                     viewModel.onOpenAIMemoryStudio?()
                 }
 
-                PopoverMenuRow(icon: "gearshape", label: "Settings", shortcut: "⌘,") {
+                PopoverMenuRow(icon: "gearshape.fill", label: "Settings", shortcut: "⌘,") {
                     viewModel.onOpenSettings?()
                 }
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
 
             Divider()
-                .opacity(0.5)
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 16)
+                .opacity(0.6)
 
-            // Quit
-            PopoverMenuRow(icon: "power", label: "Quit", tint: .secondary) {
-                viewModel.onQuit?()
+            VStack(spacing: 4) {
+                PopoverMenuRow(
+                    icon: "power",
+                    label: "Quit KeyScribe",
+                    iconTint: .primary.opacity(0.6)
+                ) {
+                    viewModel.onQuit?()
+                }
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
+            .padding(.bottom, 4)
         }
-        .frame(width: 260)
-        .background(
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .underPageBackgroundColor).opacity(0.92)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+        .frame(width: 280)
+        .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.15), lineWidth: 0.4)
         )
-        .animation(.easeInOut(duration: 0.2), value: viewModel.isDictating)
+        .shadow(color: .black.opacity(0.12), radius: 10, x: 0, y: 6)
+        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isDictating)
     }
 
     // MARK: - Header
 
     private var headerSection: some View {
-        HStack {
-            Text("KeyScribe")
-                .font(.system(.title3, design: .rounded).bold())
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [.accentColor.opacity(0.8), .accentColor],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 32, height: 32)
+                    .shadow(color: .accentColor.opacity(0.3), radius: 3, x: 0, y: 2)
+
+                Image(systemName: "waveform")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("KeyScribe")
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+
+                Text(viewModel.uiStatus.menuText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(statusPillColor)
+            }
 
             Spacer()
-
-            statusPill
         }
-    }
-
-    private var statusPill: some View {
-        Text(viewModel.uiStatus.menuText)
-            .font(.caption.weight(.medium))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(
-                Capsule()
-                    .fill(statusPillColor.opacity(0.15))
-            )
-            .foregroundStyle(statusPillColor)
     }
 
     private var statusPillColor: Color {
         switch viewModel.uiStatus {
-        case .ready:
-            return .green
-        case .listening:
-            return .green
-        case .finalizing:
-            return .orange
-        case .copiedFromHistory, .copiedToClipboard:
-            return .blue
-        case .pasteUnavailable, .accessibilityHint:
-            return .orange
-        default:
-            return .secondary
+        case .ready: return .secondary
+        case .listening: return .green
+        case .finalizing: return .orange
+        case .copiedFromHistory, .copiedToClipboard: return .blue
+        case .pasteUnavailable, .accessibilityHint: return .red
+        default: return .secondary
         }
     }
 }
@@ -146,7 +161,7 @@ private struct PopoverMenuRow: View {
     let icon: String
     let label: String
     var shortcut: String? = nil
-    var tint: Color = .primary
+    var iconTint: Color = .primary
     var isDisabled: Bool = false
     let action: () -> Void
 
@@ -154,38 +169,41 @@ private struct PopoverMenuRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
                 Image(systemName: icon)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(tint)
-                    .opacity(isDisabled ? 0.3 : 1)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(isHovered ? .white : iconTint)
                     .frame(width: 20, alignment: .center)
 
                 Text(label)
-                    .font(.callout)
-                    .foregroundStyle(.primary)
-                    .opacity(isDisabled ? 0.3 : 1)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isHovered ? .white : .primary)
 
                 Spacer()
 
                 if let shortcut {
                     Text(shortcut)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(isHovered ? Color.white.opacity(0.8) : Color.secondary.opacity(0.8))
                 }
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 7)
+            .padding(.vertical, 8)
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isHovered ? Color.primary.opacity(0.06) : Color.clear)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isHovered ? Color.accentColor : Color.clear)
             )
+            .opacity(isDisabled ? 0.4 : 1)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .onHover { hovering in
-            isHovered = hovering
+            if !isDisabled {
+                withAnimation(.easeInOut(duration: 0.1)) {
+                    isHovered = hovering
+                }
+            }
         }
     }
 }
@@ -194,54 +212,66 @@ private struct PopoverMenuRow: View {
 
 private struct RecordingIndicatorView: View {
     var audioLevel: Float
+    @State private var isAnimating = false
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 0.08)) { timeline in
-            HStack(spacing: 10) {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color.red.opacity(0.2))
+                    .frame(width: 24, height: 24)
+                    .scaleEffect(isAnimating ? 1.4 : 0.8)
+                    .opacity(isAnimating ? 0 : 1)
+                    .animation(.easeOut(duration: 1.5).repeatForever(autoreverses: false), value: isAnimating)
+
                 Circle()
                     .fill(Color.red)
                     .frame(width: 8, height: 8)
-                    .opacity(pulseOpacity(date: timeline.date))
-
-                WaveformBarsView(audioLevel: audioLevel, date: timeline.date)
-
-                Text("Recording…")
-                    .font(.callout.weight(.medium))
-                    .foregroundStyle(.red)
-
-                Spacer()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.red.opacity(0.08))
-            )
-        }
-    }
 
-    private func pulseOpacity(date: Date) -> Double {
-        let phase = date.timeIntervalSinceReferenceDate * 3
-        return 0.5 + 0.5 * sin(phase)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Listening...")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.red)
+
+                WaveformBarsView(audioLevel: audioLevel)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.red.opacity(0.05))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.red.opacity(0.1), lineWidth: 1)
+                )
+        )
+        .onAppear {
+            isAnimating = true
+        }
     }
 }
 
 private struct WaveformBarsView: View {
     var audioLevel: Float
-    var date: Date
 
     var body: some View {
-        HStack(spacing: 2.5) {
-            ForEach(0..<5, id: \.self) { i in
-                let phase = date.timeIntervalSinceReferenceDate * 4.8 + Double(i) * 0.8
-                let level = max(Double(audioLevel), (sin(phase) + 1) * 0.3)
-                let height = 4 + 14 * level
+        TimelineView(.animation(minimumInterval: 0.05)) { timeline in
+            HStack(spacing: 3) {
+                ForEach(0..<8, id: \.self) { i in
+                    let phase = timeline.date.timeIntervalSinceReferenceDate * 5.0 + Double(i) * 0.8
+                    let level = max(Double(audioLevel), (sin(phase) + 1) * 0.25)
+                    let height = 4 + 12 * level
 
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.red.opacity(0.8))
-                    .frame(width: 3, height: height)
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(Color.red.opacity(0.7))
+                        .frame(width: 3, height: CGFloat(height))
+                }
             }
+            .frame(height: 16, alignment: .center)
         }
-        .frame(height: 18)
     }
 }

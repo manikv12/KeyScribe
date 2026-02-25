@@ -35,9 +35,19 @@ final class AdaptiveCorrectionStore: ObservableObject {
         let appliedEvents: [AppliedEvent]
     }
 
+    private struct ApplyMatcher {
+        let source: String
+        let sourceTokens: [String]
+        let replacement: String
+    }
+
     static let shared = AdaptiveCorrectionStore()
 
-    @Published private(set) var learnedCorrections: [LearnedCorrection] = []
+    @Published private(set) var learnedCorrections: [LearnedCorrection] = [] {
+        didSet {
+            applyMatcherIndexNeedsRebuild = true
+        }
+    }
 
     private let defaults = UserDefaults.standard
     private static let legacyStorageKey = "KeyScribe.learnedCorrections.v1"
@@ -54,6 +64,8 @@ final class AdaptiveCorrectionStore: ObservableObject {
         pattern: "[A-Za-z0-9]+(?:[._'/-][A-Za-z0-9]+)*",
         options: []
     )
+    private var applyMatcherIndexByFirstToken: [String: [ApplyMatcher]] = [:]
+    private var applyMatcherIndexNeedsRebuild = true
 
     private init() {
         load()
@@ -71,16 +83,7 @@ final class AdaptiveCorrectionStore: ObservableObject {
         let tokens = tokenize(text)
         guard !tokens.isEmpty else { return ApplyResult(text: text, appliedEvents: []) }
 
-        let sortedCorrections = learnedCorrections
-            .sorted {
-                if $0.sourceTokenCount != $1.sourceTokenCount {
-                    return $0.sourceTokenCount > $1.sourceTokenCount
-                }
-                if $0.learnCount != $1.learnCount {
-                    return $0.learnCount > $1.learnCount
-                }
-                return $0.updatedAt > $1.updatedAt
-            }
+        ensureApplyMatcherIndex()
 
         struct PendingReplacement {
             let range: Range<String.Index>
@@ -92,12 +95,15 @@ final class AdaptiveCorrectionStore: ObservableObject {
         var index = 0
 
         while index < tokens.count {
-            var matchedCorrection: LearnedCorrection?
-            var matchedLength = 0
+            let currentNormalized = tokens[index].normalized
+            guard let candidates = applyMatcherIndexByFirstToken[currentNormalized], !candidates.isEmpty else {
+                index += 1
+                continue
+            }
 
-            for correction in sortedCorrections {
-                let sourceTokens = correction.sourceTokens
-                guard !sourceTokens.isEmpty else { continue }
+            var matchedCorrection: ApplyMatcher?
+            for candidate in candidates {
+                let sourceTokens = candidate.sourceTokens
                 guard index + sourceTokens.count <= tokens.count else { continue }
 
                 var isMatch = true
@@ -109,13 +115,13 @@ final class AdaptiveCorrectionStore: ObservableObject {
                 }
 
                 if isMatch {
-                    matchedCorrection = correction
-                    matchedLength = sourceTokens.count
+                    matchedCorrection = candidate
                     break
                 }
             }
 
             if let correction = matchedCorrection {
+                let matchedLength = correction.sourceTokens.count
                 let start = tokens[index].range.lowerBound
                 let end = tokens[index + matchedLength - 1].range.upperBound
                 let replacement = adaptReplacementCase(
@@ -178,53 +184,45 @@ final class AdaptiveCorrectionStore: ObservableObject {
         return phrases
     }
 
-    func learn(from originalText: String, correctedText: String, insertionHint: String? = nil) -> [LearningEvent] {
+    func proposedLearningEvent(from originalText: String, correctedText: String, insertionHint: String? = nil) -> LearningEvent? {
         guard let candidate = extractCandidate(from: originalText, to: correctedText) else {
+            return nil
+        }
+
+        guard shouldLearnCandidate(source: candidate.source, replacement: candidate.replacement, insertionHint: insertionHint) else {
+            return nil
+        }
+
+        if let existing = learnedCorrections.first(where: { $0.source == candidate.source }) {
+            return LearningEvent(
+                source: existing.source,
+                replacement: candidate.replacement,
+                learnCount: max(1, existing.learnCount + 1)
+            )
+        }
+
+        return LearningEvent(source: candidate.source, replacement: candidate.replacement, learnCount: 1)
+    }
+
+    func learn(from originalText: String, correctedText: String, insertionHint: String? = nil) -> [LearningEvent] {
+        guard let proposed = proposedLearningEvent(
+            from: originalText,
+            correctedText: correctedText,
+            insertionHint: insertionHint
+        ) else {
             return []
         }
 
-        let sourceTokenList = candidate.source.split(separator: " ").map(String.init)
-        let replacementTokenList = tokenize(candidate.replacement).map(\.normalized)
-
-        if let insertionHint, !insertionHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let hintTokens = Set(tokenize(insertionHint).map(\.normalized))
-            let sourceTokens = Set(sourceTokenList)
-            if !hintTokens.isEmpty && sourceTokens.isDisjoint(with: hintTokens) {
-                // Keep the unrelated-edit guard for broad rewrites, but allow focused 1-2 word fixes.
-                if sourceTokenList.count > 2 || replacementTokenList.count > 3 {
-                    return []
-                }
-            }
+        guard let saved = acceptProposedLearning(source: proposed.source, replacement: proposed.replacement) else {
+            return []
         }
 
-        if let existingIndex = learnedCorrections.firstIndex(where: { $0.source == candidate.source }) {
-            var existing = learnedCorrections[existingIndex]
-            existing.replacement = candidate.replacement
-            existing.learnCount += 1
-            existing.updatedAt = Date()
-            learnedCorrections[existingIndex] = existing
+        return [saved]
+    }
 
-            learnedCorrections.sort {
-                if $0.learnCount != $1.learnCount {
-                    return $0.learnCount > $1.learnCount
-                }
-                return $0.updatedAt > $1.updatedAt
-            }
-
-            persist()
-            return [LearningEvent(source: existing.source, replacement: existing.replacement, learnCount: existing.learnCount)]
-        }
-
-        let created = LearnedCorrection(
-            source: candidate.source,
-            replacement: candidate.replacement,
-            learnCount: 1,
-            updatedAt: Date()
-        )
-        learnedCorrections.insert(created, at: 0)
-        persist()
-
-        return [LearningEvent(source: created.source, replacement: created.replacement, learnCount: created.learnCount)]
+    @discardableResult
+    func acceptProposedLearning(source rawSource: String, replacement rawReplacement: String) -> LearningEvent? {
+        commitLearnedCorrection(source: rawSource, replacement: rawReplacement)
     }
 
     @discardableResult
@@ -268,6 +266,97 @@ final class AdaptiveCorrectionStore: ObservableObject {
         guard !learnedCorrections.isEmpty else { return }
         learnedCorrections.removeAll()
         persist()
+    }
+
+    private func shouldLearnCandidate(source: String, replacement: String, insertionHint: String?) -> Bool {
+        let sourceTokenList = source.split(separator: " ").map(String.init)
+        let replacementTokenList = tokenize(replacement).map(\.normalized)
+
+        if let insertionHint, !insertionHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let hintTokens = Set(tokenize(insertionHint).map(\.normalized))
+            let sourceTokens = Set(sourceTokenList)
+            if !hintTokens.isEmpty && sourceTokens.isDisjoint(with: hintTokens) {
+                // Keep the unrelated-edit guard for broad rewrites, but allow focused 1-2 word fixes.
+                if sourceTokenList.count > 2 || replacementTokenList.count > 3 {
+                    return false
+                }
+            }
+        }
+
+        return true
+    }
+
+    private func ensureApplyMatcherIndex() {
+        guard applyMatcherIndexNeedsRebuild else { return }
+        applyMatcherIndexNeedsRebuild = false
+
+        guard !learnedCorrections.isEmpty else {
+            applyMatcherIndexByFirstToken = [:]
+            return
+        }
+
+        let sortedCorrections = learnedCorrections.sorted {
+            if $0.sourceTokenCount != $1.sourceTokenCount {
+                return $0.sourceTokenCount > $1.sourceTokenCount
+            }
+            if $0.learnCount != $1.learnCount {
+                return $0.learnCount > $1.learnCount
+            }
+            return $0.updatedAt > $1.updatedAt
+        }
+
+        var index: [String: [ApplyMatcher]] = [:]
+        index.reserveCapacity(sortedCorrections.count)
+
+        for correction in sortedCorrections {
+            let sourceTokens = correction.sourceTokens
+            guard let firstToken = sourceTokens.first else { continue }
+            index[firstToken, default: []].append(
+                ApplyMatcher(
+                    source: correction.source,
+                    sourceTokens: sourceTokens,
+                    replacement: correction.replacement
+                )
+            )
+        }
+
+        applyMatcherIndexByFirstToken = index
+    }
+
+    private func commitLearnedCorrection(source rawSource: String, replacement rawReplacement: String) -> LearningEvent? {
+        let source = normalizedSourceKey(from: rawSource)
+        let replacement = rawReplacement.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !source.isEmpty, !replacement.isEmpty else { return nil }
+        guard source.count >= 2, replacement.count >= 2 else { return nil }
+
+        if let existingIndex = learnedCorrections.firstIndex(where: { $0.source == source }) {
+            var existing = learnedCorrections[existingIndex]
+            existing.replacement = replacement
+            existing.learnCount = max(1, existing.learnCount + 1)
+            existing.updatedAt = Date()
+            learnedCorrections[existingIndex] = existing
+
+            learnedCorrections.sort {
+                if $0.learnCount != $1.learnCount {
+                    return $0.learnCount > $1.learnCount
+                }
+                return $0.updatedAt > $1.updatedAt
+            }
+
+            persist()
+            return LearningEvent(source: existing.source, replacement: existing.replacement, learnCount: existing.learnCount)
+        }
+
+        let created = LearnedCorrection(
+            source: source,
+            replacement: replacement,
+            learnCount: 1,
+            updatedAt: Date()
+        )
+        learnedCorrections.insert(created, at: 0)
+        persist()
+        return LearningEvent(source: created.source, replacement: created.replacement, learnCount: created.learnCount)
     }
 
     private func persist() {

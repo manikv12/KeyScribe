@@ -30,7 +30,17 @@ enum MemorySQLiteStoreError: LocalizedError {
 }
 
 final class MemorySQLiteStore {
-    private static let schemaVersion = 2
+    private static let schemaVersion = 3
+    private static let cleanupUnknownIssueKey = "issue-unassigned"
+    private static let cleanupNoiseIssueKey = "issue-noise"
+
+    struct MetadataCleanupReport: Hashable {
+        let scannedCards: Int
+        let metadataUpdatedCards: Int
+        let lowValueInvalidatedCards: Int
+        let removableMarkedCards: Int
+        let removedCards: Int
+    }
 
     let databaseURL: URL
     private var database: OpaquePointer?
@@ -182,6 +192,25 @@ final class MemorySQLiteStore {
         try execute(sql: """
         CREATE INDEX IF NOT EXISTS idx_memory_cards_rewrite
             ON memory_cards(provider, is_plan_content, score DESC, updated_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS memory_links (
+            id TEXT PRIMARY KEY NOT NULL,
+            from_card_id TEXT NOT NULL REFERENCES memory_cards(id) ON DELETE CASCADE,
+            to_card_id TEXT NOT NULL REFERENCES memory_cards(id) ON DELETE CASCADE,
+            link_type TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(from_card_id, to_card_id)
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_memory_links_from_confidence
+            ON memory_links(from_card_id, confidence DESC, updated_at DESC);
         """)
 
         try execute(sql: """
@@ -361,6 +390,104 @@ final class MemorySQLiteStore {
             self.bind(card.updatedAt.timeIntervalSince1970, at: 12, in: statement)
             self.bind(card.isPlanContent ? 1 : 0, at: 13, in: statement)
             self.bind(self.encodeJSON(card.metadata, fallback: "{}"), at: 14, in: statement)
+        })
+
+        try refreshMemoryLinks(for: card)
+    }
+
+    func refreshMemoryLinks(for card: MemoryCard, topLimit: Int = 12) throws {
+        try ensureLinkSchema()
+        let normalizedLimit = max(1, min(topLimit, 24))
+        try execute(sql: "DELETE FROM memory_links WHERE from_card_id = ?;", bind: { statement in
+            self.bind(card.id.uuidString, at: 1, in: statement)
+        })
+
+        let candidatesSQL = """
+        SELECT
+            id, source_id, source_file_id, event_id, provider, title, summary, detail, keywords_json,
+            score, created_at, updated_at, is_plan_content, metadata_json
+        FROM memory_cards
+        WHERE id != ?
+            AND provider = ?
+            AND is_plan_content = 0
+        ORDER BY updated_at DESC
+        LIMIT 240;
+        """
+
+        let candidates: [MemoryCard] = try query(sql: candidatesSQL, bind: { statement in
+            self.bind(card.id.uuidString, at: 1, in: statement)
+            self.bind(card.provider.rawValue, at: 2, in: statement)
+        }, mapRow: { statement in
+            self.memoryCard(from: statement)
+        })
+
+        if candidates.isEmpty { return }
+
+        let sorted = candidates.compactMap { candidate -> (MemoryCard, String, Double, [String: String])? in
+            let scored = self.scoreLink(from: card, to: candidate)
+            guard scored.confidence >= 0.35 else { return nil }
+            return (candidate, scored.linkType, scored.confidence, scored.metadata)
+        }.sorted { lhs, rhs in
+            if lhs.2 == rhs.2 {
+                return lhs.0.updatedAt > rhs.0.updatedAt
+            }
+            return lhs.2 > rhs.2
+        }
+
+        if sorted.isEmpty { return }
+        let now = Date().timeIntervalSince1970
+        for (candidate, linkType, confidence, metadata) in sorted.prefix(normalizedLimit) {
+            let linkID = MemoryIdentifier.stableUUID(
+                for: "link|\(card.id.uuidString)|\(candidate.id.uuidString)|\(linkType)"
+            )
+            let insertSQL = """
+            INSERT INTO memory_links (
+                id, from_card_id, to_card_id, link_type, confidence, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(from_card_id, to_card_id) DO UPDATE SET
+                link_type = excluded.link_type,
+                confidence = excluded.confidence,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at;
+            """
+            try execute(sql: insertSQL, bind: { statement in
+                self.bind(linkID.uuidString, at: 1, in: statement)
+                self.bind(card.id.uuidString, at: 2, in: statement)
+                self.bind(candidate.id.uuidString, at: 3, in: statement)
+                self.bind(linkType, at: 4, in: statement)
+                self.bind(confidence, at: 5, in: statement)
+                self.bind(self.encodeJSON(metadata, fallback: "{}"), at: 6, in: statement)
+                self.bind(now, at: 7, in: statement)
+                self.bind(now, at: 8, in: statement)
+            })
+        }
+    }
+
+    func fetchRelatedCards(
+        forCardID cardID: UUID,
+        minConfidence: Double = 0.35,
+        limit: Int = 8
+    ) throws -> [MemoryCard] {
+        try ensureLinkSchema()
+        let normalizedLimit = max(1, min(limit, 24))
+        let sql = """
+        SELECT
+            c.id, c.source_id, c.source_file_id, c.event_id, c.provider, c.title, c.summary, c.detail,
+            c.keywords_json, c.score, c.created_at, c.updated_at, c.is_plan_content, c.metadata_json
+        FROM memory_links l
+        JOIN memory_cards c ON c.id = l.to_card_id
+        WHERE l.from_card_id = ?
+            AND l.confidence >= ?
+        ORDER BY l.confidence DESC, c.updated_at DESC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(cardID.uuidString, at: 1, in: statement)
+            self.bind(minConfidence, at: 2, in: statement)
+            self.bind(Int64(normalizedLimit), at: 3, in: statement)
+        }, mapRow: { statement in
+            self.memoryCard(from: statement)
         })
     }
 
@@ -793,18 +920,24 @@ final class MemorySQLiteStore {
             c.id,
             c.provider,
             s.root_path,
+            f.relative_path,
+            c.metadata_json,
+            e.metadata_json,
             c.title,
             c.summary,
             c.detail,
+            e.event_timestamp,
             c.updated_at,
             c.is_plan_content
         FROM memory_cards c
         JOIN memory_sources s ON s.id = c.source_id
+        JOIN memory_files f ON f.id = c.source_file_id
+        JOIN memory_events e ON e.id = c.event_id
         WHERE (? IS NULL OR c.provider = ?)
             AND (? = 1 OR c.is_plan_content = 0)
             AND (? IS NULL OR s.root_path = ?)
             AND (? = 0 OR c.title LIKE ? ESCAPE '\\' OR c.summary LIKE ? ESCAPE '\\' OR c.detail LIKE ? ESCAPE '\\')
-        ORDER BY c.updated_at DESC, c.score DESC
+        ORDER BY e.event_timestamp DESC, c.updated_at DESC, c.score DESC
         LIMIT ?;
         """
 
@@ -820,17 +953,258 @@ final class MemorySQLiteStore {
             self.bind(likeValue, at: 9, in: statement)
             self.bind(Int64(normalizedLimit), at: 10, in: statement)
         }, mapRow: { statement in
-            MemoryIndexedEntry(
+            let provider = MemoryProviderKind(rawValue: self.readString(at: 1, in: statement) ?? "") ?? .unknown
+            let sourceRootPath = self.readString(at: 2, in: statement) ?? ""
+            let sourceFileRelativePath = self.readString(at: 3, in: statement) ?? ""
+            let cardMetadata = self.readString(at: 4, in: statement) ?? "{}"
+            let eventMetadata = self.readString(at: 5, in: statement) ?? "{}"
+            let title = self.readString(at: 6, in: statement) ?? ""
+            let summary = self.readString(at: 7, in: statement) ?? ""
+            let detail = self.readString(at: 8, in: statement) ?? ""
+            let cardMetadataDictionary = self.decodeStringDictionary(from: cardMetadata)
+            let eventMetadataDictionary = self.decodeStringDictionary(from: eventMetadata)
+            let projectContext = self.inferProjectContext(
+                provider: provider,
+                cardMetadataJSON: cardMetadata,
+                eventMetadataJSON: eventMetadata,
+                sourceRootPath: sourceRootPath,
+                sourceFileRelativePath: sourceFileRelativePath,
+                title: title,
+                summary: summary,
+                detail: detail
+            )
+
+            return MemoryIndexedEntry(
                 id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),
-                provider: MemoryProviderKind(rawValue: self.readString(at: 1, in: statement) ?? "") ?? .unknown,
-                sourceRootPath: self.readString(at: 2, in: statement) ?? "",
-                title: self.readString(at: 3, in: statement) ?? "",
-                summary: self.readString(at: 4, in: statement) ?? "",
-                detail: self.readString(at: 5, in: statement) ?? "",
-                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 6)),
-                isPlanContent: sqlite3_column_int(statement, 7) == 1
+                provider: provider,
+                sourceRootPath: sourceRootPath,
+                sourceFileRelativePath: sourceFileRelativePath,
+                projectName: projectContext.projectName,
+                repositoryName: projectContext.repositoryName,
+                title: title,
+                summary: summary,
+                detail: detail,
+                eventTimestamp: Date(timeIntervalSince1970: sqlite3_column_double(statement, 9)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 10)),
+                isPlanContent: sqlite3_column_int(statement, 11) == 1,
+                issueKey: cardMetadataDictionary["issue_key"] ?? eventMetadataDictionary["issue_key"],
+                attemptNumber: self.parseInt(
+                    cardMetadataDictionary["attempt_number"] ?? eventMetadataDictionary["attempt_number"]
+                ),
+                attemptCount: self.parseInt(
+                    cardMetadataDictionary["attempt_count"] ?? eventMetadataDictionary["attempt_count"]
+                ),
+                outcomeStatus: cardMetadataDictionary["outcome_status"] ?? eventMetadataDictionary["outcome_status"],
+                outcomeEvidence: cardMetadataDictionary["outcome_evidence"] ?? eventMetadataDictionary["outcome_evidence"],
+                fixSummary: cardMetadataDictionary["fix_summary"] ?? eventMetadataDictionary["fix_summary"],
+                validationState: cardMetadataDictionary["validation_state"] ?? eventMetadataDictionary["validation_state"],
+                invalidatedByAttempt: self.parseInt(
+                    cardMetadataDictionary["invalidated_by_attempt"] ?? eventMetadataDictionary["invalidated_by_attempt"]
+                ),
+                relationConfidence: nil,
+                relationType: nil
             )
         })
+    }
+
+    func fetchRelatedIndexedEntries(
+        forCardID cardID: UUID,
+        includePlanContent: Bool = false,
+        limit: Int = 8
+    ) throws -> [MemoryIndexedEntry] {
+        try ensureLinkSchema()
+        let normalizedLimit = max(1, min(limit, 24))
+        let sql = """
+        SELECT
+            c.id,
+            c.provider,
+            s.root_path,
+            f.relative_path,
+            c.metadata_json,
+            e.metadata_json,
+            c.title,
+            c.summary,
+            c.detail,
+            e.event_timestamp,
+            c.updated_at,
+            c.is_plan_content,
+            l.confidence,
+            l.link_type
+        FROM memory_links l
+        JOIN memory_cards c ON c.id = l.to_card_id
+        JOIN memory_sources s ON s.id = c.source_id
+        JOIN memory_files f ON f.id = c.source_file_id
+        JOIN memory_events e ON e.id = c.event_id
+        WHERE l.from_card_id = ?
+            AND (? = 1 OR c.is_plan_content = 0)
+        ORDER BY l.confidence DESC, e.event_timestamp DESC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(cardID.uuidString, at: 1, in: statement)
+            self.bind(includePlanContent ? 1 : 0, at: 2, in: statement)
+            self.bind(Int64(normalizedLimit), at: 3, in: statement)
+        }, mapRow: { statement in
+            let provider = MemoryProviderKind(rawValue: self.readString(at: 1, in: statement) ?? "") ?? .unknown
+            let sourceRootPath = self.readString(at: 2, in: statement) ?? ""
+            let sourceFileRelativePath = self.readString(at: 3, in: statement) ?? ""
+            let cardMetadata = self.readString(at: 4, in: statement) ?? "{}"
+            let eventMetadata = self.readString(at: 5, in: statement) ?? "{}"
+            let cardMetadataDictionary = self.decodeStringDictionary(from: cardMetadata)
+            let eventMetadataDictionary = self.decodeStringDictionary(from: eventMetadata)
+            let title = self.readString(at: 6, in: statement) ?? ""
+            let summary = self.readString(at: 7, in: statement) ?? ""
+            let detail = self.readString(at: 8, in: statement) ?? ""
+            let projectContext = self.inferProjectContext(
+                provider: provider,
+                cardMetadataJSON: cardMetadata,
+                eventMetadataJSON: eventMetadata,
+                sourceRootPath: sourceRootPath,
+                sourceFileRelativePath: sourceFileRelativePath,
+                title: title,
+                summary: summary,
+                detail: detail
+            )
+
+            return MemoryIndexedEntry(
+                id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),
+                provider: provider,
+                sourceRootPath: sourceRootPath,
+                sourceFileRelativePath: sourceFileRelativePath,
+                projectName: projectContext.projectName,
+                repositoryName: projectContext.repositoryName,
+                title: title,
+                summary: summary,
+                detail: detail,
+                eventTimestamp: Date(timeIntervalSince1970: sqlite3_column_double(statement, 9)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 10)),
+                isPlanContent: sqlite3_column_int(statement, 11) == 1,
+                issueKey: cardMetadataDictionary["issue_key"] ?? eventMetadataDictionary["issue_key"],
+                attemptNumber: self.parseInt(
+                    cardMetadataDictionary["attempt_number"] ?? eventMetadataDictionary["attempt_number"]
+                ),
+                attemptCount: self.parseInt(
+                    cardMetadataDictionary["attempt_count"] ?? eventMetadataDictionary["attempt_count"]
+                ),
+                outcomeStatus: cardMetadataDictionary["outcome_status"] ?? eventMetadataDictionary["outcome_status"],
+                outcomeEvidence: cardMetadataDictionary["outcome_evidence"] ?? eventMetadataDictionary["outcome_evidence"],
+                fixSummary: cardMetadataDictionary["fix_summary"] ?? eventMetadataDictionary["fix_summary"],
+                validationState: cardMetadataDictionary["validation_state"] ?? eventMetadataDictionary["validation_state"],
+                invalidatedByAttempt: self.parseInt(
+                    cardMetadataDictionary["invalidated_by_attempt"] ?? eventMetadataDictionary["invalidated_by_attempt"]
+                ),
+                relationConfidence: sqlite3_column_double(statement, 12),
+                relationType: self.readString(at: 13, in: statement)
+            )
+        })
+    }
+
+    func fetchIssueTimelineEntries(
+        issueKey: String,
+        provider: MemoryProviderKind? = nil,
+        includePlanContent: Bool = false,
+        limit: Int = 40
+    ) throws -> [MemoryIndexedEntry] {
+        let normalizedIssueKey = issueKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedIssueKey.isEmpty else { return [] }
+        let providerRawValue = provider?.rawValue
+        let normalizedLimit = max(1, min(limit, 400))
+
+        let sql = """
+        SELECT
+            c.id,
+            c.provider,
+            s.root_path,
+            f.relative_path,
+            c.metadata_json,
+            e.metadata_json,
+            c.title,
+            c.summary,
+            c.detail,
+            e.event_timestamp,
+            c.updated_at,
+            c.is_plan_content
+        FROM memory_cards c
+        JOIN memory_sources s ON s.id = c.source_id
+        JOIN memory_files f ON f.id = c.source_file_id
+        JOIN memory_events e ON e.id = c.event_id
+        WHERE (? IS NULL OR c.provider = ?)
+            AND (? = 1 OR c.is_plan_content = 0)
+        ORDER BY e.event_timestamp DESC
+        LIMIT ?;
+        """
+
+        let entries: [MemoryIndexedEntry] = try query(sql: sql, bind: { statement in
+            self.bind(providerRawValue, at: 1, in: statement)
+            self.bind(providerRawValue, at: 2, in: statement)
+            self.bind(includePlanContent ? 1 : 0, at: 3, in: statement)
+            self.bind(Int64(normalizedLimit), at: 4, in: statement)
+        }, mapRow: { statement in
+            let provider = MemoryProviderKind(rawValue: self.readString(at: 1, in: statement) ?? "") ?? .unknown
+            let sourceRootPath = self.readString(at: 2, in: statement) ?? ""
+            let sourceFileRelativePath = self.readString(at: 3, in: statement) ?? ""
+            let cardMetadata = self.readString(at: 4, in: statement) ?? "{}"
+            let eventMetadata = self.readString(at: 5, in: statement) ?? "{}"
+            let cardMetadataDictionary = self.decodeStringDictionary(from: cardMetadata)
+            let eventMetadataDictionary = self.decodeStringDictionary(from: eventMetadata)
+            let title = self.readString(at: 6, in: statement) ?? ""
+            let summary = self.readString(at: 7, in: statement) ?? ""
+            let detail = self.readString(at: 8, in: statement) ?? ""
+            let projectContext = self.inferProjectContext(
+                provider: provider,
+                cardMetadataJSON: cardMetadata,
+                eventMetadataJSON: eventMetadata,
+                sourceRootPath: sourceRootPath,
+                sourceFileRelativePath: sourceFileRelativePath,
+                title: title,
+                summary: summary,
+                detail: detail
+            )
+
+            return MemoryIndexedEntry(
+                id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),
+                provider: provider,
+                sourceRootPath: sourceRootPath,
+                sourceFileRelativePath: sourceFileRelativePath,
+                projectName: projectContext.projectName,
+                repositoryName: projectContext.repositoryName,
+                title: title,
+                summary: summary,
+                detail: detail,
+                eventTimestamp: Date(timeIntervalSince1970: sqlite3_column_double(statement, 9)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 10)),
+                isPlanContent: sqlite3_column_int(statement, 11) == 1,
+                issueKey: cardMetadataDictionary["issue_key"] ?? eventMetadataDictionary["issue_key"],
+                attemptNumber: self.parseInt(
+                    cardMetadataDictionary["attempt_number"] ?? eventMetadataDictionary["attempt_number"]
+                ),
+                attemptCount: self.parseInt(
+                    cardMetadataDictionary["attempt_count"] ?? eventMetadataDictionary["attempt_count"]
+                ),
+                outcomeStatus: cardMetadataDictionary["outcome_status"] ?? eventMetadataDictionary["outcome_status"],
+                outcomeEvidence: cardMetadataDictionary["outcome_evidence"] ?? eventMetadataDictionary["outcome_evidence"],
+                fixSummary: cardMetadataDictionary["fix_summary"] ?? eventMetadataDictionary["fix_summary"],
+                validationState: cardMetadataDictionary["validation_state"] ?? eventMetadataDictionary["validation_state"],
+                invalidatedByAttempt: self.parseInt(
+                    cardMetadataDictionary["invalidated_by_attempt"] ?? eventMetadataDictionary["invalidated_by_attempt"]
+                ),
+                relationConfidence: nil,
+                relationType: nil
+            )
+        })
+
+        let filtered = entries.filter { entry in
+            (entry.issueKey?.lowercased() ?? "") == normalizedIssueKey
+        }
+        return filtered.sorted { lhs, rhs in
+            let leftAttempt = lhs.attemptNumber ?? Int.max
+            let rightAttempt = rhs.attemptNumber ?? Int.max
+            if leftAttempt == rightAttempt {
+                return lhs.eventTimestamp < rhs.eventTimestamp
+            }
+            return leftAttempt < rightAttempt
+        }
     }
 
     func fetchSourceFile(
@@ -903,10 +1277,212 @@ final class MemorySQLiteStore {
     func clearAllIndexedData() throws {
         try execute(sql: "DELETE FROM rewrite_suggestions;")
         try execute(sql: "DELETE FROM memory_lessons;")
+        try execute(sql: "DELETE FROM memory_links;")
         try execute(sql: "DELETE FROM memory_cards;")
         try execute(sql: "DELETE FROM memory_events;")
         try execute(sql: "DELETE FROM memory_files;")
         try execute(sql: "DELETE FROM memory_sources;")
+    }
+
+    func backfillAndCleanupMetadata(
+        removeMarkedLowValueCards: Bool = false,
+        limit: Int = 5000
+    ) throws -> MetadataCleanupReport {
+        let normalizedLimit = max(1, min(limit, 25_000))
+        let now = Date()
+        let nowEpoch = now.timeIntervalSince1970
+        let markedAt = iso8601Timestamp(now)
+        let issuePattern = #"[A-Za-z][A-Za-z0-9]{1,14}-[0-9]{1,8}"#
+
+        struct CleanupRow {
+            let cardID: String
+            let title: String
+            let summary: String
+            let detail: String
+            let score: Double
+            let sourceRootPath: String
+            let sourceFileRelativePath: String
+            let cardMetadataJSON: String
+            let eventMetadataJSON: String
+        }
+
+        let sql = """
+        SELECT
+            c.id,
+            c.provider,
+            c.title,
+            c.summary,
+            c.detail,
+            c.score,
+            s.root_path,
+            f.relative_path,
+            c.metadata_json,
+            e.metadata_json
+        FROM memory_cards c
+        JOIN memory_sources s ON s.id = c.source_id
+        JOIN memory_files f ON f.id = c.source_file_id
+        JOIN memory_events e ON e.id = c.event_id
+        WHERE c.is_plan_content = 0
+        ORDER BY c.updated_at DESC
+        LIMIT ?;
+        """
+
+        let rows: [CleanupRow] = try query(sql: sql, bind: { statement in
+            self.bind(Int64(normalizedLimit), at: 1, in: statement)
+        }, mapRow: { statement in
+            CleanupRow(
+                cardID: self.readString(at: 0, in: statement) ?? "",
+                title: self.readString(at: 2, in: statement) ?? "",
+                summary: self.readString(at: 3, in: statement) ?? "",
+                detail: self.readString(at: 4, in: statement) ?? "",
+                score: sqlite3_column_double(statement, 5),
+                sourceRootPath: self.readString(at: 6, in: statement) ?? "",
+                sourceFileRelativePath: self.readString(at: 7, in: statement) ?? "",
+                cardMetadataJSON: self.readString(at: 8, in: statement) ?? "{}",
+                eventMetadataJSON: self.readString(at: 9, in: statement) ?? "{}"
+            )
+        })
+
+        var metadataUpdatedCards = 0
+        var lowValueInvalidatedCards = 0
+        var removableMarkedCards = 0
+        var removedCards = 0
+
+        for row in rows {
+            var cardMetadata = normalizedMetadataKeys(decodeStringDictionary(from: row.cardMetadataJSON))
+            let originalCardMetadata = cardMetadata
+            let eventMetadata = normalizedMetadataKeys(decodeStringDictionary(from: row.eventMetadataJSON))
+
+            var mergedMetadata = eventMetadata
+            for (key, value) in cardMetadata {
+                mergedMetadata[key] = value
+            }
+
+            let isLowValue = isLowValueMemoryCard(
+                title: row.title,
+                summary: row.summary,
+                detail: row.detail,
+                score: row.score,
+                metadata: mergedMetadata
+            )
+
+            let issueKey = normalizedIssueKey(
+                from: cardMetadata["issue_key"]
+                    ?? eventMetadata["issue_key"]
+                    ?? firstIssueKeyMatch(
+                        in: [
+                            row.title,
+                            row.summary,
+                            row.detail,
+                            row.sourceFileRelativePath,
+                            row.sourceRootPath
+                        ],
+                        pattern: issuePattern
+                    )
+            )
+
+            var validationState = canonicalValidationState(
+                cardMetadata["validation_state"] ?? eventMetadata["validation_state"]
+            )
+            var outcomeStatus = canonicalOutcomeStatus(
+                cardMetadata["outcome_status"] ?? eventMetadata["outcome_status"]
+            )
+
+            let protectedHighSignal = isHighSignalMemoryCard(
+                title: row.title,
+                summary: row.summary,
+                detail: row.detail,
+                score: row.score,
+                issueKey: issueKey,
+                outcomeStatus: outcomeStatus,
+                validationState: validationState
+            )
+
+            if issueKey == nil {
+                cardMetadata["issue_key"] = (isLowValue && !protectedHighSignal)
+                    ? Self.cleanupNoiseIssueKey
+                    : Self.cleanupUnknownIssueKey
+            } else if let issueKey {
+                cardMetadata["issue_key"] = issueKey
+            }
+
+            if validationState == nil {
+                if isLowValue && !protectedHighSignal {
+                    validationState = MemoryRewriteLessonValidationState.invalidated.rawValue
+                } else if outcomeStatus == "fixed" {
+                    validationState = MemoryRewriteLessonValidationState.indexedValidated.rawValue
+                } else {
+                    validationState = MemoryRewriteLessonValidationState.unvalidated.rawValue
+                }
+            }
+
+            if outcomeStatus == nil {
+                switch validationState {
+                case MemoryRewriteLessonValidationState.userConfirmed.rawValue,
+                    MemoryRewriteLessonValidationState.indexedValidated.rawValue:
+                    outcomeStatus = "fixed"
+                case MemoryRewriteLessonValidationState.invalidated.rawValue:
+                    outcomeStatus = "invalidated"
+                default:
+                    outcomeStatus = "attempted"
+                }
+            }
+
+            if let validationState {
+                cardMetadata["validation_state"] = validationState
+            }
+            if let outcomeStatus {
+                cardMetadata["outcome_status"] = outcomeStatus
+            }
+
+            if isLowValue && !protectedHighSignal {
+                if cardMetadata["validation_state"] != MemoryRewriteLessonValidationState.invalidated.rawValue {
+                    cardMetadata["validation_state"] = MemoryRewriteLessonValidationState.invalidated.rawValue
+                    lowValueInvalidatedCards += 1
+                }
+                cardMetadata["outcome_status"] = "invalidated"
+                if cardMetadata["issue_key"] == Self.cleanupUnknownIssueKey {
+                    cardMetadata["issue_key"] = Self.cleanupNoiseIssueKey
+                }
+                if cardMetadata["cleanup_candidate"] != "removable" {
+                    cardMetadata["cleanup_candidate"] = "removable"
+                    removableMarkedCards += 1
+                }
+                if cardMetadata["cleanup_marked_at"] == nil {
+                    cardMetadata["cleanup_marked_at"] = markedAt
+                }
+
+                if removeMarkedLowValueCards,
+                   cardMetadata["validation_state"] == MemoryRewriteLessonValidationState.invalidated.rawValue {
+                    try execute(sql: "DELETE FROM memory_cards WHERE id = ?;", bind: { statement in
+                        self.bind(row.cardID, at: 1, in: statement)
+                    })
+                    removedCards += 1
+                    continue
+                }
+            }
+
+            if cardMetadata != originalCardMetadata {
+                try execute(sql: """
+                UPDATE memory_cards
+                SET metadata_json = ?, updated_at = ?
+                WHERE id = ?;
+                """, bind: { statement in
+                    self.bind(self.encodeJSON(cardMetadata, fallback: "{}"), at: 1, in: statement)
+                    self.bind(nowEpoch, at: 2, in: statement)
+                    self.bind(row.cardID, at: 3, in: statement)
+                })
+                metadataUpdatedCards += 1
+            }
+        }
+
+        return MetadataCleanupReport(
+            scannedCards: rows.count,
+            metadataUpdatedCards: metadataUpdatedCards,
+            lowValueInvalidatedCards: lowValueInvalidatedCards,
+            removableMarkedCards: removableMarkedCards,
+            removedCards: removedCards
+        )
     }
 
     private static func ensureParentDirectory(for databaseURL: URL, fileManager: FileManager) throws {
@@ -1194,10 +1770,571 @@ final class MemorySQLiteStore {
         return value
     }
 
+    private func memoryCard(from statement: OpaquePointer) -> MemoryCard {
+        let id = UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID()
+        let sourceID = UUID(uuidString: self.readString(at: 1, in: statement) ?? "") ?? UUID()
+        let sourceFileID = UUID(uuidString: self.readString(at: 2, in: statement) ?? "") ?? UUID()
+        let eventID = UUID(uuidString: self.readString(at: 3, in: statement) ?? "") ?? UUID()
+        let provider = MemoryProviderKind(rawValue: self.readString(at: 4, in: statement) ?? "") ?? .unknown
+        let title = self.readString(at: 5, in: statement) ?? ""
+        let summary = self.readString(at: 6, in: statement) ?? ""
+        let detail = self.readString(at: 7, in: statement) ?? ""
+        let keywordsJSON = self.readString(at: 8, in: statement) ?? "[]"
+        let score = sqlite3_column_double(statement, 9)
+        let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 10))
+        let updatedAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 11))
+        let isPlanContent = sqlite3_column_int(statement, 12) == 1
+        let metadataJSON = self.readString(at: 13, in: statement) ?? "{}"
+
+        return MemoryCard(
+            id: id,
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            eventID: eventID,
+            provider: provider,
+            title: title,
+            summary: summary,
+            detail: detail,
+            keywords: self.decodeStringArray(from: keywordsJSON),
+            score: score,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            isPlanContent: isPlanContent,
+            metadata: self.decodeStringDictionary(from: metadataJSON)
+        )
+    }
+
+    private func scoreLink(from source: MemoryCard, to candidate: MemoryCard) -> (
+        linkType: String,
+        confidence: Double,
+        metadata: [String: String]
+    ) {
+        let sourceIssue = source.metadata["issue_key"]?.lowercased()
+        let candidateIssue = candidate.metadata["issue_key"]?.lowercased()
+        let sameIssue = sourceIssue != nil && sourceIssue == candidateIssue
+
+        let sourceKeywords = Set(source.keywords.map { $0.lowercased() })
+        let candidateKeywords = Set(candidate.keywords.map { $0.lowercased() })
+        let shared = sourceKeywords.intersection(candidateKeywords)
+        let keywordUnionCount = max(1, sourceKeywords.union(candidateKeywords).count)
+        let keywordJaccard = Double(shared.count) / Double(keywordUnionCount)
+
+        let projectA = contextLabel(from: source.metadata, keys: ["project", "workspace", "repository"])
+        let projectB = contextLabel(from: candidate.metadata, keys: ["project", "workspace", "repository"])
+        let sameProject = !projectA.isEmpty && !projectB.isEmpty && projectA.caseInsensitiveCompare(projectB) == .orderedSame
+
+        var confidence = 0.0
+        var linkType = "similar_topic"
+        if sameIssue {
+            confidence += 0.55
+            linkType = "same_issue"
+        }
+        confidence += keywordJaccard * 0.35
+        if sameProject {
+            confidence += 0.1
+        }
+        confidence += min(candidate.score, source.score) * 0.05
+
+        let validationState = (candidate.metadata["validation_state"] ?? "").lowercased()
+        switch validationState {
+        case "indexed-validated", "user-confirmed":
+            confidence += 0.08
+        case "invalidated":
+            confidence -= 0.18
+        default:
+            confidence += 0.02
+        }
+
+        if sameIssue,
+           let sourceAttempt = parseInt(source.metadata["attempt_number"]),
+           let candidateAttempt = parseInt(candidate.metadata["attempt_number"]),
+           sourceAttempt > candidateAttempt {
+            linkType = "follow_up"
+        }
+
+        let bounded = min(1.0, max(0.0, confidence))
+        let metadata: [String: String] = [
+            "shared_keywords": "\(shared.count)",
+            "keyword_jaccard": String(format: "%.3f", keywordJaccard),
+            "same_project": sameProject ? "true" : "false",
+            "same_issue": sameIssue ? "true" : "false",
+            "validation_state": validationState
+        ]
+        return (linkType, bounded, metadata)
+    }
+
+    private func contextLabel(from metadata: [String: String], keys: [String]) -> String {
+        for key in keys {
+            if let value = metadata[key], !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
+        }
+        return ""
+    }
+
+    private func ensureLinkSchema() throws {
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS memory_links (
+            id TEXT PRIMARY KEY NOT NULL,
+            from_card_id TEXT NOT NULL REFERENCES memory_cards(id) ON DELETE CASCADE,
+            to_card_id TEXT NOT NULL REFERENCES memory_cards(id) ON DELETE CASCADE,
+            link_type TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(from_card_id, to_card_id)
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_memory_links_from_confidence
+            ON memory_links(from_card_id, confidence DESC, updated_at DESC);
+        """)
+    }
+
+    private func parseInt(_ value: String?) -> Int? {
+        guard let value else { return nil }
+        return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func inferProjectContext(
+        provider: MemoryProviderKind,
+        cardMetadataJSON: String,
+        eventMetadataJSON: String,
+        sourceRootPath: String,
+        sourceFileRelativePath: String,
+        title: String,
+        summary: String,
+        detail: String
+    ) -> (projectName: String?, repositoryName: String?) {
+        let cardMetadata = normalizedMetadataKeys(decodeStringDictionary(from: cardMetadataJSON))
+        let eventMetadata = normalizedMetadataKeys(decodeStringDictionary(from: eventMetadataJSON))
+
+        let repositoryKeys = [
+            "repository", "repository_name", "repo", "repo_name",
+            "git_repository", "git_repo", "repositorypath"
+        ]
+        let baseProjectKeys = [
+            "project", "project_name", "workspace", "workspace_name",
+            "folder", "cwd", "working_directory", "workdir", "path", "uri"
+        ]
+        let projectKeys = providerSpecificProjectKeys(for: provider) + baseProjectKeys
+
+        let repositoryValue = firstContextValue(
+            keys: repositoryKeys,
+            primary: cardMetadata,
+            secondary: eventMetadata
+        )
+        let projectValue = firstContextValue(
+            keys: projectKeys,
+            primary: cardMetadata,
+            secondary: eventMetadata
+        )
+
+        var repositoryName = normalizeContextLabel(repositoryValue)
+        var projectName = normalizeContextLabel(projectValue)
+
+        let textPathCandidate = extractPathLikeValue(
+            from: [detail, summary, title]
+        )
+
+        if repositoryName == nil {
+            repositoryName = derivePathLabel(from: textPathCandidate ?? sourceFileRelativePath)
+        }
+        if projectName == nil {
+            projectName = derivePathLabel(from: textPathCandidate ?? sourceFileRelativePath)
+                ?? derivePathLabel(from: sourceRootPath)
+        }
+
+        if projectName == nil {
+            projectName = repositoryName
+        }
+
+        if let projectName,
+           let repositoryName,
+           projectName.caseInsensitiveCompare(repositoryName) == .orderedSame {
+            return (projectName, nil)
+        }
+
+        return (projectName, repositoryName)
+    }
+
+    private func providerSpecificProjectKeys(for provider: MemoryProviderKind) -> [String] {
+        switch provider {
+        case .codex:
+            return ["cwd"]
+        case .opencode:
+            return ["workspace", "cwd", "path"]
+        case .claude:
+            return ["project", "cwd"]
+        case .cursor, .windsurf:
+            return ["folder", "workspace", "path", "uri"]
+        case .copilot:
+            return ["workspace", "folder", "path"]
+        case .kimi, .gemini, .codeium:
+            return ["path", "cwd", "workspace", "project", "folder"]
+        case .unknown:
+            return []
+        }
+    }
+
+    private func normalizedMetadataKeys(_ metadata: [String: String]) -> [String: String] {
+        var normalized: [String: String] = [:]
+        normalized.reserveCapacity(metadata.count)
+        for (key, value) in metadata {
+            normalized[key.lowercased()] = value
+        }
+        return normalized
+    }
+
+    private func firstContextValue(
+        keys: [String],
+        primary: [String: String],
+        secondary: [String: String]
+    ) -> String? {
+        for key in keys {
+            let normalizedKey = key.lowercased()
+            if let value = primary[normalizedKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return value
+            }
+            if let value = secondary[normalizedKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func normalizeContextLabel(_ rawValue: String?) -> String? {
+        guard var value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+
+        value = value.replacingOccurrences(of: "\\", with: "/")
+        if value.hasPrefix("file://"),
+           let url = URL(string: value) {
+            value = url.path
+        }
+        if let decoded = value.removingPercentEncoding,
+           !decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            value = decoded
+        }
+
+        if value.contains("/") {
+            return derivePathLabel(from: value)
+        }
+
+        let collapsed = MemoryTextNormalizer.collapsedWhitespace(value)
+        guard !collapsed.isEmpty else { return nil }
+        let lowered = collapsed.lowercased()
+        let genericValues: Set<String> = [
+            "workspace", "project", "repository", "repo", "unknown", "state", "storage", "clipboard"
+        ]
+        guard !genericValues.contains(lowered) else { return nil }
+        guard !looksLikeOpaqueIdentifier(collapsed) else { return nil }
+        guard !isNumericOrDatePathComponent(collapsed) else { return nil }
+        return collapsed
+    }
+
+    private func extractPathLikeValue(from texts: [String]) -> String? {
+        let patterns = [
+            #"file://[^\s"'<>\]\[)\(,;]+"#,
+            #"/(?:Users|Volumes|private)/[^\s"'<>\]\[)\(,;]{3,}"#,
+            #"[A-Za-z]:\\[^\s"'<>\]\[)\(,;]{3,}"#
+        ]
+
+        for text in texts {
+            let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else { continue }
+
+            for pattern in patterns {
+                guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+                    continue
+                }
+                let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+                guard let match = regex.firstMatch(in: normalized, options: [], range: range),
+                      let tokenRange = Range(match.range(at: 0), in: normalized) else {
+                    continue
+                }
+                let token = String(normalized[tokenRange])
+                let cleaned = cleanedExtractedPathToken(token)
+                if !cleaned.isEmpty {
+                    return cleaned
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func cleanedExtractedPathToken(_ rawToken: String) -> String {
+        var token = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimCharacters = CharacterSet(charactersIn: "\"'`()[]{}<>,;")
+        token = token.trimmingCharacters(in: trimCharacters)
+        token = token.replacingOccurrences(of: "\\", with: "/")
+        if let decoded = token.removingPercentEncoding,
+           !decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            token = decoded
+        }
+        return token
+    }
+
+    private func derivePathLabel(from rawPath: String) -> String? {
+        let normalized = rawPath
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        guard !normalized.isEmpty else { return nil }
+
+        let rawComponents = normalized
+            .split(separator: "/")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !rawComponents.isEmpty else { return nil }
+
+        for component in rawComponents.reversed() {
+            var candidate = component.removingPercentEncoding ?? component
+            candidate = stripTrackerHashSuffix(from: candidate)
+            let lowered = candidate.lowercased()
+            if isLikelyFilenameComponent(candidate) {
+                continue
+            }
+            guard !isGenericPathComponent(lowered) else { continue }
+            guard !looksLikeOpaqueIdentifier(candidate) else { continue }
+            guard !isNumericOrDatePathComponent(candidate) else { continue }
+            if candidate.count > 96 { continue }
+            return candidate
+        }
+
+        return nil
+    }
+
+    private func isGenericPathComponent(_ value: String) -> Bool {
+        let genericComponents: Set<String> = [
+            "users", "user", "library", "application support", "workspace", "workspacestorage",
+            "globalstorage", "storage", "state", "session", "sessions", "chat", "history",
+            "archives", "archived_sessions", "projects", "repos", "repositories", "repo",
+            "memory", "index", "unknown", "tmp", "temp", "active", "default", "clipboard",
+            "worktree", "worktrees",
+            ".codex", ".claude", ".opencode",
+            "codex", "claude", "opencode", "cursor", "copilot", "windsurf", "codeium", "gemini", "kimi"
+        ]
+        return genericComponents.contains(value)
+    }
+
+    private func looksLikeOpaqueIdentifier(_ value: String) -> Bool {
+        let normalized = value.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count >= 12 else { return false }
+
+        if normalized.range(of: "^[0-9a-f]{12,}$", options: .regularExpression) != nil {
+            return true
+        }
+        if normalized.range(of: "^[0-9a-f-]{20,}$", options: .regularExpression) != nil {
+            return true
+        }
+        if normalized.range(of: "^[0-9a-z_-]{24,}$", options: .regularExpression) != nil,
+           normalized.rangeOfCharacter(from: CharacterSet.letters) == nil {
+            return true
+        }
+        return false
+    }
+
+    private func isNumericOrDatePathComponent(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        if normalized.range(of: "^[0-9]+$", options: .regularExpression) != nil {
+            return true
+        }
+        let datePatterns = [
+            #"^[0-9]{4}[-_.][0-9]{1,2}([\-_.][0-9]{1,2})?$"#,
+            #"^[0-9]{8}$"#,
+            #"^[0-9]{6}$"#,
+            #"^[0-9]{1,2}[-_.][0-9]{1,2}([\-_.][0-9]{2,4})?$"#
+        ]
+        return datePatterns.contains {
+            normalized.range(of: $0, options: .regularExpression) != nil
+        }
+    }
+
+    private func stripTrackerHashSuffix(from value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        if trimmed.lowercased() == "no_repo" {
+            return ""
+        }
+
+        let parts = trimmed.split(separator: "_")
+        guard parts.count >= 2, let last = parts.last else {
+            return trimmed
+        }
+
+        let lastPart = String(last)
+        if lastPart.range(of: "^[0-9a-f]{8,}$", options: .regularExpression) != nil {
+            return parts.dropLast().map(String.init).joined(separator: "_")
+        }
+        return trimmed
+    }
+
+    private func isLikelyFilenameComponent(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.hasPrefix(".") {
+            return false
+        }
+        return trimmed.range(of: "\\.[A-Za-z]{1,8}$", options: .regularExpression) != nil
+    }
+
     private func escapedLike(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "%", with: "\\%")
             .replacingOccurrences(of: "_", with: "\\_")
+    }
+
+    private func canonicalValidationState(_ rawValue: String?) -> String? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !rawValue.isEmpty else { return nil }
+
+        if rawValue == MemoryRewriteLessonValidationState.invalidated.rawValue || rawValue.contains("invalid") {
+            return MemoryRewriteLessonValidationState.invalidated.rawValue
+        }
+        if rawValue == MemoryRewriteLessonValidationState.userConfirmed.rawValue || rawValue.contains("user") {
+            return MemoryRewriteLessonValidationState.userConfirmed.rawValue
+        }
+        if rawValue == MemoryRewriteLessonValidationState.indexedValidated.rawValue || rawValue.contains("validated") {
+            return MemoryRewriteLessonValidationState.indexedValidated.rawValue
+        }
+        if rawValue == MemoryRewriteLessonValidationState.unvalidated.rawValue || rawValue.contains("pending") {
+            return MemoryRewriteLessonValidationState.unvalidated.rawValue
+        }
+        return nil
+    }
+
+    private func canonicalOutcomeStatus(_ rawValue: String?) -> String? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !rawValue.isEmpty else { return nil }
+
+        switch rawValue {
+        case "fixed", "resolved", "success", "successful", "pass", "passed":
+            return "fixed"
+        case "invalidated", "invalid", "noise", "ignored", "discarded":
+            return "invalidated"
+        case "failed", "failure", "regressed", "error", "broken":
+            return "failed"
+        case "attempted", "responded", "in_progress", "in-progress", "started", "open":
+            return "attempted"
+        default:
+            return nil
+        }
+    }
+
+    private func normalizedIssueKey(from rawValue: String?) -> String? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawValue.isEmpty else { return nil }
+        let upper = rawValue.uppercased()
+        if upper.range(of: "^[A-Z][A-Z0-9]{1,14}-[0-9]{1,8}$", options: .regularExpression) != nil {
+            return upper
+        }
+        return nil
+    }
+
+    private func firstIssueKeyMatch(in texts: [String], pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        for text in texts {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard let match = regex.firstMatch(in: text, options: [], range: range),
+                  let matchedRange = Range(match.range, in: text) else {
+                continue
+            }
+            return String(text[matchedRange]).uppercased()
+        }
+        return nil
+    }
+
+    private func isLowValueMemoryCard(
+        title: String,
+        summary: String,
+        detail: String,
+        score: Double,
+        metadata: [String: String]
+    ) -> Bool {
+        let lowerTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowerSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowerDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let combined = "\(lowerTitle) \(lowerSummary) \(lowerDetail)"
+
+        let rewriteIndicators = ["->", "=>", "→", "rewrite", "suggested", "correction"]
+        if rewriteIndicators.contains(where: { combined.contains($0) }) {
+            return false
+        }
+
+        let genericTitles: Set<String> = [
+            "chat", "message", "conversation", "session", "history", "note", "section", "event",
+            "workspace", "storage", "state"
+        ]
+        if genericTitles.contains(lowerTitle) || genericTitles.contains(lowerSummary) {
+            return true
+        }
+        if lowerTitle == "q&a: hi" || lowerTitle == "q&a: hello" || lowerTitle == "q&a: hey" {
+            return true
+        }
+        let outcomeStatus = (metadata["outcome_status"] ?? "").lowercased()
+        let validationState = (metadata["validation_state"] ?? "").lowercased()
+        if (outcomeStatus == "responded" || outcomeStatus == "attempted" || outcomeStatus.isEmpty),
+           (validationState == "unvalidated" || validationState.isEmpty),
+           (lowerSummary.hasPrefix("q: hi")
+                || lowerSummary.hasPrefix("q: hello")
+                || lowerSummary.hasPrefix("q: hey")
+                || lowerDetail.contains("how can i help")
+                || lowerDetail.contains("how can i assist")) {
+            return true
+        }
+
+        let alphaWords = combined.split(whereSeparator: \.isWhitespace).filter { token in
+            token.contains(where: \.isLetter)
+        }
+        if alphaWords.count < 5 {
+            return true
+        }
+
+        return score < 0.35
+    }
+
+    private func isHighSignalMemoryCard(
+        title: String,
+        summary: String,
+        detail: String,
+        score: Double,
+        issueKey: String?,
+        outcomeStatus: String?,
+        validationState: String?
+    ) -> Bool {
+        let lowerTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowerSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowerDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let combined = "\(lowerTitle) \(lowerSummary) \(lowerDetail)"
+
+        if let validationState,
+           validationState == MemoryRewriteLessonValidationState.userConfirmed.rawValue
+            || validationState == MemoryRewriteLessonValidationState.indexedValidated.rawValue {
+            return true
+        }
+        if let outcomeStatus, outcomeStatus == "fixed" {
+            return true
+        }
+        if let issueKey,
+           issueKey != Self.cleanupUnknownIssueKey,
+           issueKey != Self.cleanupNoiseIssueKey {
+            return true
+        }
+        if combined.contains("->") || combined.contains("rewrite") || combined.contains("correction") {
+            return score >= 0.50
+        }
+        return score >= 0.85
     }
 }
