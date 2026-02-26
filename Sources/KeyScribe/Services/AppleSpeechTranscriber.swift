@@ -246,13 +246,18 @@ final class AppleSpeechTranscriber: NSObject {
         }
 
         let inputNode = audioEngine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        let activeRecognitionRequest = recognitionRequest
+
+        // Reset the engine before installing a fresh tap to avoid stale I/O format state
+        // when input devices/rates have changed between sessions.
+        audioEngine.stop()
+        audioEngine.reset()
 
         inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            activeRecognitionRequest?.append(buffer)
+        // Use nil format so AVAudioEngine uses the node bus format directly.
+        // This prevents NSException crashes from tap format mismatches.
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
+            self.recognitionRequest?.append(buffer)
 
             let audioLevel = self.normalizedAudioLevel(from: buffer)
             DispatchQueue.main.async {
