@@ -114,6 +114,40 @@ enum PromptRewriteProviderMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum PromptRewriteStylePreset: String, CaseIterable, Identifiable {
+    case balanced = "Balanced (Default)"
+    case formal = "Formal"
+    case casual = "Casual"
+    case architect = "Architect"
+    case seniorDeveloper = "Senior Developer"
+    case juniorDeveloper = "Junior Developer"
+    case technicalWriter = "Technical Writer"
+    case polishedWriter = "Polished Writer"
+
+    var id: Self { self }
+
+    var styleInstruction: String {
+        switch self {
+        case .balanced:
+            return "Write with a clear, practical, and structured tone."
+        case .formal:
+            return "Write in a formal, professional tone with precise wording."
+        case .casual:
+            return "Write in a friendly, conversational tone while staying clear."
+        case .architect:
+            return "Write like a software architect: emphasize system design constraints, trade-offs, and implementation boundaries."
+        case .seniorDeveloper:
+            return "Write like a senior developer: direct, technical, and execution-focused with practical details."
+        case .juniorDeveloper:
+            return "Write as a supportive junior developer collaborator: straightforward, curious, and explicit about assumptions."
+        case .technicalWriter:
+            return "Write like a technical writer: concise, unambiguous, and easy to scan with strong structure."
+        case .polishedWriter:
+            return "Write like a polished writer: smooth phrasing, coherent flow, and crisp language."
+        }
+    }
+}
+
 enum WaveformTheme: String, CaseIterable, Identifiable {
     case vibrantSpectrum = "Vibrant Spectrum"
     case professionalTech = "Professional Tech"
@@ -190,6 +224,7 @@ final class SettingsStore: ObservableObject {
         static let dictationPastedSoundName = "KeyScribe.dictationPastedSoundName"
         static let dictationCorrectionLearnedSoundName = "KeyScribe.dictationCorrectionLearnedSoundName"
         static let dictationFeedbackVolume = "KeyScribe.dictationFeedbackVolume"
+        static let promptRewriteEnabled = "KeyScribe.promptRewriteEnabled"
         static let memoryIndexingEnabled = "KeyScribe.memoryIndexingEnabled"
         static let memoryProviderCatalogAutoUpdate = "KeyScribe.memoryProviderCatalogAutoUpdate"
         static let memoryDetectedProviderIDs = "KeyScribe.memoryDetectedProviderIDs"
@@ -200,6 +235,12 @@ final class SettingsStore: ObservableObject {
         static let promptRewriteOpenAIModel = "KeyScribe.promptRewriteOpenAIModel"
         static let promptRewriteOpenAIBaseURL = "KeyScribe.promptRewriteOpenAIBaseURL"
         static let promptRewriteAlwaysConvertToMarkdown = "KeyScribe.promptRewriteAlwaysConvertToMarkdown"
+        static let promptRewriteStylePreset = "KeyScribe.promptRewriteStylePreset"
+        static let promptRewriteCustomStyleInstructions = "KeyScribe.promptRewriteCustomStyleInstructions"
+        static let promptRewriteConversationHistoryEnabled = "KeyScribe.promptRewriteConversationHistoryEnabled"
+        static let promptRewriteConversationTimeoutMinutes = "KeyScribe.promptRewriteConversationTimeoutMinutes"
+        static let promptRewriteConversationTurnLimit = "KeyScribe.promptRewriteConversationTurnLimit"
+        static let promptRewriteConversationPinnedContextID = "KeyScribe.promptRewriteConversationPinnedContextID"
     }
 
     private enum ContinuousToggleDefaults {
@@ -386,6 +427,12 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var promptRewriteEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
     @Published var memoryIndexingEnabled: Bool {
         didSet {
             save()
@@ -465,6 +512,52 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var promptRewriteAlwaysConvertToMarkdown: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var promptRewriteStylePresetRawValue: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var promptRewriteCustomStyleInstructions: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var promptRewriteConversationHistoryEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var promptRewriteConversationTimeoutMinutes: Double {
+        didSet {
+            let normalized = min(240, max(2, promptRewriteConversationTimeoutMinutes))
+            guard normalized == promptRewriteConversationTimeoutMinutes else {
+                promptRewriteConversationTimeoutMinutes = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var promptRewriteConversationTurnLimit: Int {
+        didSet {
+            let normalized = min(10, max(1, promptRewriteConversationTurnLimit))
+            guard normalized == promptRewriteConversationTurnLimit else {
+                promptRewriteConversationTurnLimit = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var promptRewriteConversationPinnedContextID: String {
         didSet {
             save()
         }
@@ -661,6 +754,12 @@ final class SettingsStore: ObservableObject {
             ? Self.defaultDictationFeedbackVolume
             : min(1, max(0, defaults.double(forKey: Keys.dictationFeedbackVolume)))
 
+        if defaults.object(forKey: Keys.promptRewriteEnabled) == nil {
+            promptRewriteEnabled = true
+        } else {
+            promptRewriteEnabled = defaults.bool(forKey: Keys.promptRewriteEnabled)
+        }
+
         if defaults.object(forKey: Keys.memoryIndexingEnabled) == nil {
             memoryIndexingEnabled = false
         } else {
@@ -725,6 +824,38 @@ final class SettingsStore: ObservableObject {
         } else {
             promptRewriteAlwaysConvertToMarkdown = defaults.bool(forKey: Keys.promptRewriteAlwaysConvertToMarkdown)
         }
+
+        let storedStylePreset = defaults.string(forKey: Keys.promptRewriteStylePreset)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let storedStylePreset,
+           let resolvedStylePreset = PromptRewriteStylePreset(rawValue: storedStylePreset) {
+            promptRewriteStylePresetRawValue = resolvedStylePreset.rawValue
+        } else {
+            promptRewriteStylePresetRawValue = PromptRewriteStylePreset.balanced.rawValue
+        }
+
+        promptRewriteCustomStyleInstructions = defaults.string(forKey: Keys.promptRewriteCustomStyleInstructions)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if defaults.object(forKey: Keys.promptRewriteConversationHistoryEnabled) == nil {
+            promptRewriteConversationHistoryEnabled = false
+        } else {
+            promptRewriteConversationHistoryEnabled = defaults.bool(forKey: Keys.promptRewriteConversationHistoryEnabled)
+        }
+
+        let storedConversationTimeout = defaults.object(forKey: Keys.promptRewriteConversationTimeoutMinutes) == nil
+            ? 25.0
+            : defaults.double(forKey: Keys.promptRewriteConversationTimeoutMinutes)
+        promptRewriteConversationTimeoutMinutes = min(240, max(2, storedConversationTimeout))
+
+        let storedConversationTurnLimit = defaults.object(forKey: Keys.promptRewriteConversationTurnLimit) == nil
+            ? 4
+            : defaults.integer(forKey: Keys.promptRewriteConversationTurnLimit)
+        promptRewriteConversationTurnLimit = min(10, max(1, storedConversationTurnLimit))
+
+        promptRewriteConversationPinnedContextID = defaults
+            .string(forKey: Keys.promptRewriteConversationPinnedContextID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: selectedPromptProvider)
 
@@ -809,6 +940,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(dictationPastedSoundName, forKey: Keys.dictationPastedSoundName)
         defaults.set(dictationCorrectionLearnedSoundName, forKey: Keys.dictationCorrectionLearnedSoundName)
         defaults.set(dictationFeedbackVolume, forKey: Keys.dictationFeedbackVolume)
+        defaults.set(promptRewriteEnabled, forKey: Keys.promptRewriteEnabled)
         defaults.set(memoryIndexingEnabled, forKey: Keys.memoryIndexingEnabled)
         defaults.set(memoryProviderCatalogAutoUpdate, forKey: Keys.memoryProviderCatalogAutoUpdate)
         defaults.set(Self.normalizedStringList(memoryDetectedProviderIDs), forKey: Keys.memoryDetectedProviderIDs)
@@ -819,6 +951,18 @@ final class SettingsStore: ObservableObject {
         defaults.set(promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIModel)
         defaults.set(promptRewriteOpenAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIBaseURL)
         defaults.set(promptRewriteAlwaysConvertToMarkdown, forKey: Keys.promptRewriteAlwaysConvertToMarkdown)
+        defaults.set(promptRewriteStylePresetRawValue, forKey: Keys.promptRewriteStylePreset)
+        defaults.set(
+            promptRewriteCustomStyleInstructions.trimmingCharacters(in: .whitespacesAndNewlines),
+            forKey: Keys.promptRewriteCustomStyleInstructions
+        )
+        defaults.set(promptRewriteConversationHistoryEnabled, forKey: Keys.promptRewriteConversationHistoryEnabled)
+        defaults.set(promptRewriteConversationTimeoutMinutes, forKey: Keys.promptRewriteConversationTimeoutMinutes)
+        defaults.set(promptRewriteConversationTurnLimit, forKey: Keys.promptRewriteConversationTurnLimit)
+        defaults.set(
+            promptRewriteConversationPinnedContextID.trimmingCharacters(in: .whitespacesAndNewlines),
+            forKey: Keys.promptRewriteConversationPinnedContextID
+        )
 
         guard !isApplyingChanges else { return }
         onChange?()
@@ -855,6 +999,11 @@ final class SettingsStore: ObservableObject {
     var promptRewriteProviderMode: PromptRewriteProviderMode {
         get { PromptRewriteProviderMode(rawValue: promptRewriteProviderModeRawValue) ?? .openAI }
         set { promptRewriteProviderModeRawValue = newValue.rawValue }
+    }
+
+    var promptRewriteStylePreset: PromptRewriteStylePreset {
+        get { PromptRewriteStylePreset(rawValue: promptRewriteStylePresetRawValue) ?? .balanced }
+        set { promptRewriteStylePresetRawValue = newValue.rawValue }
     }
 
     func hasPromptRewriteOAuthSession(for providerMode: PromptRewriteProviderMode) -> Bool {

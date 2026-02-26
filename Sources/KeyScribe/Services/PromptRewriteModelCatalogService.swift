@@ -18,6 +18,7 @@ struct PromptRewriteModelFetchResult {
 
 actor PromptRewriteModelCatalogService {
     static let shared = PromptRewriteModelCatalogService()
+    private static let cachePrefix = "KeyScribe.promptRewriteModelCatalogCache."
 
     private enum Credential {
         case none
@@ -50,40 +51,57 @@ actor PromptRewriteModelCatalogService {
         baseURL: String,
         apiKey: String
     ) async -> PromptRewriteModelFetchResult {
-        let fallbackModels = Self.fallbackModels(for: providerMode)
+        let normalizedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasOpenAIOAuth = providerMode == .openAI
+            && PromptRewriteOAuthCredentialStore.loadSession(for: .openAI) != nil
+        let hasOpenAIAPIKey = providerMode == .openAI && !normalizedAPIKey.isEmpty
+
         let credentialResolution = await resolveCredential(
             providerMode: providerMode,
             apiKey: apiKey
         )
         let credential = credentialResolution.credential
         let credentialMessage = credentialResolution.message
+        let preferOpenAIOAuthCatalog = providerMode == .openAI && hasOpenAIOAuth && !hasOpenAIAPIKey
+
+        let discoveredFallbackModels = await fallbackModels(
+            for: providerMode,
+            preferOpenAIOAuthCatalog: preferOpenAIOAuthCatalog
+        )
+        if !discoveredFallbackModels.isEmpty {
+            cacheModels(discoveredFallbackModels, for: providerMode)
+        }
+        let fallbackCatalogModels = discoveredFallbackModels.isEmpty
+            ? cachedModels(for: providerMode)
+            : discoveredFallbackModels
 
         switch providerMode {
         case .openAI:
-            if isOAuthCredential(credential) {
+            guard isAPIKeyCredential(credential) || isOAuthCredential(credential) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Using curated ChatGPT subscription model list."
-                )
-            }
-            guard isAPIKeyCredential(credential) else {
-                return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
-                    source: .fallback,
-                    message: credentialMessage ?? "Connect OpenAI to load live models. Showing curated list."
+                    message: credentialMessage ?? "Connect OpenAI to load live models."
                 )
             }
             guard let endpoint = Self.openAIModelsEndpoint(from: baseURL) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Invalid OpenAI base URL. Showing curated list."
+                    message: "Invalid OpenAI base URL."
                 )
             }
             do {
-                let models = try await fetchOpenAICompatibleModels(endpoint: endpoint, credential: credential)
+                let remoteModels = try await fetchOpenAICompatibleModels(endpoint: endpoint, credential: credential)
+                var models = preferOpenAIOAuthCatalog
+                    ? Self.openAIOAuthCompatibleModels(remoteModels)
+                    : Self.rewriteFriendlyModels(remoteModels, providerMode: .openAI)
+                if hasOpenAIOAuth && hasOpenAIAPIKey {
+                    let oauthCompatibleFallback = await fallbackModels(for: .openAI, preferOpenAIOAuthCatalog: true)
+                    models = Self.mergeModelOptions(primary: models, secondary: oauthCompatibleFallback)
+                }
                 if !models.isEmpty {
+                    cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
                         models: models,
                         source: .remote,
@@ -91,35 +109,44 @@ actor PromptRewriteModelCatalogService {
                     )
                 }
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "OpenAI returned no models. Showing curated list."
+                    message: fallbackMessage(
+                        providerName: "OpenAI",
+                        fallbackCount: fallbackCatalogModels.count,
+                        failureReason: "OpenAI returned no rewrite-suitable models."
+                    )
                 )
             } catch {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Could not load OpenAI models: \(error.localizedDescription)"
+                    message: fallbackMessage(
+                        providerName: "OpenAI",
+                        fallbackCount: fallbackCatalogModels.count,
+                        failureReason: "Could not load OpenAI models: \(error.localizedDescription)"
+                    )
                 )
             }
         case .openRouter:
             guard isAPIKeyCredential(credential) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Add OpenRouter API key to load live models. Showing curated list."
+                    message: "Add OpenRouter API key to load live models."
                 )
             }
             guard let endpoint = Self.openAIModelsEndpoint(from: baseURL) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Invalid OpenRouter base URL. Showing curated list."
+                    message: "Invalid OpenRouter base URL."
                 )
             }
             do {
                 let models = try await fetchOpenAICompatibleModels(endpoint: endpoint, credential: credential)
                 if !models.isEmpty {
+                    cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
                         models: models,
                         source: .remote,
@@ -127,13 +154,13 @@ actor PromptRewriteModelCatalogService {
                     )
                 }
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "OpenRouter returned no models. Showing curated list."
+                    message: "OpenRouter returned no models."
                 )
             } catch {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
                     message: "Could not load OpenRouter models: \(error.localizedDescription)"
                 )
@@ -141,21 +168,22 @@ actor PromptRewriteModelCatalogService {
         case .groq:
             guard isAPIKeyCredential(credential) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Add Groq API key to load live models. Showing curated list."
+                    message: "Add Groq API key to load live models."
                 )
             }
             guard let endpoint = Self.openAIModelsEndpoint(from: baseURL) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Invalid Groq base URL. Showing curated list."
+                    message: "Invalid Groq base URL."
                 )
             }
             do {
                 let models = try await fetchOpenAICompatibleModels(endpoint: endpoint, credential: credential)
                 if !models.isEmpty {
+                    cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
                         models: models,
                         source: .remote,
@@ -163,13 +191,13 @@ actor PromptRewriteModelCatalogService {
                     )
                 }
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Groq returned no models. Showing curated list."
+                    message: "Groq returned no models."
                 )
             } catch {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
                     message: "Could not load Groq models: \(error.localizedDescription)"
                 )
@@ -177,21 +205,22 @@ actor PromptRewriteModelCatalogService {
         case .anthropic:
             guard isAPIKeyCredential(credential) || isOAuthCredential(credential) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: credentialMessage ?? "Connect Anthropic to load live models. Showing curated list."
+                    message: credentialMessage ?? "Connect Anthropic to load live models."
                 )
             }
             guard let endpoint = Self.anthropicModelsEndpoint(from: baseURL) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Invalid Anthropic base URL. Showing curated list."
+                    message: "Invalid Anthropic base URL."
                 )
             }
             do {
                 let models = try await fetchAnthropicModels(endpoint: endpoint, credential: credential)
                 if !models.isEmpty {
+                    cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
                         models: models,
                         source: .remote,
@@ -199,13 +228,13 @@ actor PromptRewriteModelCatalogService {
                     )
                 }
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Anthropic returned no models. Showing curated list."
+                    message: "Anthropic returned no models."
                 )
             } catch {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
                     message: "Could not load Anthropic models: \(error.localizedDescription)"
                 )
@@ -213,14 +242,15 @@ actor PromptRewriteModelCatalogService {
         case .ollama:
             guard let openAIEndpoint = Self.openAIModelsEndpoint(from: baseURL) else {
                 return PromptRewriteModelFetchResult(
-                    models: fallbackModels,
+                    models: fallbackCatalogModels,
                     source: .fallback,
-                    message: "Invalid Ollama base URL. Showing curated list."
+                    message: "Invalid Ollama base URL."
                 )
             }
             do {
                 let models = try await fetchOpenAICompatibleModels(endpoint: openAIEndpoint, credential: .none)
                 if !models.isEmpty {
+                    cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
                         models: models,
                         source: .remote,
@@ -235,6 +265,7 @@ actor PromptRewriteModelCatalogService {
                 do {
                     let models = try await fetchOllamaTags(endpoint: tagsEndpoint)
                     if !models.isEmpty {
+                        cacheModels(models, for: providerMode)
                         return PromptRewriteModelFetchResult(
                             models: models,
                             source: .remote,
@@ -243,7 +274,7 @@ actor PromptRewriteModelCatalogService {
                     }
                 } catch {
                     return PromptRewriteModelFetchResult(
-                        models: fallbackModels,
+                        models: fallbackCatalogModels,
                         source: .fallback,
                         message: "Could not load Ollama models: \(error.localizedDescription)"
                     )
@@ -251,62 +282,119 @@ actor PromptRewriteModelCatalogService {
             }
 
             return PromptRewriteModelFetchResult(
-                models: fallbackModels,
+                models: fallbackCatalogModels,
                 source: .fallback,
-                message: "Could not load Ollama models. Showing curated list."
+                message: "Could not load Ollama models."
             )
         }
     }
 
-    static func fallbackModels(for providerMode: PromptRewriteProviderMode) -> [PromptRewriteModelOption] {
+    private func fallbackModels(
+        for providerMode: PromptRewriteProviderMode,
+        preferOpenAIOAuthCatalog: Bool
+    ) async -> [PromptRewriteModelOption] {
+        let providerID: String
         switch providerMode {
         case .openAI:
-            return buildModelOptions(
-                ids: [
-                    "gpt-5.3-codex",
-                    "gpt-5.2-codex",
-                    "gpt-5.1-codex",
-                    "gpt-5.1-codex-mini",
-                    "gpt-5.1-codex-max",
-                    "gpt-4.1-mini"
-                ]
-            )
+            providerID = "openai"
         case .openRouter:
-            return buildModelOptions(
-                ids: [
-                    "openai/gpt-4.1-mini",
-                    "openai/gpt-5-mini",
-                    "anthropic/claude-3.5-sonnet",
-                    "google/gemini-2.5-pro",
-                    "meta-llama/llama-3.3-70b-instruct"
-                ]
-            )
+            providerID = "openrouter"
         case .groq:
-            return buildModelOptions(
-                ids: [
-                    "llama-3.3-70b-versatile",
-                    "llama-3.1-8b-instant",
-                    "deepseek-r1-distill-llama-70b",
-                    "qwen-qwq-32b"
-                ]
-            )
+            providerID = "groq"
         case .anthropic:
-            return buildModelOptions(
-                ids: [
-                    "claude-3-7-sonnet-latest",
-                    "claude-3-5-sonnet-latest",
-                    "claude-3-5-haiku-latest"
-                ]
-            )
+            providerID = "anthropic"
         case .ollama:
-            return buildModelOptions(
-                ids: [
-                    "llama3.1",
-                    "qwen2.5-coder",
-                    "deepseek-r1",
-                    "mistral"
-                ]
-            )
+            providerID = "ollama"
+        }
+
+        let models = await fetchModelsDevProviderModels(providerID: providerID)
+        if providerMode == .openAI {
+            if preferOpenAIOAuthCatalog {
+                return Self.openAIOAuthCompatibleModels(models)
+            }
+            return Self.rewriteFriendlyModels(models, providerMode: providerMode)
+        }
+        return models
+    }
+
+    private func fallbackMessage(
+        providerName: String,
+        fallbackCount: Int,
+        failureReason: String
+    ) -> String {
+        if fallbackCount > 0 {
+            return "\(failureReason) Showing \(fallbackCount) fallback catalog models."
+        }
+        return "\(failureReason) No fallback catalog models were available."
+    }
+
+    private func cacheModels(_ models: [PromptRewriteModelOption], for providerMode: PromptRewriteProviderMode) {
+        guard !models.isEmpty else { return }
+        let payload = models.map { ["id": $0.id, "displayName": $0.displayName] }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else { return }
+        UserDefaults.standard.set(data, forKey: Self.cachePrefix + providerMode.rawValue)
+    }
+
+    private func cachedModels(for providerMode: PromptRewriteProviderMode) -> [PromptRewriteModelOption] {
+        let key = Self.cachePrefix + providerMode.rawValue
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let object = try? JSONSerialization.jsonObject(with: data, options: []),
+              let rows = object as? [[String: Any]] else {
+            return []
+        }
+        let options = rows.compactMap { row -> PromptRewriteModelOption? in
+            guard let id = row["id"] as? String else { return nil }
+            let displayName = (row["displayName"] as? String) ?? id
+            return PromptRewriteModelOption(id: id, displayName: displayName)
+        }
+        return Self.normalizeModelOptions(options)
+    }
+
+    private func fetchModelsDevProviderModels(providerID: String) async -> [PromptRewriteModelOption] {
+        guard let url = URL(string: "https://models.dev/api.json") else {
+            return []
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            guard let root = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                  let provider = root[providerID] as? [String: Any],
+                  let modelsDict = provider["models"] as? [String: Any] else {
+                return []
+            }
+
+            var options: [PromptRewriteModelOption] = []
+            options.reserveCapacity(modelsDict.count)
+
+            for (modelID, payload) in modelsDict {
+                let displayName: String
+                if let payload = payload as? [String: Any],
+                   let modelName = payload["name"] as? String,
+                   !modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    displayName = modelName
+                } else {
+                    displayName = modelID
+                }
+
+                options.append(
+                    PromptRewriteModelOption(
+                        id: modelID,
+                        displayName: displayName
+                    )
+                )
+            }
+
+            return Self.normalizeModelOptions(options)
+        } catch {
+            return []
         }
     }
 
@@ -341,6 +429,11 @@ actor PromptRewriteModelCatalogService {
         providerMode: PromptRewriteProviderMode,
         apiKey: String
     ) async -> (credential: Credential, message: String?) {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if providerMode == .openAI, !trimmedKey.isEmpty {
+            return (.apiKey(trimmedKey), nil)
+        }
+
         var message: String?
         if providerMode.supportsOAuthSignIn,
            let oauthSession = PromptRewriteOAuthCredentialStore.loadSession(for: providerMode) {
@@ -358,7 +451,6 @@ actor PromptRewriteModelCatalogService {
             }
         }
 
-        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedKey.isEmpty {
             return (.apiKey(trimmedKey), message)
         }
@@ -371,7 +463,7 @@ actor PromptRewriteModelCatalogService {
     ) async throws -> [PromptRewriteModelOption] {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 30
+        request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         switch credential {
@@ -402,7 +494,7 @@ actor PromptRewriteModelCatalogService {
     ) async throws -> [PromptRewriteModelOption] {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 30
+        request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         switch credential {
@@ -436,7 +528,7 @@ actor PromptRewriteModelCatalogService {
     private func fetchOllamaTags(endpoint: URL) async throws -> [PromptRewriteModelOption] {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 30
+        request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, response) = try await session.data(for: request)
@@ -585,6 +677,84 @@ actor PromptRewriteModelCatalogService {
             }
             return nameCompare == .orderedAscending
         }
+    }
+
+    private static func rewriteFriendlyModels(
+        _ options: [PromptRewriteModelOption],
+        providerMode: PromptRewriteProviderMode
+    ) -> [PromptRewriteModelOption] {
+        guard providerMode == .openAI else { return options }
+
+        let filtered = options.filter { option in
+            let modelID = option.id.lowercased()
+            if modelID.contains("codex") { return false }
+            if modelID.contains("embedding") { return false }
+            if modelID.contains("moderation") { return false }
+            if modelID.contains("transcribe") || modelID.contains("whisper") { return false }
+            if modelID.contains("tts") || modelID.contains("audio") { return false }
+            return modelID.hasPrefix("gpt") || modelID.hasPrefix("o1") || modelID.hasPrefix("o3") || modelID.hasPrefix("o4")
+        }
+
+        return filtered.isEmpty ? options : filtered
+    }
+
+    private static let openAIOAuthPreferredModelIDs: [String] = [
+        "gpt-5.2",
+        "gpt-5.2-codex",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
+        "gpt-5.1-codex",
+        "gpt-5.1-codex-max",
+        "gpt-5.1-codex-mini"
+    ]
+
+    private static let openAIOAuthAllowedNonCodexModelIDs: Set<String> = [
+        "gpt-5.2"
+    ]
+
+    static var defaultOpenAIOAuthModelID: String {
+        openAIOAuthPreferredModelIDs[0]
+    }
+
+    static func isOpenAIOAuthCompatibleModelID(_ modelID: String) -> Bool {
+        let normalized = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+        if normalized.contains("codex") {
+            return true
+        }
+        return openAIOAuthAllowedNonCodexModelIDs.contains(normalized)
+    }
+
+    static func preferredOpenAIOAuthModelID(in options: [PromptRewriteModelOption]) -> String? {
+        guard !options.isEmpty else { return nil }
+
+        let normalizedLookup = Dictionary(
+            uniqueKeysWithValues: options.map { option in
+                (option.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), option.id)
+            }
+        )
+
+        for preferredID in openAIOAuthPreferredModelIDs {
+            if let match = normalizedLookup[preferredID] {
+                return match
+            }
+        }
+
+        return options.first(where: { isOpenAIOAuthCompatibleModelID($0.id) })?.id
+    }
+
+    private static func openAIOAuthCompatibleModels(_ options: [PromptRewriteModelOption]) -> [PromptRewriteModelOption] {
+        let filtered = options.filter { option in
+            isOpenAIOAuthCompatibleModelID(option.id)
+        }
+        return filtered.isEmpty ? options : filtered
+    }
+
+    private static func mergeModelOptions(
+        primary: [PromptRewriteModelOption],
+        secondary: [PromptRewriteModelOption]
+    ) -> [PromptRewriteModelOption] {
+        normalizeModelOptions(primary + secondary)
     }
 
     private func isAPIKeyCredential(_ credential: Credential) -> Bool {

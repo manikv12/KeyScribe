@@ -10,6 +10,7 @@ enum PromptRewriteFeedbackAction: String, Equatable {
     case usedSuggested = "used-suggested"
     case editedThenInserted = "edited-then-inserted"
     case insertedOriginal = "inserted-original"
+    case dismissedSuggestion = "dismissed-suggestion"
     case retriedAfterFailure = "retried-after-failure"
     case insertedOriginalAfterFailure = "inserted-original-after-failure"
     case canceledAfterFailure = "canceled-after-failure"
@@ -41,7 +42,11 @@ struct PromptRewriteFeedbackEvent {
 }
 
 protocol PromptRewriteBackendServing {
-    func retrieveSuggestion(for cleanedTranscript: String) async throws -> PromptRewriteSuggestion?
+    func retrieveSuggestion(
+        for cleanedTranscript: String,
+        conversationContext: PromptRewriteConversationContext?,
+        conversationHistory: [PromptRewriteConversationTurn]
+    ) async throws -> PromptRewriteSuggestion?
     func recordFeedback(_ event: PromptRewriteFeedbackEvent) async
 }
 
@@ -64,7 +69,7 @@ final class PromptRewriteService {
 
     init(
         backend: PromptRewriteBackendServing = BackendPromptRewriteService.shared,
-        timeoutSeconds: TimeInterval = 3
+        timeoutSeconds: TimeInterval = 2.5
     ) {
         self.backend = backend
         self.timeoutSeconds = min(
@@ -73,14 +78,22 @@ final class PromptRewriteService {
         )
     }
 
-    func retrieveSuggestion(for cleanedTranscript: String) async throws -> PromptRewriteSuggestion? {
+    func retrieveSuggestion(
+        for cleanedTranscript: String,
+        conversationContext: PromptRewriteConversationContext? = nil,
+        conversationHistory: [PromptRewriteConversationTurn] = []
+    ) async throws -> PromptRewriteSuggestion? {
         let normalizedTranscript = cleanedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedTranscript.isEmpty else { return nil }
 
         do {
             return try await withThrowingTaskGroup(of: PromptRewriteSuggestion?.self) { group in
                 group.addTask {
-                    try await self.backend.retrieveSuggestion(for: normalizedTranscript)
+                    try await self.backend.retrieveSuggestion(
+                        for: normalizedTranscript,
+                        conversationContext: conversationContext,
+                        conversationHistory: conversationHistory
+                    )
                 }
                 group.addTask {
                     try await Task.sleep(nanoseconds: self.timeoutNanoseconds)
@@ -204,6 +217,8 @@ private struct PromptRewriteLiveConfiguration {
     let openAIBaseURL: String
     let apiKey: String
     let oauthSession: PromptRewriteOAuthSession?
+    let rewriteStylePreset: PromptRewriteStylePreset
+    let rewriteCustomStyleInstructions: String
 
     var hasCredentials: Bool {
         if let oauthSession {
@@ -232,7 +247,11 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         self.openAIProvider = .shared
     }
 
-    func retrieveSuggestion(for cleanedTranscript: String) async throws -> PromptRewriteSuggestion? {
+    func retrieveSuggestion(
+        for cleanedTranscript: String,
+        conversationContext: PromptRewriteConversationContext?,
+        conversationHistory: [PromptRewriteConversationTurn]
+    ) async throws -> PromptRewriteSuggestion? {
         let mode = Self.stubMode
         switch mode {
         case .live:
@@ -242,19 +261,34 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                     return nil
                 }
 
-                let rewriteContext = try await retrievalService.fetchPromptRewriteContext(
-                    for: cleanedTranscript,
-                    lessonLimit: 8,
-                    cardLimit: 8
-                )
-                // Do not pay a provider round-trip unless we have an actual rewrite lesson match.
-                // Supporting cards alone are too weak and can add latency without improving quality.
-                guard !rewriteContext.lessons.isEmpty else { return nil }
+                let memoryEnabled = await MainActor.run { FeatureFlags.aiMemoryEnabled }
+                if memoryEnabled {
+                    let rewriteContext = try await retrievalService.fetchPromptRewriteContext(
+                        for: cleanedTranscript,
+                        lessonLimit: 8,
+                        cardLimit: 8
+                    )
+                    // Do not pay a provider round-trip unless we have an actual rewrite lesson match.
+                    // Supporting cards alone are too weak and can add latency without improving quality.
+                    guard !rewriteContext.lessons.isEmpty else { return nil }
+
+                    return try await openAIProvider.retrieveSuggestion(
+                        for: cleanedTranscript,
+                        rewriteContext: rewriteContext,
+                        includeMemoryContext: true,
+                        configuration: config,
+                        conversationContext: conversationContext,
+                        conversationHistory: conversationHistory
+                    )
+                }
 
                 return try await openAIProvider.retrieveSuggestion(
                     for: cleanedTranscript,
-                    rewriteContext: rewriteContext,
-                    configuration: config
+                    rewriteContext: MemoryRewritePromptContext(lessons: [], supportingCards: []),
+                    includeMemoryContext: false,
+                    configuration: config,
+                    conversationContext: conversationContext,
+                    conversationHistory: conversationHistory
                 )
             } catch let backendError as PromptRewriteBackendError {
                 throw backendError
@@ -282,6 +316,9 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
     }
 
     func recordFeedback(_ event: PromptRewriteFeedbackEvent) async {
+        let memoryEnabled = await MainActor.run { FeatureFlags.aiMemoryEnabled }
+        guard memoryEnabled else { return }
+
         let original = event.originalText.trimmingCharacters(in: .whitespacesAndNewlines)
         let suggested = event.suggestedText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let final = event.finalInsertedText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -329,7 +366,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                         // best effort invalidation
                     }
                 }
-            case .usedSuggested,
+            case .dismissedSuggestion,
+                 .usedSuggested,
                  .retriedAfterFailure,
                  .insertedOriginalAfterFailure,
                  .canceledAfterFailure:
@@ -351,6 +389,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
             return "User edited suggested rewrite and inserted"
         case .insertedOriginal:
             return "User inserted original text"
+        case .dismissedSuggestion:
+            return "User dismissed rewrite suggestion"
         case .retriedAfterFailure:
             return "User retried rewrite after failure"
         case .insertedOriginalAfterFailure:
@@ -368,6 +408,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
             return 0.90
         case .insertedOriginal:
             return 0.25
+        case .dismissedSuggestion:
+            return 0.10
         case .retriedAfterFailure:
             return 0.40
         case .insertedOriginalAfterFailure:
@@ -430,28 +472,34 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         let baseURL = defaults
             .string(forKey: "KeyScribe.promptRewriteOpenAIBaseURL")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let stylePresetRawValue = defaults
+            .string(forKey: "KeyScribe.promptRewriteStylePreset")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? PromptRewriteStylePreset.balanced.rawValue
+        let stylePreset = PromptRewriteStylePreset(rawValue: stylePresetRawValue) ?? .balanced
+        let customStyleInstructions = defaults
+            .string(forKey: "KeyScribe.promptRewriteCustomStyleInstructions")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         let oauthSession = PromptRewriteOAuthCredentialStore.loadSession(for: providerMode.settingsProviderMode)
+        let loadedAPIKey = loadProviderAPIKey(for: providerMode)
         var resolvedModel = (model?.isEmpty == false) ? model! : providerMode.defaultModel
-        if providerMode == .openAI,
-           oauthSession != nil,
-           resolvedModel == PromptRewriteLiveProviderMode.openAI.defaultModel {
-            // OpenAI OAuth sessions in OpenCode-compatible flow map to Codex models.
-            resolvedModel = "gpt-5.3-codex"
-        }
-        if providerMode == .openAI,
-           oauthSession == nil,
-           resolvedModel.lowercased().contains("codex") {
-            // Codex models are for OAuth/Codex flow and often fail on plain OpenAI API-key chat-completions.
-            resolvedModel = PromptRewriteLiveProviderMode.openAI.defaultModel
+        if providerMode == .openAI {
+            let usingOpenAIOAuthOnly = oauthSession != nil
+                && loadedAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if usingOpenAIOAuthOnly,
+               !PromptRewriteModelCatalogService.isOpenAIOAuthCompatibleModelID(resolvedModel) {
+                resolvedModel = PromptRewriteModelCatalogService.defaultOpenAIOAuthModelID
+            }
         }
         let resolvedBaseURL = (baseURL?.isEmpty == false) ? baseURL! : providerMode.defaultBaseURL
         return PromptRewriteLiveConfiguration(
             providerMode: providerMode,
             openAIModel: resolvedModel,
             openAIBaseURL: resolvedBaseURL,
-            apiKey: loadProviderAPIKey(for: providerMode),
-            oauthSession: oauthSession
+            apiKey: loadedAPIKey,
+            oauthSession: oauthSession,
+            rewriteStylePreset: stylePreset,
+            rewriteCustomStyleInstructions: customStyleInstructions
         )
     }
 
@@ -537,44 +585,97 @@ private actor OpenAIPromptRewriteProvider {
     func retrieveSuggestion(
         for cleanedTranscript: String,
         rewriteContext: MemoryRewritePromptContext,
-        configuration: PromptRewriteLiveConfiguration
+        includeMemoryContext: Bool,
+        configuration: PromptRewriteLiveConfiguration,
+        conversationContext: PromptRewriteConversationContext?,
+        conversationHistory: [PromptRewriteConversationTurn]
     ) async throws -> PromptRewriteSuggestion? {
-        guard !rewriteContext.isEmpty else { return nil }
+        guard includeMemoryContext == false || !rewriteContext.isEmpty else { return nil }
 
         let lessonPayload = formattedLessonPayload(from: rewriteContext.lessons.prefix(8).map { $0 })
         let supportingCardPayload = formattedSupportingCardPayload(from: rewriteContext.supportingCards.prefix(4).map { $0 })
-        let systemPrompt = """
-        You improve user prompts using previous prompt-fix memories.
-        Prioritize validated mistake->correction lessons over generic memory cards.
-        Return strict JSON only with this shape:
-        {
-          "should_rewrite": boolean,
-          "suggested_text": string,
-          "memory_context": string
+        let styleGuidance = styleGuidanceBlock(configuration: configuration)
+        let conversationContextLine = conversationContextLine(from: conversationContext)
+        let conversationHistoryPayload = formattedConversationPayload(
+            from: conversationHistory.suffix(6).map { $0 }
+        )
+        let systemPrompt: String
+        let userPrompt: String
+        if includeMemoryContext {
+            systemPrompt = """
+            You improve user prompts using previous prompt-fix memories.
+            Prioritize validated mistake->correction lessons over generic memory cards.
+            Return strict JSON only with this shape:
+            {
+              "should_rewrite": boolean,
+              "suggested_text": string,
+              "memory_context": string
+            }
+            Rules:
+            - Keep user intent unchanged.
+            - Do not invent new requirements.
+            - If no meaningful rewrite is needed, set should_rewrite=false and suggested_text equal to the original prompt.
+            - Prefer lesson entries where validated=true.
+            - Apply mistake->correction lessons only when the mistake is actually present or strongly implied.
+            - Use supporting cards only as secondary context after lesson matching.
+            - memory_context should mention lesson provenance and validation status when relevant.
+            - suggested_text must be a fully formatted final response ready to paste.
+            - Preserve structural formatting from the original prompt when present (questions, bullet points, numbered lists, markdown sections).
+            - Do not collapse list/question formatting into a single paragraph.
+            - Keep the conversation flow continuous; avoid introducing disruptive meta prompts, sudden action lists, or unrelated dialogue pivots.
+            - When same-context history is provided, continue naturally without restarting the dialogue.
+            \(styleGuidance)
+            """
+
+            userPrompt = """
+            Original prompt:
+            \(cleanedTranscript)
+
+            Conversation context (same app/screen bucket):
+            \(conversationContextLine)
+
+            Recent conversation turns (oldest -> newest):
+            \(conversationHistoryPayload)
+
+            Rewrite lessons payload (primary):
+            \(lessonPayload)
+
+            Supporting memory cards payload (secondary):
+            \(supportingCardPayload)
+            """
+        } else {
+            systemPrompt = """
+            You improve user prompts for clarity, structure, and execution quality.
+            Return strict JSON only with this shape:
+            {
+              "should_rewrite": boolean,
+              "suggested_text": string,
+              "memory_context": string
+            }
+            Rules:
+            - Keep user intent unchanged.
+            - Do not invent new requirements.
+            - If no meaningful rewrite is needed, set should_rewrite=false and suggested_text equal to the original prompt.
+            - suggested_text must be a fully formatted final response ready to paste.
+            - Preserve structural formatting from the original prompt when present (questions, bullet points, numbered lists, markdown sections).
+            - Do not collapse list/question formatting into a single paragraph.
+            - Set memory_context to an empty string when memory is not used.
+            - Keep the conversation flow continuous; avoid introducing disruptive meta prompts, sudden action lists, or unrelated dialogue pivots.
+            - When same-context history is provided, continue naturally without restarting the dialogue.
+            \(styleGuidance)
+            """
+
+            userPrompt = """
+            Original prompt:
+            \(cleanedTranscript)
+
+            Conversation context (same app/screen bucket):
+            \(conversationContextLine)
+
+            Recent conversation turns (oldest -> newest):
+            \(conversationHistoryPayload)
+            """
         }
-        Rules:
-        - Keep user intent unchanged.
-        - Do not invent new requirements.
-        - If no meaningful rewrite is needed, set should_rewrite=false and suggested_text equal to the original prompt.
-        - Prefer lesson entries where validated=true.
-        - Apply mistake->correction lessons only when the mistake is actually present or strongly implied.
-        - Use supporting cards only as secondary context after lesson matching.
-        - memory_context should mention lesson provenance and validation status when relevant.
-        - suggested_text must be a fully formatted final response ready to paste.
-        - Preserve structural formatting from the original prompt when present (questions, bullet points, numbered lists, markdown sections).
-        - Do not collapse list/question formatting into a single paragraph.
-        """
-
-        let userPrompt = """
-        Original prompt:
-        \(cleanedTranscript)
-
-        Rewrite lessons payload (primary):
-        \(lessonPayload)
-
-        Supporting memory cards payload (secondary):
-        \(supportingCardPayload)
-        """
 
         let credential = try await resolveCredential(for: configuration)
         let request = try buildRequest(
@@ -625,11 +726,54 @@ private actor OpenAIPromptRewriteProvider {
 
         return PromptRewriteSuggestion(
             suggestedText: rewritten,
-            memoryContext: synthesizedMemoryContext(
-                modelContext: responsePayload.memoryContext,
-                lessons: rewriteContext.lessons
-            )
+            memoryContext: includeMemoryContext
+                ? synthesizedMemoryContext(
+                    modelContext: responsePayload.memoryContext,
+                    lessons: rewriteContext.lessons
+                )
+                : nil
         )
+    }
+
+    private func styleGuidanceBlock(configuration: PromptRewriteLiveConfiguration) -> String {
+        let preset = configuration.rewriteStylePreset
+        let customInstructions = configuration.rewriteCustomStyleInstructions
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var lines: [String] = [
+            "Style guidance:",
+            "- Baseline style preset: \(preset.rawValue).",
+            "- \(preset.styleInstruction)"
+        ]
+
+        if !customInstructions.isEmpty {
+            lines.append("- User custom style instructions (honor these unless they conflict with user intent or safety): \(customInstructions)")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func conversationContextLine(from context: PromptRewriteConversationContext?) -> String {
+        guard let context else {
+            return "none"
+        }
+        return snippet(context.providerContextLabel, limit: 180)
+    }
+
+    private func formattedConversationPayload(from turns: [PromptRewriteConversationTurn]) -> String {
+        guard !turns.isEmpty else { return "[]" }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+
+        let payload = turns.map { turn in
+            [
+                "timestamp": formatter.string(from: turn.timestamp),
+                "user": snippet(turn.userText, limit: 220),
+                "assistant": snippet(turn.assistantText, limit: 220)
+            ] as [String: String]
+        }
+        return jsonString(for: payload)
     }
 
     private func buildRequest(
@@ -689,7 +833,7 @@ private actor OpenAIPromptRewriteProvider {
 
         guard let endpoint else {
             throw PromptRewriteBackendError.providerFailure(
-                reason: "Invalid provider base URL. Update Settings > Memory & Sources > Prompt Rewrite AI."
+                reason: "Invalid provider base URL. Update AI Studio > Prompt Models."
             )
         }
 
@@ -700,7 +844,7 @@ private actor OpenAIPromptRewriteProvider {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 30
+        request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = requestBody
 
@@ -741,6 +885,34 @@ private actor OpenAIPromptRewriteProvider {
     }
 
     private func resolveCredential(for configuration: PromptRewriteLiveConfiguration) async throws -> ProviderCredential {
+        let apiKey = configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelID = configuration.openAIModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefersCodexOAuth = configuration.providerMode == .openAI && modelID.contains("codex")
+
+        if prefersCodexOAuth, let oauthSession = configuration.oauthSession {
+            do {
+                let refreshed = try await PromptRewriteProviderOAuthService.shared.refreshSessionIfNeeded(
+                    oauthSession,
+                    providerMode: configuration.providerMode.settingsProviderMode
+                )
+                return .oauth(refreshed)
+            } catch {
+                if !apiKey.isEmpty {
+                    return .apiKey(apiKey)
+                }
+                let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                throw PromptRewriteBackendError.providerFailure(
+                    reason: message.isEmpty
+                        ? "OAuth session expired. Reconnect the provider in AI Studio."
+                        : "OAuth session refresh failed: \(message)"
+                )
+            }
+        }
+
+        if configuration.providerMode == .openAI, !apiKey.isEmpty {
+            return .apiKey(apiKey)
+        }
+
         if let oauthSession = configuration.oauthSession {
             do {
                 let refreshed = try await PromptRewriteProviderOAuthService.shared.refreshSessionIfNeeded(
@@ -752,12 +924,11 @@ private actor OpenAIPromptRewriteProvider {
                 let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
                 throw PromptRewriteBackendError.providerFailure(
                     reason: message.isEmpty
-                        ? "OAuth session expired. Reconnect the provider in AI Memory Studio."
+                        ? "OAuth session expired. Reconnect the provider in AI Studio."
                         : "OAuth session refresh failed: \(message)"
                 )
             }
         }
-        let apiKey = configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !apiKey.isEmpty {
             return .apiKey(apiKey)
         }

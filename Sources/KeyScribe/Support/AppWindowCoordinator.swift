@@ -154,7 +154,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
                 backing: .buffered,
                 defer: false
             )
-            window.title = "AI Memory Studio"
+            window.title = "AI Studio"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isOpaque = false
@@ -173,7 +173,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         }
 
         guard let window = aiStudioWindowController?.window else {
-            onStatusUpdate(.message("Could not open AI Memory Studio"))
+            onStatusUpdate(.message("Could not open AI Studio"))
             return
         }
 

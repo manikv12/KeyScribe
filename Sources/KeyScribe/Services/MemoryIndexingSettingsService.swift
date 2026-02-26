@@ -127,7 +127,7 @@ final class MemoryIndexingSettingsService {
         var indexQueued = false
         var queuedSourceCount = 0
 
-        if runIndexing {
+        if runIndexing && FeatureFlags.aiMemoryEnabled {
             let enabledSources = enabledSourcesForIndexing(
                 enabledProviderIDs: enabledProviderIDs,
                 enabledSourceFolderIDs: enabledSourceFolderIDs
@@ -139,6 +139,8 @@ final class MemoryIndexingSettingsService {
             } else {
                 logger.notice("Rescan did not queue indexing because no enabled source folders matched current selection.")
             }
+        } else if runIndexing {
+            logger.notice("Rescan skipped indexing because AI memory feature flag is disabled.")
         } else {
             logger.notice("Rescan skipped indexing because AI memory assistant is paused.")
         }
@@ -155,6 +157,15 @@ final class MemoryIndexingSettingsService {
         enabledProviderIDs: [String] = [],
         enabledSourceFolderIDs: [String] = []
     ) {
+        guard FeatureFlags.aiMemoryEnabled else {
+            postIndexingDidFinishNotification(
+                rebuild: true,
+                cancelled: false,
+                totalSources: 0,
+                report: MemoryIndexingReport()
+            )
+            return
+        }
         let enabledSources = enabledSourcesForIndexing(
             enabledProviderIDs: enabledProviderIDs,
             enabledSourceFolderIDs: enabledSourceFolderIDs
@@ -175,6 +186,15 @@ final class MemoryIndexingSettingsService {
         enabledProviderIDs: [String] = [],
         enabledSourceFolderIDs: [String] = []
     ) {
+        guard FeatureFlags.aiMemoryEnabled else {
+            postIndexingDidFinishNotification(
+                rebuild: true,
+                cancelled: false,
+                totalSources: 0,
+                report: MemoryIndexingReport()
+            )
+            return
+        }
         let enabledSources = enabledSourcesForIndexing(
             enabledProviderIDs: enabledProviderIDs,
             enabledSourceFolderIDs: enabledSourceFolderIDs

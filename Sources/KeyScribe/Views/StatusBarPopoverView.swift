@@ -45,7 +45,7 @@ struct StatusBarPopoverView: View {
                     icon: viewModel.isContinuousMode ? "stop.circle.fill" : "mic.circle.fill",
                     label: viewModel.isContinuousMode ? "Stop Dictation" : "Start Dictation",
                     shortcut: nil,
-                    iconTint: viewModel.isContinuousMode ? .red : .accentColor,
+                    iconTint: viewModel.isContinuousMode ? .red : AppVisualTheme.accentTint,
                     isDisabled: !viewModel.permissionsReady
                 ) {
                     viewModel.onToggleDictation?()
@@ -54,7 +54,8 @@ struct StatusBarPopoverView: View {
                 PopoverMenuRow(
                     icon: "doc.on.clipboard",
                     label: "Paste Last Transcript",
-                    shortcut: "⌘⌥V"
+                    shortcut: "⌘⌥V",
+                    iconTint: AppVisualTheme.accentTint
                 ) {
                     viewModel.onPasteLastTranscript?()
                 }
@@ -67,15 +68,15 @@ struct StatusBarPopoverView: View {
                 .opacity(0.6)
 
             VStack(spacing: 4) {
-                PopoverMenuRow(icon: "clock.arrow.circlepath", label: "History") {
+                PopoverMenuRow(icon: "clock.arrow.circlepath", label: "History", iconTint: AppVisualTheme.accentTint) {
                     viewModel.onOpenHistory?()
                 }
 
-                PopoverMenuRow(icon: "brain.head.profile", label: "AI Memory Studio") {
+                PopoverMenuRow(icon: "brain.head.profile", label: "AI Studio", iconTint: AppVisualTheme.accentTint) {
                     viewModel.onOpenAIMemoryStudio?()
                 }
 
-                PopoverMenuRow(icon: "gearshape.fill", label: "Settings", shortcut: "⌘,") {
+                PopoverMenuRow(icon: "gearshape.fill", label: "Settings", shortcut: "⌘,", iconTint: AppVisualTheme.accentTint) {
                     viewModel.onOpenSettings?()
                 }
             }
@@ -90,7 +91,7 @@ struct StatusBarPopoverView: View {
                 PopoverMenuRow(
                     icon: "power",
                     label: "Quit KeyScribe",
-                    iconTint: .primary.opacity(0.6)
+                    iconTint: .gray
                 ) {
                     viewModel.onQuit?()
                 }
@@ -99,11 +100,16 @@ struct StatusBarPopoverView: View {
             .padding(.vertical, 8)
             .padding(.bottom, 4)
         }
-        .frame(width: 280)
-        .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.16)
+        .frame(width: 296)
+        .appThemedSurface(
+            cornerRadius: 16,
+            tint: AppVisualTheme.panelTint,
+            strokeOpacity: 0.18,
+            tintOpacity: 0.05
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.15), lineWidth: 0.4)
+                .stroke(Color.white.opacity(0.15), lineWidth: 0.55)
         )
         .shadow(color: .black.opacity(0.12), radius: 10, x: 0, y: 6)
         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isDictating)
@@ -113,29 +119,21 @@ struct StatusBarPopoverView: View {
 
     private var headerSection: some View {
         HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [.accentColor.opacity(0.8), .accentColor],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 32, height: 32)
-                    .shadow(color: .accentColor.opacity(0.3), radius: 3, x: 0, y: 2)
-
-                Image(systemName: "waveform")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.white)
-            }
+            AppIconBadge(
+                symbol: "waveform",
+                tint: AppVisualTheme.accentTint,
+                size: 34,
+                symbolSize: 15,
+                isEmphasized: true
+            )
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("KeyScribe")
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.95))
 
                 Text(viewModel.uiStatus.menuText)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundColor(statusPillColor)
             }
 
@@ -146,9 +144,8 @@ struct StatusBarPopoverView: View {
     private var statusPillColor: Color {
         switch viewModel.uiStatus {
         case .ready: return .secondary
-        case .listening: return .green
-        case .finalizing: return .orange
-        case .copiedFromHistory, .copiedToClipboard: return .blue
+        case .listening, .finalizing, .copiedFromHistory, .copiedToClipboard:
+            return AppVisualTheme.accentTint
         case .pasteUnavailable, .accessibilityHint: return .red
         default: return .secondary
         }
@@ -161,7 +158,7 @@ private struct PopoverMenuRow: View {
     let icon: String
     let label: String
     var shortcut: String? = nil
-    var iconTint: Color = .primary
+    var iconTint: Color = AppVisualTheme.accentTint
     var isDisabled: Bool = false
     let action: () -> Void
 
@@ -170,28 +167,50 @@ private struct PopoverMenuRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 12) {
-                Image(systemName: icon)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(isHovered ? .white : iconTint)
-                    .frame(width: 20, alignment: .center)
+                AppIconBadge(
+                    symbol: icon,
+                    tint: iconTint,
+                    size: 22,
+                    symbolSize: 10,
+                    isEmphasized: isHovered
+                )
 
                 Text(label)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isHovered ? .white : .primary)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundColor(isHovered ? .white : Color.white.opacity(0.92))
 
                 Spacer()
 
                 if let shortcut {
                     Text(shortcut)
                         .font(.system(size: 11, weight: .regular, design: .monospaced))
-                        .foregroundStyle(isHovered ? Color.white.opacity(0.8) : Color.secondary.opacity(0.8))
+                        .foregroundStyle(isHovered ? Color.white.opacity(0.8) : AppVisualTheme.mutedText)
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(isHovered ? Color.accentColor : Color.clear)
+                    .fill(
+                        isHovered
+                            ? LinearGradient(
+                                colors: [
+                                    AppVisualTheme.rowSelection.opacity(0.42),
+                                    AppVisualTheme.rowSelection.opacity(0.26)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            : LinearGradient(
+                                colors: [Color.clear, Color.clear],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(isHovered ? Color.white.opacity(0.24) : Color.clear, lineWidth: 0.7)
+                    )
             )
             .opacity(isDisabled ? 0.4 : 1)
             .contentShape(Rectangle())

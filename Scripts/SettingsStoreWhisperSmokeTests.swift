@@ -113,6 +113,8 @@ struct SettingsStoreWhisperSmokeTests {
                 defaults.stringArray(forKey: "KeyScribe.memoryEnabledSourceFolderIDs") == ["/tmp/keyscribe-a", "/tmp/keyscribe-c"],
                 "Enabled source folder IDs key should be saved in UserDefaults"
             )
+
+            testAdaptiveCorrectionAmbiguousMergeAutoApplyGating()
         }
 
         await MainActor.run {
@@ -128,5 +130,66 @@ struct SettingsStoreWhisperSmokeTests {
         }
 
         print("✅ Settings store whisper smoke tests passed")
+    }
+
+    @MainActor
+    private static func testAdaptiveCorrectionAmbiguousMergeAutoApplyGating() {
+        let now = Date()
+
+        let singleLearnStore = AdaptiveCorrectionStore.inMemoryStoreForSmokeTests(
+            seedCorrections: [
+                .init(source: "time of", replacement: "timeoff", learnCount: 1, updatedAt: now)
+            ]
+        )
+        let singleLearnResult = singleLearnStore.applyWithEvents(to: "what time of day is it")
+        check(
+            singleLearnResult.text == "what time of day is it",
+            "Ambiguous merged corrections should not auto-apply after a single learn"
+        )
+        check(
+            singleLearnResult.appliedEvents.isEmpty,
+            "Ambiguous merged corrections should not report applied events after a single learn"
+        )
+
+        let repeatedLearnStore = AdaptiveCorrectionStore.inMemoryStoreForSmokeTests(
+            seedCorrections: [
+                .init(source: "time of", replacement: "timeoff", learnCount: 2, updatedAt: now)
+            ]
+        )
+        let repeatedLearnResult = repeatedLearnStore.applyWithEvents(to: "need time of tomorrow")
+        check(
+            repeatedLearnResult.text == "need timeoff tomorrow",
+            "Ambiguous merged corrections should auto-apply after repeated learns"
+        )
+        check(
+            repeatedLearnResult.appliedEvents.count == 1,
+            "Ambiguous merged corrections should emit an applied event once they are trusted"
+        )
+
+        let typoStore = AdaptiveCorrectionStore.inMemoryStoreForSmokeTests(
+            seedCorrections: [
+                .init(source: "teh", replacement: "the", learnCount: 1, updatedAt: now)
+            ]
+        )
+        let typoResult = typoStore.applyWithEvents(to: "teh cat")
+        check(
+            typoResult.text == "the cat",
+            "Non-ambiguous single-word corrections should still auto-apply at learn count 1"
+        )
+
+        let manualStore = AdaptiveCorrectionStore.inMemoryStoreForSmokeTests()
+        guard let manualCorrection = manualStore.upsertManualCorrection(source: "time of", replacement: "timeoff") else {
+            check(false, "Manual correction should be accepted for valid input")
+            return
+        }
+        check(
+            manualCorrection.learnCount >= 2,
+            "Manual corrections should be trusted immediately to avoid extra confirmation loops"
+        )
+        let manualResult = manualStore.applyWithEvents(to: "need time of tomorrow")
+        check(
+            manualResult.text == "need timeoff tomorrow",
+            "Manual corrections should auto-apply immediately even for ambiguous merged phrases"
+        )
     }
 }

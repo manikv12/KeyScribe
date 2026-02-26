@@ -39,6 +39,8 @@ final class AdaptiveCorrectionStore: ObservableObject {
         let source: String
         let sourceTokens: [String]
         let replacement: String
+        let learnCount: Int
+        let minimumLearnCountToApply: Int
     }
 
     static let shared = AdaptiveCorrectionStore()
@@ -64,11 +66,33 @@ final class AdaptiveCorrectionStore: ObservableObject {
         pattern: "[A-Za-z0-9]+(?:[._'/-][A-Za-z0-9]+)*",
         options: []
     )
+    private static let ambiguousMergeFunctionWords: Set<String> = [
+        "a", "an", "and", "as", "at", "by", "for", "from", "if", "in", "of", "on", "or", "the", "to", "with"
+    ]
+
+    private let persistenceEnabled: Bool
     private var applyMatcherIndexByFirstToken: [String: [ApplyMatcher]] = [:]
     private var applyMatcherIndexNeedsRebuild = true
 
-    private init() {
-        load()
+    private init(
+        loadPersistedCorrections: Bool = true,
+        persistenceEnabled: Bool = true,
+        seedCorrections: [LearnedCorrection] = []
+    ) {
+        self.persistenceEnabled = persistenceEnabled
+        if loadPersistedCorrections {
+            load()
+        } else {
+            learnedCorrections = seedCorrections
+        }
+    }
+
+    static func inMemoryStoreForSmokeTests(seedCorrections: [LearnedCorrection] = []) -> AdaptiveCorrectionStore {
+        AdaptiveCorrectionStore(
+            loadPersistedCorrections: false,
+            persistenceEnabled: false,
+            seedCorrections: seedCorrections
+        )
     }
 
     func apply(to text: String) -> String {
@@ -103,6 +127,7 @@ final class AdaptiveCorrectionStore: ObservableObject {
 
             var matchedCorrection: ApplyMatcher?
             for candidate in candidates {
+                guard candidate.learnCount >= candidate.minimumLearnCountToApply else { continue }
                 let sourceTokens = candidate.sourceTokens
                 guard index + sourceTokens.count <= tokens.count else { continue }
 
@@ -237,8 +262,8 @@ final class AdaptiveCorrectionStore: ObservableObject {
             var existing = learnedCorrections[existingIndex]
             existing.replacement = replacement
             existing.updatedAt = Date()
-            if existing.learnCount < 1 {
-                existing.learnCount = 1
+            if existing.learnCount < 2 {
+                existing.learnCount = 2
             }
             learnedCorrections[existingIndex] = existing
             persist()
@@ -248,7 +273,7 @@ final class AdaptiveCorrectionStore: ObservableObject {
         let created = LearnedCorrection(
             source: source,
             replacement: replacement,
-            learnCount: 1,
+            learnCount: 2,
             updatedAt: Date()
         )
         learnedCorrections.insert(created, at: 0)
@@ -286,6 +311,67 @@ final class AdaptiveCorrectionStore: ObservableObject {
         return true
     }
 
+    private func minimumLearnCountForAutoApply(sourceTokens: [String], replacement: String) -> Int {
+        isAmbiguousConcatenationMerge(sourceTokens: sourceTokens, replacement: replacement) ? 2 : 1
+    }
+
+    private func isAmbiguousConcatenationMerge(sourceTokens: [String], replacement: String) -> Bool {
+        guard sourceTokens.count >= 2 else { return false }
+        let replacementTokens = tokenize(replacement).map(\.normalized)
+        guard replacementTokens.count == 1 else { return false }
+        guard editDistanceAtMostOne(sourceTokens.joined(), replacementTokens[0]) else { return false }
+        return sourceTokens.contains { Self.ambiguousMergeFunctionWords.contains($0) }
+    }
+
+    private func editDistanceAtMostOne(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs == rhs { return true }
+
+        let left = Array(lhs)
+        let right = Array(rhs)
+        let countDelta = left.count - right.count
+        if abs(countDelta) > 1 { return false }
+
+        if countDelta == 0 {
+            var mismatches = 0
+            for index in left.indices where left[index] != right[index] {
+                mismatches += 1
+                if mismatches > 1 {
+                    return false
+                }
+            }
+            return true
+        }
+
+        if countDelta > 0 {
+            return canAlignBySkippingSingleCharacter(longer: left, shorter: right)
+        }
+
+        return canAlignBySkippingSingleCharacter(longer: right, shorter: left)
+    }
+
+    private func canAlignBySkippingSingleCharacter(longer: [Character], shorter: [Character]) -> Bool {
+        var longIndex = 0
+        var shortIndex = 0
+        var skipped = false
+
+        while longIndex < longer.count, shortIndex < shorter.count {
+            if longer[longIndex] == shorter[shortIndex] {
+                longIndex += 1
+                shortIndex += 1
+                continue
+            }
+
+            if skipped {
+                return false
+            }
+
+            skipped = true
+            longIndex += 1
+        }
+
+        return true
+    }
+
     private func ensureApplyMatcherIndex() {
         guard applyMatcherIndexNeedsRebuild else { return }
         applyMatcherIndexNeedsRebuild = false
@@ -311,11 +397,17 @@ final class AdaptiveCorrectionStore: ObservableObject {
         for correction in sortedCorrections {
             let sourceTokens = correction.sourceTokens
             guard let firstToken = sourceTokens.first else { continue }
+            let minimumLearnCountToApply = minimumLearnCountForAutoApply(
+                sourceTokens: sourceTokens,
+                replacement: correction.replacement
+            )
             index[firstToken, default: []].append(
                 ApplyMatcher(
                     source: correction.source,
                     sourceTokens: sourceTokens,
-                    replacement: correction.replacement
+                    replacement: correction.replacement,
+                    learnCount: correction.learnCount,
+                    minimumLearnCountToApply: minimumLearnCountToApply
                 )
             )
         }
@@ -360,6 +452,8 @@ final class AdaptiveCorrectionStore: ObservableObject {
     }
 
     private func persist() {
+        guard persistenceEnabled else { return }
+
         if learnedCorrections.isEmpty {
             if let fileURL = Self.storageFileURL() {
                 try? FileManager.default.removeItem(at: fileURL)

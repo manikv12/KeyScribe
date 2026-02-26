@@ -129,12 +129,28 @@ struct AIMemoryStudioView: View {
         }
 
         var tint: Color {
-            AppVisualTheme.accentTint
+            switch self {
+            case .dashboard:
+                return Color(red: 0.46, green: 0.69, blue: 0.97)
+            case .connection:
+                return Color(red: 0.62, green: 0.57, blue: 0.94)
+            case .models:
+                return Color(red: 0.44, green: 0.78, blue: 0.82)
+            case .memorySources:
+                return Color(red: 0.43, green: 0.79, blue: 0.66)
+            case .sourceFolders:
+                return Color(red: 0.44, green: 0.72, blue: 0.90)
+            case .browser:
+                return Color(red: 0.52, green: 0.63, blue: 0.96)
+            case .actions:
+                return Color(red: 0.93, green: 0.67, blue: 0.39)
+            }
         }
     }
 
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let studioSidebarWidth: CGFloat = 190
+    private let aiCorePages: [StudioPage] = [.dashboard, .connection, .models]
 
     var body: some View {
         ZStack {
@@ -155,25 +171,13 @@ struct AIMemoryStudioView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(.regularMaterial)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(AppVisualTheme.baseTint.opacity(0.05))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .stroke(Color.primary.opacity(0.20), lineWidth: 0.7)
-                        )
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
             .padding(.top, 34)
             .padding(.horizontal, 12)
             .padding(.bottom, 12)
         }
         .appScrollbars()
+        .tint(AppVisualTheme.accentTint)
         .sheet(isPresented: $showingProvidersSheet) {
             providersSelectionSheet
         }
@@ -184,6 +188,7 @@ struct AIMemoryStudioView: View {
             memoryDetailSheet
         }
         .onAppear {
+            sanitizeSelectedStudioPage()
             prepare()
         }
         .onReceive(
@@ -207,21 +212,29 @@ struct AIMemoryStudioView: View {
     }
 
     private var studioBackground: some View {
-        AppChromeBackground()
+        AppSplitChromeBackground(
+            leadingPaneFraction: 0.24,
+            leadingPaneMaxWidth: studioSidebarWidth + 26,
+            leadingTint: AppVisualTheme.sidebarTint,
+            trailingTint: Color.black,
+            accent: AppVisualTheme.accentTint
+        )
     }
 
     private var studioHeader: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("AI Memory Studio")
+                    Text("AI Studio")
                         .font(.system(size: 30, weight: .bold, design: .rounded))
-                    Text("Configure memory sources and rewrite models.")
+                    Text(isMemoryFeatureEnabled
+                         ? "Configure AI providers, prompt rewrite, and memory systems."
+                         : "Configure AI providers and prompt rewrite.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                metricPill(label: "Assistant", value: memoryAssistantStateLabel, tint: memoryAssistantStateTint)
+                metricPill(label: "Assistant", value: promptAssistantStateLabel, tint: promptAssistantStateTint)
             }
 
             HStack(spacing: 8) {
@@ -230,16 +243,31 @@ struct AIMemoryStudioView: View {
                     value: "\(connectedModelProviderCount)/\(PromptRewriteProviderMode.allCases.count)",
                     tint: AppVisualTheme.accentTint
                 )
-                metricPill(
-                    label: "Folders",
-                    value: "\(enabledSourceFolderCount)/\(totalSourceFoldersForEnabledProvidersCount)",
-                    tint: AppVisualTheme.accentTint
-                )
-                metricPill(
-                    label: "Visible",
-                    value: "\(memoryBrowserVisibleCount)",
-                    tint: AppVisualTheme.accentTint
-                )
+                if isMemoryFeatureEnabled {
+                    metricPill(
+                        label: "Folders",
+                        value: "\(enabledSourceFolderCount)/\(totalSourceFoldersForEnabledProvidersCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Visible",
+                        value: "\(memoryBrowserVisibleCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                } else {
+                    metricPill(
+                        label: "Rewrite",
+                        value: settings.promptRewriteEnabled ? "On" : "Off",
+                        tint: promptAssistantStateTint
+                    )
+                    metricPill(
+                        label: "Model",
+                        value: settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? settings.promptRewriteProviderMode.defaultModel
+                            : settings.promptRewriteOpenAIModel,
+                        tint: AppVisualTheme.accentTint
+                    )
+                }
             }
         }
         .padding(18)
@@ -263,7 +291,7 @@ struct AIMemoryStudioView: View {
                 .padding(.top, 10)
 
             VStack(spacing: 3) {
-                ForEach(StudioPage.allCases) { page in
+                ForEach(availableStudioPages) { page in
                     Button {
                         selectedStudioPage = page
                     } label: {
@@ -279,14 +307,6 @@ struct AIMemoryStudioView: View {
         .padding(.bottom, 10)
         .frame(width: studioSidebarWidth)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.clear)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.primary.opacity(0.16), lineWidth: 0.6)
-                )
-        )
     }
 
     @ViewBuilder
@@ -294,14 +314,13 @@ struct AIMemoryStudioView: View {
         let isSelected = selectedStudioPage == page
 
         HStack(spacing: 10) {
-            Image(systemName: page.iconName)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(isSelected ? .white : page.tint)
-                .frame(width: 26, height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(isSelected ? page.tint : page.tint.opacity(0.12))
-                )
+            AppIconBadge(
+                symbol: page.iconName,
+                tint: page.tint,
+                size: 24,
+                symbolSize: 11,
+                isEmphasized: isSelected
+            )
 
             Text(page.title)
                 .font(.callout.weight(isSelected ? .semibold : .medium))
@@ -316,10 +335,10 @@ struct AIMemoryStudioView: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? page.tint.opacity(0.20) : Color.clear)
+                .fill(isSelected ? page.tint.opacity(0.06) : Color.clear)
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(isSelected ? page.tint.opacity(0.62) : Color.clear, lineWidth: 0.8)
+                        .stroke(isSelected ? page.tint.opacity(0.22) : Color.clear, lineWidth: 0.8)
                 )
         )
     }
@@ -334,41 +353,66 @@ struct AIMemoryStudioView: View {
         case .models:
             studioModelPage
         case .memorySources:
-            studioProvidersPage
+            if isMemoryFeatureEnabled { studioProvidersPage } else { studioOverviewPage }
         case .sourceFolders:
-            studioSourceFoldersPage
+            if isMemoryFeatureEnabled { studioSourceFoldersPage } else { studioOverviewPage }
         case .browser:
-            studioBrowserPage
+            if isMemoryFeatureEnabled { studioBrowserPage } else { studioOverviewPage }
         case .actions:
-            studioActionsPage
+            if isMemoryFeatureEnabled { studioActionsPage } else { studioOverviewPage }
         }
     }
 
     private var studioOverviewPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsCard(
-                title: "AI Memory Assistant",
-                subtitle: "Toggle the assistant and auto-refresh behavior.",
+                title: isMemoryFeatureEnabled ? "AI Memory Assistant" : "AI Prompt Assistant",
+                subtitle: isMemoryFeatureEnabled
+                    ? "Toggle the assistant and auto-refresh behavior."
+                    : "Toggle prompt correction and formatting behavior.",
                 symbol: "brain.head.profile",
-                tint: memoryAssistantStateTint
+                tint: promptAssistantStateTint
             ) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
-                    Toggle("Auto-refresh detected providers and folders", isOn: $settings.memoryProviderCatalogAutoUpdate)
+                    Toggle("Enable AI prompt correction", isOn: $settings.promptRewriteEnabled)
+                    if isMemoryFeatureEnabled {
+                        Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
+                        Toggle("Auto-refresh detected providers and folders", isOn: $settings.memoryProviderCatalogAutoUpdate)
+                    }
                     Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
-                        .disabled(!settings.memoryIndexingEnabled)
-                    Text("Turn this off if you only want manual control via maintenance actions.")
+                        .disabled(!settings.promptRewriteEnabled)
+                    Toggle(
+                        "Enable conversation-aware rewrite history (app + screen)",
+                        isOn: $settings.promptRewriteConversationHistoryEnabled
+                    )
+                    .disabled(!settings.promptRewriteEnabled)
+                    if settings.promptRewriteConversationHistoryEnabled {
+                        HStack {
+                            Text("Conversation timeout")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(Int(settings.promptRewriteConversationTimeoutMinutes.rounded())) min")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.top, 2)
+                    }
+                    Text(isMemoryFeatureEnabled
+                         ? "Turn this off if you only want manual control via maintenance actions."
+                         : "Prompt correction works without memory indexing in this mode.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
 
-            settingsCard(
-                title: "Memory Analytics",
-                subtitle: "Repeated mistakes avoided, invalidation rate, and fix success by provider/project.",
-                symbol: "chart.line.uptrend.xyaxis",
-                tint: AppVisualTheme.accentTint
-            ) {
+            if isMemoryFeatureEnabled {
+                settingsCard(
+                    title: "Memory Analytics",
+                    subtitle: "Repeated mistakes avoided, invalidation rate, and fix success by provider/project.",
+                    symbol: "chart.line.uptrend.xyaxis",
+                    tint: AppVisualTheme.accentTint
+                ) {
                 HStack(spacing: 8) {
                     metricPill(
                         label: "Avoided",
@@ -378,12 +422,12 @@ struct AIMemoryStudioView: View {
                     metricPill(
                         label: "Invalidation",
                         value: percentLabel(memoryAnalytics.overview.invalidationRate),
-                        tint: .orange
+                        tint: AppVisualTheme.accentTint
                     )
                     metricPill(
                         label: "Fix Success",
                         value: percentLabel(memoryAnalytics.overview.fixSuccessRate),
-                        tint: .green
+                        tint: AppVisualTheme.accentTint
                     )
                     metricPill(
                         label: "Tracked",
@@ -426,16 +470,17 @@ struct AIMemoryStudioView: View {
                                     .frame(width: 58, alignment: .trailing)
                                 Text("\(row.invalidatedCount)")
                                     .font(.caption.monospacedDigit())
-                                    .foregroundStyle(row.invalidatedCount > 0 ? .orange : .secondary)
+                                    .foregroundStyle(row.invalidatedCount > 0 ? AppVisualTheme.accentTint : .secondary)
                                     .frame(width: 48, alignment: .trailing)
                                 Text(percentLabel(row.successRate))
                                     .font(.caption.monospacedDigit())
-                                    .foregroundStyle(row.successRate >= 0.6 ? .green : .secondary)
+                                    .foregroundStyle(row.successRate >= 0.6 ? AppVisualTheme.accentTint : .secondary)
                                     .frame(width: 56, alignment: .trailing)
                             }
                         }
                     }
                 }
+            }
             }
 
             Text("Quick Navigation")
@@ -444,7 +489,7 @@ struct AIMemoryStudioView: View {
                 .padding(.leading, 2)
 
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                ForEach(StudioPage.allCases.filter { $0 != .dashboard }) { page in
+                ForEach(availableStudioPages.filter { $0 != .dashboard }) { page in
                     Button {
                         selectedStudioPage = page
                     } label: {
@@ -455,7 +500,7 @@ struct AIMemoryStudioView: View {
                                 .frame(width: 24, height: 24)
                                 .background(
                                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(page.tint.opacity(0.12))
+                                        .fill(page.tint.opacity(0.06))
                                 )
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(page.title)
@@ -475,12 +520,12 @@ struct AIMemoryStudioView: View {
                                 .fill(.regularMaterial)
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .fill(page.tint.opacity(0.14))
+                                        .fill(page.tint.opacity(0.08))
                                 )
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(page.tint.opacity(0.3), lineWidth: 0.8)
+                                .stroke(page.tint.opacity(0.2), lineWidth: 0.8)
                         )
                     }
                     .buttonStyle(.plain)
@@ -924,6 +969,14 @@ struct AIMemoryStudioView: View {
         }.count
     }
 
+    private var isMemoryFeatureEnabled: Bool {
+        FeatureFlags.aiMemoryEnabled
+    }
+
+    private var availableStudioPages: [StudioPage] {
+        isMemoryFeatureEnabled ? StudioPage.allCases : aiCorePages
+    }
+
     private var enabledSourceProviderCount: Int {
         detectedMemoryProviders.filter { settings.isMemoryProviderEnabled($0.id) }.count
     }
@@ -948,12 +1001,12 @@ struct AIMemoryStudioView: View {
         sourceFoldersForEnabledProviders.filter { settings.isMemorySourceFolderEnabled($0.id) }.count
     }
 
-    private var memoryAssistantStateLabel: String {
-        settings.memoryIndexingEnabled ? "Enabled" : "Paused"
+    private var promptAssistantStateLabel: String {
+        settings.promptRewriteEnabled ? "Enabled" : "Paused"
     }
 
-    private var memoryAssistantStateTint: Color {
-        settings.memoryIndexingEnabled ? .green : .orange
+    private var promptAssistantStateTint: Color {
+        settings.promptRewriteEnabled ? AppVisualTheme.accentTint : Color.white.opacity(0.58)
     }
 
     private var memoryBrowserVisibleCount: Int {
@@ -977,12 +1030,12 @@ struct AIMemoryStudioView: View {
                 .fill(.regularMaterial)
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(tint.opacity(0.14))
+                        .fill(tint.opacity(0.07))
                 )
         )
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(tint.opacity(0.3), lineWidth: 0.7)
+                .stroke(tint.opacity(0.22), lineWidth: 0.7)
         )
     }
 
@@ -1034,7 +1087,7 @@ struct AIMemoryStudioView: View {
                     .lineLimit(1)
                 Spacer(minLength: 0)
                 if entry.isPlanContent {
-                    memoryEntryBadge("Plan", tint: .orange)
+                    memoryEntryBadge("Plan", tint: AppVisualTheme.accentTint)
                 }
                 memoryEntryBadge(entry.provider.displayName, tint: AppVisualTheme.accentTint)
             }
@@ -1096,7 +1149,7 @@ struct AIMemoryStudioView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.06))
+                .fill(isSelected ? AppVisualTheme.accentTint.opacity(0.08) : Color.primary.opacity(0.06))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(.regularMaterial)
@@ -1105,8 +1158,8 @@ struct AIMemoryStudioView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(
-                    isSelected ? Color.accentColor.opacity(0.7) : Color.primary.opacity(0.07),
-                    lineWidth: isSelected ? 1.2 : 0.8
+                    isSelected ? AppVisualTheme.accentTint.opacity(0.22) : Color.primary.opacity(0.07),
+                    lineWidth: isSelected ? 1.0 : 0.8
                 )
         )
     }
@@ -1124,7 +1177,7 @@ struct AIMemoryStudioView: View {
                         Spacer()
                         memoryEntryBadge(entry.provider.displayName, tint: AppVisualTheme.accentTint)
                         if entry.isPlanContent {
-                            memoryEntryBadge("Plan", tint: .orange)
+                            memoryEntryBadge("Plan", tint: AppVisualTheme.accentTint)
                         }
                         Button("Done") {
                             showMemoryDetailSheet = false
@@ -1375,7 +1428,7 @@ struct AIMemoryStudioView: View {
                                         .fill(.regularMaterial)
                                         .overlay(
                                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(Color.accentColor.opacity(0.08))
+                                                .fill(AppVisualTheme.accentTint.opacity(0.05))
                                         )
                                 )
                             }
@@ -1400,12 +1453,16 @@ struct AIMemoryStudioView: View {
     private func memoryEntryBadge(_ label: String, tint: Color) -> some View {
         Text(label)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(tint)
+            .foregroundStyle(Color.white.opacity(0.88))
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(
                 Capsule(style: .continuous)
-                    .fill(tint.opacity(0.16))
+                    .fill(Color.white.opacity(0.08))
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(tint.opacity(0.22), lineWidth: 0.7)
+                    )
             )
     }
 
@@ -1483,7 +1540,6 @@ struct AIMemoryStudioView: View {
                 .textFieldStyle(.roundedBorder)
 
             Toggle("Always convert generated suggestions to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
-                .disabled(!settings.memoryIndexingEnabled)
 
             Button("Use \(mode.displayName) Defaults") {
                 settings.applyPromptRewriteProviderDefaultsIfNeeded(force: true)
@@ -1570,7 +1626,7 @@ struct AIMemoryStudioView: View {
 
             HStack(spacing: 8) {
                 Image(systemName: isConnected ? "checkmark.shield.fill" : "key.slash.fill")
-                    .foregroundStyle(isConnected ? .green : .orange)
+                    .foregroundStyle(isConnected ? AppVisualTheme.accentTint : AppVisualTheme.baseTint)
                 Text(isConnected ? "OAuth session is active." : "OAuth session is inactive.")
                     .font(.callout)
                 Spacer()
@@ -1655,6 +1711,10 @@ struct AIMemoryStudioView: View {
     private func promptRewriteAuthStateLabel(for mode: PromptRewriteProviderMode) -> String {
         if mode.supportsOAuthSignIn {
             let isConnected = oauthConnectedProviders[mode.rawValue] ?? false
+            let hasKey = !settings.promptRewriteOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if isConnected && hasKey {
+                return "OAuth + API key"
+            }
             return isConnected ? "OAuth connected" : "OAuth not connected"
         }
 
@@ -1668,12 +1728,12 @@ struct AIMemoryStudioView: View {
 
     private func promptRewriteAuthStateTint(for mode: PromptRewriteProviderMode) -> Color {
         switch promptRewriteAuthStateLabel(for: mode) {
-        case "OAuth connected", "API key configured":
-            return .green
+        case "OAuth connected", "OAuth + API key", "API key configured":
+            return AppVisualTheme.accentTint
         case "API key missing", "OAuth not connected":
-            return .orange
+            return AppVisualTheme.baseTint
         default:
-            return .blue
+            return Color.white.opacity(0.58)
         }
     }
 
@@ -1883,6 +1943,7 @@ struct AIMemoryStudioView: View {
     private func prepare() {
         refreshOAuthConnectionState()
         refreshPromptRewriteModels(showMessage: false)
+        guard isMemoryFeatureEnabled else { return }
         refreshMemoryAnalytics()
         if settings.memoryProviderCatalogAutoUpdate {
             rescanMemorySources(showMessage: false)
@@ -1895,6 +1956,12 @@ struct AIMemoryStudioView: View {
         hydrateMemorySourcesFromSavedSettings()
         normalizeMemoryBrowserSelections()
         refreshMemoryBrowser()
+    }
+
+    private func sanitizeSelectedStudioPage() {
+        if !availableStudioPages.contains(selectedStudioPage) {
+            selectedStudioPage = .dashboard
+        }
     }
 
     private func connectOAuth(for mode: PromptRewriteProviderMode) {
@@ -1940,9 +2007,6 @@ struct AIMemoryStudioView: View {
                     oauthBusyProviderRawValue = nil
                     oauthStatusMessage = "\(mode.displayName) OAuth connected."
                     resetOpenAIDeviceCodeState()
-                    if mode.requiresAPIKey {
-                        settings.promptRewriteOpenAIAPIKey = ""
-                    }
                     refreshOAuthConnectionState()
                     refreshPromptRewriteModels(showMessage: true)
                 }
@@ -1997,11 +2061,40 @@ struct AIMemoryStudioView: View {
             await MainActor.run {
                 guard requestToken == promptRewriteModelRequestToken else { return }
                 promptRewriteModelsLoading = false
-                promptRewriteAvailableModels = result.models
 
                 let currentModel = settings.promptRewriteOpenAIModel
                     .trimmingCharacters(in: .whitespacesAndNewlines)
+                let currentModelExistsInCatalog = result.models.contains { option in
+                    option.id.caseInsensitiveCompare(currentModel) == .orderedSame
+                }
+                if result.models.isEmpty, !currentModel.isEmpty {
+                    promptRewriteAvailableModels = [
+                        PromptRewriteModelOption(
+                            id: currentModel,
+                            displayName: currentModel
+                        )
+                    ]
+                } else {
+                    promptRewriteAvailableModels = result.models
+                }
+
                 if currentModel.isEmpty, let firstModel = result.models.first {
+                    settings.promptRewriteOpenAIModel = firstModel.id
+                } else if mode == .openAI,
+                          settings.hasPromptRewriteOAuthSession(for: .openAI),
+                          !settings.hasPromptRewriteAPIKey(for: .openAI),
+                          (!currentModelExistsInCatalog
+                           || !PromptRewriteModelCatalogService.isOpenAIOAuthCompatibleModelID(currentModel)) {
+                    if let preferredModelID = PromptRewriteModelCatalogService.preferredOpenAIOAuthModelID(
+                        in: result.models
+                    ) {
+                        settings.promptRewriteOpenAIModel = preferredModelID
+                    } else if let firstModel = result.models.first {
+                        settings.promptRewriteOpenAIModel = firstModel.id
+                    }
+                } else if !currentModel.isEmpty,
+                          !currentModelExistsInCatalog,
+                          let firstModel = result.models.first {
                     settings.promptRewriteOpenAIModel = firstModel.id
                 }
 
@@ -2458,7 +2551,9 @@ struct AIMemoryStudioView: View {
         } else if showMessage {
             memoryIndexingProgressSummary = nil
             memoryIndexingProgressDetail = nil
-            if !settings.memoryIndexingEnabled {
+            if !FeatureFlags.aiMemoryEnabled {
+                memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. AI memory feature flag is disabled, so no sources were queued."
+            } else if !settings.memoryIndexingEnabled {
                 memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Assistant is paused, so no sources were queued."
             } else if settings.memoryEnabledProviderIDs.isEmpty {
                 memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Enable at least one source provider to queue indexing."
@@ -2583,14 +2678,12 @@ struct AIMemoryStudioView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: symbol)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(tint)
-                    .frame(width: 28, height: 28)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(tint.opacity(0.16))
-                    )
+                AppIconBadge(
+                    symbol: symbol,
+                    tint: tint,
+                    size: 28,
+                    symbolSize: 12
+                )
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
@@ -2610,17 +2703,11 @@ struct AIMemoryStudioView: View {
             content()
         }
         .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.regularMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(tint.opacity(0.08))
-                )
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.18), lineWidth: 0.7)
+        .appThemedSurface(
+            cornerRadius: 12,
+            tint: tint,
+            strokeOpacity: 0.17,
+            tintOpacity: 0.03
         )
     }
 }

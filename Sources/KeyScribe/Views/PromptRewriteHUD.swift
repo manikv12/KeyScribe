@@ -6,6 +6,7 @@ enum PromptRewritePreviewChoice {
     case useSuggested
     case editThenInsert
     case insertOriginal
+    case rejectSuggestion
 }
 
 @MainActor
@@ -26,7 +27,7 @@ final class PromptRewriteHUDManager {
     func present(originalText: String, suggestion: PromptRewriteSuggestion) async -> PromptRewritePreviewChoice {
         if window == nil {
             let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 460, height: .zero),
+                contentRect: NSRect(x: 0, y: 0, width: 392, height: .zero),
                 styleMask: [.borderless, .nonactivatingPanel],
                 backing: .buffered,
                 defer: false
@@ -35,7 +36,7 @@ final class PromptRewriteHUDManager {
             panel.level = .floating
             panel.backgroundColor = .clear
             panel.isOpaque = false
-            panel.hasShadow = false
+            panel.hasShadow = true
             panel.hidesOnDeactivate = false
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window = panel
@@ -92,20 +93,17 @@ final class PromptRewriteHUDManager {
         let hosting = NSHostingController(rootView: view)
         window.contentViewController = hosting
 
-        let targetSize = hosting.sizeThatFits(in: NSSize(width: 460, height: 900))
+        let targetSize = hosting.sizeThatFits(in: NSSize(width: 392, height: 420))
         let frame = NSRect(
             x: 0,
             y: 0,
-            width: 460,
-            height: min(760, max(300, targetSize.height))
+            width: 392,
+            height: min(340, max(142, targetSize.height))
         )
         hosting.view.frame = frame
 
-        if let screen = NSScreen.main ?? NSScreen.screens.first {
-            let x = screen.frame.midX - (frame.width * 0.5)
-            let y = screen.frame.minY + 180
-            window.setFrame(NSRect(x: x, y: y, width: frame.width, height: frame.height), display: true)
-        }
+        let placement = resolvedFrame(for: frame.size)
+        window.setFrame(placement, display: true)
     }
 
     private func selectPage(_ index: Int) {
@@ -130,6 +128,126 @@ final class PromptRewriteHUDManager {
 
         selectedSuggestionIndex = min(index, pendingSuggestions.count - 1)
         render()
+    }
+
+    private func resolvedFrame(for panelSize: NSSize) -> NSRect {
+        let margin: CGFloat = 8
+        let anchorRect = insertionAnchorRect() ?? mouseAnchorRect()
+        let anchorPoint = NSPoint(x: anchorRect.midX, y: anchorRect.midY)
+        let screen = screenContaining(point: anchorPoint) ?? NSScreen.main ?? NSScreen.screens.first
+        let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
+
+        let preferredX = anchorRect.midX - (panelSize.width * 0.5)
+        let minX = visibleFrame.minX + margin
+        let maxX = visibleFrame.maxX - panelSize.width - margin
+        let x = min(max(preferredX, minX), maxX)
+
+        let preferredAboveY = anchorRect.maxY + margin
+        let preferredBelowY = anchorRect.minY - panelSize.height - margin
+        let minY = visibleFrame.minY + margin
+        let maxY = visibleFrame.maxY - panelSize.height - margin
+
+        let y: CGFloat
+        if preferredAboveY <= maxY {
+            y = preferredAboveY
+        } else if preferredBelowY >= minY {
+            y = preferredBelowY
+        } else {
+            y = min(max(preferredAboveY, minY), maxY)
+        }
+
+        return NSRect(x: x, y: y, width: panelSize.width, height: panelSize.height)
+    }
+
+    private func insertionAnchorRect() -> NSRect? {
+        guard AXIsProcessTrusted() else { return nil }
+
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        let focusedResult = AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        )
+        guard focusedResult == .success,
+              let focusedRef,
+              CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        let focusedElement = unsafeBitCast(focusedRef, to: AXUIElement.self)
+
+        var selectedRangeRef: CFTypeRef?
+        let selectedRangeResult = AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXSelectedTextRangeAttribute as CFString,
+            &selectedRangeRef
+        )
+        guard selectedRangeResult == .success,
+              let selectedRangeRef,
+              CFGetTypeID(selectedRangeRef) == AXValueGetTypeID() else {
+            return nil
+        }
+        let selectedRangeAXValue = unsafeBitCast(selectedRangeRef, to: AXValue.self)
+        guard AXValueGetType(selectedRangeAXValue) == .cfRange else {
+            return nil
+        }
+
+        var boundsRef: CFTypeRef?
+        let boundsResult = AXUIElementCopyParameterizedAttributeValue(
+            focusedElement,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            selectedRangeAXValue,
+            &boundsRef
+        )
+        guard boundsResult == .success,
+              let boundsRef,
+              CFGetTypeID(boundsRef) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let boundsAXValue = unsafeBitCast(boundsRef, to: AXValue.self)
+        guard AXValueGetType(boundsAXValue) == .cgRect else {
+            return nil
+        }
+
+        var cgRect = CGRect.zero
+        guard AXValueGetValue(boundsAXValue, .cgRect, &cgRect) else {
+            return nil
+        }
+
+        if let normalized = normalizeAccessibilityRectToScreen(cgRect) {
+            return normalized
+        }
+        return nil
+    }
+
+    private func normalizeAccessibilityRectToScreen(_ rect: CGRect) -> NSRect? {
+        let direct = NSRect(x: rect.origin.x, y: rect.origin.y, width: rect.width, height: rect.height)
+        let directPoint = NSPoint(x: direct.midX, y: direct.midY)
+        if screenContaining(point: directPoint) != nil {
+            return direct
+        }
+
+        let globalMaxY = NSScreen.screens.map(\.frame.maxY).max() ?? 0
+        let flippedY = globalMaxY - rect.origin.y - rect.height
+        let flipped = NSRect(x: rect.origin.x, y: flippedY, width: rect.width, height: rect.height)
+        let flippedPoint = NSPoint(x: flipped.midX, y: flipped.midY)
+        if screenContaining(point: flippedPoint) != nil {
+            return flipped
+        }
+
+        return nil
+    }
+
+    private func mouseAnchorRect() -> NSRect {
+        let point = NSEvent.mouseLocation
+        return NSRect(x: point.x, y: point.y, width: 1, height: 1)
+    }
+
+    private func screenContaining(point: NSPoint) -> NSScreen? {
+        NSScreen.screens.first { screen in
+            screen.frame.contains(point)
+        }
     }
 }
 
@@ -156,144 +274,97 @@ private struct PromptRewriteHUDView: View {
     }
 
     var body: some View {
-        VStack(spacing: 16) {
-            HStack(spacing: 8) {
-                Image(systemName: "bubble.left.and.bubble.right.fill")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.purple)
-                Text("AI Discussion")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                Spacer()
-            }
-
-            if pages.count > 1 {
-                HStack(spacing: 10) {
-                    Button {
-                        onSelectPage(safeSelectedIndex - 1)
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(safeSelectedIndex == 0)
-
-                    Text("Suggestion \(safeSelectedIndex + 1) of \(pages.count)")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    Button {
-                        onSelectPage(safeSelectedIndex + 1)
-                    } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(safeSelectedIndex >= pages.count - 1)
-
-                    Spacer()
-                }
-            }
-
+        Group {
             if let selectedPage {
-                suggestionDetail(for: selectedPage)
+                compactSuggestion(for: selectedPage)
             } else {
                 Text("No suggestion available.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .appThemedSurface(
+                        cornerRadius: 14,
+                        tint: AppVisualTheme.panelTint,
+                        strokeOpacity: 0.12,
+                        tintOpacity: 0.01
+                    )
+            }
+        }
+        .frame(width: 392)
+    }
+
+    @ViewBuilder
+    private func compactSuggestion(for page: PromptRewriteDiscussionPage) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                AppIconBadge(
+                    symbol: "sparkles",
+                    tint: AppVisualTheme.accentTint,
+                    size: 20,
+                    symbolSize: 9,
+                    isEmphasized: true
+                )
+                Text("AI suggestion")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.95))
+                Spacer(minLength: 0)
+                if pages.count > 1 {
+                    Text("\(safeSelectedIndex + 1)/\(pages.count)")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(AppVisualTheme.mutedText)
+                }
             }
 
-            HStack(spacing: 10) {
-                Button {
+            ScrollView {
+                Text(page.suggestion.suggestedText)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(.vertical, 1)
+            }
+            .frame(minHeight: 50, maxHeight: 170)
+
+            HStack(spacing: 8) {
+                Text("Esc to keep original")
+                    .font(.caption2)
+                    .foregroundStyle(AppVisualTheme.mutedText)
+                Spacer(minLength: 0)
+                Button("Insert") {
                     onChoice(.useSuggested)
-                } label: {
-                    Text("Use Suggested")
-                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.purple)
-                .disabled(selectedPage == nil)
-
-                Button {
-                    onChoice(.editThenInsert)
-                } label: {
-                    Text("Edit")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(selectedPage == nil)
-
-                Button {
-                    onChoice(.insertOriginal)
-                } label: {
-                    Text("Insert Original")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(selectedPage == nil)
+                .controlSize(.small)
+                .tint(AppVisualTheme.accentTint)
             }
-            .padding(.top, 4)
         }
-        .padding(20)
-        .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.18)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
+        .padding(12)
+        .appThemedSurface(
+            cornerRadius: 14,
+            tint: AppVisualTheme.panelTint,
+            strokeOpacity: 0.12,
+            tintOpacity: 0.01
         )
-        .frame(width: 460)
-        .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 6)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.11), lineWidth: 0.5)
+        )
+        .overlay(alignment: .bottomLeading) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(Color.white.opacity(0.10))
+                .frame(width: 12, height: 12)
+                .rotationEffect(.degrees(45))
+                .offset(x: 38, y: 6)
+        }
+        .shadow(color: .black.opacity(0.16), radius: 10, x: 0, y: 4)
+        .onExitCommand {
+            onChoice(.insertOriginal)
+        }
     }
 
     @ViewBuilder
     private func suggestionDetail(for page: PromptRewriteDiscussionPage) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let memoryContext = page.suggestion.memoryContext,
-               !memoryContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Memory Context")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.purple)
-                    Text(memoryContext)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-
-                Divider()
-                    .padding(.vertical, 2)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Suggested")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                ScrollView {
-                    Text(page.suggestion.suggestedText)
-                        .font(.callout)
-                        .foregroundStyle(.primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-                .frame(minHeight: 80, maxHeight: 220)
-            }
-
-            Divider()
-                .padding(.vertical, 2)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Original")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                ScrollView {
-                    Text(page.originalText)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-                .frame(minHeight: 56, maxHeight: 150)
-            }
-        }
+        EmptyView()
     }
 }
