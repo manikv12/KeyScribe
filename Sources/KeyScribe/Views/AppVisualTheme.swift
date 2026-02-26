@@ -2,13 +2,13 @@ import AppKit
 import SwiftUI
 
 enum AppVisualTheme {
-    static let baseTint = Color(red: 0.19, green: 0.22, blue: 0.28)
-    static let accentTint = Color(red: 0.45, green: 0.62, blue: 0.90)
-    static let canvasBase = Color(red: 0.07, green: 0.09, blue: 0.14)
-    static let canvasDeep = Color(red: 0.04, green: 0.05, blue: 0.09)
-    static let sidebarTint = Color(red: 0.11, green: 0.13, blue: 0.19)
-    static let panelTint = Color(red: 0.14, green: 0.17, blue: 0.23)
-    static let rowSelection = Color(red: 0.28, green: 0.40, blue: 0.62)
+    static let baseTint = Color(red: 0.24, green: 0.21, blue: 0.27)
+    static let accentTint = Color(red: 0.63, green: 0.58, blue: 0.83)
+    static let canvasBase = Color(red: 0.08, green: 0.08, blue: 0.12)
+    static let canvasDeep = Color(red: 0.05, green: 0.05, blue: 0.08)
+    static let sidebarTint = Color(red: 0.13, green: 0.12, blue: 0.18)
+    static let panelTint = Color(red: 0.17, green: 0.15, blue: 0.21)
+    static let rowSelection = Color(red: 0.42, green: 0.38, blue: 0.56)
     static let mutedText = Color.white.opacity(0.62)
 }
 
@@ -118,12 +118,12 @@ struct AppSplitChromeBackground: View {
                             material: .sidebar,
                             blendingMode: .behindWindow
                         )
-                        .opacity(0.58)
+                        .opacity(0.84)
 
                         LinearGradient(
                             colors: [
-                                leadingTint.opacity(0.14),
-                                leadingTint.opacity(0.05)
+                                leadingTint.opacity(0.08),
+                                leadingTint.opacity(0.02)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -131,7 +131,7 @@ struct AppSplitChromeBackground: View {
 
                         RadialGradient(
                             colors: [
-                                accent.opacity(0.06),
+                                accent.opacity(0.04),
                                 Color.clear
                             ],
                             center: .topLeading,
@@ -322,21 +322,21 @@ extension View {
                         material: .sidebar,
                         blendingMode: .withinWindow
                     )
-                    .opacity(0.88)
+                    .opacity(0.93)
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(Color.black.opacity(0.25))
+                        .fill(Color.black.opacity(0.14))
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(tint.opacity(0.05))
+                        .fill(tint.opacity(0.03))
                 )
         )
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .stroke(Color.white.opacity(0.15), lineWidth: 0.8)
+                .stroke(Color.white.opacity(0.18), lineWidth: 0.8)
         )
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)

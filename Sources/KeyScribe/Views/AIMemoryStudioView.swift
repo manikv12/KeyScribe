@@ -131,17 +131,17 @@ struct AIMemoryStudioView: View {
         var tint: Color {
             switch self {
             case .dashboard:
-                return Color(red: 0.46, green: 0.69, blue: 0.97)
+                return Color(red: 0.52, green: 0.75, blue: 0.66)
             case .connection:
-                return Color(red: 0.62, green: 0.57, blue: 0.94)
+                return Color(red: 0.72, green: 0.62, blue: 0.90)
             case .models:
-                return Color(red: 0.44, green: 0.78, blue: 0.82)
+                return Color(red: 0.50, green: 0.77, blue: 0.73)
             case .memorySources:
-                return Color(red: 0.43, green: 0.79, blue: 0.66)
+                return Color(red: 0.56, green: 0.78, blue: 0.62)
             case .sourceFolders:
-                return Color(red: 0.44, green: 0.72, blue: 0.90)
+                return Color(red: 0.63, green: 0.67, blue: 0.87)
             case .browser:
-                return Color(red: 0.52, green: 0.63, blue: 0.96)
+                return Color(red: 0.81, green: 0.61, blue: 0.78)
             case .actions:
                 return Color(red: 0.93, green: 0.67, blue: 0.39)
             }
@@ -158,9 +158,9 @@ struct AIMemoryStudioView: View {
             VStack(spacing: 0) {
                 studioHeader
 
-                HStack(spacing: 0) {
+                HStack(alignment: .top, spacing: 12) {
                     studioSidebar
-                    Divider()
+                        .appSidebarSurface(cornerRadius: 14)
 
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
@@ -169,7 +169,9 @@ struct AIMemoryStudioView: View {
                         .padding(18)
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
+                    .appThemedSurface(cornerRadius: 14, tint: AppVisualTheme.panelTint)
                 }
+                .padding(.top, 10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .padding(.top, 34)
@@ -225,11 +227,18 @@ struct AIMemoryStudioView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("AI Studio")
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
-                    Text(isMemoryFeatureEnabled
-                         ? "Configure AI providers, prompt rewrite, and memory systems."
-                         : "Configure AI providers and prompt rewrite.")
+                    HStack(spacing: 10) {
+                        AppIconBadge(
+                            symbol: selectedStudioPage.iconName,
+                            tint: selectedStudioPage.tint,
+                            size: 32,
+                            symbolSize: 14,
+                            isEmphasized: true
+                        )
+                        Text("AI Studio")
+                            .font(.system(size: 30, weight: .bold, design: .rounded))
+                    }
+                    Text(selectedStudioPage.subtitle)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
