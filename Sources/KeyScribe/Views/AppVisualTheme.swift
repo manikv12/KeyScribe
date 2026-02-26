@@ -9,6 +9,9 @@ enum AppVisualTheme {
     static let sidebarTint = Color(red: 0.13, green: 0.12, blue: 0.18)
     static let panelTint = Color(red: 0.17, green: 0.15, blue: 0.21)
     static let rowSelection = Color(red: 0.42, green: 0.38, blue: 0.56)
+    static let historyTint = Color(red: 0.56, green: 0.78, blue: 0.62)
+    static let aiStudioTint = Color(red: 0.72, green: 0.62, blue: 0.90)
+    static let settingsTint = Color(red: 0.86, green: 0.72, blue: 0.52)
     static let mutedText = Color.white.opacity(0.62)
 }
 

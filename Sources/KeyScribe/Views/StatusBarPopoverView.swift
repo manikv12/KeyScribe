@@ -71,7 +71,7 @@ struct StatusBarPopoverView: View {
                 PopoverMenuRow(
                     icon: "clock.arrow.circlepath",
                     label: "History",
-                    iconTint: Color(red: 0.56, green: 0.78, blue: 0.62)
+                    iconTint: AppVisualTheme.historyTint
                 ) {
                     viewModel.onOpenHistory?()
                 }
@@ -79,7 +79,7 @@ struct StatusBarPopoverView: View {
                 PopoverMenuRow(
                     icon: "brain.head.profile",
                     label: "AI Studio",
-                    iconTint: Color(red: 0.72, green: 0.62, blue: 0.90)
+                    iconTint: AppVisualTheme.aiStudioTint
                 ) {
                     viewModel.onOpenAIMemoryStudio?()
                 }
@@ -88,7 +88,7 @@ struct StatusBarPopoverView: View {
                     icon: "gearshape.fill",
                     label: "Settings",
                     shortcut: "⌘,",
-                    iconTint: Color(red: 0.86, green: 0.72, blue: 0.52)
+                    iconTint: AppVisualTheme.settingsTint
                 ) {
                     viewModel.onOpenSettings?()
                 }
