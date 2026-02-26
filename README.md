@@ -91,6 +91,41 @@ This produces a notarized DMG that opens without Gatekeeper warnings on any Mac.
 - With this OFF setting, KeyScribe still pastes reliably via transient clipboard flow and history, but avoids permanently pushing dictation text into clipboard managers when possible.
 - Explicit copy actions from History always copy to system clipboard by design.
 
+## Memory rewrite preview (AI-filtered indexing)
+
+KeyScribe can learn from local chat-history files and show a rewrite preview before text is inserted.
+
+### How indexing works now
+
+- Indexing scans local provider folders (for example `.codex`, `.claude`, `.cursor`, `.copilot`, `.gemini`, `.windsurf`, `.codeium`).
+- Parsed file content is **not persisted** as memory cards/events unless AI-backed rewrite extraction returns valid rewrite signal.
+- This prevents non-AI fallback indexing from filling the database with low-signal/junk memories.
+- Validation-oriented data from AI-backed extraction is still retained (for example lesson confidence and rewrite metadata).
+
+### Controls
+
+- Go to `Settings -> Memory & Sources` to control this feature.
+- Turn on `Enable AI memory assistant` to allow indexing + rewrite suggestions.
+- Use provider/folder toggles to pick which sources are allowed.
+- Click `Rescan` to detect source folders and optionally start indexing.
+- Click `Rebuild Index` when you want to re-index from scratch.
+- `Clear Memories` removes indexed memory cards and rewrite entries.
+- `Clear Archive` removes all indexed source/archive rows.
+
+When a final transcript is ready:
+
+- KeyScribe asks the rewrite backend for a suggestion using indexed memory context.
+- A blocking preview dialog appears with:
+  - `Use Suggested`
+  - `Edit Then Insert`
+  - `Insert Original`
+- If the provider fails, a blocking fallback dialog appears with:
+  - `Retry`
+  - `Insert Original`
+  - `Cancel`
+
+This is opt-in. Rewrite/provider behavior is configurable behind the backend service layer.
+
 ## Build and install
 
 Build app + drag-and-drop DMG:
@@ -143,6 +178,8 @@ Run smoke/regression suite:
 ```bash
 Scripts/run-tests.sh
 ```
+
+The smoke suite includes prompt-rewrite and memory-indexing coverage.
 
 Run insertion decision regression only:
 

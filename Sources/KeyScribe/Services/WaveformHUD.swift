@@ -6,19 +6,34 @@ private enum HUDLayout {
     static let waveformHeight: CGFloat = 34
     static let toastWidth: CGFloat = 360
     static let toastHeight: CGFloat = 38
+    static let correctionWidth: CGFloat = 520
+    static let correctionHeight: CGFloat = 44
     static let toastVerticalGap: CGFloat = 12
+    static let correctionDecisionTimeout: TimeInterval = 30
     /// Fixed offset from the bottom of the screen so the HUD always sits
     /// above the Dock region, even on screens that don't host the Dock.
     static let dockReserve: CGFloat = 80
+}
+
+private enum HUDCorrectionDecision {
+    case accept
+    case reject
+    case timedOut
 }
 
 @MainActor
 final class WaveformHUDManager {
     private var waveformPanel: NSPanel?
     private var toastPanel: NSPanel?
+    private var correctionPanel: NSPanel?
     private let waveformModel = WaveformModel()
     private let toastModel = HUDToastModel()
+    private let correctionModel = HUDCorrectionDecisionModel()
     private var toastHideWorkItem: DispatchWorkItem?
+    private var correctionHideWorkItem: DispatchWorkItem?
+    private var correctionDecisionToken = UUID()
+    private var correctionAcceptHandler: (() -> Void)?
+    private var correctionRejectHandler: (() -> Void)?
 
     func show() {
         if waveformPanel == nil {
@@ -35,6 +50,7 @@ final class WaveformHUDManager {
         waveformModel.stopAnimating()
         waveformModel.reset()
         waveformPanel?.orderOut(nil)
+        dismissCorrectionDecisionUI()
     }
 
     func updateLevel(_ level: Float) {
@@ -64,6 +80,53 @@ final class WaveformHUDManager {
         }
         toastHideWorkItem = hideWorkItem
         DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: hideWorkItem)
+    }
+
+    func presentCorrectionDecision(
+        source: String,
+        replacement: String,
+        onAccept: @escaping () -> Void,
+        onReject: @escaping () -> Void
+    ) {
+        let trimmedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedReplacement = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSource.isEmpty, !trimmedReplacement.isEmpty else { return }
+
+        if correctionPanel == nil {
+            createCorrectionPanel()
+        }
+        guard let correctionPanel else { return }
+
+        dismissCorrectionDecisionUI()
+        correctionAcceptHandler = onAccept
+        correctionRejectHandler = onReject
+
+        correctionModel.source = trimmedSource
+        correctionModel.replacement = trimmedReplacement
+
+        let token = UUID()
+        correctionDecisionToken = token
+        correctionModel.onAcceptTap = { [weak self] in
+            self?.completeCorrectionDecision(token: token, decision: .accept)
+        }
+        correctionModel.onRejectTap = { [weak self] in
+            self?.completeCorrectionDecision(token: token, decision: .reject)
+        }
+
+        repositionCorrectionPanel()
+        correctionPanel.orderFrontRegardless()
+        correctionPanel.makeKeyAndOrderFront(nil)
+
+        let hideWorkItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.completeCorrectionDecision(token: token, decision: .timedOut)
+            }
+        }
+        correctionHideWorkItem = hideWorkItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + HUDLayout.correctionDecisionTimeout,
+            execute: hideWorkItem
+        )
     }
 
     private func createWaveformPanel() {
@@ -114,6 +177,30 @@ final class WaveformHUDManager {
         toastPanel = panel
     }
 
+    private func createCorrectionPanel() {
+        let frame = NSRect(x: 0, y: 0, width: HUDLayout.correctionWidth, height: HUDLayout.correctionHeight)
+        let panel = NSPanel(
+            contentRect: frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.ignoresMouseEvents = false
+
+        let hosting = NSHostingController(rootView: HUDCorrectionDecisionView(model: correctionModel))
+        hosting.view.frame = frame
+        panel.contentViewController = hosting
+        correctionPanel = panel
+    }
+
     private func repositionWaveformPanel() {
         guard let waveformPanel else { return }
         let screen = NSScreen.main ?? NSScreen.screens.first
@@ -133,6 +220,43 @@ final class WaveformHUDManager {
         let x = screen.frame.midX - (toastPanel.frame.width * 0.5)
         let y = screen.frame.minY + HUDLayout.dockReserve + HUDLayout.waveformHeight + HUDLayout.toastVerticalGap
         toastPanel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func repositionCorrectionPanel() {
+        guard let correctionPanel else { return }
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return }
+
+        let x = screen.frame.midX - (correctionPanel.frame.width * 0.5)
+        let y = screen.frame.minY + HUDLayout.dockReserve + HUDLayout.waveformHeight + HUDLayout.toastVerticalGap
+        correctionPanel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func completeCorrectionDecision(token: UUID, decision: HUDCorrectionDecision) {
+        guard token == correctionDecisionToken else { return }
+
+        let onAccept = correctionAcceptHandler
+        let onReject = correctionRejectHandler
+        dismissCorrectionDecisionUI()
+
+        switch decision {
+        case .accept:
+            onAccept?()
+        case .reject:
+            onReject?()
+        case .timedOut:
+            break
+        }
+    }
+
+    private func dismissCorrectionDecisionUI() {
+        correctionHideWorkItem?.cancel()
+        correctionHideWorkItem = nil
+        correctionAcceptHandler = nil
+        correctionRejectHandler = nil
+        correctionModel.onAcceptTap = nil
+        correctionModel.onRejectTap = nil
+        correctionPanel?.orderOut(nil)
     }
 }
 
@@ -207,15 +331,53 @@ struct WaveformPanelView: View {
         .background(
             ZStack {
                 Capsule()
-                    .fill(.ultraThinMaterial)
+                    .fill(.regularMaterial)
+                Capsule()
+                    .fill(AppVisualTheme.baseTint.opacity(0.12))
                 Capsule()
                     .fill(Color.white.opacity(0.06))
                 Capsule()
-                    .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
+                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
             }
         )
         .frame(width: HUDLayout.waveformWidth, height: HUDLayout.waveformHeight, alignment: .center)
         .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
+    }
+}
+
+struct WaveformThemePreview: View {
+    let theme: WaveformTheme
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.red.opacity(0.8))
+                .frame(width: 8, height: 8)
+
+            SoundWaveLine(
+                level: 0.48,
+                phase: 1.2,
+                impulse: 0.12,
+                theme: theme
+            )
+            .frame(height: 22)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            ZStack {
+                Capsule()
+                    .fill(.regularMaterial)
+                Capsule()
+                    .fill(AppVisualTheme.baseTint.opacity(0.12))
+                Capsule()
+                    .fill(Color.white.opacity(0.06))
+                Capsule()
+                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
+            }
+        )
+        .frame(height: 34)
+        .frame(width: 188, height: 34, alignment: .leading)
     }
 }
 
@@ -250,15 +412,132 @@ struct HUDToastView: View {
         .background(
             ZStack {
                 Capsule()
-                    .fill(.ultraThinMaterial)
+                    .fill(.regularMaterial)
+                Capsule()
+                    .fill(AppVisualTheme.baseTint.opacity(0.12))
                 Capsule()
                     .fill(Color.white.opacity(0.06))
                 Capsule()
-                    .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
+                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
             }
         )
         .frame(width: HUDLayout.toastWidth, height: HUDLayout.toastHeight, alignment: .center)
         .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
+    }
+}
+
+@MainActor
+final class HUDCorrectionDecisionModel: ObservableObject {
+    @Published var source: String = ""
+    @Published var replacement: String = ""
+    var onAcceptTap: (() -> Void)?
+    var onRejectTap: (() -> Void)?
+}
+
+struct HUDCorrectionDecisionView: View {
+    @ObservedObject var model: HUDCorrectionDecisionModel
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 7, height: 7)
+
+            Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.green)
+
+            Text("Save correction:")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Text("\(model.source) -> \(model.replacement)")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 4)
+
+            Button("Reject") {
+                model.onRejectTap?()
+            }
+            .buttonStyle(HUDPillActionButtonStyle(kind: .reject))
+
+            Button("Accept") {
+                model.onAcceptTap?()
+            }
+            .buttonStyle(HUDPillActionButtonStyle(kind: .accept))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            ZStack {
+                Capsule()
+                    .fill(.regularMaterial)
+                Capsule()
+                    .fill(AppVisualTheme.baseTint.opacity(0.12))
+                Capsule()
+                    .fill(Color.white.opacity(0.06))
+                Capsule()
+                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
+            }
+        )
+        .frame(width: HUDLayout.correctionWidth, height: HUDLayout.correctionHeight, alignment: .center)
+        .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
+    }
+}
+
+private struct HUDPillActionButtonStyle: ButtonStyle {
+    enum Kind {
+        case accept
+        case reject
+    }
+
+    let kind: Kind
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .fill(backgroundColor.opacity(configuration.isPressed ? 0.65 : 1))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(strokeColor.opacity(configuration.isPressed ? 0.65 : 1), lineWidth: 0.8)
+            )
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+
+    private var foregroundColor: Color {
+        switch kind {
+        case .accept:
+            return Color.green
+        case .reject:
+            return Color.red
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch kind {
+        case .accept:
+            return Color.green.opacity(0.12)
+        case .reject:
+            return Color.red.opacity(0.12)
+        }
+    }
+
+    private var strokeColor: Color {
+        switch kind {
+        case .accept:
+            return Color.green.opacity(0.36)
+        case .reject:
+            return Color.red.opacity(0.36)
+        }
     }
 }
 

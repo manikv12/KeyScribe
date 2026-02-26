@@ -16,33 +16,39 @@ struct PermissionOnboardingView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .underPageBackgroundColor).opacity(0.88)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            AppChromeBackground()
 
             VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Finish Permission Setup")
-                        .font(.title2.weight(.semibold))
-                    Text("KeyScribe needs these permissions before dictation and global shortcuts can run.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    if let icon = NSApplication.shared.applicationIconImage {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 56, height: 56)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Finish Permission Setup")
+                            .font(.title2.weight(.semibold))
+                        Text("KeyScribe needs these permissions before dictation and global shortcuts can run.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
                     permissionRow(
-                        title: "Accessibility",
-                        hint: "Required for global hotkeys and text insertion across apps.",
-                        granted: accessibilityGranted,
-                        required: true,
-                        action: {
-                            PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
+                            title: "Accessibility",
+                            hint: "Required for global hotkeys and text insertion across apps.",
+                            granted: accessibilityGranted,
+                            required: true,
+                            action: {
+                            PermissionCenter.requestAccessibilityPermission(
+                                using: settings,
+                                promptIfNeeded: true,
+                                openSettingsIfDenied: false
+                            )
                             refreshPermissionSnapshot()
                         }
                     )
@@ -72,14 +78,7 @@ struct PermissionOnboardingView: View {
                     )
                 }
                 .padding(12)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.primary.opacity(0.05))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-                )
+                .appThemedSurface(cornerRadius: 12, strokeOpacity: 0.17)
 
                 if !allRequiredGranted {
                     Text("KeyScribe stays paused until required permissions are granted.")
@@ -110,7 +109,10 @@ struct PermissionOnboardingView: View {
                 }
             }
             .padding(22)
+            .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.18)
+            .shadow(color: .black.opacity(0.16), radius: 18, x: 0, y: 10)
             .frame(width: 620, height: 460, alignment: .topLeading)
+            .padding(18)
         }
         .onAppear {
             refreshPermissionSnapshot()

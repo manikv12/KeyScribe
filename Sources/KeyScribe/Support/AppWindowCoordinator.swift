@@ -5,6 +5,8 @@ import SwiftUI
 final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let settingsDefaultSize = NSSize(width: 900, height: 680)
     private let settingsMinimumSize = NSSize(width: 820, height: 560)
+    private let aiStudioDefaultSize = NSSize(width: 1120, height: 760)
+    private let aiStudioMinimumSize = NSSize(width: 1000, height: 620)
     private let historyDefaultSize = NSSize(width: 620, height: 500)
     private let historyMinimumSize = NSSize(width: 520, height: 360)
     private let onboardingDefaultSize = NSSize(width: 620, height: 460)
@@ -16,6 +18,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let onInsertText: (String) -> Void
 
     private var settingsWindowController: NSWindowController?
+    private var aiStudioWindowController: NSWindowController?
     private var historyWindowController: NSWindowController?
     private var onboardingWindowController: NSWindowController?
     private var historyTargetApplication: NSRunningApplication?
@@ -36,6 +39,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
     func openSettingsWindow() {
         onStatusUpdate(.openingSettings)
+        requestDockActivation()
 
         if settingsWindowController == nil {
             let hostingController = NSHostingController(rootView: SettingsView().environmentObject(settings))
@@ -49,6 +53,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.title = "KeyScribe Settings"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = true
             window.contentViewController = hostingController
@@ -83,6 +89,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
     func openPermissionOnboardingWindow(onComplete: @escaping () -> Void) {
         onboardingCompletion = onComplete
+        requestDockActivation()
 
         if onboardingWindowController == nil {
             let onboardingView = PermissionOnboardingView(onComplete: { [weak self] in
@@ -102,6 +109,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.title = "KeyScribe Permission Setup"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = true
             window.contentViewController = hostingController
@@ -133,6 +142,55 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
+    func openAIMemoryStudioWindow() {
+        onStatusUpdate(.openingSettings)
+        requestDockActivation()
+
+        if aiStudioWindowController == nil {
+            let hostingController = NSHostingController(rootView: AIMemoryStudioView().environmentObject(settings))
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: aiStudioDefaultSize),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "AI Studio"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.toolbarStyle = .unifiedCompact
+            window.isMovableByWindowBackground = true
+            window.contentViewController = hostingController
+            window.hidesOnDeactivate = false
+            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.isReleasedWhenClosed = false
+            window.minSize = aiStudioMinimumSize
+            centerWindowOnActiveScreen(window)
+            window.delegate = self
+
+            aiStudioWindowController = NSWindowController(window: window)
+        }
+
+        guard let window = aiStudioWindowController?.window else {
+            onStatusUpdate(.message("Could not open AI Studio"))
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        aiStudioWindowController?.showWindow(nil)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        if window.frame.width < aiStudioMinimumSize.width || window.frame.height < aiStudioMinimumSize.height {
+            window.setContentSize(aiStudioDefaultSize)
+        }
+        centerWindowOnActiveScreen(window)
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        onStatusUpdate(.ready)
+    }
+
     func closePermissionOnboardingWindow() {
         onboardingWindowController?.close()
         onboardingWindowController = nil
@@ -143,6 +201,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             historyTargetApplication = frontmost
         }
+        requestDockActivation()
 
         if historyWindowController == nil {
             let historyView = TranscriptHistoryView(
@@ -168,6 +227,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             panel.title = "Transcript History"
             panel.titleVisibility = .hidden
             panel.titlebarAppearsTransparent = true
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
             panel.isMovableByWindowBackground = true
             panel.toolbarStyle = .unifiedCompact
             panel.contentViewController = hostingController
@@ -201,20 +262,26 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         onboardingWindowController = nil
         settingsWindowController?.close()
         settingsWindowController = nil
+        aiStudioWindowController?.close()
+        aiStudioWindowController = nil
         historyWindowController?.close()
         historyWindowController = nil
+        setActivationPolicyForOpenWindows()
     }
 
     func windowWillClose(_ notification: Notification) {
         if let closingWindow = notification.object as? NSWindow {
             if closingWindow === settingsWindowController?.window {
                 settingsWindowController = nil
+            } else if closingWindow === aiStudioWindowController?.window {
+                aiStudioWindowController = nil
             } else if closingWindow === historyWindowController?.window {
                 historyWindowController = nil
             } else if closingWindow === onboardingWindowController?.window {
                 onboardingWindowController = nil
             }
         }
+        setActivationPolicyForOpenWindows()
     }
 
     private func reinsertFromHistory(_ text: String) {
@@ -242,5 +309,18 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             y: visibleFrame.midY - (frame.height / 2)
         )
         window.setFrameOrigin(origin)
+    }
+
+    private func requestDockActivation() {
+        NSApp.setActivationPolicy(.regular)
+    }
+
+    private func setActivationPolicyForOpenWindows() {
+        let hasOpenWindows =
+            settingsWindowController != nil ||
+            aiStudioWindowController != nil ||
+            historyWindowController != nil ||
+            onboardingWindowController != nil
+        NSApp.setActivationPolicy(hasOpenWindows ? .regular : .accessory)
     }
 }

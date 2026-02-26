@@ -4,6 +4,10 @@ import Combine
 import Speech
 import SwiftUI
 
+extension Notification.Name {
+    static let keyScribeOpenAIMemoryStudio = Notification.Name("KeyScribe.openAIMemoryStudio")
+}
+
 @main
 struct KeyScribeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
@@ -28,6 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let whisperModelManager = WhisperModelManager.shared
     private let settings = SettingsStore.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
+    private let promptRewriteService = PromptRewriteService.shared
+    private let promptRewriteConversationStore = PromptRewriteConversationStore.shared
     private let postInsertCorrectionMonitor = PostInsertCorrectionMonitor()
     private let waveform = WaveformHUDManager()
     private var hotkeyManager: HoldToTalkManager?
@@ -37,11 +43,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowCoordinator: AppWindowCoordinator?
 
     private var statusItem: NSStatusItem?
-    private var statusLabelItem: NSMenuItem?
-    private var startStopMenuItem: NSMenuItem?
-    private var permissionSetupMenuItem: NSMenuItem?
+    private let statusBarViewModel = StatusBarViewModel()
+    private var popover: NSPopover?
     private var accessibilityTrustObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
+    private var aiStudioRequestObserver: NSObjectProtocol?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var permissionsReady = false
     private var didRequestStartupPermissionPrompt = false
@@ -52,6 +58,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var dictationInputMode: DictationInputMode = .idle
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
+    private var hasScheduledPermissionRestart = false
+
+    private enum PromptRewriteFailureChoice {
+        case retry
+        case insertOriginal
+        case close
+    }
+
+    private struct PromptRewriteInsertionResolution {
+        let insertionText: String
+        let conversationContext: PromptRewriteConversationContext?
+    }
     private enum DictationFeedbackCue: CaseIterable {
         case startListening
         case stopListening
@@ -59,16 +77,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case pasted
         case correctionLearned
 
+        // Keep nonisolated defaults local so this enum can be used from non-main contexts
+        // without reading @MainActor-isolated state from SettingsStore.
+        private static let defaultStartSoundName = "Ping"
+        private static let defaultStopSoundName = "Glass"
+        private static let defaultProcessingSoundName = "Ping"
+        private static let defaultPastedSoundName = "Pop"
+        private static let defaultCorrectionLearnedSoundName = "Purr"
+
         var systemSoundName: String {
             switch self {
             case .startListening, .processing:
-                return SettingsStore.defaultDictationStartSoundName
+                return Self.defaultStartSoundName
             case .stopListening:
-                return SettingsStore.defaultDictationStopSoundName
+                return Self.defaultStopSoundName
             case .pasted:
-                return SettingsStore.defaultDictationPastedSoundName
+                return Self.defaultPastedSoundName
             case .correctionLearned:
-                return SettingsStore.defaultDictationCorrectionLearnedSoundName
+                return Self.defaultCorrectionLearnedSoundName
             }
         }
 
@@ -97,23 +123,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         private static var startingFallback: String {
-            SettingsStore.defaultDictationStartSoundName
+            Self.defaultStartSoundName
         }
 
         private static var stopFallback: String {
-            SettingsStore.defaultDictationStopSoundName
+            Self.defaultStopSoundName
         }
 
         private static var processingFallback: String {
-            SettingsStore.defaultDictationProcessingSoundName
+            Self.defaultProcessingSoundName
         }
 
         private static var pastedFallback: String {
-            SettingsStore.defaultDictationPastedSoundName
+            Self.defaultPastedSoundName
         }
 
         private static var correctionLearnedFallback: String {
-            SettingsStore.defaultDictationCorrectionLearnedSoundName
+            Self.defaultCorrectionLearnedSoundName
         }
 
         var volumeMultiplier: Float {
@@ -213,37 +239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         transcriber.onFinalText = { [weak self] text in
             guard let self else { return }
-            let cleaned = TextCleanup.process(text, mode: self.settings.textCleanupMode)
-            guard !cleaned.isEmpty else { return }
-
-            let readyForInsert: String
-            var appliedEvents: [AdaptiveCorrectionStore.AppliedEvent] = []
-            if self.settings.adaptiveCorrectionsEnabled {
-                let applyResult = self.adaptiveCorrectionStore.applyWithEvents(to: cleaned)
-                readyForInsert = applyResult.text
-                appliedEvents = applyResult.appliedEvents
-            } else {
-                readyForInsert = cleaned
-            }
-
-            if !appliedEvents.isEmpty {
-                let applyMessage: String
-                if appliedEvents.count == 1, let first = appliedEvents.first {
-                    applyMessage = "Applied learned: \(first.source) -> \(first.replacement)"
-                } else {
-                    applyMessage = "Applied \(appliedEvents.count) learned corrections"
-                }
-                self.waveform.flashEvent(
-                    message: applyMessage,
-                    symbolName: "arrow.triangle.2.circlepath.circle.fill",
-                    duration: 1.2
-                )
-            }
-
-            self.transcriptHistory.add(readyForInsert)
-            self.insertText(readyForInsert, trackCorrections: self.settings.adaptiveCorrectionsEnabled)
             Task { @MainActor in
-                self.setUIStatus(.ready)
+                await self.handleFinalTranscript(text)
             }
         }
 
@@ -280,7 +277,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.schedulePermissionRestartIfNeeded()
                 self?.updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+            }
+        }
+
+        aiStudioRequestObserver = NotificationCenter.default.addObserver(
+            forName: .keyScribeOpenAIMemoryStudio,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.windowCoordinator?.openAIMemoryStudioWindow()
             }
         }
 
@@ -295,6 +303,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let workspaceActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
             self.workspaceActivationObserver = nil
+        }
+        if let aiStudioRequestObserver {
+            NotificationCenter.default.removeObserver(aiStudioRequestObserver)
+            self.aiStudioRequestObserver = nil
         }
         adaptiveCorrectionObserver?.cancel()
         adaptiveCorrectionObserver = nil
@@ -323,12 +335,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updatePermissionGate(openOnboardingIfNeeded: Bool, reconfigureHotkeysIfReady: Bool = false) {
+        let hadAccessibilityPermission = settings.accessibilityTrusted
         let snapshot = currentPermissionSnapshot()
         let wasReady = permissionsReady
         permissionsReady = snapshot.allRequiredGranted
 
         if permissionsReady {
             transcriber.requestPermissions(promptIfNeeded: false)
+            if !hadAccessibilityPermission && snapshot.accessibilityGranted {
+                schedulePermissionRestartIfNeeded()
+            }
             windowCoordinator?.closePermissionOnboardingWindow()
             if !wasReady || reconfigureHotkeysIfReady {
                 applyHotkeyMode()
@@ -351,6 +367,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updateMenuState()
+    }
+
+    private func schedulePermissionRestartIfNeeded() {
+        guard !hasScheduledPermissionRestart else { return }
+        hasScheduledPermissionRestart = true
+
+        let appURL = Bundle.main.bundleURL
+
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        config.promptsUserIfNeeded = false
+
+        NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, error in
+            if let error {
+                CrashReporter.logError("Restart after permission grant failed: \(error)")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                NSApplication.shared.terminate(nil)
+            }
+        }
     }
 
     private func stopPermissionDependentFeatures() {
@@ -411,51 +447,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.button?.imagePosition = .imageOnly
         statusItem?.button?.image = makeStatusIcon(isRecording: false, level: 0)
         statusItem?.button?.toolTip = "KeyScribe"
+        statusItem?.button?.target = self
+        statusItem?.button?.action = #selector(togglePopover)
+        statusItem?.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
-        let menu = NSMenu()
-        statusItem?.menu = menu
-
-        menu.addItem(NSMenuItem(title: "KeyScribe", action: nil, keyEquivalent: ""))
-
-        statusLabelItem = NSMenuItem(title: DictationUIStatus.ready.menuText, action: nil, keyEquivalent: "")
-        menu.addItem(statusLabelItem!)
-
-        menu.addItem(NSMenuItem.separator())
-
-        startStopMenuItem = NSMenuItem(title: "Start Continuous Dictation", action: #selector(toggleDictation), keyEquivalent: "")
-        startStopMenuItem?.target = self
-        menu.addItem(startStopMenuItem!)
-
-        let pasteLastItem = NSMenuItem(title: "Paste Last Transcript", action: #selector(pasteLastTranscriptMenuItem(_:)), keyEquivalent: "v")
-        pasteLastItem.keyEquivalentModifierMask = [.command, .option]
-        pasteLastItem.target = self
-        menu.addItem(pasteLastItem)
-
-        let historyItem = NSMenuItem(title: "History…", action: #selector(openHistoryMenuItem(_:)), keyEquivalent: "h")
-        historyItem.target = self
-        menu.addItem(historyItem)
-
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsMenuItem(_:)), keyEquivalent: ",")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
-
-        let permissionItem = NSMenuItem(title: "Complete Permission Setup…", action: #selector(requestAccessibilityMenuItem(_:)), keyEquivalent: "")
-        permissionItem.target = self
-        permissionItem.isHidden = permissionsReady
-        menu.addItem(permissionItem)
-        self.permissionSetupMenuItem = permissionItem
-
-        if CrashReporter.hasLogs {
-            let crashLogsItem = NSMenuItem(title: "View Crash Logs…", action: #selector(viewCrashLogs(_:)), keyEquivalent: "")
-            crashLogsItem.target = self
-            menu.addItem(crashLogsItem)
+        // Wire view model actions
+        statusBarViewModel.onToggleDictation = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.toggleContinuousDictation()
+        }
+        statusBarViewModel.onPasteLastTranscript = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.pasteLastTranscriptFromHistory()
+        }
+        statusBarViewModel.onOpenHistory = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.windowCoordinator?.openHistoryWindow()
+        }
+        statusBarViewModel.onOpenAIMemoryStudio = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.windowCoordinator?.openAIMemoryStudioWindow()
+        }
+        statusBarViewModel.onOpenSettings = { [weak self] in
+            self?.popover?.performClose(nil)
+            self?.windowCoordinator?.openSettingsWindow()
+        }
+        statusBarViewModel.onQuit = {
+            NSApplication.shared.terminate(nil)
         }
 
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let popover = NSPopover()
+        popover.contentSize = NSSize(width: 260, height: 10)
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentViewController = NSHostingController(
+            rootView: StatusBarPopoverView(viewModel: statusBarViewModel)
+        )
+        self.popover = popover
+    }
 
-        if statusItem?.button != nil {
-            statusItem?.button?.appearsDisabled = false
+    @objc private func togglePopover() {
+        guard let button = statusItem?.button else { return }
+        if let popover, popover.isShown {
+            popover.performClose(nil)
+        } else {
+            popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
     }
 
@@ -585,29 +621,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteLastTranscriptHotkeyManager?.start()
     }
 
-    @objc private func openSettingsMenuItem(_ sender: Any?) {
-        windowCoordinator?.openSettingsWindow()
-    }
-
-    @objc private func openHistoryMenuItem(_ sender: Any?) {
-        windowCoordinator?.openHistoryWindow()
-    }
-
-    @objc private func viewCrashLogs(_ sender: Any?) {
-        CrashReporter.revealInFinder()
-    }
-
-    @objc private func requestAccessibilityMenuItem(_ sender: Any?) {
-        updatePermissionGate(openOnboardingIfNeeded: true)
-    }
-
-    @objc private func pasteLastTranscriptMenuItem(_ sender: Any?) {
-        pasteLastTranscriptFromHistory()
-    }
-
-    @objc private func toggleDictation() {
-        toggleContinuousDictation()
-    }
 
     private func startHoldToTalkDictation() {
         guard DictationInputModeStateMachine.onHoldStart(dictationInputMode) == .holdToTalk else {
@@ -708,6 +721,376 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         waveform.hide()
         stopStatusIconAnimation()
         updateMenuState()
+    }
+
+    private func handleFinalTranscript(_ text: String) async {
+        let cleaned = TextCleanup.process(text, mode: settings.textCleanupMode)
+        guard !cleaned.isEmpty else {
+            setUIStatus(.ready)
+            return
+        }
+
+        let rewriteResolution: PromptRewriteInsertionResolution
+        if settings.promptRewriteEnabled {
+            guard let resolved = await resolvePromptRewriteInsertionText(for: cleaned) else {
+                setUIStatus(.ready)
+                return
+            }
+            rewriteResolution = resolved
+        } else {
+            rewriteResolution = PromptRewriteInsertionResolution(
+                insertionText: cleaned,
+                conversationContext: nil
+            )
+        }
+
+        let readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolution.insertionText)
+        if settings.promptRewriteEnabled,
+           settings.promptRewriteConversationHistoryEnabled,
+           let conversationContext = rewriteResolution.conversationContext {
+            promptRewriteConversationStore.recordTurn(
+                originalText: cleaned,
+                finalText: readyForInsert,
+                context: conversationContext,
+                timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes,
+                maxTurns: settings.promptRewriteConversationTurnLimit
+            )
+        }
+        transcriptHistory.add(readyForInsert)
+        insertText(readyForInsert, trackCorrections: settings.adaptiveCorrectionsEnabled)
+        setUIStatus(.ready)
+    }
+
+    private func resolvePromptRewriteInsertionText(
+        for cleanedTranscript: String
+    ) async -> PromptRewriteInsertionResolution? {
+        guard settings.promptRewriteEnabled else {
+            return PromptRewriteInsertionResolution(
+                insertionText: cleanedTranscript,
+                conversationContext: nil
+            )
+        }
+
+        let conversationRequestContext = promptRewriteConversationRequestContext()
+        let conversationContext = conversationRequestContext?.context
+        let conversationHistory = conversationRequestContext?.history ?? []
+
+        while true {
+            do {
+                guard let rawSuggestion = try await promptRewriteService.retrieveSuggestion(
+                    for: cleanedTranscript,
+                    conversationContext: conversationContext,
+                    conversationHistory: conversationHistory
+                ) else {
+                    return PromptRewriteInsertionResolution(
+                        insertionText: cleanedTranscript,
+                        conversationContext: conversationContext
+                    )
+                }
+                let suggestion = formatPromptRewriteSuggestion(rawSuggestion, originalText: cleanedTranscript)
+
+                while true {
+                    switch await presentPromptRewritePreviewDialog(
+                        originalText: cleanedTranscript,
+                        suggestion: suggestion
+                    ) {
+                    case .useSuggested:
+                        await recordPromptRewriteFeedback(
+                            action: .usedSuggested,
+                            originalText: cleanedTranscript,
+                            suggestedText: suggestion.suggestedText,
+                            finalInsertedText: suggestion.suggestedText
+                        )
+                        return PromptRewriteInsertionResolution(
+                            insertionText: suggestion.suggestedText,
+                            conversationContext: conversationContext
+                        )
+                    case .editThenInsert:
+                        guard let edited = presentPromptRewriteEditDialog(initialText: suggestion.suggestedText) else {
+                            continue
+                        }
+                        let normalizedEdited = PromptRewriteFormatting.prepareEditedTextForInsertion(
+                            edited,
+                            forceMarkdown: settings.promptRewriteAlwaysConvertToMarkdown
+                        )
+                        let finalEdited = normalizedEdited.isEmpty ? edited : normalizedEdited
+                        await recordPromptRewriteFeedback(
+                            action: .editedThenInserted,
+                            originalText: cleanedTranscript,
+                            suggestedText: suggestion.suggestedText,
+                            finalInsertedText: finalEdited
+                        )
+                        return PromptRewriteInsertionResolution(
+                            insertionText: finalEdited,
+                            conversationContext: conversationContext
+                        )
+                    case .insertOriginal:
+                        await recordPromptRewriteFeedback(
+                            action: .insertedOriginal,
+                            originalText: cleanedTranscript,
+                            suggestedText: suggestion.suggestedText,
+                            finalInsertedText: cleanedTranscript
+                        )
+                        return PromptRewriteInsertionResolution(
+                            insertionText: cleanedTranscript,
+                            conversationContext: conversationContext
+                        )
+                    case .rejectSuggestion:
+                        await recordPromptRewriteFeedback(
+                            action: .dismissedSuggestion,
+                            originalText: cleanedTranscript,
+                            suggestedText: suggestion.suggestedText
+                        )
+                        return nil
+                    }
+                }
+            } catch {
+                let failureDetail = promptRewriteFailureDetail(for: error)
+                switch presentPromptRewriteFailureDialog(failureDetail: failureDetail) {
+                case .retry:
+                    await recordPromptRewriteFeedback(
+                        action: .retriedAfterFailure,
+                        originalText: cleanedTranscript,
+                        failureDetail: failureDetail
+                    )
+                    continue
+                case .insertOriginal:
+                    await recordPromptRewriteFeedback(
+                        action: .insertedOriginalAfterFailure,
+                        originalText: cleanedTranscript,
+                        finalInsertedText: cleanedTranscript,
+                        failureDetail: failureDetail
+                    )
+                    return PromptRewriteInsertionResolution(
+                        insertionText: cleanedTranscript,
+                        conversationContext: conversationContext
+                    )
+                case .close:
+                    await recordPromptRewriteFeedback(
+                        action: .canceledAfterFailure,
+                        originalText: cleanedTranscript,
+                        failureDetail: failureDetail
+                    )
+                    return nil
+                }
+            }
+        }
+    }
+
+    private func promptRewriteConversationRequestContext() -> PromptRewriteConversationStore.RequestContext? {
+        guard settings.promptRewriteEnabled, settings.promptRewriteConversationHistoryEnabled else {
+            return nil
+        }
+
+        let fallbackApp = lastTargetApplication ?? lastExternalApplication
+        let capturedContext = PromptRewriteConversationContextResolver.captureCurrentContext(
+            fallbackApp: fallbackApp
+        )
+        let requestContext = promptRewriteConversationStore.prepareRequestContext(
+            capturedContext: capturedContext,
+            timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes,
+            turnLimit: settings.promptRewriteConversationTurnLimit,
+            pinnedContextID: settings.promptRewriteConversationPinnedContextID
+        )
+
+        let pinnedID = settings.promptRewriteConversationPinnedContextID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pinnedID.isEmpty, !requestContext.usesPinnedContext {
+            settings.promptRewriteConversationPinnedContextID = ""
+        }
+
+        return requestContext
+    }
+
+    private func applyAdaptiveCorrectionsIfNeeded(to text: String) -> String {
+        let readyForInsert: String
+        let appliedEvents: [AdaptiveCorrectionStore.AppliedEvent]
+        if settings.adaptiveCorrectionsEnabled {
+            let applyResult = adaptiveCorrectionStore.applyWithEvents(to: text)
+            readyForInsert = applyResult.text
+            appliedEvents = applyResult.appliedEvents
+        } else {
+            readyForInsert = text
+            appliedEvents = []
+        }
+
+        if !appliedEvents.isEmpty {
+            let applyMessage: String
+            if appliedEvents.count == 1, let first = appliedEvents.first {
+                applyMessage = "Applied learned: \(first.source) -> \(first.replacement)"
+            } else {
+                applyMessage = "Applied \(appliedEvents.count) learned corrections"
+            }
+            waveform.flashEvent(
+                message: applyMessage,
+                symbolName: "arrow.triangle.2.circlepath.circle.fill",
+                duration: 1.2
+            )
+        }
+
+        return readyForInsert
+    }
+
+    private func presentPromptRewritePreviewDialog(
+        originalText: String,
+        suggestion: PromptRewriteSuggestion
+    ) async -> PromptRewritePreviewChoice {
+        await PromptRewriteHUDManager.shared.present(originalText: originalText, suggestion: suggestion)
+    }
+
+    private func presentPromptRewriteEditDialog(initialText: String) -> String? {
+        var draft = initialText
+        while true {
+            let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 190))
+            textView.string = draft
+            textView.font = NSFont.systemFont(ofSize: 13)
+            textView.isRichText = false
+            textView.isAutomaticQuoteSubstitutionEnabled = false
+            textView.isAutomaticDashSubstitutionEnabled = false
+            textView.isAutomaticTextReplacementEnabled = false
+            textView.textContainerInset = NSSize(width: 8, height: 8)
+
+            let scrollView = NSScrollView(frame: textView.frame)
+            scrollView.borderType = .bezelBorder
+            scrollView.hasVerticalScroller = true
+            scrollView.documentView = textView
+
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Edit Suggested Rewrite"
+            alert.informativeText = "Update the text below, then choose Insert Edited."
+            alert.accessoryView = scrollView
+            alert.addButton(withTitle: "Insert Edited")
+            alert.addButton(withTitle: "Back")
+
+            let response = alert.runModal()
+            if response != .alertFirstButtonReturn {
+                return nil
+            }
+
+            let edited = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !edited.isEmpty {
+                return edited
+            }
+
+            draft = textView.string
+            let emptyAlert = NSAlert()
+            emptyAlert.alertStyle = .warning
+            emptyAlert.messageText = "Edited text is empty"
+            emptyAlert.informativeText = "Enter text before inserting, or go back and choose a different action."
+            emptyAlert.addButton(withTitle: "Continue Editing")
+            _ = emptyAlert.runModal()
+        }
+    }
+
+    private func presentPromptRewriteFailureDialog(failureDetail: String) -> PromptRewriteFailureChoice {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Rewrite Provider Unavailable"
+        alert.informativeText = "Could not get a rewrite suggestion.\n\(failureDetail)"
+        alert.addButton(withTitle: "Retry")
+        alert.addButton(withTitle: "Keep Original")
+        alert.addButton(withTitle: "Close")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .retry
+        case .alertSecondButtonReturn:
+            return .insertOriginal
+        default:
+            return .close
+        }
+    }
+
+    private func promptRewritePreviewBody(
+        originalText: String,
+        suggestion: PromptRewriteSuggestion
+    ) -> String {
+        let suggestedSnippet = promptRewriteSnippet(for: suggestion.suggestedText)
+        let originalSnippet = promptRewriteSnippet(for: originalText)
+        if let memoryContext = suggestion.memoryContext?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !memoryContext.isEmpty {
+            let memorySnippet = promptRewriteSnippet(for: memoryContext, maxLength: 160)
+            return """
+            Memory context:
+            \(memorySnippet)
+
+            Suggested:
+            \(suggestedSnippet)
+
+            Original:
+            \(originalSnippet)
+            """
+        }
+
+        return """
+        Suggested:
+        \(suggestedSnippet)
+
+        Original:
+        \(originalSnippet)
+        """
+    }
+
+    private func promptRewriteSnippet(for text: String, maxLength: Int = 320) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > maxLength else {
+            return normalized
+        }
+        let prefix = normalized.prefix(maxLength)
+        return "\(prefix)..."
+    }
+
+    private func promptRewriteFailureDetail(for error: Error) -> String {
+        if let serviceError = error as? PromptRewriteServiceError {
+            switch serviceError {
+            case let .timedOut(timeoutSeconds):
+                return "Timed out after \(String(format: "%.1f", timeoutSeconds))s."
+            case let .providerUnavailable(reason):
+                return reason
+            }
+        }
+
+        let raw = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty {
+            return "unknown-provider-error"
+        }
+        return raw
+    }
+
+    private func formatPromptRewriteSuggestion(
+        _ suggestion: PromptRewriteSuggestion,
+        originalText: String
+    ) -> PromptRewriteSuggestion {
+        let formatted = PromptRewriteFormatting.prepareSuggestedTextForInsertion(
+            suggestion.suggestedText,
+            originalText: originalText,
+            forceMarkdown: settings.promptRewriteAlwaysConvertToMarkdown
+        )
+        let resolvedText = formatted.isEmpty ? suggestion.suggestedText : formatted
+        return PromptRewriteSuggestion(
+            suggestedText: resolvedText,
+            memoryContext: suggestion.memoryContext
+        )
+    }
+
+    private func recordPromptRewriteFeedback(
+        action: PromptRewriteFeedbackAction,
+        originalText: String,
+        suggestedText: String? = nil,
+        finalInsertedText: String? = nil,
+        failureDetail: String? = nil
+    ) async {
+        let event = PromptRewriteFeedbackEvent(
+            action: action,
+            originalText: originalText,
+            suggestedText: suggestedText,
+            finalInsertedText: finalInsertedText,
+            failureDetail: failureDetail
+        )
+        await promptRewriteService.recordFeedback(event)
     }
 
     private func insertText(
@@ -859,17 +1242,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleLearnedCorrection(from originalText: String, correctedText: String, insertedText: String) {
         guard settings.adaptiveCorrectionsEnabled else { return }
 
-        let learningEvents = adaptiveCorrectionStore.learn(
+        guard let proposedEvent = adaptiveCorrectionStore.proposedLearningEvent(
             from: originalText,
             correctedText: correctedText,
             insertionHint: insertedText
-        )
-        guard !learningEvents.isEmpty else { return }
+        ) else { return }
 
-        let event = learningEvents[0]
-        let source = event.source
-        let replacement = event.replacement
-        let hudMessage = "Learned correction: \(source) -> \(replacement)"
+        let source = proposedEvent.source
+        let replacement = proposedEvent.replacement
+        waveform.presentCorrectionDecision(
+            source: source,
+            replacement: replacement,
+            onAccept: { [weak self] in
+                self?.acceptLearnedCorrection(source: source, replacement: replacement)
+            },
+            onReject: { [weak self] in
+                self?.setUIStatus(.message("Skipped correction: \(source) -> \(replacement)"))
+            }
+        )
+    }
+
+    private func acceptLearnedCorrection(source: String, replacement: String) {
+        guard let event = adaptiveCorrectionStore.acceptProposedLearning(
+            source: source,
+            replacement: replacement
+        ) else {
+            return
+        }
+
+        let hudMessage = "Learned correction: \(event.source) -> \(event.replacement)"
 
         waveform.flashEvent(
             message: hudMessage,
@@ -941,7 +1342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setUIStatus(_ status: DictationUIStatus) {
-        statusLabelItem?.title = status.menuText
+        statusBarViewModel.uiStatus = status
 
         if status.resetsDictationIndicators {
             isDictating = false
@@ -964,11 +1365,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateMenuState() {
-        startStopMenuItem?.title = dictationInputMode == .continuous
-            ? "Stop Continuous Dictation"
-            : "Start Continuous Dictation"
-        startStopMenuItem?.isEnabled = permissionsReady
-        permissionSetupMenuItem?.isHidden = permissionsReady
+        statusBarViewModel.isContinuousMode = (dictationInputMode == .continuous)
+        statusBarViewModel.permissionsReady = permissionsReady
+        statusBarViewModel.isDictating = isDictating
+        statusBarViewModel.currentAudioLevel = currentAudioLevel
         statusItem?.button?.image = makeStatusIcon(isRecording: isDictating, level: currentAudioLevel)
         statusItem?.button?.contentTintColor = nil
     }
@@ -1011,37 +1411,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let symbol: NSImage?
         if #available(macOS 13.3, *) {
-            let variableValue = isRecording ? max(0.30, Double(animatedLevel)) : 0
-            symbol = NSImage(systemSymbolName: "waveform", variableValue: variableValue, accessibilityDescription: "KeyScribe")
+            let variableValue = isRecording ? max(0.30, Double(animatedLevel)) : 0.45
+            symbol = NSImage(systemSymbolName: "waveform.circle", variableValue: variableValue, accessibilityDescription: "KeyScribe")
         } else {
-            symbol = NSImage(systemSymbolName: "waveform", accessibilityDescription: "KeyScribe")
+            symbol = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "KeyScribe")
         }
 
         guard let symbol else {
             return nil
         }
 
-        if isRecording {
-            let recordingConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .heavy)
-            let configured = symbol.withSymbolConfiguration(recordingConfig)
-            configured?.isTemplate = true
-            return configured
-        }
+        let pointSize: CGFloat = 18
+        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .light)
+        guard let configured = symbol.withSymbolConfiguration(config) else { return nil }
+        configured.isTemplate = true
 
-        let idleConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .heavy)
-        let configured = symbol.withSymbolConfiguration(idleConfig)
-        configured?.isTemplate = true
-        return configured
+        // Flip horizontally so the variable fill runs left-to-right
+        let size = configured.size
+        let flipped = NSImage(size: size, flipped: false) { rect in
+            let transform = NSAffineTransform()
+            transform.translateX(by: size.width, yBy: 0)
+            transform.scaleX(by: -1, yBy: 1)
+            transform.concat()
+            configured.draw(in: rect)
+            return true
+        }
+        flipped.isTemplate = true
+        return flipped
     }
 }
 
 struct SettingsView: View {
     private enum SettingsSection: CaseIterable, Identifiable {
-        case general
+        case essentials
         case shortcuts
-        case microphone
-        case recognition
-        case models
+        case speech
+        case aiModels
         case corrections
         case about
 
@@ -1049,11 +1454,10 @@ struct SettingsView: View {
 
         var title: String {
             switch self {
-            case .general: return "General"
+            case .essentials: return "Essentials"
             case .shortcuts: return "Shortcuts"
-            case .microphone: return "Microphone"
-            case .recognition: return "Recognition"
-            case .models: return "Models"
+            case .speech: return "Speech & Input"
+            case .aiModels: return "AI & Models"
             case .corrections: return "Corrections"
             case .about: return "About & Permissions"
             }
@@ -1061,11 +1465,10 @@ struct SettingsView: View {
 
         var subtitle: String {
             switch self {
-            case .general: return "Output, clipboard, and appearance"
+            case .essentials: return "Daily controls and dictation feedback"
             case .shortcuts: return "Hold-to-talk and continuous toggle keys"
-            case .microphone: return "Input device selection and refresh"
-            case .recognition: return "Speech behavior and text quality"
-            case .models: return "Install and select whisper models"
+            case .speech: return "Microphone, engine, timing, and text quality"
+            case .aiModels: return "whisper runtime, model library, and AI memory"
             case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
@@ -1073,11 +1476,10 @@ struct SettingsView: View {
 
         var iconName: String {
             switch self {
-            case .general: return "gearshape"
+            case .essentials: return "sparkles"
             case .shortcuts: return "keyboard"
-            case .microphone: return "mic.fill"
-            case .recognition: return "waveform"
-            case .models: return "shippingbox.fill"
+            case .speech: return "waveform.and.mic"
+            case .aiModels: return "shippingbox.fill"
             case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"
             }
@@ -1085,28 +1487,31 @@ struct SettingsView: View {
 
         var tint: Color {
             switch self {
-            case .general: return .blue
-            case .shortcuts: return .indigo
-            case .microphone: return .red
-            case .recognition: return .green
-            case .models: return .teal
-            case .corrections: return .mint
-            case .about: return .orange
+            case .essentials:
+                return Color(red: 0.44, green: 0.68, blue: 0.97)
+            case .shortcuts:
+                return Color(red: 0.59, green: 0.56, blue: 0.93)
+            case .speech:
+                return Color(red: 0.40, green: 0.78, blue: 0.72)
+            case .aiModels:
+                return Color(red: 0.45, green: 0.70, blue: 0.96)
+            case .corrections:
+                return Color(red: 0.46, green: 0.82, blue: 0.64)
+            case .about:
+                return Color(red: 0.92, green: 0.66, blue: 0.38)
             }
         }
 
         var searchTerms: [String] {
             switch self {
-            case .general:
-                return ["general", "clipboard", "waveform", "accessibility", "output", "sound", "feedback"]
+            case .essentials:
+                return ["essential", "clipboard", "waveform", "accessibility", "output", "sound", "feedback"]
             case .shortcuts:
                 return ["shortcut", "keyboard", "hold to talk", "continuous", "hotkey"]
-            case .microphone:
-                return ["microphone", "input", "device", "audio"]
-            case .recognition:
+            case .speech:
                 return ["recognition", "engine", "punctuation", "context", "cleanup", "delay", "text quality", "speech"]
-            case .models:
-                return ["whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large"]
+            case .aiModels:
+                return ["whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large", "memory", "provider", "ai"]
             case .corrections:
                 return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
             case .about:
@@ -1168,54 +1573,86 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @StateObject private var whisperModelManager = WhisperModelManager.shared
     @StateObject private var adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
-    @State private var selectedSection: SettingsSection = .general
+    @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
+    @State private var selectedSection: SettingsSection = .essentials
     @State private var searchQuery = ""
+    @State private var hoveredSection: SettingsSection?
     @State private var isCapturingShortcut = false
     @State private var shortcutCaptureTarget: ShortcutCaptureTarget?
     @State private var shortcutCaptureMessage: String?
     @State private var showHoldManualMap = false
     @State private var showContinuousManualMap = false
+    @State private var showDictationOutputSettings = false
+    @State private var showDictationSoundSettings = false
+    @State private var showWaveformAppearanceSettings = false
+    @State private var showQuickReferenceTips = false
+    @State private var showAppleSpeechAdvancedSettings = false
+    @State private var showRecognitionAdvancedSettings = false
     @State private var whisperModelSearchQuery = ""
     @State private var whisperFamilyFilter = "all"
     @State private var whisperShowInstalledOnly = false
     @State private var whisperBrowserModelID = ""
+    @State private var showWhisperModelFilters = false
+    @State private var showUninstallSheet = false
     @State private var showUninstallConfirmation = false
     @State private var uninstallDeleteDownloadedModels = false
     @State private var uninstallDeleteLearnedCorrections = false
+    @State private var uninstallDeleteMemories = false
+    @State private var uninstallDeleteProviderCredentials = false
     @State private var isCorrectionEditorPresented = false
     @State private var correctionSourceDraft = ""
     @State private var correctionReplacementDraft = ""
     @State private var correctionEditingSource: String?
     @State private var correctionDialogMessage: String?
-    private let settingsSidebarWidth: CGFloat = 278
+    @State private var detectedMemoryProviders: [MemoryIndexingSettingsService.Provider] = []
+    @State private var detectedMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] = []
+    @State private var memoryProviderFilterQuery = ""
+    @State private var memoryFolderFilterQuery = ""
+    @State private var memoryShowSelectedProvidersOnly = false
+    @State private var memoryShowSelectedFoldersOnly = false
+    @State private var memoryFoldersOnlyEnabledProviders = true
+    @State private var memoryBrowserQuery = ""
+    @State private var memoryBrowserSelectedProviderID = "all"
+    @State private var memoryBrowserSelectedFolderID = "all"
+    @State private var memoryBrowserIncludePlanContent = false
+    @State private var memoryBrowserHighSignalOnly = true
+    @State private var memoryBrowserEntries: [MemoryIndexedEntry] = []
+    @State private var promptRewriteOpenAIKeyVisible = false
+    @State private var memoryActionMessage: String?
+    @State private var showingProvidersSheet = false
+    @State private var showingSourceFoldersSheet = false
+    @State private var showingCorrectionsListSheet = false
+    @State private var correctionsSearchQuery = ""
+    private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
+    private let settingsSidebarWidth: CGFloat = 304
     private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
         ShortcutKeyOption(keyCode: $0, label: ShortcutValidation.keyName(for: $0))
     }
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .underPageBackgroundColor).opacity(0.80)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+            AppSplitChromeBackground(
+                leadingPaneFraction: 0.33,
+                leadingPaneMaxWidth: settingsSidebarWidth + 30,
+                leadingTint: AppVisualTheme.sidebarTint,
+                trailingTint: Color.black,
+                accent: AppVisualTheme.accentTint
             )
-            .ignoresSafeArea()
 
             HStack(spacing: 0) {
                 settingsSidebar
                 Divider()
+                    .overlay(Color.white.opacity(0.10))
+                    .padding(.vertical, 12)
                 settingsDetailPane
             }
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.65))
+            .padding(10)
 
             ShortcutCaptureMonitor(
                 isCapturing: $isCapturingShortcut,
                 onCapture: { keyCode, modifiers in
                     guard let target = shortcutCaptureTarget else {
-                        return
+                        return false
                     }
 
                     let didApply = applyShortcutSelection(
@@ -1224,9 +1661,10 @@ struct SettingsView: View {
                         modifiersRaw: modifiers,
                         validationMessage: "Shortcut must use 2 to 4 keys. Try again."
                     )
-                    guard didApply else { return }
+                    guard didApply else { return false }
                     shortcutCaptureTarget = nil
                     isCapturingShortcut = false
+                    return true
                 },
                 onCancel: {
                     shortcutCaptureMessage = nil
@@ -1237,7 +1675,9 @@ struct SettingsView: View {
             .frame(width: 1, height: 1)
             .opacity(0.001)
         }
-        .frame(minWidth: 860, idealWidth: 900, minHeight: 620, idealHeight: 680)
+        .appScrollbars()
+        .tint(AppVisualTheme.accentTint)
+        .frame(minWidth: 900, idealWidth: 980, minHeight: 640, idealHeight: 720)
         .onChange(of: searchQuery) { _ in
             guard !trimmedSearchQuery.isEmpty else { return }
             if let firstMatch = filteredSearchEntries.first {
@@ -1246,48 +1686,90 @@ struct SettingsView: View {
                 selectedSection = firstSection
             }
         }
+        .onChange(of: selectedSection) { _ in
+            cancelShortcutCapture()
+        }
+        .onAppear {
+            sanitizePinnedConversationContextSelection()
+        }
+        .onChange(of: promptRewriteConversationStore.contextSummaries) { _ in
+            sanitizePinnedConversationContextSelection()
+        }
         .sheet(isPresented: $isCorrectionEditorPresented) {
             correctionEditorSheet
+        }
+        .sheet(isPresented: $showingCorrectionsListSheet) {
+            correctionsListSheet
         }
     }
 
     @ViewBuilder
-    private var settingsHeader: some View {
-        HStack(alignment: .firstTextBaseline) {
+    private func settingsHeroCard(for section: SettingsSection) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            AppIconBadge(
+                symbol: section.iconName,
+                tint: section.tint,
+                size: 40,
+                symbolSize: 18,
+                isEmphasized: true
+            )
+
             VStack(alignment: .leading, spacing: 4) {
-                Text("KeyScribe Settings")
-                    .font(.title2.weight(.semibold))
-                Text("Use search or the sidebar to quickly find any setting.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text(section.title)
+                    .font(.system(size: 29, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.97))
+                Text(section.subtitle)
+                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                    .foregroundStyle(AppVisualTheme.mutedText)
             }
 
-            Spacer()
-
-            if !trimmedSearchQuery.isEmpty {
-                Button("Clear Search") {
-                    searchQuery = ""
-                }
-                .buttonStyle(.bordered)
-            }
+            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
+        .padding(18)
+        .appThemedSurface(
+            cornerRadius: 16,
+            tint: section.tint,
+            strokeOpacity: 0.20,
+            tintOpacity: 0.05
+        )
+    }
+
+    @ViewBuilder
+    private var sidebarBrandHeader: some View {
+        HStack(spacing: 10) {
+            AppIconBadge(
+                symbol: "waveform",
+                tint: AppVisualTheme.accentTint,
+                size: 34,
+                symbolSize: 15,
+                isEmphasized: true
+            )
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("KeyScribe")
+                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.96))
+                Text("Settings")
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundStyle(AppVisualTheme.mutedText)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
     }
 
     @ViewBuilder
     private var settingsSidebar: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-                TextField("Search settings…", text: $searchQuery)
-                    .textFieldStyle(.roundedBorder)
-            }
-            .padding(.bottom, 4)
+        VStack(alignment: .leading, spacing: 12) {
+            sidebarBrandHeader
 
-            VStack(spacing: 2) {
+            AppSidebarSearchField(
+                placeholder: "Search settings",
+                text: $searchQuery
+            )
+
+            VStack(spacing: 4) {
                 ForEach(filteredSections) { section in
                     Button {
                         selectedSection = section
@@ -1295,45 +1777,55 @@ struct SettingsView: View {
                         sidebarSectionRow(for: section)
                     }
                     .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onHover { isHovering in
+                        if isHovering {
+                            hoveredSection = section
+                        } else if hoveredSection == section {
+                            hoveredSection = nil
+                        }
+                    }
                 }
             }
 
             if filteredSections.isEmpty {
                 Text("No matching sections")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppVisualTheme.mutedText)
             }
 
             Spacer(minLength: 0)
         }
-        .padding(14)
+        .padding(.top, 16)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 14)
         .frame(width: settingsSidebarWidth, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
     }
 
     @ViewBuilder
     private func sidebarSectionRow(for section: SettingsSection) -> some View {
         let isSelected = selectedSection == section
+        let isHovered = hoveredSection == section
         let matchCount = matchCount(for: section)
 
         HStack(spacing: 10) {
-            Image(systemName: section.iconName)
-                .foregroundStyle(isSelected ? .white : section.tint)
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 24, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isSelected ? section.tint : section.tint.opacity(0.12))
-                )
+            AppIconBadge(
+                symbol: section.iconName,
+                tint: section.tint,
+                size: 25,
+                symbolSize: 11,
+                isEmphasized: isSelected
+            )
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(section.title)
-                    .font(.callout.weight(isSelected ? .semibold : .medium))
-                    .foregroundStyle(.primary)
+                    .font(.system(size: 14, weight: isSelected ? .semibold : .medium, design: .rounded))
+                    .foregroundStyle(isSelected ? .white : .white.opacity(0.94))
                 Text(section.subtitle)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isSelected ? .white.opacity(0.76) : AppVisualTheme.mutedText)
                     .lineLimit(1)
             }
 
@@ -1342,63 +1834,106 @@ struct SettingsView: View {
             if !trimmedSearchQuery.isEmpty && matchCount > 0 {
                 Text("\(matchCount)")
                     .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isSelected ? .white.opacity(0.84) : AppVisualTheme.mutedText)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isSelected ? Color.primary.opacity(0.08) : Color.clear)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(
+                    isSelected
+                        ? AnyShapeStyle(
+                            LinearGradient(
+                                colors: [
+                                    AppVisualTheme.rowSelection.opacity(0.46),
+                                    AppVisualTheme.rowSelection.opacity(0.30)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        : AnyShapeStyle(Color.white.opacity(isHovered ? 0.06 : 0.015))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(
+                            isSelected
+                                ? Color.white.opacity(0.22)
+                                : Color.white.opacity(isHovered ? 0.16 : 0.07),
+                            lineWidth: 0.7
+                        )
+                )
         )
     }
 
     @ViewBuilder
     private var settingsDetailPane: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 16) {
+                settingsHeroCard(for: selectedSection)
+
                 if !trimmedSearchQuery.isEmpty {
                     searchHighlightsCard
                 }
                 sectionContent(for: selectedSection)
             }
-            .padding(20)
+            .padding(.top, 34)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 20)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
 
     @ViewBuilder
     private func settingsSectionHeader(for section: SettingsSection) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(section.subtitle)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+        HStack(spacing: 8) {
+            AppIconBadge(
+                symbol: section.iconName,
+                tint: section.tint,
+                size: 22,
+                symbolSize: 10
+            )
+            Text("Section details")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(AppVisualTheme.mutedText)
         }
+        .padding(.leading, 2)
     }
 
     @ViewBuilder
     private var searchHighlightsCard: some View {
         settingsCard(
             title: "Search Results",
-            subtitle: "Matching controls for \"\(searchQuery.trimmingCharacters(in: .whitespacesAndNewlines))\""
+            subtitle: "Matching controls for \"\(searchQuery.trimmingCharacters(in: .whitespacesAndNewlines))\"",
+            symbol: "magnifyingglass.circle.fill",
+            tint: AppVisualTheme.accentTint
         ) {
             if filteredSearchEntries.isEmpty {
                 Text("No exact setting name matched. Try another keyword or use the section list.")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppVisualTheme.mutedText)
             } else {
                 ForEach(Array(filteredSearchEntries.prefix(7))) { entry in
                     Button {
                         selectedSection = entry.section
                     } label: {
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        HStack(alignment: .top, spacing: 10) {
+                            AppIconBadge(
+                                symbol: entry.section.iconName,
+                                tint: entry.section.tint,
+                                size: 24,
+                                symbolSize: 11
+                            )
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(entry.title)
                                     .font(.callout.weight(.semibold))
-                                    .foregroundStyle(.primary)
+                                    .foregroundStyle(.white.opacity(0.94))
                                 Text(entry.detail)
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppVisualTheme.mutedText)
                             }
                             Spacer()
                             Text(entry.section.title)
@@ -1409,7 +1944,15 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(entry.section.tint.opacity(0.12))
+                                .fill(Color.white.opacity(0.06))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(entry.section.tint.opacity(0.08))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .stroke(entry.section.tint.opacity(0.22), lineWidth: 0.65)
+                                )
                         )
                     }
                     .buttonStyle(.plain)
@@ -1421,16 +1964,14 @@ struct SettingsView: View {
     @ViewBuilder
     private func sectionContent(for section: SettingsSection) -> some View {
         switch section {
-        case .general:
-            generalSection
+        case .essentials:
+            essentialsSection
         case .shortcuts:
             shortcutsSection
-        case .microphone:
-            microphoneSection
-        case .recognition:
-            recognitionSection
-        case .models:
-            modelsSection
+        case .speech:
+            speechSection
+        case .aiModels:
+            aiModelsSection
         case .corrections:
             correctionsSection
         case .about:
@@ -1439,21 +1980,29 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private var generalSection: some View {
+    private var essentialsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .general)
+            settingsSectionHeader(for: .essentials)
             accessibilityCard
 
-            settingsCard(title: "Dictation Output") {
+            settingsDisclosureCard(
+                title: "Dictation Output",
+                symbol: "doc.on.clipboard",
+                tint: AppVisualTheme.accentTint,
+                isExpanded: $showDictationOutputSettings
+            ) {
                 Toggle("Also copy transcript to system clipboard", isOn: $settings.copyToClipboard)
                     .help("Turn off to keep dictations out of clipboard history. Explicit Copy actions from History still copy as expected.")
             }
 
-                    settingsCard(
-                        title: "Dictation Sounds",
-                        subtitle: "Choose the sounds for each dictation event."
-                    ) {
-                        VStack(alignment: .leading, spacing: 10) {
+            settingsDisclosureCard(
+                title: "Dictation Sounds",
+                subtitle: "Choose the sounds for each dictation event.",
+                symbol: "speaker.wave.2.fill",
+                tint: AppVisualTheme.accentTint,
+                isExpanded: $showDictationSoundSettings
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
                     dictationSoundRow(
                         title: "Start listening",
                         selection: $settings.dictationStartSoundName
@@ -1469,28 +2018,34 @@ struct SettingsView: View {
                         selection: $settings.dictationProcessingSoundName
                     )
 
-                            dictationSoundRow(
-                                title: "Pasted",
-                                selection: $settings.dictationPastedSoundName
-                            )
+                    dictationSoundRow(
+                        title: "Pasted",
+                        selection: $settings.dictationPastedSoundName
+                    )
 
-                            VStack(spacing: 6) {
-                                HStack {
-                                    Text("Feedback volume")
-                                        .font(.callout.weight(.medium))
-                                    Spacer()
-                                    Text("\(Int(settings.dictationFeedbackVolume * 100))%")
-                                        .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 52, alignment: .trailing)
-                                }
-                                Slider(value: $settings.dictationFeedbackVolume, in: 0...1, step: 0.01)
-                                    .help("Reduce this value to lower all dictation feedback sounds.")
-                            }
+                    VStack(spacing: 6) {
+                        HStack {
+                            Text("Feedback volume")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            Text("\(Int(settings.dictationFeedbackVolume * 100))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 52, alignment: .trailing)
                         }
+                        Slider(value: $settings.dictationFeedbackVolume, in: 0...1, step: 0.01)
+                            .help("Reduce this value to lower all dictation feedback sounds.")
                     }
+                }
+            }
 
-            settingsCard(title: "Waveform Appearance") {
+            settingsDisclosureCard(
+                title: "Appearance & Visual Feedback",
+                subtitle: "Customize waveform colors and visual style.",
+                symbol: "sparkles.tv.fill",
+                tint: AppVisualTheme.accentTint,
+                isExpanded: $showWaveformAppearanceSettings
+            ) {
                 Picker("Waveform Theme", selection: $settings.waveformThemeRawValue) {
                     ForEach(WaveformTheme.allCases) { theme in
                         Text(theme.rawValue).tag(theme.rawValue)
@@ -1498,9 +2053,24 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.menu)
                 .help("Choose the color scheme for the recording waveform.")
+
+                Divider()
+                    .padding(.vertical, 6)
+
+                Text("Preview")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                WaveformThemePreview(theme: settings.waveformTheme)
             }
 
-            settingsCard(title: "Quick Reference") {
+            settingsDisclosureCard(
+                title: "Quick Reference",
+                subtitle: "Reminders for common dictation actions.",
+                symbol: "lightbulb.fill",
+                tint: AppVisualTheme.accentTint,
+                isExpanded: $showQuickReferenceTips
+            ) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Paste last transcript shortcut: ⌥⌘V")
                     Text("Hold-to-talk: hold your shortcut while speaking.")
@@ -1509,6 +2079,12 @@ struct SettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
+        }
+        .onAppear {
+            showDictationOutputSettings = false
+            showDictationSoundSettings = false
+            showWaveformAppearanceSettings = false
+            showQuickReferenceTips = false
         }
     }
 
@@ -1537,7 +2113,9 @@ struct SettingsView: View {
             settingsSectionHeader(for: .shortcuts)
             settingsCard(
                 title: "Hold-to-Talk Shortcut",
-                subtitle: "Hold this shortcut while speaking."
+                subtitle: "Hold this shortcut while speaking.",
+                symbol: "mic.badge.plus",
+                tint: AppVisualTheme.accentTint
             ) {
                 shortcutSegmentRow(holdToTalkShortcutSegments)
 
@@ -1571,13 +2149,15 @@ struct SettingsView: View {
                 if !isHoldToTalkShortcutValid {
                     Text("Hold-to-talk shortcut must include 2 to 4 keys.")
                         .font(.callout)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(AppVisualTheme.accentTint)
                 }
             }
 
             settingsCard(
                 title: "Continuous Toggle Shortcut",
-                subtitle: "Press once to start, press again to stop."
+                subtitle: "Press once to start, press again to stop.",
+                symbol: "repeat.circle.fill",
+                tint: AppVisualTheme.accentTint
             ) {
                 shortcutSegmentRow(continuousToggleShortcutSegments)
 
@@ -1608,11 +2188,15 @@ struct SettingsView: View {
                 if !isContinuousToggleShortcutValid {
                     Text("Continuous toggle shortcut must include 2 to 4 keys.")
                         .font(.callout)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(AppVisualTheme.accentTint)
                 }
             }
 
-            settingsCard(title: "Reserved Shortcut") {
+            settingsCard(
+                title: "Reserved Shortcut",
+                symbol: "lock.fill",
+                tint: .gray
+            ) {
                 Text("⌥⌘V is reserved for Paste Last Transcript and cannot be reassigned.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -1621,46 +2205,53 @@ struct SettingsView: View {
             if let shortcutCaptureMessage {
                 Text(shortcutCaptureMessage)
                     .font(.callout)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(AppVisualTheme.accentTint)
             }
         }
     }
 
     @ViewBuilder
-    private var microphoneSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .microphone)
-            settingsCard(title: "Input Device") {
-                Toggle("Auto-detect microphone", isOn: $settings.autoDetectMicrophone)
+    private var microphoneInputCard: some View {
+        settingsCard(
+            title: "Input Device",
+            symbol: "mic.fill",
+            tint: AppVisualTheme.accentTint
+        ) {
+            Toggle("Auto-detect microphone", isOn: $settings.autoDetectMicrophone)
 
-                HStack {
-                    Picker("Microphone", selection: $settings.selectedMicrophoneUID) {
-                        ForEach(settings.availableMicrophones) { mic in
-                            Text(mic.name).tag(mic.uid)
-                        }
+            HStack {
+                Picker("Microphone", selection: $settings.selectedMicrophoneUID) {
+                    ForEach(settings.availableMicrophones) { mic in
+                        Text(mic.name).tag(mic.uid)
                     }
-                    .disabled(settings.autoDetectMicrophone)
-
-                    Button("Refresh") {
-                        settings.refreshMicrophones()
-                    }
-                    .disabled(settings.autoDetectMicrophone)
                 }
+                .disabled(settings.autoDetectMicrophone)
 
-                if settings.availableMicrophones.isEmpty {
-                    Text("No microphones detected.")
-                        .font(.callout)
-                        .foregroundStyle(.orange)
+                Button("Refresh") {
+                    settings.refreshMicrophones()
                 }
+                .disabled(settings.autoDetectMicrophone)
+            }
+
+            if settings.availableMicrophones.isEmpty {
+                Text("No microphones detected.")
+                    .font(.callout)
+                    .foregroundStyle(AppVisualTheme.accentTint)
             }
         }
     }
 
     @ViewBuilder
-    private var recognitionSection: some View {
+    private var speechSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .recognition)
-            settingsCard(title: "Transcription Engine") {
+            settingsSectionHeader(for: .speech)
+            microphoneInputCard
+
+            settingsCard(
+                title: "Transcription Engine",
+                symbol: "waveform",
+                tint: AppVisualTheme.accentTint
+            ) {
                 HStack {
                     Text("Engine")
                         .font(.callout.weight(.medium))
@@ -1683,7 +2274,9 @@ struct SettingsView: View {
             if settings.transcriptionEngine == .appleSpeech {
                 settingsCard(
                     title: "Apple Speech Behavior",
-                    subtitle: "Tune recognition behavior and punctuation for Apple Speech."
+                    subtitle: "Keep common recognition controls visible and tuck advanced tuning below.",
+                    symbol: "apple.logo",
+                    tint: AppVisualTheme.accentTint
                 ) {
                     Toggle("Use contextual language bias", isOn: $settings.enableContextualBias)
                         .help("Boost likely words/phrases for better recognition.")
@@ -1691,40 +2284,47 @@ struct SettingsView: View {
                     Toggle("Preserve words across short pauses", isOn: $settings.keepTextAcrossPauses)
                         .help("Helps avoid dropping earlier words when you pause briefly mid-sentence.")
 
-                    HStack {
-                        Text("Recognition mode")
-                            .font(.callout.weight(.medium))
-                        Spacer()
-                        Picker("", selection: $settings.recognitionModeRawValue) {
-                            ForEach(RecognitionMode.allCases) { mode in
-                                Text(mode.displayName).tag(mode.rawValue)
+                    DisclosureGroup("Advanced Apple Speech options", isExpanded: $showAppleSpeechAdvancedSettings) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("Recognition mode")
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+                                Picker("", selection: $settings.recognitionModeRawValue) {
+                                    ForEach(RecognitionMode.allCases) { mode in
+                                        Text(mode.displayName).tag(mode.rawValue)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(width: 150)
                             }
+                            .help(settings.recognitionMode.helpText)
+
+                            Text(settings.recognitionMode.helpText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
+                                .help("Uses Apple Speech punctuation generation during recognition.")
                         }
-                        .pickerStyle(.menu)
-                        .frame(width: 150)
+                        .padding(.top, 8)
                     }
-                    .help(settings.recognitionMode.helpText)
-
-                    Text(settings.recognitionMode.helpText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
-                        .help("Uses Apple Speech punctuation generation during recognition.")
                 }
             } else {
                 settingsCard(
                     title: "whisper.cpp",
-                    subtitle: "Model install and selection are managed in the Models section."
+                    subtitle: "Model install and selection are managed in AI & Models.",
+                    symbol: "waveform.path.ecg.rectangle",
+                    tint: AppVisualTheme.accentTint
                 ) {
-                    Text("Open Models to install, delete, and switch whisper models.")
+                    Text("Open AI & Models to install, delete, and switch whisper models.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
 
                     HStack {
-                        Button("Open Models") {
-                            selectedSection = .models
+                        Button("Open AI & Models") {
+                            selectedSection = .aiModels
                         }
                         .buttonStyle(.borderedProminent)
 
@@ -1735,7 +2335,9 @@ struct SettingsView: View {
 
             settingsCard(
                 title: "Text Quality & Timing",
-                subtitle: "Control finalize speed, cleanup, and custom vocabulary."
+                subtitle: "Keep finalize timing visible and place deep text processing in advanced controls.",
+                symbol: "text.badge.checkmark",
+                tint: AppVisualTheme.accentTint
             ) {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Finalize delay: \(Int(settings.finalizeDelaySeconds * 1000)) ms")
@@ -1745,42 +2347,47 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    Divider()
+                    DisclosureGroup("Advanced text processing", isExpanded: $showRecognitionAdvancedSettings) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("Cleanup mode")
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+                                Picker("", selection: $settings.textCleanupModeRawValue) {
+                                    ForEach(TextCleanupMode.allCases) { mode in
+                                        Text(mode.displayName).tag(mode.rawValue)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(width: 170)
+                            }
+                            .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
 
-                    HStack {
-                        Text("Cleanup mode")
-                            .font(.callout.weight(.medium))
-                        Spacer()
-                        Picker("", selection: $settings.textCleanupModeRawValue) {
-                            ForEach(TextCleanupMode.allCases) { mode in
-                                Text(mode.displayName).tag(mode.rawValue)
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Custom phrases (comma or new line separated)")
+                                    .font(.callout.weight(.medium))
+                                TextEditor(text: $settings.customContextPhrases)
+                                    .frame(height: 120)
+                                    .font(.callout)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                                    )
+                                Text("Examples: names, products, acronyms, slang")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
-                        .pickerStyle(.menu)
-                        .frame(width: 170)
-                    }
-                    .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Custom phrases (comma or new line separated)")
-                            .font(.callout.weight(.medium))
-                        TextEditor(text: $settings.customContextPhrases)
-                            .frame(height: 120)
-                            .font(.callout)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(Color.primary.opacity(0.15), lineWidth: 1)
-                            )
-                        Text("Examples: names, products, acronyms, slang")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        .padding(.top, 8)
                     }
                 }
             }
 
             settingsCard(
                 title: "Adaptive Corrections",
-                subtitle: "Learning controls and correction management moved to a dedicated section."
+                subtitle: "Learning controls and correction management moved to a dedicated section.",
+                symbol: "wand.and.rays",
+                tint: AppVisualTheme.accentTint
             ) {
                 Text("Open Corrections to review learned fixes, add custom replacements, and tune correction sound.")
                     .font(.callout)
@@ -1796,17 +2403,23 @@ struct SettingsView: View {
                 }
             }
         }
+        .onAppear {
+            showAppleSpeechAdvancedSettings = false
+            showRecognitionAdvancedSettings = false
+        }
     }
 
     @ViewBuilder
-    private var modelsSection: some View {
+    private var aiModelsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .models)
+            settingsSectionHeader(for: .aiModels)
 
             if settings.transcriptionEngine != .whisperCpp {
                 settingsCard(
                     title: "whisper.cpp Required",
-                    subtitle: "Model install and selection are only used with whisper.cpp."
+                    subtitle: "Model install and selection are only used with whisper.cpp.",
+                    symbol: "exclamationmark.triangle.fill",
+                    tint: AppVisualTheme.accentTint
                 ) {
                     Text("Switch the transcription engine to whisper.cpp to manage local models.")
                         .font(.callout)
@@ -1818,7 +2431,11 @@ struct SettingsView: View {
                     .buttonStyle(.borderedProminent)
                 }
             } else {
-                settingsCard(title: "Model Runtime") {
+                settingsCard(
+                    title: "Model Runtime",
+                    symbol: "cpu.fill",
+                    tint: AppVisualTheme.accentTint
+                ) {
                     Toggle("Use Core ML encoder when available", isOn: $settings.whisperUseCoreML)
                         .help("If installed for the selected model, Core ML can improve whisper speed on Apple Silicon.")
 
@@ -1833,44 +2450,62 @@ struct SettingsView: View {
                     }
                 }
 
-                settingsCard(
-                    title: "Model Library",
-                    subtitle: "Browse, filter, install, and choose whisper models."
-                ) {
+                    settingsCard(
+                        title: "Model Library",
+                        subtitle: "Use focused controls first, then expand filters when you need to narrow down.",
+                        symbol: "shippingbox.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
                     if WhisperModelCatalog.curatedModels.isEmpty {
                         Text("No curated whisper models are configured.")
                             .font(.callout)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(AppVisualTheme.accentTint)
                     } else {
                         VStack(alignment: .leading, spacing: 10) {
-                            HStack(spacing: 10) {
-                                TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
-                                    .textFieldStyle(.roundedBorder)
+                            DisclosureGroup("Find a model", isExpanded: $showWhisperModelFilters) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(spacing: 10) {
+                                        TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
+                                            .textFieldStyle(.roundedBorder)
 
-                                Toggle("Installed only", isOn: $whisperShowInstalledOnly)
-                                    .toggleStyle(.switch)
-                                    .fixedSize()
+                                        Toggle("Installed only", isOn: $whisperShowInstalledOnly)
+                                            .toggleStyle(.switch)
+                                            .fixedSize()
+                                    }
+
+                                    HStack(spacing: 10) {
+                                        Picker("Family", selection: $whisperFamilyFilter) {
+                                            ForEach(whisperFamilyFilterOptions, id: \.self) { family in
+                                                Text(family == "all" ? "All families" : family.capitalized)
+                                                    .tag(family)
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                        .frame(width: 180)
+
+                                        Spacer()
+                                    }
+                                }
+                                .padding(.top, 8)
                             }
 
                             HStack(spacing: 10) {
-                                Picker("Family", selection: $whisperFamilyFilter) {
-                                    ForEach(whisperFamilyFilterOptions, id: \.self) { family in
-                                        Text(family == "all" ? "All families" : family.capitalized)
-                                            .tag(family)
-                                    }
-                                }
-                                .pickerStyle(.menu)
-                                .frame(width: 180)
-
+                                Text("Model")
+                                    .font(.callout.weight(.medium))
                                 Spacer()
 
                                 Picker("Model", selection: $whisperBrowserModelID) {
-                                    ForEach(filteredWhisperModels) { model in
-                                        Text(model.displayName).tag(model.id)
+                                    if filteredWhisperModels.isEmpty {
+                                        Text("No matching models").tag("")
+                                    } else {
+                                        ForEach(filteredWhisperModels) { model in
+                                            Text(model.displayName).tag(model.id)
+                                        }
                                     }
                                 }
                                 .pickerStyle(.menu)
                                 .frame(width: 290)
+                                .disabled(filteredWhisperModels.isEmpty)
                             }
 
                             if let browsingModel = activeWhisperBrowserModel {
@@ -1885,9 +2520,13 @@ struct SettingsView: View {
                     }
                 }
             }
+
+            aiMemoryAssistantCard
+            aiProviderStatusCard
         }
         .onAppear {
             refreshWhisperModelBrowserState()
+            showWhisperModelFilters = false
         }
         .onChange(of: settings.transcriptionEngineRawValue) { _ in
             if settings.transcriptionEngine == .whisperCpp {
@@ -1917,13 +2556,178 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var aiMemoryAssistantCard: some View {
+        settingsCard(
+            title: "AI Prompt Assistant",
+            subtitle: "Enable prompt rewrite assistance and choose formatting behavior.",
+            symbol: "brain.head.profile",
+            tint: AppVisualTheme.accentTint
+        ) {
+            Toggle("Enable AI prompt correction", isOn: $settings.promptRewriteEnabled)
+            if FeatureFlags.aiMemoryEnabled {
+                Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
+            }
+            Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
+
+            HStack {
+                Text("Rewrite style")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Picker("Rewrite style", selection: $settings.promptRewriteStylePresetRawValue) {
+                    ForEach(PromptRewriteStylePreset.allCases) { preset in
+                        Text(preset.rawValue).tag(preset.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 220)
+                .labelsHidden()
+                .disabled(!settings.promptRewriteEnabled)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Custom style instructions (optional)")
+                    .font(.callout.weight(.medium))
+                TextEditor(text: $settings.promptRewriteCustomStyleInstructions)
+                    .frame(height: 88)
+                    .font(.callout)
+                    .disabled(!settings.promptRewriteEnabled)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                    )
+                Text("Examples: \"Sound like a principal architect\", \"Write as a senior iOS engineer\", \"Keep tone concise and formal\".")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Toggle(
+                "Enable conversation-aware rewrite history (app + screen)",
+                isOn: $settings.promptRewriteConversationHistoryEnabled
+            )
+            .disabled(!settings.promptRewriteEnabled)
+
+            if settings.promptRewriteConversationHistoryEnabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Conversation timeout")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Text("\(Int(settings.promptRewriteConversationTimeoutMinutes.rounded())) min")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: $settings.promptRewriteConversationTimeoutMinutes,
+                        in: 2...180,
+                        step: 1
+                    )
+                    .disabled(!settings.promptRewriteEnabled)
+
+                    HStack {
+                        Text("Turns kept per context")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Stepper(
+                            "\(settings.promptRewriteConversationTurnLimit)",
+                            value: $settings.promptRewriteConversationTurnLimit,
+                            in: 1...10
+                        )
+                        .labelsHidden()
+                        Text("\(settings.promptRewriteConversationTurnLimit)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Text("History source")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Picker(
+                            "History source",
+                            selection: promptRewriteConversationContextSelection
+                        ) {
+                            Text("Automatic (current app/screen)").tag("auto")
+                            ForEach(promptRewriteConversationStore.contextSummaries.prefix(12)) { summary in
+                                Text("\(summary.displayName) • \(summary.turnCount) turns")
+                                    .tag(summary.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 360)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Start New Conversation") {
+                            startNewPromptRewriteConversation()
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Clear All Conversation History") {
+                            promptRewriteConversationStore.clearAll()
+                            settings.promptRewriteConversationPinnedContextID = ""
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    Text("Only a small rolling history is kept per app/screen context for rewrite continuity. This is separate from indexed memory cards.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .disabled(!settings.promptRewriteEnabled)
+            }
+
+            Text("Current rewrite provider: \(settings.promptRewriteProviderMode.displayName)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Structured suggestions keep their formatting when inserted, including bullets and question lists. Rewrites are instructed to keep dialogue flow continuous.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var aiProviderStatusCard: some View {
+        settingsCard(
+            title: "Provider Connection Status",
+            subtitle: "Open AI Studio for full provider setup and prompt model controls.",
+            symbol: "network.badge.shield.half.filled",
+            tint: AppVisualTheme.accentTint
+        ) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("OpenAI")
+                    Spacer()
+                    Text(settings.hasPromptRewriteOAuthSession(for: .openAI) ? "Connected" : "Not connected")
+                        .foregroundStyle(settings.hasPromptRewriteOAuthSession(for: .openAI) ? AppVisualTheme.accentTint : .secondary)
+                }
+                HStack {
+                    Text("Anthropic")
+                    Spacer()
+                    Text(settings.hasPromptRewriteOAuthSession(for: .anthropic) ? "Connected" : "Not connected")
+                        .foregroundStyle(settings.hasPromptRewriteOAuthSession(for: .anthropic) ? AppVisualTheme.accentTint : .secondary)
+                }
+                HStack {
+                    Spacer()
+                    Button("Open AI Studio…") {
+                        cancelShortcutCapture()
+                        NotificationCenter.default.post(name: .keyScribeOpenAIMemoryStudio, object: nil)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
     private var correctionsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsSectionHeader(for: .corrections)
 
             settingsCard(
                 title: "Adaptive Corrections",
-                subtitle: "Learn from quick edits and manage learned replacements."
+                subtitle: "Learn from quick edits and manage learned replacements.",
+                symbol: "text.badge.checkmark",
+                tint: AppVisualTheme.accentTint
             ) {
                 Text("Learned corrections are used as recognition hints for Apple Speech and whisper.cpp.")
                     .font(.caption)
@@ -1983,9 +2787,14 @@ struct SettingsView: View {
                         }
 
                         if adaptiveCorrectionStore.learnedCorrections.count > 12 {
-                            Text("Showing first 12 corrections.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            HStack {
+                                Button("View All \\(adaptiveCorrectionStore.learnedCorrections.count) Corrections...") {
+                                    showingCorrectionsListSheet = true
+                                }
+                                .buttonStyle(.bordered)
+                                Spacer()
+                            }
+                            .padding(.top, 4)
                         }
 
                         HStack {
@@ -2000,6 +2809,557 @@ struct SettingsView: View {
         }
     }
 
+    private var filteredCorrections: [AdaptiveCorrectionStore.LearnedCorrection] {
+        let all = adaptiveCorrectionStore.learnedCorrections
+        let query = correctionsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if query.isEmpty { return all }
+        return all.filter {
+            $0.source.lowercased().contains(query) || $0.replacement.lowercased().contains(query)
+        }
+    }
+
+    @ViewBuilder
+    private var correctionsListSheet: some View {
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Learned Corrections")
+                        .font(.headline)
+                    Spacer()
+                    Button("Done") {
+                        showingCorrectionsListSheet = false
+                    }
+                }
+                .padding()
+                Divider()
+
+                VStack(alignment: .leading, spacing: 14) {
+                    if adaptiveCorrectionStore.learnedCorrections.isEmpty {
+                        Text("No learned corrections yet. Fix a mistaken word once and KeyScribe can learn it.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    } else {
+                        TextField("Search corrections", text: $correctionsSearchQuery)
+                            .textFieldStyle(.roundedBorder)
+
+                        if filteredCorrections.isEmpty {
+                            Text("No corrections match \"\\(correctionsSearchQuery)\".")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredCorrections, id: \.id) { correction in
+                                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                            Text(correction.source)
+                                                .font(.callout.monospaced())
+                                            Image(systemName: "arrow.right")
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+                                            Text(correction.replacement)
+                                                .font(.callout.monospaced())
+                                            Spacer()
+                                            Button("Edit") {
+                                                beginEditingCorrection(correction)
+                                            }
+                                            .buttonStyle(.borderless)
+                                            Button("Remove") {
+                                                adaptiveCorrectionStore.removeCorrection(source: correction.source)
+                                            }
+                                            .buttonStyle(.borderless)
+                                        }
+                                    }
+                                }
+                                .padding(.trailing)
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
+        }
+        .frame(width: 500, height: 500)
+    }
+
+    @ViewBuilder
+    private var providersSelectionSheet: some View {
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Manage Detected Providers")
+                        .font(.headline)
+                    Spacer()
+                    Button("Done") {
+                        showingProvidersSheet = false
+                    }
+                }
+                .padding()
+                Divider()
+
+                VStack(alignment: .leading, spacing: 14) {
+                    if detectedMemoryProviders.isEmpty {
+                        Text("No providers detected yet. Click Rescan to detect providers.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    } else {
+                        HStack(spacing: 8) {
+                            TextField("Filter providers", text: $memoryProviderFilterQuery)
+                                .textFieldStyle(.roundedBorder)
+                            Toggle("Selected only", isOn: $memoryShowSelectedProvidersOnly)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Select All Visible") {
+                                setMemoryProvidersEnabled(filteredMemoryProviders, enabled: true)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+
+                            Button("Clear Visible") {
+                                setMemoryProvidersEnabled(filteredMemoryProviders, enabled: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+                        }
+
+                        if filteredMemoryProviders.isEmpty {
+                            Text("No providers match the current filters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredMemoryProviders) { provider in
+                                        Toggle(isOn: Binding(
+                                            get: { settings.isMemoryProviderEnabled(provider.id) },
+                                            set: { isEnabled in
+                                                settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
+                                            }
+                                        )) {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(provider.name)
+                                                    .font(.callout.weight(.medium))
+                                                Text(provider.detail)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .disabled(!settings.memoryIndexingEnabled)
+                                    }
+                                }
+                                .padding(.trailing)
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
+        }
+        .frame(width: 450, height: 500)
+    }
+
+    @ViewBuilder
+    private var sourceFoldersSelectionSheet: some View {
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Manage Detected Source Folders")
+                        .font(.headline)
+                    Spacer()
+                    Button("Done") {
+                        showingSourceFoldersSheet = false
+                    }
+                }
+                .padding()
+                Divider()
+
+                VStack(alignment: .leading, spacing: 14) {
+                    if detectedMemorySourceFolders.isEmpty {
+                        Text("No source folders detected yet. Click Rescan to find folders.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    } else {
+                        HStack(spacing: 8) {
+                            TextField("Filter source folders", text: $memoryFolderFilterQuery)
+                                .textFieldStyle(.roundedBorder)
+                            Toggle("Selected only", isOn: $memoryShowSelectedFoldersOnly)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                            Toggle("Only", isOn: $memoryFoldersOnlyEnabledProviders)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+                                .help("Only enabled source providers")
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Select All Visible") {
+                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: true)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+
+                            Button("Clear Visible") {
+                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+                        }
+
+                        if filteredMemorySourceFolders.isEmpty {
+                            Text("No source folders match the current filters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(filteredMemorySourceFolders) { folder in
+                                        Toggle(isOn: Binding(
+                                            get: { settings.isMemorySourceFolderEnabled(folder.id) },
+                                            set: { isEnabled in
+                                                settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
+                                            }
+                                        )) {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(folder.name)
+                                                    .font(.callout.weight(.medium))
+                                                Text(folder.path)
+                                                    .font(.caption2.monospaced())
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                            }
+                                        }
+                                        .disabled(!settings.memoryIndexingEnabled)
+                                    }
+                                }
+                                .padding(.trailing)
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+            .padding(10)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+            .padding(8)
+        }
+        .frame(width: 550, height: 500)
+    }
+
+    private func prepareMemorySourcesSection() {
+        if settings.memoryProviderCatalogAutoUpdate {
+            rescanMemorySources(showMessage: false)
+            return
+        }
+
+        if settings.memoryDetectedProviderIDs.isEmpty && settings.memoryDetectedSourceFolderIDs.isEmpty {
+            rescanMemorySources(showMessage: false)
+            return
+        }
+
+        hydrateMemorySourcesFromSavedSettings()
+        normalizeMemoryBrowserSelections()
+        refreshMemoryBrowser()
+    }
+
+    private func hydrateMemorySourcesFromSavedSettings() {
+        let providerLookup = Dictionary(
+            uniqueKeysWithValues: memoryIndexingSettingsService.detectedProviders().map { ($0.id, $0) }
+        )
+        detectedMemoryProviders = settings.memoryDetectedProviderIDs.map { providerID in
+            providerLookup[providerID] ?? MemoryIndexingSettingsService.Provider(
+                id: providerID,
+                name: providerDisplayName(from: providerID),
+                detail: "Previously detected provider.",
+                sourceCount: 0
+            )
+        }
+
+        detectedMemorySourceFolders = settings.memoryDetectedSourceFolderIDs.map { folderPath in
+            let folderURL = URL(fileURLWithPath: folderPath, isDirectory: true)
+            let fallbackName = folderURL.lastPathComponent.isEmpty ? folderPath : folderURL.lastPathComponent
+            return MemoryIndexingSettingsService.SourceFolder(
+                id: folderPath,
+                name: fallbackName,
+                path: folderPath,
+                providerID: inferredProviderID(forFolderPath: folderPath)
+            )
+        }
+    }
+
+    private func inferredProviderID(forFolderPath folderPath: String) -> String {
+        let normalizedPath = folderPath.lowercased()
+        let candidates = Array(
+            Set(settings.memoryDetectedProviderIDs + detectedMemoryProviders.map(\.id))
+        )
+            .map { $0.lowercased() }
+            .filter { !$0.isEmpty }
+            .sorted()
+
+        if let directMatch = candidates.first(where: { normalizedPath.contains($0) }) {
+            return directMatch
+        }
+
+        if normalizedPath.contains("codex") { return MemoryProviderKind.codex.rawValue }
+        if normalizedPath.contains("opencode") { return MemoryProviderKind.opencode.rawValue }
+        if normalizedPath.contains("claude") || normalizedPath.contains("claw") { return MemoryProviderKind.claude.rawValue }
+        if normalizedPath.contains("copilot") { return MemoryProviderKind.copilot.rawValue }
+        if normalizedPath.contains("cursor") { return MemoryProviderKind.cursor.rawValue }
+        if normalizedPath.contains("kimi") { return MemoryProviderKind.kimi.rawValue }
+        if normalizedPath.contains("gemini") || normalizedPath.contains("gmini") { return MemoryProviderKind.gemini.rawValue }
+        if normalizedPath.contains("windsurf") { return MemoryProviderKind.windsurf.rawValue }
+        if normalizedPath.contains("codeium") { return MemoryProviderKind.codeium.rawValue }
+
+        return MemoryProviderKind.unknown.rawValue
+    }
+
+    private func providerDisplayName(from providerID: String) -> String {
+        providerID
+            .replacingOccurrences(of: "-", with: " ")
+            .split(separator: " ")
+            .map { token in
+                let first = token.prefix(1).uppercased()
+                let remainder = String(token.dropFirst())
+                return first + remainder
+            }
+            .joined(separator: " ")
+    }
+
+    private var filteredMemoryProviders: [MemoryIndexingSettingsService.Provider] {
+        var providers = detectedMemoryProviders
+
+        if memoryShowSelectedProvidersOnly {
+            providers = providers.filter { provider in
+                settings.isMemoryProviderEnabled(provider.id)
+            }
+        }
+
+        let query = normalizedMemoryFilter(memoryProviderFilterQuery)
+        guard !query.isEmpty else { return providers }
+
+        return providers.filter { provider in
+            matchesMemoryFilter(query, in: provider.name)
+                || matchesMemoryFilter(query, in: provider.detail)
+                || matchesMemoryFilter(query, in: provider.id)
+        }
+    }
+
+    private var filteredMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] {
+        var folders = detectedMemorySourceFolders
+
+        if memoryFoldersOnlyEnabledProviders {
+            folders = folders.filter { folder in
+                settings.isMemoryProviderEnabled(folder.providerID)
+            }
+        }
+
+        if memoryShowSelectedFoldersOnly {
+            folders = folders.filter { folder in
+                settings.isMemorySourceFolderEnabled(folder.id)
+            }
+        }
+
+        let query = normalizedMemoryFilter(memoryFolderFilterQuery)
+        guard !query.isEmpty else { return folders }
+
+        return folders.filter { folder in
+            matchesMemoryFilter(query, in: folder.name)
+                || matchesMemoryFilter(query, in: folder.path)
+                || matchesMemoryFilter(query, in: providerDisplayName(from: folder.providerID))
+                || matchesMemoryFilter(query, in: folder.providerID)
+        }
+    }
+
+    private var memoryBrowserProviderOptions: [MemoryIndexingSettingsService.Provider] {
+        detectedMemoryProviders.sorted { lhs, rhs in
+            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private var memoryBrowserFolderOptions: [MemoryIndexingSettingsService.SourceFolder] {
+        let providerID = normalizedMemoryBrowserProviderID
+        return detectedMemorySourceFolders
+            .filter { folder in
+                guard let providerID else { return true }
+                return folder.providerID == providerID
+            }
+            .sorted { lhs, rhs in
+                if lhs.providerID != rhs.providerID {
+                    return lhs.providerID.localizedCaseInsensitiveCompare(rhs.providerID) == .orderedAscending
+                }
+                if lhs.name != rhs.name {
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                }
+                return lhs.path.localizedCaseInsensitiveCompare(rhs.path) == .orderedAscending
+            }
+    }
+
+    private var normalizedMemoryBrowserProviderID: String? {
+        let trimmedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedProviderID.isEmpty, trimmedProviderID != "all" else {
+            return nil
+        }
+        return trimmedProviderID
+    }
+
+    private var normalizedMemoryBrowserFolderID: String? {
+        let trimmedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedFolderID.isEmpty, trimmedFolderID != "all" else {
+            return nil
+        }
+        return trimmedFolderID
+    }
+
+    private func normalizeMemoryBrowserSelections() {
+        let providerIDs = Set(memoryBrowserProviderOptions.map(\.id))
+        let selectedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedProviderID != "all", !providerIDs.contains(selectedProviderID) {
+            memoryBrowserSelectedProviderID = "all"
+        }
+
+        let folderIDs = Set(memoryBrowserFolderOptions.map(\.id))
+        let selectedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedFolderID != "all", !folderIDs.contains(selectedFolderID) {
+            memoryBrowserSelectedFolderID = "all"
+        }
+    }
+
+    private func refreshMemoryBrowser() {
+        let entries = memoryIndexingSettingsService.browseIndexedMemories(
+            query: memoryBrowserQuery,
+            providerID: normalizedMemoryBrowserProviderID,
+            sourceFolderID: normalizedMemoryBrowserFolderID,
+            includePlanContent: memoryBrowserIncludePlanContent,
+            limit: 200
+        )
+        if memoryBrowserHighSignalOnly {
+            memoryBrowserEntries = entries.filter(isHighSignalMemoryEntry)
+        } else {
+            memoryBrowserEntries = entries
+        }
+    }
+
+    private func isHighSignalMemoryEntry(_ entry: MemoryIndexedEntry) -> Bool {
+        let title = entry.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if title == "workspace" || title == "storage" || title == "state" {
+            return false
+        }
+
+        let detail = entry.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.hasPrefix("{") && detail.hasSuffix("}") {
+            if !detail.contains("->"),
+               !detail.localizedCaseInsensitiveContains("prompt"),
+               !detail.localizedCaseInsensitiveContains("rewrite"),
+               !detail.localizedCaseInsensitiveContains("response") {
+                return false
+            }
+        }
+
+        let combined = "\(entry.summary) \(entry.detail)"
+        let alphaWords = combined.split(whereSeparator: \.isWhitespace).filter { token in
+            token.contains(where: \.isLetter)
+        }
+        return alphaWords.count >= 5
+    }
+
+    private func setMemoryProvidersEnabled(
+        _ providers: [MemoryIndexingSettingsService.Provider],
+        enabled: Bool
+    ) {
+        for provider in providers {
+            settings.setMemoryProviderEnabled(provider.id, enabled: enabled)
+        }
+    }
+
+    private func setMemorySourceFoldersEnabled(
+        _ folders: [MemoryIndexingSettingsService.SourceFolder],
+        enabled: Bool
+    ) {
+        for folder in folders {
+            settings.setMemorySourceFolderEnabled(folder.id, enabled: enabled)
+        }
+    }
+
+    private func normalizedMemoryFilter(_ query: String) -> String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func matchesMemoryFilter(_ normalizedQuery: String, in value: String) -> Bool {
+        value.lowercased().contains(normalizedQuery)
+    }
+
+    private func rescanMemorySources(showMessage: Bool) {
+        let result = memoryIndexingSettingsService.rescan(
+            enabledProviderIDs: settings.memoryEnabledProviderIDs,
+            enabledSourceFolderIDs: settings.memoryEnabledSourceFolderIDs,
+            runIndexing: settings.memoryIndexingEnabled
+        )
+        detectedMemoryProviders = result.providers
+        detectedMemorySourceFolders = result.sourceFolders
+
+        settings.updateDetectedMemoryProviders(result.providers.map(\.id))
+        settings.updateDetectedMemorySourceFolders(result.sourceFolders.map(\.id))
+        normalizeMemoryBrowserSelections()
+        refreshMemoryBrowser()
+
+        guard showMessage else { return }
+        if result.indexQueued {
+            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued \(result.queuedSourceCount) selected source(s) for indexing in the background."
+        } else if !FeatureFlags.aiMemoryEnabled {
+            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. AI memory feature flag is disabled, so no sources were queued."
+        } else {
+            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued 0 selected sources for indexing."
+        }
+    }
+
+    private func handleMemoryIndexingCompletion(_ notification: Notification) {
+        let userInfo = notification.userInfo ?? [:]
+        let isRebuild = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.rebuild] as? Bool ?? false
+        let indexedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedFiles] as? Int ?? 0
+        let skippedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.skippedFiles] as? Int ?? 0
+        let indexedCards = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedCards] as? Int ?? 0
+        let indexedRewrites = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedRewriteSuggestions] as? Int ?? 0
+        let failureCount = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.failureCount] as? Int ?? 0
+        let firstFailure = (
+            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.firstFailure] as? String
+        )?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let actionLabel = isRebuild ? "Rebuild" : "Indexing"
+        if failureCount > 0 {
+            if let firstFailure, !firstFailure.isEmpty {
+                memoryActionMessage = "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards. First issue: \(firstFailure)"
+            } else {
+                memoryActionMessage = "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards."
+            }
+            refreshMemoryBrowser()
+            return
+        }
+
+        memoryActionMessage = "\(actionLabel) finished. Indexed \(indexedFiles) files, skipped \(skippedFiles), produced \(indexedCards) cards, and generated \(indexedRewrites) rewrite suggestion(s)."
+        refreshMemoryBrowser()
+    }
+
     private func refreshWhisperModelBrowserState() {
         whisperModelManager.refreshInstallStates()
         ensureSelectedWhisperModelIsValid()
@@ -2010,9 +3370,30 @@ struct SettingsView: View {
     private func whisperModelRow(for model: WhisperModelCatalog.Model) -> some View {
         let installState = whisperModelManager.installStateByModelID[model.id] ?? .notInstalled
         let isSelected = settings.selectedWhisperModelID == model.id
+        let cardTint: Color = {
+            if isSelected { return AppVisualTheme.accentTint }
+            switch installState {
+            case .installed:
+                return AppVisualTheme.accentTint
+            case .downloading, .installing:
+                return AppVisualTheme.baseTint
+            case .failed:
+                return Color.red.opacity(0.78)
+            case .notInstalled:
+                return AppVisualTheme.baseTint.opacity(0.65)
+            }
+        }()
 
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                AppIconBadge(
+                    symbol: "waveform.path.ecg.rectangle.fill",
+                    tint: cardTint,
+                    size: 22,
+                    symbolSize: 10,
+                    isEmphasized: isSelected
+                )
+
                 Text(model.displayName)
                     .font(.callout.weight(.semibold))
 
@@ -2029,10 +3410,10 @@ struct SettingsView: View {
                 if isSelected {
                     Text("Selected")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(AppVisualTheme.accentTint)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Capsule().fill(Color.green.opacity(0.14)))
+                        .background(Capsule().fill(AppVisualTheme.accentTint.opacity(0.12)))
                 }
                 Spacer()
                 Text(model.diskSizeText)
@@ -2063,12 +3444,12 @@ struct SettingsView: View {
             case .failed(let message):
                 Text(message)
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(Color.red.opacity(0.82))
 
             case .installed:
                 Text("Installed")
                     .font(.caption)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(AppVisualTheme.accentTint)
 
             case .notInstalled:
                 Text("Not installed")
@@ -2115,14 +3496,12 @@ struct SettingsView: View {
                 }
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.primary.opacity(0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+        .padding(12)
+        .appThemedSurface(
+            cornerRadius: 12,
+            tint: cardTint,
+            strokeOpacity: 0.19,
+            tintOpacity: 0.09
         )
     }
 
@@ -2130,12 +3509,16 @@ struct SettingsView: View {
     private func whisperModelBadge(_ text: String) -> some View {
         Text(text)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.white.opacity(0.82))
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(
                 Capsule()
-                    .fill(Color.primary.opacity(0.10))
+                    .fill(Color.white.opacity(0.10))
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(0.18), lineWidth: 0.6)
+                    )
             )
     }
 
@@ -2239,31 +3622,93 @@ struct SettingsView: View {
     private func settingsCard<Content: View>(
         title: String,
         subtitle: String? = nil,
+        symbol: String? = nil,
+        tint: Color = AppVisualTheme.accentTint,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                if let symbol {
+                    AppIconBadge(
+                        symbol: symbol,
+                        tint: tint,
+                        size: 28,
+                        symbolSize: 12
+                    )
                 }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.96))
+
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(AppVisualTheme.mutedText)
+                    }
+                }
+
+                Spacer(minLength: 0)
             }
 
             content()
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+        .padding(15)
+        .appThemedSurface(
+            cornerRadius: 14,
+            tint: tint,
+            strokeOpacity: 0.18,
+            tintOpacity: 0.04
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+    }
+
+    @ViewBuilder
+    private func settingsDisclosureCard<Content: View>(
+        title: String,
+        subtitle: String? = nil,
+        symbol: String? = nil,
+        tint: Color = AppVisualTheme.accentTint,
+        isExpanded: Binding<Bool>,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            DisclosureGroup(isExpanded: isExpanded) {
+                VStack(alignment: .leading, spacing: 10) {
+                    content()
+                }
+                .padding(.top, 6)
+            } label: {
+                HStack(alignment: .top, spacing: 10) {
+                    if let symbol {
+                        AppIconBadge(
+                            symbol: symbol,
+                            tint: tint,
+                            size: 26,
+                            symbolSize: 11
+                        )
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.96))
+
+                        if let subtitle {
+                            Text(subtitle)
+                                .font(.caption)
+                                .foregroundStyle(AppVisualTheme.mutedText)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(15)
+        .appThemedSurface(
+            cornerRadius: 14,
+            tint: tint,
+            strokeOpacity: 0.18,
+            tintOpacity: 0.04
         )
     }
 
@@ -2272,12 +3717,17 @@ struct SettingsView: View {
         HStack(spacing: 8) {
             ForEach(segments, id: \.self) { segment in
                 Text(segment)
-                    .font(.callout.weight(.semibold))
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.95))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
                     .background(
                         Capsule()
-                            .fill(Color.primary.opacity(0.10))
+                            .fill(AppVisualTheme.accentTint.opacity(0.18))
+                            .overlay(
+                                Capsule()
+                                    .stroke(AppVisualTheme.accentTint.opacity(0.38), lineWidth: 0.7)
+                            )
                     )
             }
         }
@@ -2362,36 +3812,90 @@ struct SettingsView: View {
         )
     }
 
+    private var promptRewriteConversationContextSelection: Binding<String> {
+        Binding(
+            get: {
+                let pinned = settings.promptRewriteConversationPinnedContextID
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) else {
+                    return "auto"
+                }
+                return pinned
+            },
+            set: { selected in
+                if selected == "auto" {
+                    settings.promptRewriteConversationPinnedContextID = ""
+                } else {
+                    settings.promptRewriteConversationPinnedContextID = selected
+                }
+            }
+        )
+    }
+
+    private func sanitizePinnedConversationContextSelection() {
+        let pinned = settings.promptRewriteConversationPinnedContextID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pinned.isEmpty else { return }
+        if !promptRewriteConversationStore.hasContext(id: pinned) {
+            settings.promptRewriteConversationPinnedContextID = ""
+        }
+    }
+
+    private func startNewPromptRewriteConversation() {
+        let pinned = settings.promptRewriteConversationPinnedContextID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) {
+            promptRewriteConversationStore.clearContext(id: pinned)
+            settings.promptRewriteConversationPinnedContextID = ""
+            return
+        }
+
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let context = PromptRewriteConversationContextResolver.captureCurrentContext(
+            fallbackApp: frontmost
+        )
+        promptRewriteConversationStore.clearContext(id: context.id)
+    }
+
     private var trimmedSearchQuery: String {
         searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private var searchEntries: [SettingSearchEntry] {
         [
-            .init(section: .general, title: "Accessibility access", detail: "Grant or verify accessibility permission", keywords: ["accessibility", "permission", "grant"]),
-            .init(section: .general, title: "Copy transcript to clipboard", detail: "Automatically copy dictation results", keywords: ["clipboard", "copy", "output"]),
-            .init(section: .general, title: "Dictation sound profile", detail: "Choose tones for start, stop, processing, and pasted cues", keywords: ["sound", "start", "listening", "feedback", "processing", "stop", "pasted"]),
-            .init(section: .general, title: "Waveform theme", detail: "Choose visual waveform style", keywords: ["waveform", "theme", "appearance"]),
+            .init(section: .essentials, title: "Accessibility access", detail: "Grant or verify accessibility permission", keywords: ["accessibility", "permission", "grant"]),
+            .init(section: .essentials, title: "Copy transcript to clipboard", detail: "Automatically copy dictation results", keywords: ["clipboard", "copy", "output"]),
+            .init(section: .essentials, title: "Dictation sound profile", detail: "Choose tones for start, stop, processing, and pasted cues", keywords: ["sound", "start", "listening", "feedback", "processing", "stop", "pasted"]),
+            .init(section: .essentials, title: "Waveform theme", detail: "Choose visual waveform style", keywords: ["waveform", "theme", "appearance"]),
             .init(section: .shortcuts, title: "Hold-to-talk shortcut", detail: "Set keys for press-and-hold dictation", keywords: ["hold", "shortcut", "keyboard"]),
             .init(section: .shortcuts, title: "Mute shortcut system sounds", detail: "Optionally suppress beeps while hold-to-talk is pressed", keywords: ["mute", "beep", "sound", "hold", "shortcut"]),
             .init(section: .shortcuts, title: "Manual shortcut map", detail: "Click modifiers and choose a key manually", keywords: ["manual", "map", "shortcut", "click", "keys"]),
             .init(section: .shortcuts, title: "Continuous toggle shortcut", detail: "Set keys for start/stop dictation mode", keywords: ["continuous", "toggle", "shortcut"]),
             .init(section: .shortcuts, title: "Paste last transcript", detail: "Reserved shortcut: ⌥⌘V", keywords: ["paste", "last transcript", "reserved"]),
-            .init(section: .microphone, title: "Auto-detect microphone", detail: "Automatically use best available input", keywords: ["microphone", "input", "auto"]),
-            .init(section: .microphone, title: "Microphone device picker", detail: "Choose a specific microphone manually", keywords: ["microphone", "device", "picker"]),
-            .init(section: .recognition, title: "Transcription engine", detail: "Switch between Apple Speech and whisper.cpp", keywords: ["engine", "whisper", "apple", "recognition"]),
-            .init(section: .recognition, title: "Contextual language bias", detail: "Improve recognition with likely words", keywords: ["context", "bias", "recognition"]),
-            .init(section: .recognition, title: "Preserve words across pauses", detail: "Prevent dropped words in short pauses", keywords: ["pause", "preserve", "recognition"]),
-            .init(section: .recognition, title: "Recognition mode", detail: "Choose local/cloud behavior for Apple Speech", keywords: ["on-device", "cloud", "privacy", "recognition"]),
-            .init(section: .recognition, title: "Automatic punctuation", detail: "Enable punctuation from Apple Speech", keywords: ["punctuation", "speech"]),
-            .init(section: .recognition, title: "Finalize delay", detail: "Control speed vs stability before insertion", keywords: ["delay", "finalize", "timing"]),
-            .init(section: .recognition, title: "Cleanup mode", detail: "Light or aggressive text cleanup", keywords: ["cleanup", "mode"]),
-            .init(section: .recognition, title: "Custom phrases", detail: "Add names, acronyms, and domain language", keywords: ["phrases", "vocabulary", "context"]),
-            .init(section: .models, title: "whisper model install", detail: "Download and manage all whisper.cpp models", keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]),
-            .init(section: .models, title: "whisper Core ML", detail: "Use Core ML encoder when available", keywords: ["core ml", "ane", "whisper", "speed"]),
+            .init(section: .speech, title: "Auto-detect microphone", detail: "Automatically use best available input", keywords: ["microphone", "input", "auto"]),
+            .init(section: .speech, title: "Microphone device picker", detail: "Choose a specific microphone manually", keywords: ["microphone", "device", "picker"]),
+            .init(section: .speech, title: "Transcription engine", detail: "Switch between Apple Speech and whisper.cpp", keywords: ["engine", "whisper", "apple", "recognition"]),
+            .init(section: .speech, title: "Contextual language bias", detail: "Improve recognition with likely words", keywords: ["context", "bias", "recognition"]),
+            .init(section: .speech, title: "Preserve words across pauses", detail: "Prevent dropped words in short pauses", keywords: ["pause", "preserve", "recognition"]),
+            .init(section: .speech, title: "Recognition mode", detail: "Choose local/cloud behavior for Apple Speech", keywords: ["on-device", "cloud", "privacy", "recognition"]),
+            .init(section: .speech, title: "Automatic punctuation", detail: "Enable punctuation from Apple Speech", keywords: ["punctuation", "speech"]),
+            .init(section: .speech, title: "Finalize delay", detail: "Control speed vs stability before insertion", keywords: ["delay", "finalize", "timing"]),
+            .init(section: .speech, title: "Cleanup mode", detail: "Light or aggressive text cleanup", keywords: ["cleanup", "mode"]),
+            .init(section: .speech, title: "Custom phrases", detail: "Add names, acronyms, and domain language", keywords: ["phrases", "vocabulary", "context"]),
+            .init(section: .aiModels, title: "whisper model install", detail: "Download and manage all whisper.cpp models", keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]),
+            .init(section: .aiModels, title: "whisper Core ML", detail: "Use Core ML encoder when available", keywords: ["core ml", "ane", "whisper", "speed"]),
             .init(section: .corrections, title: "Adaptive corrections", detail: "Learn from your quick word/phrase fixes", keywords: ["adaptive", "learned", "corrections", "backspace"]),
             .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
             .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
+            .init(section: .aiModels, title: "AI prompt correction toggle", detail: "Enable or disable AI prompt rewrite assistance", keywords: ["prompt", "rewrite", "toggle", "enable", "ai"]),
+            .init(section: .aiModels, title: "Markdown suggestion conversion", detail: "Always convert AI suggestions to Markdown before insertion", keywords: ["markdown", "format", "rewrite", "insert", "assistant"]),
+            .init(section: .aiModels, title: "Rewrite style preset", detail: "Choose formal, casual, architect, developer, or writer voice", keywords: ["style", "tone", "formal", "casual", "architect", "senior", "junior", "writer"]),
+            .init(section: .aiModels, title: "Custom style instructions", detail: "Provide role-specific or domain-specific rewrite guidance", keywords: ["custom", "style", "persona", "voice", "architect", "developer", "writer", "instruction"]),
+            .init(section: .aiModels, title: "Conversation-aware rewrite history", detail: "Opt in to rolling history scoped by app and screen", keywords: ["conversation", "history", "context", "app", "screen", "rewrite"]),
+            .init(section: .aiModels, title: "Rewrite conversation timeout", detail: "Expire conversation buckets after inactivity", keywords: ["timeout", "expire", "conversation", "history", "minutes"]),
+            .init(section: .aiModels, title: "Rewrite history source switch", detail: "Pin to a saved context or use automatic app/screen context", keywords: ["switch", "pin", "context", "history", "conversation"]),
+            .init(section: .aiModels, title: "Provider connection status", detail: "See OAuth connection status for OpenAI and Anthropic", keywords: ["provider", "oauth", "openai", "anthropic", "connection"]),
+            .init(section: .aiModels, title: "Open AI Studio", detail: "Launch dedicated AI page for provider and prompt model controls", keywords: ["ai", "studio", "providers", "models", "rewrite"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall KeyScribe", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
@@ -2495,7 +3999,7 @@ struct SettingsView: View {
             if let correctionDialogMessage {
                 Text(correctionDialogMessage)
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(AppVisualTheme.accentTint)
             }
 
             HStack(spacing: 10) {
@@ -2514,6 +4018,9 @@ struct SettingsView: View {
             }
         }
         .padding(20)
+        .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+        .padding(10)
+        .background(AppChromeBackground())
         .frame(width: 460)
     }
 
@@ -2523,20 +4030,14 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var accessibilityCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: settings.accessibilityTrusted ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(settings.accessibilityTrusted ? .green : .orange)
-                Text(settings.accessibilityTrusted ? "Accessibility access granted" : "Accessibility access required")
-                    .font(.callout.weight(.semibold))
-            }
-
-            Text(settings.accessibilityTrusted
-                 ? "KeyScribe can control paste and insertion reliably."
-                 : "Enable KeyScribe in Privacy & Security → Accessibility so paste and text insertion work across apps.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
+        settingsCard(
+            title: settings.accessibilityTrusted ? "Accessibility access granted" : "Accessibility access required",
+            subtitle: settings.accessibilityTrusted
+                ? "KeyScribe can control paste and insertion reliably."
+                : "Enable KeyScribe in Privacy & Security -> Accessibility so paste and text insertion works across apps.",
+            symbol: settings.accessibilityTrusted ? "checkmark.shield.fill" : "exclamationmark.triangle.fill",
+            tint: settings.accessibilityTrusted ? AppVisualTheme.accentTint : AppVisualTheme.baseTint
+        ) {
             HStack(spacing: 8) {
                 Button("Check again") {
                     settings.refreshAccessibilityStatus(prompt: false)
@@ -2545,21 +4046,16 @@ struct SettingsView: View {
 
                 if !settings.accessibilityTrusted {
                     Button("Grant Accessibility Access…") {
-                        PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
+                        PermissionCenter.requestAccessibilityPermission(
+                            using: settings,
+                            promptIfNeeded: true,
+                            openSettingsIfDenied: false
+                        )
                     }
                     .buttonStyle(.borderedProminent)
                 }
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.primary.opacity(0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-        )
         .onAppear {
             settings.refreshAccessibilityStatus(prompt: false)
         }
@@ -2657,6 +4153,12 @@ struct SettingsView: View {
         isCapturingShortcut = true
     }
 
+    private func cancelShortcutCapture() {
+        shortcutCaptureTarget = nil
+        shortcutCaptureMessage = nil
+        isCapturingShortcut = false
+    }
+
     private func shortcutConflictMessage(
         for target: ShortcutCaptureTarget,
         keyCode: UInt16,
@@ -2698,116 +4200,177 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private func appLogoImage(size: CGFloat) -> some View {
+        if let icon = NSApplication.shared.applicationIconImage {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.2, style: .continuous))
+        } else {
+            Image(systemName: "app.fill")
+                .font(.system(size: size * 0.6))
+                .frame(width: size, height: size)
+        }
+    }
+
+    @ViewBuilder
     private var aboutSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             settingsSectionHeader(for: .about)
 
-            // Version info
-            HStack(spacing: 10) {
-                Image(systemName: "app.badge.checkmark.fill")
-                    .font(.title2)
-                    .foregroundStyle(.blue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("KeyScribe")
-                        .font(.headline)
-                    Text("Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "–"))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            settingsCard(
+                title: "App Info",
+                subtitle: "Current version and release details.",
+                symbol: "app.badge.fill",
+                tint: AppVisualTheme.accentTint
+            ) {
+                HStack(spacing: 12) {
+                    appLogoImage(size: 48)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("KeyScribe")
+                            .font(.headline)
+                        Text("Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "–"))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
-            Divider()
+            settingsCard(
+                title: "Permissions",
+                subtitle: "Grant access for full dictation reliability.",
+                symbol: "hand.raised.fill",
+                tint: AppVisualTheme.accentTint
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    permissionRow(
+                        name: "Accessibility",
+                        granted: settings.accessibilityTrusted,
+                        hint: "Required for text insertion and global hotkeys",
+                        action: {
+                            PermissionCenter.requestAccessibilityPermission(
+                                using: settings,
+                                promptIfNeeded: true,
+                                openSettingsIfDenied: false
+                            )
+                        }
+                    )
 
-            // Permissions status
-            Text("Permissions")
-                .font(.headline)
+                    permissionRow(
+                        name: "Microphone",
+                        granted: microphoneAuthorized,
+                        hint: "Required to capture speech",
+                        action: {
+                            requestMicrophonePermission()
+                        }
+                    )
 
-            VStack(alignment: .leading, spacing: 10) {
-                permissionRow(
-                    name: "Accessibility",
-                    granted: settings.accessibilityTrusted,
-                    hint: "Required for text insertion and global hotkeys",
-                    action: {
-                        PermissionCenter.requestAccessibilityPermission(using: settings, promptIfNeeded: true)
-                    }
-                )
-
-                permissionRow(
-                    name: "Microphone",
-                    granted: microphoneAuthorized,
-                    hint: "Required to capture speech",
-                    action: {
-                        requestMicrophonePermission()
-                    }
-                )
-
-                permissionRow(
-                    name: "Speech Recognition",
-                    granted: settings.transcriptionEngine == .appleSpeech ? speechRecognitionAuthorized : true,
-                    hint: settings.transcriptionEngine == .appleSpeech
-                        ? "Required when Apple Speech engine is selected"
-                        : "Not required while whisper.cpp engine is selected",
-                    action: {
-                        requestSpeechRecognitionPermission()
-                    }
-                )
+                    permissionRow(
+                        name: "Speech Recognition",
+                        granted: settings.transcriptionEngine == .appleSpeech ? speechRecognitionAuthorized : true,
+                        hint: settings.transcriptionEngine == .appleSpeech
+                            ? "Required when Apple Speech engine is selected"
+                            : "Not required while whisper.cpp engine is selected",
+                        action: {
+                            requestSpeechRecognitionPermission()
+                        }
+                    )
+                }
             }
-            .padding(10)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.primary.opacity(0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-            )
 
             if CrashReporter.hasLogs {
-                Divider()
-                HStack {
-                    Text("Crash logs available")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Reveal in Finder") {
-                        CrashReporter.revealInFinder()
+                settingsCard(
+                    title: "Diagnostics",
+                    subtitle: "Crash reports were detected on this Mac.",
+                    symbol: "stethoscope",
+                    tint: AppVisualTheme.accentTint
+                ) {
+                    HStack {
+                        Text("Crash logs available")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Reveal in Finder") {
+                            CrashReporter.revealInFinder()
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    .buttonStyle(.bordered)
                 }
             }
 
-            Divider()
-
-            // Uninstall
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Uninstall")
-                    .font(.headline)
-                Text("Remove KeyScribe, reset permissions, and clear local app data. You can optionally keep downloaded whisper models for faster re-testing.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Toggle("Also delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
-                    .toggleStyle(.switch)
-
-                Toggle("Also delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
-                    .toggleStyle(.switch)
-
+            settingsCard(
+                title: "Uninstall",
+                subtitle: "Remove KeyScribe, reset permissions, and clear local app data.",
+                symbol: "trash.fill",
+                tint: .red
+            ) {
                 Button(role: .destructive, action: {
-                    showUninstallConfirmation = true
+                    uninstallDeleteDownloadedModels = false
+                    uninstallDeleteLearnedCorrections = false
+                    uninstallDeleteMemories = false
+                    uninstallDeleteProviderCredentials = false
+                    showUninstallSheet = true
                 }) {
                     Label("Uninstall KeyScribe…", systemImage: "trash")
                 }
                 .buttonStyle(.bordered)
-                .alert("Uninstall KeyScribe?", isPresented: $showUninstallConfirmation) {
-                    Button("Cancel", role: .cancel) { }
-                    Button("Uninstall", role: .destructive) {
-                        SettingsStore.resetAndUninstall(
-                            deleteDownloadedModels: uninstallDeleteDownloadedModels,
-                            deleteLearnedCorrections: uninstallDeleteLearnedCorrections
-                        )
+                .sheet(isPresented: $showUninstallSheet) {
+                    ZStack {
+                        AppChromeBackground()
+
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text("Uninstall KeyScribe")
+                                .font(.title2.bold())
+
+                            Text("This will reset permissions, remove settings, and uninstall the app. Enable any options below to also remove additional data.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Toggle("Delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
+                                    .toggleStyle(.switch)
+                                Toggle("Delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
+                                    .toggleStyle(.switch)
+                                Toggle("Delete indexed memories", isOn: $uninstallDeleteMemories)
+                                    .toggleStyle(.switch)
+                                Toggle("Delete provider credentials (API keys & OAuth sessions)", isOn: $uninstallDeleteProviderCredentials)
+                                    .toggleStyle(.switch)
+                            }
+
+                            Divider()
+
+                            Text(uninstallSummaryText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            HStack {
+                                Spacer()
+                                Button("Cancel") {
+                                    showUninstallSheet = false
+                                }
+                                .keyboardShortcut(.cancelAction)
+
+                                Button("Uninstall", role: .destructive) {
+                                    showUninstallSheet = false
+                                    SettingsStore.resetAndUninstall(
+                                        deleteDownloadedModels: uninstallDeleteDownloadedModels,
+                                        deleteLearnedCorrections: uninstallDeleteLearnedCorrections,
+                                        deleteMemories: uninstallDeleteMemories,
+                                        deleteProviderCredentials: uninstallDeleteProviderCredentials
+                                    )
+                                }
+                                .keyboardShortcut(.defaultAction)
+                            }
+                        }
+                        .padding(24)
+                        .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.17)
+                        .padding(10)
                     }
-                } message: {
-                    Text(uninstallSummaryText)
+                    .frame(width: 420)
                 }
             }
 
@@ -2820,21 +4383,30 @@ struct SettingsView: View {
     private var uninstallSummaryText: String {
         let modelText = uninstallDeleteDownloadedModels ? "delete downloaded whisper models" : "keep downloaded whisper models"
         let correctionText = uninstallDeleteLearnedCorrections ? "delete learned corrections" : "keep learned corrections"
+        let memoryText = uninstallDeleteMemories ? "delete indexed memories" : "keep indexed memories"
+        let credentialText = uninstallDeleteProviderCredentials ? "delete provider credentials" : "keep provider credentials"
 
-        return "This will reset permissions, remove settings, \(modelText), \(correctionText), and uninstall the app."
+        return "This will reset permissions, remove settings, \(modelText), \(correctionText), \(memoryText), \(credentialText), and uninstall the app."
     }
 
     @ViewBuilder
     private func permissionRow(name: String, granted: Bool, hint: String, action: @escaping () -> Void) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(granted ? .green : .orange)
+        HStack(spacing: 10) {
+            AppIconBadge(
+                symbol: granted ? "checkmark" : "exclamationmark.triangle.fill",
+                tint: granted ? AppVisualTheme.accentTint : AppVisualTheme.baseTint,
+                size: 24,
+                symbolSize: 10,
+                isEmphasized: granted
+            )
+
             VStack(alignment: .leading, spacing: 1) {
                 Text(name)
-                    .font(.callout.weight(.medium))
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.94))
                 Text(hint)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppVisualTheme.mutedText)
             }
             Spacer()
             if !granted {
@@ -2845,6 +4417,16 @@ struct SettingsView: View {
                 .controlSize(.small)
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+                )
+        )
     }
 
     private var microphoneAuthorized: Bool {
@@ -2902,15 +4484,7 @@ struct TranscriptHistoryView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .underPageBackgroundColor)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            AppChromeBackground()
 
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .firstTextBaseline) {
@@ -2979,8 +4553,14 @@ struct TranscriptHistoryView: View {
                     }
                 }
             }
-            .padding(18)
+            .padding(.top, 34)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 18)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.18)
+            .padding(10)
         }
+        .appScrollbars()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -2998,14 +4578,7 @@ struct TranscriptHistoryView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.thinMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-        )
+        .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.16)
     }
 }
 
@@ -3078,20 +4651,13 @@ private struct TranscriptHistoryEntryCard: View {
             }
         }
         .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.thinMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-        )
+        .appThemedSurface(cornerRadius: 12, strokeOpacity: 0.16)
     }
 }
 
 struct ShortcutCaptureMonitor: NSViewRepresentable {
     @Binding var isCapturing: Bool
-    let onCapture: (UInt16, UInt) -> Void
+    let onCapture: (UInt16, UInt) -> Bool
     let onCancel: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -3115,13 +4681,12 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
     }
 
     final class Coordinator {
+        private static let manualModifierOnlyKeyCode: UInt16 = UInt16.max
         private var parent: ShortcutCaptureMonitor
         private var globalKeyMonitor: Any?
         private var localKeyMonitor: Any?
         private var globalFlagsMonitor: Any?
         private var localFlagsMonitor: Any?
-        private var pendingModifierCaptureWorkItem: DispatchWorkItem?
-        private var pendingModifierCaptureFlags: NSEvent.ModifierFlags = []
         private var didCapture = false
 
         init(parent: ShortcutCaptureMonitor) {
@@ -3131,7 +4696,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         func start() {
             guard globalKeyMonitor == nil, localKeyMonitor == nil, globalFlagsMonitor == nil, localFlagsMonitor == nil else { return }
             didCapture = false
-            cancelPendingModifierCapture()
 
             let mask = ShortcutValidation.supportedModifierFlags
 
@@ -3159,7 +4723,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         @discardableResult
         private func handleKeyDown(_ event: NSEvent, mask: NSEvent.ModifierFlags) -> Bool {
             guard !didCapture else { return true }
-            cancelPendingModifierCapture()
 
             if event.keyCode == 53 { // Escape
                 didCapture = true
@@ -3178,9 +4741,12 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
 
             let capturedMods = ShortcutValidation.filteredModifierRawValue(from: event.modifierFlags.intersection(mask).rawValue)
             guard capturedMods != 0 else { return false }
+            let didCaptureShortcut = parent.onCapture(capturedCode, capturedMods)
+            guard didCaptureShortcut else { return false }
             didCapture = true
+            stop()
             DispatchQueue.main.async {
-                self.parent.onCapture(capturedCode, capturedMods)
+                self.parent.isCapturing = false
             }
             return true
         }
@@ -3191,34 +4757,19 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
 
             let capturedFlags = event.modifierFlags.intersection(mask)
             let count = ShortcutValidation.modifierCount(in: capturedFlags)
-            guard (2...4).contains(count) else {
-                cancelPendingModifierCapture()
-                return false
-            }
+            guard (2...4).contains(count) else { return false }
 
-            scheduleModifierOnlyCapture(with: capturedFlags)
+            let didCaptureShortcut = parent.onCapture(
+                Self.manualModifierOnlyKeyCode,
+                capturedFlags.rawValue
+            )
+            guard didCaptureShortcut else { return false }
+            didCapture = true
+            stop()
+            DispatchQueue.main.async {
+                self.parent.isCapturing = false
+            }
             return true
-        }
-
-        private func scheduleModifierOnlyCapture(with flags: NSEvent.ModifierFlags) {
-            cancelPendingModifierCapture()
-            pendingModifierCaptureFlags = flags
-
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self, !self.didCapture else { return }
-                let currentFlags = NSEvent.modifierFlags.intersection(ShortcutValidation.supportedModifierFlags)
-                guard currentFlags == self.pendingModifierCaptureFlags else { return }
-                self.didCapture = true
-                self.parent.onCapture(UInt16.max, self.pendingModifierCaptureFlags.rawValue)
-            }
-            pendingModifierCaptureWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
-        }
-
-        private func cancelPendingModifierCapture() {
-            pendingModifierCaptureWorkItem?.cancel()
-            pendingModifierCaptureWorkItem = nil
-            pendingModifierCaptureFlags = []
         }
 
         func stop() {
@@ -3238,7 +4789,6 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
                 NSEvent.removeMonitor(localFlagsMonitor)
                 self.localFlagsMonitor = nil
             }
-            cancelPendingModifierCapture()
             didCapture = false
         }
 
