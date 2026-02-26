@@ -292,6 +292,7 @@ private struct PromptRewriteHUDView: View {
             }
         }
         .frame(width: 392)
+        .tint(AppVisualTheme.accentTint)
     }
 
     @ViewBuilder

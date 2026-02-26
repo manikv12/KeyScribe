@@ -68,15 +68,28 @@ struct StatusBarPopoverView: View {
                 .opacity(0.6)
 
             VStack(spacing: 4) {
-                PopoverMenuRow(icon: "clock.arrow.circlepath", label: "History", iconTint: AppVisualTheme.accentTint) {
+                PopoverMenuRow(
+                    icon: "clock.arrow.circlepath",
+                    label: "History",
+                    iconTint: Color(red: 0.56, green: 0.78, blue: 0.62)
+                ) {
                     viewModel.onOpenHistory?()
                 }
 
-                PopoverMenuRow(icon: "brain.head.profile", label: "AI Studio", iconTint: AppVisualTheme.accentTint) {
+                PopoverMenuRow(
+                    icon: "brain.head.profile",
+                    label: "AI Studio",
+                    iconTint: Color(red: 0.72, green: 0.62, blue: 0.90)
+                ) {
                     viewModel.onOpenAIMemoryStudio?()
                 }
 
-                PopoverMenuRow(icon: "gearshape.fill", label: "Settings", shortcut: "⌘,", iconTint: AppVisualTheme.accentTint) {
+                PopoverMenuRow(
+                    icon: "gearshape.fill",
+                    label: "Settings",
+                    shortcut: "⌘,",
+                    iconTint: Color(red: 0.86, green: 0.72, blue: 0.52)
+                ) {
                     viewModel.onOpenSettings?()
                 }
             }
@@ -132,9 +145,14 @@ struct StatusBarPopoverView: View {
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.95))
 
-                Text(viewModel.uiStatus.menuText)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundColor(statusPillColor)
+                HStack(spacing: 6) {
+                    Text(viewModel.uiStatus.menuText)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundColor(statusPillColor)
+                    Text("Quick Controls")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppVisualTheme.mutedText)
+                }
             }
 
             Spacer()
