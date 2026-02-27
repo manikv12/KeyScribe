@@ -205,6 +205,12 @@ actor LocalAIRuntimeManager: LocalAIRuntimeManaging {
     }
 
     func stop() async {
+        if runtimeExecutablePath == nil,
+           let appURL = findRuntimeAppURL(),
+           let executableURL = executableURL(for: appURL) {
+            runtimeExecutablePath = executableURL.path
+        }
+
         let ownedRuntimePID = runtimeProcess.map { Int32($0.processIdentifier) }
         let processTable = Self.captureProcessTable()
         let ownedChildPIDs = ownedRuntimePID.map { Self.descendantPIDs(of: $0, from: processTable) } ?? []
