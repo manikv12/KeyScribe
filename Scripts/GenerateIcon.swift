@@ -1,219 +1,114 @@
 #!/usr/bin/env swift
 
 import AppKit
-import SwiftUI
 
-// MARK: - Icon View (speech bubbles + microphone + sparkles)
+// MARK: - Load the transparent logo PNG
 
-struct AppIconView: View {
-    let size: CGFloat
+let logoImagePath = FileManager.default.currentDirectoryPath + "/KeyScribe.png"
 
-    private let darkBubble = Color(red: 0.10, green: 0.14, blue: 0.22)
-    private let tealBubbleLeading = Color(red: 0.18, green: 0.42, blue: 0.48)
-    private let tealBubbleTrailing = Color(red: 0.24, green: 0.58, blue: 0.56)
-    private let sparkleColor = Color.white.opacity(0.85)
-    private let containerTop = Color(red: 0.20, green: 0.24, blue: 0.33)
-    private let containerBottom = Color(red: 0.07, green: 0.09, blue: 0.15)
-    private let glowColor = Color(red: 0.48, green: 0.72, blue: 0.82)
+func loadLogoPNG() -> NSImage? {
+    guard let img = NSImage(contentsOfFile: logoImagePath) else {
+        print("ERROR: Could not load logo PNG from \(logoImagePath)")
+        return nil
+    }
+    return img
+}
 
-    private var containerDiameter: CGFloat { size * 0.86 }
-    private var logoDiameter: CGFloat { containerDiameter * 0.90 }
+// MARK: - Trim transparent padding
 
-    var body: some View {
-        ZStack {
-            Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [containerTop, containerBottom],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .overlay(
-                    Circle()
-                        .fill(
-                            RadialGradient(
-                                colors: [
-                                    glowColor.opacity(0.36),
-                                    glowColor.opacity(0.12),
-                                    Color.clear
-                                ],
-                                center: UnitPoint(x: 0.68, y: 0.34),
-                                startRadius: 0,
-                                endRadius: containerDiameter * 0.52
-                            )
-                        )
-                )
-                .overlay(
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(0.10),
-                                    Color.white.opacity(0.01),
-                                    Color.black.opacity(0.30)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                )
-                .overlay(
-                    Circle()
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(0.32),
-                                    Color.white.opacity(0.08),
-                                    Color.black.opacity(0.35)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            ),
-                            lineWidth: max(1, size * 0.0055)
-                        )
-                )
-                .overlay(
-                    Circle()
-                        .stroke(Color.black.opacity(0.24), lineWidth: max(1, size * 0.0025))
-                )
-                .shadow(color: .black.opacity(0.22), radius: size * 0.03, x: 0, y: size * 0.010)
+func trimmedToContent(_ image: NSImage) -> NSImage {
+    guard let tiff = image.tiffRepresentation,
+          let rep = NSBitmapImageRep(data: tiff) else { return image }
 
-            Canvas { context, canvasSize in
-                let s = min(canvasSize.width, canvasSize.height) / 256
-                let cx = canvasSize.width / 2
-                let cy = canvasSize.height / 2
+    let w = rep.pixelsWide
+    let h = rep.pixelsHigh
+    var minX = w, minY = h, maxX = 0, maxY = 0
 
-                // ── Left (dark) speech bubble ──
-                let leftBubble = speechBubblePath(
-                    center: CGPoint(x: cx - 30 * s, y: cy + 8 * s),
-                    width: 140 * s, height: 100 * s,
-                    tailOnRight: false, scale: s
-                )
-                context.fill(leftBubble, with: .color(darkBubble))
-
-                // ── Right (teal) speech bubble ──
-                let rightBubble = speechBubblePath(
-                    center: CGPoint(x: cx + 30 * s, y: cy + 8 * s),
-                    width: 140 * s, height: 100 * s,
-                    tailOnRight: true, scale: s
-                )
-                context.fill(
-                    rightBubble,
-                    with: .linearGradient(
-                        Gradient(colors: [tealBubbleLeading, tealBubbleTrailing]),
-                        startPoint: CGPoint(x: cx - 10 * s, y: cy - 40 * s),
-                        endPoint: CGPoint(x: cx + 70 * s, y: cy + 60 * s)
-                    )
-                )
-
-                // Text lines on right bubble
-                let lineY = cy
-                for i in 0..<3 {
-                    let w: CGFloat = i == 2 ? 36 : 50
-                    let rect = CGRect(x: cx + 8 * s, y: lineY + CGFloat(i) * 14 * s, width: w * s, height: 4 * s)
-                    context.fill(Path(roundedRect: rect, cornerRadius: 2 * s), with: .color(.white.opacity(0.35)))
-                }
-
-                // Sound wave lines on left bubble
-                let waveX = cx - 50 * s
-                let waveY = cy + 2 * s
-                let waveHeights: [CGFloat] = [16, 28, 40, 28, 16]
-                for (i, h) in waveHeights.enumerated() {
-                    let x = waveX + CGFloat(i) * 10 * s
-                    let rect = CGRect(x: x - 2 * s, y: waveY - h / 2 * s, width: 4 * s, height: h * s)
-                    context.fill(Path(roundedRect: rect, cornerRadius: 2 * s), with: .color(.white.opacity(0.3)))
-                }
-
-                // ── Microphone ──
-                let micHeadRect = CGRect(x: cx - 22 * s, y: cy - 64 * s, width: 44 * s, height: 72 * s)
-                let micHead = Path(roundedRect: micHeadRect, cornerRadius: 22 * s)
-                context.fill(
-                    micHead,
-                    with: .linearGradient(
-                        Gradient(colors: [
-                            Color(red: 0.22, green: 0.26, blue: 0.36),
-                            Color(red: 0.12, green: 0.14, blue: 0.22)
-                        ]),
-                        startPoint: CGPoint(x: cx - 22 * s, y: cy - 64 * s),
-                        endPoint: CGPoint(x: cx + 22 * s, y: cy + 8 * s)
-                    )
-                )
-                context.stroke(micHead, with: .color(.white.opacity(0.15)), lineWidth: 1.5 * s)
-
-                // Mic grille lines
-                for i in 0..<5 {
-                    let gy = cy - 48 * s + CGFloat(i) * 12 * s
-                    let gw: CGFloat = i == 0 || i == 4 ? 20 : 30
-                    let grilleLine = Path { p in
-                        p.move(to: CGPoint(x: cx - gw / 2 * s, y: gy))
-                        p.addLine(to: CGPoint(x: cx + gw / 2 * s, y: gy))
-                    }
-                    context.stroke(grilleLine, with: .color(.white.opacity(0.18)), lineWidth: 1.2 * s)
-                }
-
-                // Mic stand
-                let stemRect = CGRect(x: cx - 4 * s, y: cy + 8 * s, width: 8 * s, height: 40 * s)
-                context.fill(Path(roundedRect: stemRect, cornerRadius: 3 * s), with: .color(Color(red: 0.14, green: 0.16, blue: 0.24)))
-
-                // Mic base
-                let baseRect = CGRect(x: cx - 20 * s, y: cy + 44 * s, width: 40 * s, height: 8 * s)
-                context.fill(Path(roundedRect: baseRect, cornerRadius: 4 * s), with: .color(Color(red: 0.14, green: 0.16, blue: 0.24)))
-
-                // ── Sparkles ──
-                drawSparkle(in: &context, at: CGPoint(x: cx + 60 * s, y: cy - 52 * s), size: 10 * s)
-                drawSparkle(in: &context, at: CGPoint(x: cx + 76 * s, y: cy - 38 * s), size: 6 * s)
-                drawSparkle(in: &context, at: CGPoint(x: cx + 68 * s, y: cy - 68 * s), size: 5 * s)
-                drawSparkle(in: &context, at: CGPoint(x: cx + 84 * s, y: cy - 56 * s), size: 4 * s)
+    for y in 0..<h {
+        for x in 0..<w {
+            let color = rep.colorAt(x: x, y: y)
+            if let a = color?.alphaComponent, a > 0.15 {
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
             }
-            .frame(width: logoDiameter, height: logoDiameter)
-            .offset(y: -containerDiameter * 0.01)
-            .shadow(color: .black.opacity(0.25), radius: size * 0.014, x: 0, y: size * 0.004)
-        }
-        .frame(width: containerDiameter, height: containerDiameter)
-        .frame(width: size, height: size)
-    }
- 
-    private func speechBubblePath(center: CGPoint, width: CGFloat, height: CGFloat, tailOnRight: Bool, scale: CGFloat) -> Path {
-        Path { p in
-            let r = height * 0.38
-            let rect = CGRect(x: center.x - width / 2, y: center.y - height / 2, width: width, height: height)
-            p.addRoundedRect(in: rect, cornerSize: CGSize(width: r, height: r))
-            let tailX = tailOnRight ? rect.maxX - 24 * scale : rect.minX + 24 * scale
-            let tailDir: CGFloat = tailOnRight ? 1 : -1
-            p.move(to: CGPoint(x: tailX, y: rect.maxY - 4 * scale))
-            p.addLine(to: CGPoint(x: tailX + 12 * tailDir * scale, y: rect.maxY + 14 * scale))
-            p.addLine(to: CGPoint(x: tailX + 20 * tailDir * scale, y: rect.maxY - 4 * scale))
         }
     }
- 
-    private func drawSparkle(in context: inout GraphicsContext, at point: CGPoint, size: CGFloat) {
-        let spark = Path { p in
-            p.move(to: CGPoint(x: point.x, y: point.y - size))
-            p.addLine(to: CGPoint(x: point.x + size * 0.25, y: point.y - size * 0.25))
-            p.addLine(to: CGPoint(x: point.x + size, y: point.y))
-            p.addLine(to: CGPoint(x: point.x + size * 0.25, y: point.y + size * 0.25))
-            p.addLine(to: CGPoint(x: point.x, y: point.y + size))
-            p.addLine(to: CGPoint(x: point.x - size * 0.25, y: point.y + size * 0.25))
-            p.addLine(to: CGPoint(x: point.x - size, y: point.y))
-            p.addLine(to: CGPoint(x: point.x - size * 0.25, y: point.y - size * 0.25))
-            p.closeSubpath()
-        }
-        context.fill(spark, with: .color(sparkleColor))
-    }
+
+    guard maxX >= minX, maxY >= minY else { return image }
+
+    // No extra margin — we want edge-to-edge
+    let margin = 0
+    minX = max(0, minX - margin)
+    minY = max(0, minY - margin)
+    maxX = min(w - 1, maxX + margin)
+    maxY = min(h - 1, maxY + margin)
+
+    let cropRect = CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    guard let cgImage = rep.cgImage?.cropping(to: cropRect) else { return image }
+
+    let trimmed = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+    print("Trimmed from \(w)x\(h) to \(cgImage.width)x\(cgImage.height)")
+    return trimmed
 }
 
 // MARK: - Rendering
 
 @MainActor
-func renderIcon(size: Int) -> NSImage? {
-    let view = AppIconView(size: CGFloat(size))
-        .frame(width: CGFloat(size), height: CGFloat(size), alignment: .center)
-    let renderer = ImageRenderer(content: view)
-    renderer.proposedSize = ProposedViewSize(width: CGFloat(size), height: CGFloat(size))
-    renderer.scale = 1.0
-    guard let cgImage = renderer.cgImage else { return nil }
-    return NSImage(cgImage: cgImage, size: NSSize(width: size, height: size))
+func renderIcon(size: Int, logo: NSImage) -> NSImage? {
+    let s = CGFloat(size)
+    let result = NSImage(size: NSSize(width: s, height: s))
+    result.lockFocus()
+
+    let ctx = NSGraphicsContext.current!.cgContext
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let rect = CGRect(x: 0, y: 0, width: s, height: s)
+    let center = CGPoint(x: s / 2, y: s / 2)
+
+    // Full-canvas radial gradient (fills corners too for macOS rounded rect)
+    // Deep navy tones
+    let bgColors = [
+        CGColor(red: 0.04, green: 0.06, blue: 0.14, alpha: 1.0),   // deep navy center
+        CGColor(red: 0.03, green: 0.08, blue: 0.16, alpha: 1.0),   // slightly bluer mid
+        CGColor(red: 0.02, green: 0.05, blue: 0.12, alpha: 1.0),   // dark teal-navy edge
+    ] as CFArray
+    if let bgGrad = CGGradient(colorsSpace: colorSpace, colors: bgColors, locations: [0, 0.5, 1]) {
+        ctx.drawRadialGradient(bgGrad,
+            startCenter: CGPoint(x: s * 0.45, y: s * 0.55),
+            startRadius: 0,
+            endCenter: center,
+            endRadius: s * 0.72,
+            options: [.drawsAfterEndLocation])
+    }
+
+    // Scale logo down slightly so it sits well within the macOS rounded mask
+    let logoScale: CGFloat = 0.88
+    let logoSize = s * logoScale
+    let logoRect = CGRect(
+        x: (s - logoSize) / 2,
+        y: (s - logoSize) / 2,
+        width: logoSize,
+        height: logoSize
+    )
+
+    // White circle filling entire area inside the gold ring
+    let innerCircleInset = s * 0.09
+    let innerCircleRect = CGRect(
+        x: innerCircleInset,
+        y: innerCircleInset,
+        width: s - (innerCircleInset * 2),
+        height: s - (innerCircleInset * 2)
+    )
+    ctx.setFillColor(CGColor(red: 0.96, green: 0.95, blue: 0.92, alpha: 1.0))
+    ctx.addEllipse(in: innerCircleRect)
+    ctx.fillPath()
+
+    // Draw the full logo on top at full opacity
+    logo.draw(in: logoRect, from: .zero, operation: .sourceOver, fraction: 1.0)
+
+    result.unlockFocus()
+    return result
 }
 
 func savePNG(_ image: NSImage, to path: String) {
@@ -238,6 +133,13 @@ let projectDir = FileManager.default.currentDirectoryPath
 let iconsetDir = "/tmp/KeyScribeIcon.iconset"
 let resourcesDir = projectDir + "/Resources"
 
+guard let rawLogo = loadLogoPNG() else {
+    print("Cannot proceed without logo image.")
+    return
+}
+let logo = trimmedToContent(rawLogo)
+print("Logo ready: \(logo.size)")
+
 // Create iconset directory
 try? FileManager.default.removeItem(atPath: iconsetDir)
 try! FileManager.default.createDirectory(atPath: iconsetDir, withIntermediateDirectories: true)
@@ -258,13 +160,13 @@ let sizes: [(name: String, pixels: Int)] = [
 
 for entry in sizes {
     print("Rendering \(entry.name) (\(entry.pixels)px)...")
-    if let img = renderIcon(size: entry.pixels) {
+    if let img = renderIcon(size: entry.pixels, logo: logo) {
         savePNG(img, to: "\(iconsetDir)/\(entry.name).png")
     }
 }
 
 // Also save 1024px as AppIcon.png
-if let fullImg = renderIcon(size: 1024) {
+if let fullImg = renderIcon(size: 1024, logo: logo) {
     savePNG(fullImg, to: "\(resourcesDir)/AppIcon.png")
     print("Saved AppIcon.png")
 }

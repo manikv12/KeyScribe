@@ -60,6 +60,7 @@ cp -R "$WHISPER_MACOS_FRAMEWORK" "$APP_DIR/Contents/MacOS/"
 echo "Copying Info.plist and resources..."
 cp Resources/Info.plist "$APP_DIR/Contents/"
 cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
+cp Resources/AppIcon.png "$APP_DIR/Contents/Resources/"
 
 echo "Applying code signature..."
 if [ -n "${DEVELOPER_ID:-}" ]; then

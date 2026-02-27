@@ -141,9 +141,11 @@ final class PromptRewriteHUDManager {
     private var activeSessionOrder: [PromptRewriteHUDSessionKey] = []
     private var globalKeyMonitor: Any?
     private var localKeyMonitor: Any?
+    private var loadingBypassRequests: Set<PromptRewriteHUDSessionKey> = []
 
     func showLoadingIndicator(insertionContext: PromptRewriteInsertionHUDContext) {
         let key = sessionKey(for: insertionContext)
+        loadingBypassRequests.remove(key)
         let session: PromptRewriteLoadingSession
         if let existing = loadingSessions[key] {
             session = existing
@@ -153,8 +155,11 @@ final class PromptRewriteHUDManager {
             loadingSessions[key] = session
         }
 
-        if session.window.contentViewController == nil {
-            let hosting = NSHostingController(rootView: PromptRewriteLoadingView())
+        let loadingView = makeLoadingView(for: key)
+        if let hosting = session.window.contentViewController as? NSHostingController<PromptRewriteLoadingView> {
+            hosting.rootView = loadingView
+        } else {
+            let hosting = NSHostingController(rootView: loadingView)
             session.window.contentViewController = hosting
             hosting.view.wantsLayer = true
             hosting.view.layer?.backgroundColor = NSColor.clear.cgColor
@@ -170,6 +175,20 @@ final class PromptRewriteHUDManager {
     func hideLoadingIndicator(insertionContext: PromptRewriteInsertionHUDContext) {
         let key = sessionKey(for: insertionContext)
         hideLoadingSession(for: key)
+    }
+
+    func clearLoadingBypassRequest(insertionContext: PromptRewriteInsertionHUDContext) {
+        let key = sessionKey(for: insertionContext)
+        loadingBypassRequests.remove(key)
+    }
+
+    func consumeLoadingBypassRequest(insertionContext: PromptRewriteInsertionHUDContext) -> Bool {
+        let key = sessionKey(for: insertionContext)
+        return loadingBypassRequests.remove(key) != nil
+    }
+
+    func requestLoadingBypass(insertionContext: PromptRewriteInsertionHUDContext) {
+        requestLoadingBypass(for: sessionKey(for: insertionContext))
     }
 
     func captureCurrentInsertionContext(fallbackApp: NSRunningApplication?) -> PromptRewriteInsertionHUDContext {
@@ -509,6 +528,19 @@ final class PromptRewriteHUDManager {
         }
     }
 
+    private func makeLoadingView(for key: PromptRewriteHUDSessionKey) -> PromptRewriteLoadingView {
+        PromptRewriteLoadingView(
+            onPause: { [weak self] in
+                self?.requestLoadingBypass(for: key)
+            }
+        )
+    }
+
+    private func requestLoadingBypass(for key: PromptRewriteHUDSessionKey) {
+        loadingBypassRequests.insert(key)
+        hideLoadingSession(for: key)
+    }
+
     private func hideLoadingSession(for key: PromptRewriteHUDSessionKey) {
         guard let loading = loadingSessions.removeValue(forKey: key) else { return }
         loading.window.contentViewController = nil
@@ -567,6 +599,7 @@ final class PromptRewriteHUDManager {
         guard let session = sessions.removeValue(forKey: key) else {
             return
         }
+        loadingBypassRequests.remove(key)
         removeSessionFromOrder(key)
         hide(session: session)
         hideLoadingSession(for: key)
@@ -975,6 +1008,7 @@ private struct PromptRewriteDiscussionPage: Identifiable, Equatable {
 }
 
 private struct PromptRewriteLoadingView: View {
+    let onPause: () -> Void
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
@@ -987,9 +1021,18 @@ private struct PromptRewriteLoadingView: View {
             ProgressView()
                 .controlSize(.small)
                 .tint(AppVisualTheme.accentTint)
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.78))
+            Button(action: onPause) {
+                Image(systemName: "pause.fill")
+                    .font(.system(size: 8.5, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.96))
+                    .frame(width: 17, height: 17)
+                    .background(
+                        Circle()
+                            .fill(Color.red.opacity(0.92))
+                    )
+            }
+            .buttonStyle(.plain)
+            .help("Pause AI rewrite and insert transcribed text")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)

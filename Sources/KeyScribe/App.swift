@@ -66,6 +66,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case close
     }
 
+    private enum PromptRewriteRetrievalOutcome {
+        case suggestion(PromptRewriteSuggestion?)
+        case bypassed
+    }
+
     private struct PromptRewriteSessionContext {
         let conversationContext: PromptRewriteConversationContext
         let insertionHUDContext: PromptRewriteInsertionHUDContext
@@ -173,6 +178,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         CrashReporter.install()
         NSApp.setActivationPolicy(.accessory)
+
+        // Set app icon programmatically to bypass macOS automatic icon margin
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
+           let iconImage = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = iconImage
+        }
+
         setupStatusBar()
 
         windowCoordinator = AppWindowCoordinator(
@@ -806,18 +818,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 PromptRewriteHUDManager.shared.showLoadingIndicator(
                     insertionContext: insertionSessionContext.insertionHUDContext
                 )
-                let rawSuggestion: PromptRewriteSuggestion?
+                let retrievalOutcome: PromptRewriteRetrievalOutcome
                 do {
                     defer {
                         PromptRewriteHUDManager.shared.hideLoadingIndicator(
                             insertionContext: insertionSessionContext.insertionHUDContext
                         )
                     }
-                    rawSuggestion = try await promptRewriteService.retrieveSuggestion(
+                    retrievalOutcome = try await retrievePromptRewriteSuggestionOrBypass(
                         for: cleanedTranscript,
                         conversationContext: conversationContext,
-                        conversationHistory: conversationHistory
+                        conversationHistory: conversationHistory,
+                        insertionContext: insertionSessionContext.insertionHUDContext
                     )
+                }
+
+                if case .bypassed = retrievalOutcome {
+                    await recordPromptRewriteFeedback(
+                        action: .insertedOriginal,
+                        originalText: cleanedTranscript,
+                        finalInsertedText: cleanedTranscript,
+                        failureDetail: "user-paused-ai-refinement"
+                    )
+                    setUIStatus(.message("AI refinement paused - using transcript"))
+                    return PromptRewriteInsertionResolution(
+                        insertionText: cleanedTranscript,
+                        conversationContext: conversationContext,
+                        insertionHUDContext: insertionSessionContext.insertionHUDContext
+                    )
+                }
+
+                let rawSuggestion: PromptRewriteSuggestion?
+                switch retrievalOutcome {
+                case let .suggestion(suggestion):
+                    rawSuggestion = suggestion
+                case .bypassed:
+                    rawSuggestion = nil
                 }
 
                 guard let rawSuggestion else {
@@ -924,6 +960,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return nil
                 }
             }
+        }
+    }
+
+    private func retrievePromptRewriteSuggestionOrBypass(
+        for cleanedTranscript: String,
+        conversationContext: PromptRewriteConversationContext?,
+        conversationHistory: [PromptRewriteConversationTurn],
+        insertionContext: PromptRewriteInsertionHUDContext
+    ) async throws -> PromptRewriteRetrievalOutcome {
+        PromptRewriteHUDManager.shared.clearLoadingBypassRequest(insertionContext: insertionContext)
+
+        return try await withThrowingTaskGroup(of: PromptRewriteRetrievalOutcome.self) { group in
+            group.addTask {
+                let suggestion = try await PromptRewriteService.shared.retrieveSuggestion(
+                    for: cleanedTranscript,
+                    conversationContext: conversationContext,
+                    conversationHistory: conversationHistory
+                )
+                return .suggestion(suggestion)
+            }
+
+            group.addTask {
+                while true {
+                    if await PromptRewriteHUDManager.shared.consumeLoadingBypassRequest(
+                        insertionContext: insertionContext
+                    ) {
+                        return .bypassed
+                    }
+                    if Task.isCancelled {
+                        return .suggestion(nil)
+                    }
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+                }
+            }
+
+            guard let firstResult = try await group.next() else {
+                group.cancelAll()
+                return .suggestion(nil)
+            }
+
+            group.cancelAll()
+            return firstResult
         }
     }
 
