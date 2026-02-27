@@ -329,16 +329,7 @@ struct WaveformPanelView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            ZStack {
-                Capsule()
-                    .fill(.regularMaterial)
-                Capsule()
-                    .fill(AppVisualTheme.baseTint.opacity(0.12))
-                Capsule()
-                    .fill(Color.white.opacity(0.06))
-                Capsule()
-                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
-            }
+            HUDCapsuleBackground(tint: AppVisualTheme.baseTint)
         )
         .frame(width: HUDLayout.waveformWidth, height: HUDLayout.waveformHeight, alignment: .center)
         .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
@@ -365,16 +356,7 @@ struct WaveformThemePreview: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            ZStack {
-                Capsule()
-                    .fill(.regularMaterial)
-                Capsule()
-                    .fill(AppVisualTheme.baseTint.opacity(0.12))
-                Capsule()
-                    .fill(Color.white.opacity(0.06))
-                Capsule()
-                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
-            }
+            HUDCapsuleBackground(tint: AppVisualTheme.baseTint)
         )
         .frame(height: 34)
         .frame(width: 188, height: 34, alignment: .leading)
@@ -410,16 +392,7 @@ struct HUDToastView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            ZStack {
-                Capsule()
-                    .fill(.regularMaterial)
-                Capsule()
-                    .fill(AppVisualTheme.baseTint.opacity(0.12))
-                Capsule()
-                    .fill(Color.white.opacity(0.06))
-                Capsule()
-                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
-            }
+            HUDCapsuleBackground(tint: AppVisualTheme.accentTint)
         )
         .frame(width: HUDLayout.toastWidth, height: HUDLayout.toastHeight, alignment: .center)
         .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
@@ -472,19 +445,70 @@ struct HUDCorrectionDecisionView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            ZStack {
-                Capsule()
-                    .fill(.regularMaterial)
-                Capsule()
-                    .fill(AppVisualTheme.baseTint.opacity(0.12))
-                Capsule()
-                    .fill(Color.white.opacity(0.06))
-                Capsule()
-                    .stroke(Color.primary.opacity(0.20), lineWidth: 0.55)
-            }
+            HUDCapsuleBackground(tint: AppVisualTheme.accentTint)
         )
         .frame(width: HUDLayout.correctionWidth, height: HUDLayout.correctionHeight, alignment: .center)
         .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
+    }
+}
+
+private struct HUDCapsuleBackground: View {
+    let tint: Color
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+
+        Capsule(style: .continuous)
+            .fill(
+                LinearGradient(
+                    colors: [
+                        tokens.surfaceTop.opacity(0.66),
+                        tint.opacity(0.18),
+                        tokens.surfaceBottom.opacity(0.94)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+            .overlay {
+                if tokens.useMaterial {
+                    Capsule(style: .continuous)
+                        .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
+                        .opacity(0.42)
+                }
+            }
+            .overlay(
+                LinearGradient(
+                    colors: [
+                        tokens.glowRed.opacity(0.22),
+                        tokens.glowBlue.opacity(0.18),
+                        Color.clear
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .clipShape(Capsule(style: .continuous))
+            )
+            .overlay(
+                RadialGradient(
+                    colors: [
+                        tokens.glowBlue.opacity(0.22),
+                        Color.clear
+                    ],
+                    center: .topTrailing,
+                    startRadius: 12,
+                    endRadius: 180
+                )
+                .clipShape(Capsule(style: .continuous))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(tokens.strokeTop.opacity(0.14), lineWidth: 0.45)
+            )
     }
 }
 

@@ -401,7 +401,7 @@ struct AIMemoryStudioView: View {
         .padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -982,7 +982,7 @@ struct AIMemoryStudioView: View {
                             .padding(10)
                             .background(
                                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .fill(.regularMaterial)
+                                    .fill(AppVisualTheme.adaptiveMaterialFill())
                             )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1150,14 +1150,14 @@ struct AIMemoryStudioView: View {
                                     .padding(8)
                                     .background(
                                         RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(.regularMaterial)
+                                            .fill(AppVisualTheme.adaptiveMaterialFill())
                                     )
                                 }
                             }
                             .padding(10)
                             .background(
                                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .fill(.regularMaterial)
+                                    .fill(AppVisualTheme.adaptiveMaterialFill())
                             )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1364,7 +1364,7 @@ struct AIMemoryStudioView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -1396,7 +1396,7 @@ struct AIMemoryStudioView: View {
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1445,7 +1445,7 @@ struct AIMemoryStudioView: View {
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1462,7 +1462,7 @@ struct AIMemoryStudioView: View {
             .padding(10)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(.regularMaterial)
+                    .fill(AppVisualTheme.adaptiveMaterialFill())
                     .overlay(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
@@ -1598,7 +1598,7 @@ struct AIMemoryStudioView: View {
                 .padding(10)
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(.regularMaterial)
+                        .fill(AppVisualTheme.adaptiveMaterialFill())
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1869,7 +1869,7 @@ struct AIMemoryStudioView: View {
         .padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
         )
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -1901,7 +1901,7 @@ struct AIMemoryStudioView: View {
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1983,7 +1983,7 @@ struct AIMemoryStudioView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -2042,7 +2042,7 @@ struct AIMemoryStudioView: View {
                                 .padding(10)
                             .background(
                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(.regularMaterial)
+                                    .fill(AppVisualTheme.adaptiveMaterialFill())
                             )
 
                             if entry.outcomeStatus != nil || entry.attemptNumber != nil || entry.issueKey != nil {
@@ -2251,7 +2251,7 @@ struct AIMemoryStudioView: View {
                                     .padding(10)
                                 .background(
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(.regularMaterial)
+                                        .fill(AppVisualTheme.adaptiveMaterialFill())
                                 )
                             }
                         }
@@ -2670,7 +2670,7 @@ struct AIMemoryStudioView: View {
                 .padding(8)
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(.regularMaterial)
+                        .fill(AppVisualTheme.adaptiveMaterialFill())
                 )
             }
 

@@ -802,18 +802,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         while true {
             do {
-                guard let rawSuggestion = try await promptRewriteService.retrieveSuggestion(
-                    for: cleanedTranscript,
-                    conversationContext: conversationContext,
-                    conversationHistory: conversationHistory
-                ) else {
+                let refinementStart = Date()
+                PromptRewriteHUDManager.shared.showLoadingIndicator(
+                    insertionContext: insertionSessionContext.insertionHUDContext
+                )
+                let rawSuggestion: PromptRewriteSuggestion?
+                do {
+                    defer {
+                        PromptRewriteHUDManager.shared.hideLoadingIndicator(
+                            insertionContext: insertionSessionContext.insertionHUDContext
+                        )
+                    }
+                    rawSuggestion = try await promptRewriteService.retrieveSuggestion(
+                        for: cleanedTranscript,
+                        conversationContext: conversationContext,
+                        conversationHistory: conversationHistory
+                    )
+                }
+
+                guard let rawSuggestion else {
                     return PromptRewriteInsertionResolution(
                         insertionText: cleanedTranscript,
                         conversationContext: conversationContext,
                         insertionHUDContext: insertionSessionContext.insertionHUDContext
                     )
                 }
-                let suggestion = formatPromptRewriteSuggestion(rawSuggestion, originalText: cleanedTranscript)
+                let refinementElapsed = Date().timeIntervalSince(refinementStart)
+                let suggestion = formatPromptRewriteSuggestion(
+                    rawSuggestion,
+                    originalText: cleanedTranscript,
+                    refinementDurationSeconds: refinementElapsed
+                )
 
                 while true {
                     switch await presentPromptRewritePreviewDialog(
@@ -1122,7 +1141,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func formatPromptRewriteSuggestion(
         _ suggestion: PromptRewriteSuggestion,
-        originalText: String
+        originalText: String,
+        refinementDurationSeconds: TimeInterval? = nil
     ) -> PromptRewriteSuggestion {
         let formatted = PromptRewriteFormatting.prepareSuggestedTextForInsertion(
             suggestion.suggestedText,
@@ -1132,7 +1152,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let resolvedText = formatted.isEmpty ? suggestion.suggestedText : formatted
         return PromptRewriteSuggestion(
             suggestedText: resolvedText,
-            memoryContext: suggestion.memoryContext
+            memoryContext: suggestion.memoryContext,
+            refinementDurationSeconds: refinementDurationSeconds ?? suggestion.refinementDurationSeconds
         )
     }
 
@@ -2151,6 +2172,20 @@ struct SettingsView: View {
                 tint: AppVisualTheme.accentTint,
                 isExpanded: $showWaveformAppearanceSettings
             ) {
+                Picker("Interface Style", selection: $settings.appChromeStyleRawValue) {
+                    ForEach(AppChromeStyle.allCases) { style in
+                        Text(style.rawValue).tag(style.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Text("Glass style auto-adjusts when macOS Reduce Transparency is enabled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+                    .padding(.vertical, 6)
+
                 Picker("Waveform Theme", selection: $settings.waveformThemeRawValue) {
                     ForEach(WaveformTheme.allCases) { theme in
                         Text(theme.rawValue).tag(theme.rawValue)
@@ -2661,7 +2696,7 @@ struct SettingsView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Custom style instructions (optional)")
+                        Text("Custom style instructions (tone only, optional)")
                             .font(.callout.weight(.medium))
                         TextEditor(text: $settings.promptRewriteCustomStyleInstructions)
                             .frame(height: 88)
@@ -2670,7 +2705,7 @@ struct SettingsView: View {
                                 RoundedRectangle(cornerRadius: 6)
                                     .stroke(Color.primary.opacity(0.15), lineWidth: 1)
                             )
-                        Text("Examples: \"Sound like a principal architect\", \"Write as a senior iOS engineer\", \"Keep tone concise and formal\".")
+                        Text("Examples: \"Sound like a principal architect\", \"Write as a senior iOS engineer\", \"Keep tone concise and formal\". These adjust tone only, not behavior.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -3983,7 +4018,7 @@ struct SettingsView: View {
             .init(section: .aiModels, title: "AI prompt correction toggle", detail: "Enable or disable AI prompt rewrite assistance", keywords: ["prompt", "rewrite", "toggle", "enable", "ai"]),
             .init(section: .aiModels, title: "Markdown suggestion conversion", detail: "Always convert AI suggestions to Markdown before insertion", keywords: ["markdown", "format", "rewrite", "insert", "assistant"]),
             .init(section: .aiModels, title: "Rewrite style preset", detail: "Choose formal, casual, architect, developer, or writer voice", keywords: ["style", "tone", "formal", "casual", "architect", "senior", "junior", "writer"]),
-            .init(section: .aiModels, title: "Custom style instructions", detail: "Provide role-specific or domain-specific rewrite guidance", keywords: ["custom", "style", "persona", "voice", "architect", "developer", "writer", "instruction"]),
+            .init(section: .aiModels, title: "Custom style instructions", detail: "Provide tone-only rewrite guidance without changing refine-only behavior", keywords: ["custom", "style", "persona", "voice", "architect", "developer", "writer", "instruction", "tone-only"]),
             .init(section: .aiModels, title: "Conversation-aware rewrite history", detail: "Opt in to rolling history scoped by app and screen", keywords: ["conversation", "history", "context", "app", "screen", "rewrite"]),
             .init(section: .aiModels, title: "Rewrite conversation timeout", detail: "Expire conversation buckets after inactivity", keywords: ["timeout", "expire", "conversation", "history", "minutes"]),
             .init(section: .aiModels, title: "Rewrite history source switch", detail: "Pin to a saved context or use automatic app/screen context", keywords: ["switch", "pin", "context", "history", "conversation"]),
@@ -4621,12 +4656,13 @@ struct TranscriptHistoryView: View {
                     )
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 10) {
-                            ForEach(filteredEntries) { entry in
+                        LazyVStack(spacing: 0) {
+                            ForEach(Array(filteredEntries.enumerated()), id: \.element.id) { index, entry in
                                 TranscriptHistoryEntryCard(
                                     entry: entry,
                                     timestampText: timestampFormatter.string(from: entry.createdAt),
                                     relativeText: relativeFormatter.localizedString(for: entry.createdAt, relativeTo: Date()),
+                                    showsDivider: index < (filteredEntries.count - 1),
                                     onCopy: { onCopy(entry.text) },
                                     onReinsert: {
                                         onReinsert(entry.text)
@@ -4642,7 +4678,6 @@ struct TranscriptHistoryView: View {
                                 )
                             }
                         }
-                        .padding(1)
                     }
                 }
             }
@@ -4650,7 +4685,10 @@ struct TranscriptHistoryView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, 18)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.18)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(AppVisualTheme.adaptiveMaterialFill())
+            )
             .padding(10)
         }
         .appScrollbars()
@@ -4671,7 +4709,6 @@ struct TranscriptHistoryView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .appThemedSurface(cornerRadius: 14, strokeOpacity: 0.16)
     }
 }
 
@@ -4679,6 +4716,7 @@ private struct TranscriptHistoryEntryCard: View {
     let entry: TranscriptHistoryStore.Entry
     let timestampText: String
     let relativeText: String
+    let showsDivider: Bool
     let onCopy: () -> Void
     let onReinsert: () -> Void
     let onDelete: () -> Void
@@ -4744,7 +4782,13 @@ private struct TranscriptHistoryEntryCard: View {
             }
         }
         .padding(12)
-        .appThemedSurface(cornerRadius: 12, strokeOpacity: 0.16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) {
+            if showsDivider {
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+            }
+        }
     }
 }
 

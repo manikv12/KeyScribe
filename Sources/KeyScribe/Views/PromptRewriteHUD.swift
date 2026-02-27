@@ -38,7 +38,9 @@ private enum PromptRewriteHUDLayout {
     static let maxPanelHeight: CGFloat = 166
     static let screenMargin: CGFloat = 8
     static let anchorGap: CGFloat = 14
-    static let cornerRadius: CGFloat = 20
+    static let cornerRadius: CGFloat = 26
+    static let loadingSize = NSSize(width: 72, height: 30)
+    static let loadingOffsetY: CGFloat = 16
 }
 
 @MainActor
@@ -65,6 +67,8 @@ final class PromptRewriteHUDManager {
         let window: NSPanel
         var pendingSuggestions: [PendingSuggestion]
         var selectedSuggestionIndex: Int = 0
+        var manualOffset: CGSize = .zero
+        var dragBaseManualOffset: CGSize?
 
         init(key: PromptRewriteHUDSessionKey, insertionContext: PromptRewriteInsertionHUDContext, pendingSuggestions: [PendingSuggestion] = [], selectedSuggestionIndex: Int = 0) {
             self.key = key
@@ -79,9 +83,11 @@ final class PromptRewriteHUDManager {
             self.window.level = .floating
             self.window.backgroundColor = .clear
             self.window.isOpaque = false
-            self.window.hasShadow = true
+            self.window.hasShadow = false
             self.window.hidesOnDeactivate = false
             self.window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            self.window.contentView?.wantsLayer = true
+            self.window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
             self.pendingSuggestions = pendingSuggestions
             self.selectedSuggestionIndex = selectedSuggestionIndex
         }
@@ -95,9 +101,76 @@ final class PromptRewriteHUDManager {
         }
     }
 
+    @MainActor
+    private final class PromptRewriteLoadingSession {
+        let key: PromptRewriteHUDSessionKey
+        var insertionContext: PromptRewriteInsertionHUDContext
+        let window: NSPanel
+
+        init(key: PromptRewriteHUDSessionKey, insertionContext: PromptRewriteInsertionHUDContext) {
+            self.key = key
+            self.insertionContext = insertionContext
+            self.window = NSPanel(
+                contentRect: NSRect(origin: .zero, size: PromptRewriteHUDLayout.loadingSize),
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            self.window.isFloatingPanel = true
+            self.window.level = .floating
+            self.window.backgroundColor = .clear
+            self.window.isOpaque = false
+            self.window.hasShadow = false
+            self.window.hidesOnDeactivate = false
+            self.window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            self.window.contentView?.wantsLayer = true
+            self.window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
+        }
+
+        deinit {
+            let win = window
+            Task { @MainActor [weak win] in
+                win?.orderOut(nil)
+                win?.contentViewController = nil
+            }
+        }
+    }
+
     private var sessions: [PromptRewriteHUDSessionKey: PromptRewriteHUDSession] = [:]
+    private var loadingSessions: [PromptRewriteHUDSessionKey: PromptRewriteLoadingSession] = [:]
     private var activeSessionOrder: [PromptRewriteHUDSessionKey] = []
-    private var keyMonitor: Any?
+    private var globalKeyMonitor: Any?
+    private var localKeyMonitor: Any?
+
+    func showLoadingIndicator(insertionContext: PromptRewriteInsertionHUDContext) {
+        let key = sessionKey(for: insertionContext)
+        let session: PromptRewriteLoadingSession
+        if let existing = loadingSessions[key] {
+            session = existing
+            session.insertionContext = insertionContext
+        } else {
+            session = PromptRewriteLoadingSession(key: key, insertionContext: insertionContext)
+            loadingSessions[key] = session
+        }
+
+        if session.window.contentViewController == nil {
+            let hosting = NSHostingController(rootView: PromptRewriteLoadingView())
+            session.window.contentViewController = hosting
+            hosting.view.wantsLayer = true
+            hosting.view.layer?.backgroundColor = NSColor.clear.cgColor
+            hosting.view.frame = NSRect(origin: .zero, size: PromptRewriteHUDLayout.loadingSize)
+        }
+
+        let frame = loadingFrame(for: session.insertionContext)
+        session.window.alphaValue = 1
+        session.window.setFrame(frame, display: true)
+        session.window.orderFrontRegardless()
+    }
+
+    func hideLoadingIndicator(insertionContext: PromptRewriteInsertionHUDContext) {
+        let key = sessionKey(for: insertionContext)
+        hideLoadingSession(for: key)
+    }
 
     func captureCurrentInsertionContext(fallbackApp: NSRunningApplication?) -> PromptRewriteInsertionHUDContext {
         let rawAnchorRect = insertionAnchorRect()
@@ -129,6 +202,7 @@ final class PromptRewriteHUDManager {
         insertionContext: PromptRewriteInsertionHUDContext
     ) async -> PromptRewritePreviewChoice {
         let key = sessionKey(for: insertionContext)
+        hideLoadingSession(for: key)
         let session: PromptRewriteHUDSession
         if let existing = sessions[key] {
             session = existing
@@ -213,6 +287,8 @@ final class PromptRewriteHUDManager {
             )
         )
         session.window.contentViewController = hosting
+        hosting.view.wantsLayer = true
+        hosting.view.layer?.backgroundColor = NSColor.clear.cgColor
 
         let targetSize = hosting.sizeThatFits(
             in: NSSize(width: PromptRewriteHUDLayout.panelWidth, height: PromptRewriteHUDLayout.maxPanelHeight)
@@ -228,7 +304,11 @@ final class PromptRewriteHUDManager {
         )
         hosting.view.frame = frame
 
-        let placement = resolvedPlacement(for: frame.size, context: session.insertionContext)
+        let placement = resolvedPlacement(
+            for: frame.size,
+            context: session.insertionContext,
+            manualOffset: session.manualOffset
+        )
         hosting.rootView = makeView(
             pages: pages,
             selectedIndex: boundedIndex,
@@ -259,6 +339,14 @@ final class PromptRewriteHUDManager {
             onChoice: { [weak self] choice in
                 guard let self else { return }
                 self.finishSelected(sessionKey, with: choice)
+            },
+            onDragChanged: { [weak self] translation in
+                guard let self else { return }
+                self.updateDrag(translation, for: sessionKey, ended: false)
+            },
+            onDragEnded: { [weak self] translation in
+                guard let self else { return }
+                self.updateDrag(translation, for: sessionKey, ended: true)
             }
         )
     }
@@ -351,6 +439,104 @@ final class PromptRewriteHUDManager {
         )
     }
 
+    private func resolvedPlacement(
+        for panelSize: NSSize,
+        context: PromptRewriteInsertionHUDContext,
+        manualOffset: CGSize
+    ) -> PromptRewriteHUDPlacement {
+        let basePlacement = resolvedPlacement(for: panelSize, context: context)
+        guard manualOffset != .zero else { return basePlacement }
+
+        let anchorRect = context.anchorRect
+        let anchorPoint = NSPoint(x: anchorRect.midX, y: anchorRect.midY)
+        let screen = screenForDisplayNumber(context.screenNumber)
+            ?? screenContaining(point: anchorPoint)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
+
+        let minX = visibleFrame.minX + PromptRewriteHUDLayout.screenMargin
+        let maxX = visibleFrame.maxX - panelSize.width - PromptRewriteHUDLayout.screenMargin
+        let minY = visibleFrame.minY + PromptRewriteHUDLayout.screenMargin
+        let maxY = visibleFrame.maxY - panelSize.height - PromptRewriteHUDLayout.screenMargin
+
+        let translatedX = basePlacement.frame.origin.x + manualOffset.width
+        let translatedY = basePlacement.frame.origin.y + manualOffset.height
+        let clampedX = min(max(translatedX, minX), maxX)
+        let clampedY = min(max(translatedY, minY), maxY)
+        let frame = NSRect(x: clampedX, y: clampedY, width: panelSize.width, height: panelSize.height)
+
+        let bubbleEdge: PromptRewriteBubbleEdge = frame.midY >= anchorRect.midY ? .bottom : .top
+        let maxBubbleOffset = (panelSize.width * 0.5) - 28
+        let rawBubbleOffset = anchorRect.midX - frame.midX
+        let bubbleOffsetX = min(max(rawBubbleOffset, -maxBubbleOffset), maxBubbleOffset)
+
+        return PromptRewriteHUDPlacement(
+            frame: frame,
+            bubbleEdge: bubbleEdge,
+            bubbleOffsetX: bubbleOffsetX
+        )
+    }
+
+    private func updateDrag(
+        _ translation: CGSize,
+        for key: PromptRewriteHUDSessionKey,
+        ended: Bool
+    ) {
+        guard let session = sessions[key], session.window.isVisible else { return }
+
+        if session.dragBaseManualOffset == nil {
+            session.dragBaseManualOffset = session.manualOffset
+        }
+        let baseOffset = session.dragBaseManualOffset ?? .zero
+        // SwiftUI drag translation is in top-left coordinates. NSWindow uses bottom-left.
+        let windowDelta = CGSize(width: translation.width, height: -translation.height)
+        session.manualOffset = CGSize(
+            width: baseOffset.width + windowDelta.width,
+            height: baseOffset.height + windowDelta.height
+        )
+
+        let placement = resolvedPlacement(
+            for: session.window.frame.size,
+            context: session.insertionContext,
+            manualOffset: session.manualOffset
+        )
+        session.window.setFrame(placement.frame, display: true)
+
+        if ended {
+            session.dragBaseManualOffset = nil
+            render(session: session)
+        }
+    }
+
+    private func hideLoadingSession(for key: PromptRewriteHUDSessionKey) {
+        guard let loading = loadingSessions.removeValue(forKey: key) else { return }
+        loading.window.contentViewController = nil
+        loading.window.orderOut(nil)
+        loading.window.alphaValue = 1
+    }
+
+    private func loadingFrame(for context: PromptRewriteInsertionHUDContext) -> NSRect {
+        let size = PromptRewriteHUDLayout.loadingSize
+        let anchorRect = context.anchorRect
+        let anchorPoint = NSPoint(x: anchorRect.midX, y: anchorRect.midY)
+        let screen = screenForDisplayNumber(context.screenNumber)
+            ?? screenContaining(point: anchorPoint)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
+
+        let proposedX = anchorRect.midX - (size.width * 0.5)
+        let proposedY = anchorRect.midY + PromptRewriteHUDLayout.loadingOffsetY
+        let minX = visibleFrame.minX + PromptRewriteHUDLayout.screenMargin
+        let maxX = visibleFrame.maxX - size.width - PromptRewriteHUDLayout.screenMargin
+        let minY = visibleFrame.minY + PromptRewriteHUDLayout.screenMargin
+        let maxY = visibleFrame.maxY - size.height - PromptRewriteHUDLayout.screenMargin
+        let clampedX = min(max(proposedX, minX), maxX)
+        let clampedY = min(max(proposedY, minY), maxY)
+        return NSRect(x: clampedX, y: clampedY, width: size.width, height: size.height)
+    }
+
     private func show(window: NSPanel, at frame: NSRect, bubbleEdge: PromptRewriteBubbleEdge, animated: Bool) {
         installKeyMonitor()
 
@@ -383,6 +569,7 @@ final class PromptRewriteHUDManager {
         }
         removeSessionFromOrder(key)
         hide(session: session)
+        hideLoadingSession(for: key)
         if sessions.isEmpty {
             removeKeyMonitor()
         }
@@ -399,27 +586,48 @@ final class PromptRewriteHUDManager {
     }
 
     private func installKeyMonitor() {
-        guard keyMonitor == nil else { return }
-        // Use global monitor since the panel is non-activating and won't receive local key events
-        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else { return }
-            let activeModifiers = event.modifierFlags.intersection([.command, .option, .control, .shift, .function])
-            guard activeModifiers.isEmpty else { return }
-            switch event.keyCode {
-            case HUDKeyCodes.escape:
-                self.cancelMostRecentSession()
-            case HUDKeyCodes.returnKey, HUDKeyCodes.keypadEnter:
-                self.acceptMostRecentSession()
-            default:
-                break
-            }
+        guard globalKeyMonitor == nil, localKeyMonitor == nil else { return }
+
+        // Use both monitors: global handles when another app is focused,
+        // local handles cases where KeyScribe is active.
+        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            _ = self?.handleMonitoredKeyDown(event)
+        }
+
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let handled = self.handleMonitoredKeyDown(event)
+            return handled ? nil : event
         }
     }
 
     private func removeKeyMonitor() {
-        if let monitor = keyMonitor {
+        if let monitor = globalKeyMonitor {
             NSEvent.removeMonitor(monitor)
-            keyMonitor = nil
+            globalKeyMonitor = nil
+        }
+        if let monitor = localKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            localKeyMonitor = nil
+        }
+    }
+
+    @discardableResult
+    private func handleMonitoredKeyDown(_ event: NSEvent) -> Bool {
+        // Ignore only explicit shortcut modifiers; do not gate on .function
+        // because some keyboards set it for Esc/Enter variants.
+        let blockingModifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard blockingModifiers.isEmpty else { return false }
+
+        switch event.keyCode {
+        case HUDKeyCodes.escape:
+            cancelMostRecentSession()
+            return true
+        case HUDKeyCodes.returnKey, HUDKeyCodes.keypadEnter:
+            acceptMostRecentSession()
+            return true
+        default:
+            return false
         }
     }
 
@@ -436,6 +644,10 @@ final class PromptRewriteHUDManager {
     private func latestVisibleSessionKey() -> PromptRewriteHUDSessionKey? {
         for key in activeSessionOrder.reversed() {
             guard let session = sessions[key], session.window.isVisible else { continue }
+            return key
+        }
+        // Fallback for edge cases where visibility state lags while a session is still active.
+        for key in activeSessionOrder.reversed() where sessions[key] != nil {
             return key
         }
         return nil
@@ -762,6 +974,47 @@ private struct PromptRewriteDiscussionPage: Identifiable, Equatable {
     let suggestion: PromptRewriteSuggestion
 }
 
+private struct PromptRewriteLoadingView: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+
+        HStack(spacing: 7) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(AppVisualTheme.accentTint)
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.78))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background {
+            PromptRewriteGlassSurface(cornerRadius: 14)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.clear, lineWidth: 0)
+        )
+        .shadow(
+            color: tokens.cardShadowColor.opacity(0.78),
+            radius: max(7, tokens.cardShadowRadius * 0.62),
+            x: 0,
+            y: max(3, tokens.cardShadowYOffset * 0.72)
+        )
+        .frame(
+            width: PromptRewriteHUDLayout.loadingSize.width,
+            height: PromptRewriteHUDLayout.loadingSize.height,
+            alignment: .center
+        )
+    }
+}
+
 private struct PromptRewriteHUDView: View {
     let pages: [PromptRewriteDiscussionPage]
     let selectedIndex: Int
@@ -769,6 +1022,9 @@ private struct PromptRewriteHUDView: View {
     let bubbleOffsetX: CGFloat
     let onSelectPage: (Int) -> Void
     let onChoice: (PromptRewritePreviewChoice) -> Void
+    let onDragChanged: (CGSize) -> Void
+    let onDragEnded: (CGSize) -> Void
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var isPresented = false
 
     private var safeSelectedIndex: Int {
@@ -813,6 +1069,11 @@ private struct PromptRewriteHUDView: View {
 
     @ViewBuilder
     private func compactSuggestion(for page: PromptRewriteDiscussionPage) -> some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+
         HStack(alignment: .top, spacing: 11) {
             HStack(spacing: 9) {
                 AppIconBadge(
@@ -835,12 +1096,12 @@ private struct PromptRewriteHUDView: View {
             }
             .frame(width: 112, alignment: .leading)
 
-            Rectangle()
+            Capsule(style: .continuous)
                 .fill(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(0.15),
-                                Color.white.opacity(0.03)
+                                tokens.strokeTop.opacity(0.54),
+                                tokens.strokeMid.opacity(0.35)
                             ],
                             startPoint: .top,
                             endPoint: .bottom
@@ -858,7 +1119,6 @@ private struct PromptRewriteHUDView: View {
                         .textSelection(.enabled)
                 }
                 .frame(maxHeight: 62)
-                .appScrollbars(tint: AppVisualTheme.accentTint)
 
                 HStack {
                     Text("Enter inserts • Esc keeps original")
@@ -870,62 +1130,99 @@ private struct PromptRewriteHUDView: View {
                     Button("Insert") {
                         onChoice(.useSuggested)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 7)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(AppVisualTheme.accentTint.opacity(0.26))
+                    )
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(tokens.strokeTop.opacity(0.26), lineWidth: 0.6)
+                    )
                     .controlSize(.small)
-                    .tint(AppVisualTheme.accentTint)
+                        .foregroundStyle(Color.white.opacity(0.95))
+                }
+
+                if let duration = page.suggestion.refinementDurationSeconds {
+                    Text("Refined in \(formattedDuration(duration))")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(Color.white.opacity(0.58))
                 }
             }
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             PromptRewriteGlassSurface(cornerRadius: PromptRewriteHUDLayout.cornerRadius)
         }
         .clipShape(RoundedRectangle(cornerRadius: PromptRewriteHUDLayout.cornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: PromptRewriteHUDLayout.cornerRadius, style: .continuous)
-                .stroke(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.24),
-                            Color.white.opacity(0.05),
-                            Color.black.opacity(0.34)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ),
-                    lineWidth: 0.6
-                )
+                .stroke(.clear, lineWidth: 0)
         )
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.clear)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { value in
+                            onDragChanged(value.translation)
+                        }
+                        .onEnded { value in
+                            onDragEnded(value.translation)
+                        }
+                )
+        }
         .overlay(alignment: bubbleEdge == .bottom ? .bottom : .top) {
             bubbleTail
                 .offset(x: bubbleOffsetX, y: bubbleEdge == .bottom ? 6 : -6)
         }
-        .shadow(color: .black.opacity(0.32), radius: 14, x: 0, y: 5)
+        .shadow(
+            color: tokens.cardShadowColor,
+            radius: max(10, tokens.cardShadowRadius),
+            x: 0,
+            y: max(4, tokens.cardShadowYOffset)
+        )
         .onExitCommand {
             onChoice(.insertOriginal)
         }
     }
 
+    private func formattedDuration(_ seconds: TimeInterval) -> String {
+        let clamped = max(0, seconds)
+        if clamped < 1 {
+            return String(format: "%.0f ms", clamped * 1000)
+        }
+        if clamped < 10 {
+            return String(format: "%.1f s", clamped)
+        }
+        return String(format: "%.0f s", clamped)
+    }
+
     private var bubbleTail: some View {
-        RoundedRectangle(cornerRadius: 2, style: .continuous)
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+
+        return Circle()
             .fill(
                 LinearGradient(
                     colors: [
-                        Color(red: 0.16, green: 0.19, blue: 0.26).opacity(0.95),
-                        Color(red: 0.09, green: 0.11, blue: 0.16).opacity(0.98)
+                        tokens.surfaceTop.opacity(0.96),
+                        tokens.surfaceBottom.opacity(0.98)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
                 )
             )
             .frame(width: 12, height: 12)
-            .rotationEffect(.degrees(45))
-            .overlay(
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
-                    .rotationEffect(.degrees(45))
-            )
     }
 }
 
@@ -951,28 +1248,72 @@ private struct PromptRewriteMaterialView: NSViewRepresentable {
 
 private struct PromptRewriteGlassSurface: View {
     let cornerRadius: CGFloat
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         ZStack {
-            PromptRewriteMaterialView(material: .menu, blendingMode: .withinWindow)
+            if tokens.useMaterial {
+                PromptRewriteMaterialView(
+                    material: tokens.surfaceMaterial,
+                    blendingMode: tokens.surfaceBlendingMode
+                )
+                .opacity(tokens.materialOpacity * 0.48)
+            } else {
+                tokens.surfaceBottom.opacity(0.96)
+            }
             LinearGradient(
                 colors: [
-                    Color(red: 0.19, green: 0.23, blue: 0.32).opacity(0.95),
-                    Color(red: 0.10, green: 0.12, blue: 0.18).opacity(0.98)
+                    tokens.surfaceTop.opacity(0.86),
+                    AppVisualTheme.baseTint.opacity(0.20),
+                    tokens.surfaceBottom.opacity(0.98)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
-            LinearGradient(
+            VStack(spacing: 0) {
+                LinearGradient(
+                    colors: [
+                        tokens.glowRed.opacity(0.22),
+                        tokens.glowBlue.opacity(0.20),
+                        Color.clear
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(height: max(56, cornerRadius * 2.4))
+                Spacer(minLength: 0)
+            }
+            RadialGradient(
                 colors: [
-                    AppVisualTheme.accentTint.opacity(0.14),
+                    tokens.glowRed.opacity(0.34),
                     Color.clear
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                center: .bottomLeading,
+                startRadius: 18,
+                endRadius: 320
             )
-            Color.black.opacity(0.28)
+            RadialGradient(
+                colors: [
+                    tokens.glowBlue.opacity(0.32),
+                    Color.clear
+                ],
+                center: .topTrailing,
+                startRadius: 20,
+                endRadius: 340
+            )
+            LinearGradient(
+                colors: [
+                    Color.black.opacity(tokens.useMaterial ? 0.12 : 0.16),
+                    Color.black.opacity(tokens.useMaterial ? 0.22 : 0.28)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
         }
         .clipShape(shape)
     }

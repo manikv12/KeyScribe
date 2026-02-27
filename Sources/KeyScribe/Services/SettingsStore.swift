@@ -167,6 +167,13 @@ enum WaveformTheme: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+enum AppChromeStyle: String, CaseIterable, Identifiable {
+    case glassHighContrast = "Glass (High Contrast)"
+    case classic = "Classic"
+
+    var id: Self { self }
+}
+
 @MainActor
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
@@ -220,6 +227,7 @@ final class SettingsStore: ObservableObject {
         static let textCleanupMode = "KeyScribe.textCleanupMode"
         static let autoPunctuation = "KeyScribe.autoPunctuation"
         static let waveformTheme = "KeyScribe.waveformTheme"
+        static let appChromeStyle = "KeyScribe.appChromeStyle"
         static let transcriptionEngine = "KeyScribe.transcriptionEngine"
         static let selectedWhisperModelID = "KeyScribe.selectedWhisperModelID"
         static let whisperUseCoreML = "KeyScribe.whisperUseCoreML"
@@ -379,6 +387,12 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var waveformThemeRawValue: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var appChromeStyleRawValue: String {
         didSet {
             save()
         }
@@ -787,6 +801,13 @@ final class SettingsStore: ObservableObject {
             waveformThemeRawValue = storedTheme
         }
 
+        let storedChromeStyle = defaults.string(forKey: Keys.appChromeStyle) ?? AppChromeStyle.glassHighContrast.rawValue
+        if AppChromeStyle(rawValue: storedChromeStyle) == nil {
+            appChromeStyleRawValue = AppChromeStyle.glassHighContrast.rawValue
+        } else {
+            appChromeStyleRawValue = storedChromeStyle
+        }
+
         let storedEngine = defaults.string(forKey: Keys.transcriptionEngine) ?? TranscriptionEngineType.appleSpeech.rawValue
         if TranscriptionEngineType(rawValue: storedEngine) == nil {
             transcriptionEngineRawValue = TranscriptionEngineType.appleSpeech.rawValue
@@ -1063,6 +1084,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(textCleanupModeRawValue, forKey: Keys.textCleanupMode)
         defaults.set(autoPunctuation, forKey: Keys.autoPunctuation)
         defaults.set(waveformThemeRawValue, forKey: Keys.waveformTheme)
+        defaults.set(appChromeStyleRawValue, forKey: Keys.appChromeStyle)
         defaults.set(transcriptionEngineRawValue, forKey: Keys.transcriptionEngine)
         defaults.set(selectedWhisperModelID, forKey: Keys.selectedWhisperModelID)
         defaults.set(whisperUseCoreML, forKey: Keys.whisperUseCoreML)
@@ -1131,6 +1153,11 @@ final class SettingsStore: ObservableObject {
     var waveformTheme: WaveformTheme {
         get { WaveformTheme(rawValue: waveformThemeRawValue) ?? .vibrantSpectrum }
         set { waveformThemeRawValue = newValue.rawValue }
+    }
+
+    var appChromeStyle: AppChromeStyle {
+        get { AppChromeStyle(rawValue: appChromeStyleRawValue) ?? .glassHighContrast }
+        set { appChromeStyleRawValue = newValue.rawValue }
     }
 
     var transcriptionEngine: TranscriptionEngineType {

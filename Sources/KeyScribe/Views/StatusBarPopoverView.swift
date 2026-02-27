@@ -116,11 +116,7 @@ struct StatusBarPopoverView: View {
         }
         .frame(width: 312)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.18), lineWidth: 0.7)
-        )
-        .shadow(color: .black.opacity(0.35), radius: 18, x: 0, y: 10)
+        .shadow(color: .black.opacity(0.30), radius: 18, x: 0, y: 9)
         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isDictating)
     }
 
@@ -176,32 +172,55 @@ struct StatusBarPopoverView: View {
 }
 
 private struct StatusBarPopoverBackground: View {
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.70)
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-            Rectangle()
-                .fill(.regularMaterial)
-                .opacity(0.55)
+    var body: some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+
+        ZStack {
+            tokens.canvasDeep.opacity(0.95)
+
+            if tokens.useMaterial {
+                Rectangle()
+                    .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
+                    .opacity(0.62)
+            } else {
+                Rectangle()
+                    .fill(tokens.surfaceBottom.opacity(0.94))
+            }
 
             LinearGradient(
                 colors: [
-                    Color.white.opacity(0.06),
-                    Color.black.opacity(0.16),
-                    Color.black.opacity(0.38)
+                    tokens.surfaceTop.opacity(0.50),
+                    AppVisualTheme.baseTint.opacity(0.16),
+                    tokens.surfaceBottom.opacity(0.88),
+                    Color.black.opacity(0.34)
                 ],
-                startPoint: .top,
+                startPoint: .topLeading,
                 endPoint: .bottom
             )
 
             RadialGradient(
                 colors: [
-                    Color.white.opacity(0.05),
+                    tokens.glowRed.opacity(0.84),
                     Color.clear
                 ],
-                center: .topLeading,
-                startRadius: 10,
-                endRadius: 240
+                center: .bottomLeading,
+                startRadius: 22,
+                endRadius: 420
+            )
+
+            RadialGradient(
+                colors: [
+                    tokens.glowBlue.opacity(0.84),
+                    Color.clear
+                ],
+                center: .topTrailing,
+                startRadius: 18,
+                endRadius: 420
             )
         }
         .ignoresSafeArea()
@@ -245,10 +264,27 @@ private struct PopoverMenuRow: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(isHovered ? 0.10 : 0.03))
-            )
+            .background {
+                if isHovered {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    iconTint.opacity(0.20),
+                                    Color.white.opacity(0.07),
+                                    Color.black.opacity(0.16)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .stroke(Color.white.opacity(0.09), lineWidth: 0.45)
+                        )
+                        .transition(.opacity)
+                }
+            }
             .opacity(isDisabled ? 0.4 : 1)
             .contentShape(Rectangle())
         }
@@ -297,14 +333,7 @@ private struct RecordingIndicatorView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.red.opacity(0.05))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.red.opacity(0.1), lineWidth: 1)
-                )
-        )
+        .appThemedSurface(cornerRadius: 10, tint: .red, strokeOpacity: 0.12, tintOpacity: 0.04)
         .onAppear {
             isAnimating = true
         }

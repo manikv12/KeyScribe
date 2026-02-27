@@ -15,19 +15,19 @@ APP_DIR_ABS="${PROJECT_ROOT}/${APP_DIR}"
 DIST_DIR_ABS="${PROJECT_ROOT}/dist"
 
 INSTALL_APP=false
-NO_DMG=false
+MAKE_DMG=false
 
 for arg in "$@"; do
     case "$arg" in
         --install)
             INSTALL_APP=true
             ;;
-        --no-dmg)
-            NO_DMG=true
+        --make-dmg)
+            MAKE_DMG=true
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: ./build.sh [--install] [--no-dmg]"
+            echo "Usage: ./build.sh [--install] [--make-dmg]"
             exit 1
             ;;
     esac
@@ -71,7 +71,7 @@ else
     codesign --force --deep --sign - "$APP_DIR"
 fi
 
-if [ "$NO_DMG" = false ]; then
+if [ "$MAKE_DMG" = true ]; then
     echo "Creating professional drag-and-drop DMG at ${DMG_FINAL}..."
     rm -f "$DMG_FINAL"
 
@@ -93,14 +93,14 @@ if [ "$INSTALL_APP" = true ]; then
     echo ""
     echo "Build complete! Installed to ${INSTALL_DIR}"
     echo "Run with: open ${INSTALL_DIR}"
-    if [ "$NO_DMG" = false ]; then
+    if [ "$MAKE_DMG" = true ]; then
         echo "Drag-and-drop installer created at: ${DMG_FINAL}"
     fi
     echo "Then re-grant Accessibility access in System Settings -> Privacy & Security -> Accessibility"
 else
     echo ""
     echo "Build complete! App bundle at: ${APP_DIR}"
-    if [ "$NO_DMG" = false ]; then
+    if [ "$MAKE_DMG" = true ]; then
         echo "Drag-and-drop installer ready at: ${DMG_FINAL}"
         echo "Open installer with: open ${DMG_FINAL}"
     fi
