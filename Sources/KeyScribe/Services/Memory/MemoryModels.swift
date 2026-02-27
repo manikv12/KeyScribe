@@ -39,6 +39,170 @@ enum MemoryProviderKind: String, CaseIterable, Codable, Hashable {
     }
 }
 
+enum MemoryPromotionTrigger: String, Codable, Hashable {
+    case autoCompaction = "auto-compaction"
+    case timeout = "timeout"
+    case manualCompaction = "manual-compaction"
+    case manualPin = "manual-pin"
+}
+
+enum MemoryPatternOutcome: String, Codable, Hashable {
+    case good
+    case bad
+    case neutral
+}
+
+struct MemoryScopeContext: Codable, Hashable {
+    let appName: String
+    let bundleID: String
+    let surfaceLabel: String
+    let projectName: String?
+    let repositoryName: String?
+    let identityKey: String?
+    let identityType: String?
+    let identityLabel: String?
+    let scopeKey: String
+    let isCodingContext: Bool
+
+    init(
+        appName: String,
+        bundleID: String,
+        surfaceLabel: String,
+        projectName: String? = nil,
+        repositoryName: String? = nil,
+        identityKey: String? = nil,
+        identityType: String? = nil,
+        identityLabel: String? = nil,
+        scopeKey: String? = nil,
+        isCodingContext: Bool
+    ) {
+        let normalizedAppName = MemoryTextNormalizer.collapsedWhitespace(appName)
+        let normalizedBundleID = MemoryTextNormalizer.collapsedWhitespace(bundleID).lowercased()
+        let normalizedSurface = MemoryTextNormalizer.collapsedWhitespace(surfaceLabel)
+        let normalizedProject = MemoryScopeContext.normalizedScopeValue(projectName)
+        let normalizedRepository = MemoryScopeContext.normalizedScopeValue(repositoryName)
+        let normalizedIdentityKey = MemoryScopeContext.normalizedScopeValue(identityKey)?.lowercased()
+        let normalizedIdentityType = MemoryScopeContext.normalizedScopeValue(identityType)?.lowercased()
+        let normalizedIdentityLabel = MemoryScopeContext.normalizedScopeValue(identityLabel)
+
+        self.appName = normalizedAppName.isEmpty ? "Unknown App" : normalizedAppName
+        self.bundleID = normalizedBundleID.isEmpty ? "unknown.bundle" : normalizedBundleID
+        self.surfaceLabel = normalizedSurface.isEmpty ? "Unknown Surface" : normalizedSurface
+        self.projectName = normalizedProject
+        self.repositoryName = normalizedRepository
+        self.identityKey = normalizedIdentityKey
+        self.identityType = normalizedIdentityType
+        self.identityLabel = normalizedIdentityLabel
+        self.isCodingContext = isCodingContext
+        self.scopeKey = scopeKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? scopeKey!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : MemoryScopeContext.makeScopeKey(
+                bundleID: self.bundleID,
+                surfaceLabel: self.surfaceLabel,
+                projectName: self.projectName,
+                repositoryName: self.repositoryName,
+                identityKey: self.identityKey,
+                identityType: self.identityType
+            )
+    }
+
+    static func makeScopeKey(
+        bundleID: String,
+        surfaceLabel: String,
+        projectName: String?,
+        repositoryName: String?,
+        identityKey: String? = nil,
+        identityType: String? = nil
+    ) -> String {
+        let normalizedBundleID = MemoryTextNormalizer.collapsedWhitespace(bundleID).lowercased()
+        let normalizedSurface = MemoryTextNormalizer.collapsedWhitespace(surfaceLabel).lowercased()
+        let normalizedProject = normalizedScopeValue(projectName)?.lowercased() ?? "-"
+        let normalizedRepository = normalizedScopeValue(repositoryName)?.lowercased() ?? "-"
+        let normalizedIdentityKey = normalizedScopeValue(identityKey)?.lowercased() ?? "-"
+        let normalizedIdentityType = normalizedScopeValue(identityType)?.lowercased() ?? "-"
+        return "scope|\(normalizedBundleID)|\(normalizedSurface)|\(normalizedProject)|\(normalizedRepository)|\(normalizedIdentityType)|\(normalizedIdentityKey)"
+    }
+
+    static func normalizedScopeValue(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = MemoryTextNormalizer.collapsedWhitespace(value)
+        guard !normalized.isEmpty else { return nil }
+        return normalized
+    }
+}
+
+struct ConversationTupleTags: Codable, Hashable {
+    let projectKey: String
+    let projectLabel: String
+    let identityKey: String
+    let identityType: String
+    let identityLabel: String
+    let people: [String]
+    let nativeThreadKey: String
+
+    init(
+        projectKey: String,
+        projectLabel: String,
+        identityKey: String,
+        identityType: String,
+        identityLabel: String,
+        people: [String] = [],
+        nativeThreadKey: String = ""
+    ) {
+        let normalizedProjectKey = MemoryTextNormalizer.collapsedWhitespace(projectKey).lowercased()
+        let normalizedProjectLabel = MemoryTextNormalizer.collapsedWhitespace(projectLabel)
+        let normalizedIdentityKey = MemoryTextNormalizer.collapsedWhitespace(identityKey).lowercased()
+        let normalizedIdentityType = MemoryTextNormalizer.collapsedWhitespace(identityType).lowercased()
+        let normalizedIdentityLabel = MemoryTextNormalizer.collapsedWhitespace(identityLabel)
+        let normalizedNativeThread = MemoryTextNormalizer.collapsedWhitespace(nativeThreadKey).lowercased()
+
+        self.projectKey = normalizedProjectKey.isEmpty ? "project:unknown" : normalizedProjectKey
+        self.projectLabel = normalizedProjectLabel.isEmpty ? "Unknown Project" : normalizedProjectLabel
+        self.identityKey = normalizedIdentityKey.isEmpty ? "identity:unknown" : normalizedIdentityKey
+        self.identityType = normalizedIdentityType.isEmpty ? "unknown" : normalizedIdentityType
+        self.identityLabel = normalizedIdentityLabel.isEmpty ? "Unknown Identity" : normalizedIdentityLabel
+        self.people = people
+            .map { MemoryTextNormalizer.collapsedWhitespace($0) }
+            .filter { !$0.isEmpty }
+        self.nativeThreadKey = normalizedNativeThread
+    }
+}
+
+struct MemoryPatternStats: Codable, Hashable, Identifiable {
+    let patternKey: String
+    let scopeKey: String
+    let appName: String
+    let bundleID: String
+    let surfaceLabel: String
+    let projectName: String?
+    let repositoryName: String?
+    let occurrenceCount: Int
+    let goodRepeatCount: Int
+    let badRepeatCount: Int
+    let firstSeenAt: Date
+    let lastSeenAt: Date
+    let lastOutcome: MemoryPatternOutcome
+    let confidence: Double
+    let metadata: [String: String]
+
+    var id: String { patternKey }
+
+    var isRepeating: Bool {
+        occurrenceCount >= 2
+    }
+}
+
+struct MemoryPatternOccurrence: Codable, Hashable, Identifiable {
+    let id: UUID
+    let patternKey: String
+    let cardID: UUID?
+    let lessonID: UUID?
+    let eventTimestamp: Date
+    let outcome: MemoryPatternOutcome
+    let trigger: MemoryPromotionTrigger
+    let metadata: [String: String]
+}
+
 enum MemoryEventKind: String, Codable, Hashable {
     case conversation
     case rewrite
@@ -215,6 +379,42 @@ struct MemoryIndexedEntry: Hashable, Identifiable {
     let invalidatedByAttempt: Int?
     let relationConfidence: Double?
     let relationType: String?
+}
+
+struct ConversationThreadRecord: Codable, Hashable, Identifiable {
+    let id: String
+    var appName: String
+    var bundleID: String
+    var logicalSurfaceKey: String
+    var screenLabel: String
+    var fieldLabel: String
+    var projectKey: String
+    var projectLabel: String
+    var identityKey: String
+    var identityType: String
+    var identityLabel: String
+    var nativeThreadKey: String
+    var people: [String]
+    var runningSummary: String
+    var totalExchangeTurns: Int
+    var createdAt: Date
+    var lastActivityAt: Date
+    var updatedAt: Date
+}
+
+struct ConversationTurnRecord: Codable, Hashable, Identifiable {
+    let id: String
+    let threadID: String
+    let role: String
+    let userText: String
+    let assistantText: String
+    let normalizedText: String
+    let isSummary: Bool
+    let sourceTurnCount: Int
+    let compactionVersion: Int?
+    let metadata: [String: String]
+    let createdAt: Date
+    let turnDedupeKey: String
 }
 
 struct RewriteSuggestion: Codable, Hashable, Identifiable {

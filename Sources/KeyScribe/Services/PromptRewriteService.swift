@@ -63,13 +63,15 @@ final class PromptRewriteService {
     static let shared = PromptRewriteService()
     private static let minTimeoutSeconds: TimeInterval = 0.25
     private static let maxTimeoutSeconds: TimeInterval = 120
+    private static let localRuntimeMinimumTimeoutSeconds: TimeInterval = 45
+    fileprivate static let timeoutSettingsDefaultsKey = "KeyScribe.promptRewriteRequestTimeoutSeconds"
 
     private let backend: PromptRewriteBackendServing
     private let timeoutSeconds: TimeInterval
 
     init(
         backend: PromptRewriteBackendServing = BackendPromptRewriteService.shared,
-        timeoutSeconds: TimeInterval = 2.5
+        timeoutSeconds: TimeInterval = 8.0
     ) {
         self.backend = backend
         self.timeoutSeconds = min(
@@ -85,6 +87,11 @@ final class PromptRewriteService {
     ) async throws -> PromptRewriteSuggestion? {
         let normalizedTranscript = cleanedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedTranscript.isEmpty else { return nil }
+        let configuredTimeout = Self.configuredTimeout(fallback: timeoutSeconds)
+        let effectiveTimeoutSeconds = Self.effectiveTimeoutSeconds(
+            baseTimeoutSeconds: configuredTimeout.seconds,
+            hasUserConfiguredTimeout: configuredTimeout.userConfigured
+        )
 
         do {
             return try await withThrowingTaskGroup(of: PromptRewriteSuggestion?.self) { group in
@@ -96,8 +103,8 @@ final class PromptRewriteService {
                     )
                 }
                 group.addTask {
-                    try await Task.sleep(nanoseconds: self.timeoutNanoseconds)
-                    throw PromptRewriteServiceError.timedOut(timeoutSeconds: self.timeoutSeconds)
+                    try await Task.sleep(nanoseconds: Self.timeoutNanoseconds(for: effectiveTimeoutSeconds))
+                    throw PromptRewriteServiceError.timedOut(timeoutSeconds: effectiveTimeoutSeconds)
                 }
 
                 let firstResult = try await group.next()
@@ -109,14 +116,14 @@ final class PromptRewriteService {
         } catch let backendError as PromptRewriteBackendError {
             switch backendError {
             case let .providerFailure(reason):
-                throw PromptRewriteServiceError.providerUnavailable(reason: reason)
+                throw PromptRewriteServiceError.providerUnavailable(reason: Self.userFacingProviderFailureReason(reason))
             }
         } catch {
             let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
             if detail.isEmpty {
-                throw PromptRewriteServiceError.providerUnavailable(reason: "unknown-provider-error")
+                throw PromptRewriteServiceError.providerUnavailable(reason: Self.userFacingProviderFailureReason("unknown-provider-error"))
             }
-            throw PromptRewriteServiceError.providerUnavailable(reason: detail)
+            throw PromptRewriteServiceError.providerUnavailable(reason: Self.userFacingProviderFailureReason(detail))
         }
     }
 
@@ -124,7 +131,7 @@ final class PromptRewriteService {
         await backend.recordFeedback(event)
     }
 
-    private var timeoutNanoseconds: UInt64 {
+    private static func timeoutNanoseconds(for timeoutSeconds: TimeInterval) -> UInt64 {
         let nanos = timeoutSeconds * 1_000_000_000
         if !nanos.isFinite || nanos <= 0 {
             return UInt64(Self.minTimeoutSeconds * 1_000_000_000)
@@ -134,10 +141,59 @@ final class PromptRewriteService {
         }
         return UInt64(nanos.rounded())
     }
+
+    fileprivate static func configuredTimeout(fallback: TimeInterval) -> (seconds: TimeInterval, userConfigured: Bool) {
+        let defaults = UserDefaults.standard
+        let userConfigured = defaults.object(forKey: timeoutSettingsDefaultsKey) != nil
+        let rawValue = userConfigured ? defaults.double(forKey: timeoutSettingsDefaultsKey) : fallback
+        let normalized = min(max(Self.minTimeoutSeconds, rawValue), Self.maxTimeoutSeconds)
+        return (seconds: normalized, userConfigured: userConfigured)
+    }
+
+    fileprivate static func effectiveTimeoutSeconds(
+        baseTimeoutSeconds: TimeInterval,
+        hasUserConfiguredTimeout: Bool
+    ) -> TimeInterval {
+        guard isOllamaProviderActive, !hasUserConfiguredTimeout else { return baseTimeoutSeconds }
+        return max(baseTimeoutSeconds, localRuntimeMinimumTimeoutSeconds)
+    }
+
+    private static func userFacingProviderFailureReason(_ reason: String) -> String {
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = trimmed.isEmpty ? "Provider is unavailable." : trimmed
+
+        guard isOllamaProviderActive else { return fallback }
+        let normalized = fallback.lowercased()
+        let localRuntimeNeedles = [
+            "localhost",
+            "11434",
+            "cannot connect",
+            "connection refused",
+            "network is unreachable",
+            "timed out",
+            "invalid provider base url",
+            "request failed: the operation couldn’t be completed",
+            "request failed: could not connect"
+        ]
+
+        if localRuntimeNeedles.contains(where: { normalized.contains($0) }) {
+            return "Local AI runtime is unavailable. Open AI Studio -> Prompt Models -> Local AI Setup, then install or repair Local AI."
+        }
+        return fallback
+    }
+
+    private static var isOllamaProviderActive: Bool {
+        let rawValue = UserDefaults.standard
+            .string(forKey: "KeyScribe.promptRewriteProviderMode")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return rawValue == "ollama (local)" || rawValue == "ollama"
+    }
 }
 
 private enum PromptRewriteLiveProviderMode: String {
     case openAI = "openai"
+    case google = "google"
     case openRouter = "openrouter"
     case groq = "groq"
     case anthropic = "anthropic"
@@ -147,7 +203,7 @@ private enum PromptRewriteLiveProviderMode: String {
         switch self {
         case .ollama:
             return false
-        case .openAI, .openRouter, .groq, .anthropic:
+        case .openAI, .google, .openRouter, .groq, .anthropic:
             return true
         }
     }
@@ -156,7 +212,7 @@ private enum PromptRewriteLiveProviderMode: String {
         switch self {
         case .openAI, .anthropic:
             return true
-        case .openRouter, .groq, .ollama:
+        case .google, .openRouter, .groq, .ollama:
             return false
         }
     }
@@ -165,6 +221,8 @@ private enum PromptRewriteLiveProviderMode: String {
         switch self {
         case .openAI:
             return "gpt-4.1-mini"
+        case .google:
+            return "gemini-3-flash-preview"
         case .openRouter:
             return "openai/gpt-4.1-mini"
         case .groq:
@@ -180,6 +238,8 @@ private enum PromptRewriteLiveProviderMode: String {
         switch self {
         case .openAI:
             return "https://api.openai.com/v1"
+        case .google:
+            return "https://generativelanguage.googleapis.com/v1beta/openai"
         case .openRouter:
             return "https://openrouter.ai/api/v1"
         case .groq:
@@ -199,6 +259,8 @@ private enum PromptRewriteLiveProviderMode: String {
         switch self {
         case .openAI:
             return .openAI
+        case .google:
+            return .google
         case .openRouter:
             return .openRouter
         case .groq:
@@ -258,19 +320,43 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
             do {
                 let config = Self.liveConfiguration()
                 if config.providerMode.requiresAuthentication && !config.hasCredentials {
+                    CrashReporter.logInfo(
+                        """
+                        Prompt rewrite skipped provider request \
+                        reason=missing-credentials \
+                        provider=\(config.providerMode.rawValue) \
+                        model=\(config.openAIModel)
+                        """
+                    )
                     return nil
                 }
 
+                try await Self.ensureLocalRuntimeReadyIfNeeded(configuration: config)
+
                 let memoryEnabled = await MainActor.run { FeatureFlags.aiMemoryEnabled }
                 if memoryEnabled {
+                    let scope = Self.memoryScope(from: conversationContext)
                     let rewriteContext = try await retrievalService.fetchPromptRewriteContext(
                         for: cleanedTranscript,
                         lessonLimit: 8,
-                        cardLimit: 8
+                        cardLimit: 8,
+                        scope: scope
                     )
                     // Do not pay a provider round-trip unless we have an actual rewrite lesson match.
                     // Supporting cards alone are too weak and can add latency without improving quality.
-                    guard !rewriteContext.lessons.isEmpty else { return nil }
+                    guard !rewriteContext.lessons.isEmpty else {
+                        CrashReporter.logInfo(
+                            """
+                            Prompt rewrite skipped provider request \
+                            reason=no-matching-lessons \
+                            provider=\(config.providerMode.rawValue) \
+                            model=\(config.openAIModel) \
+                            transcriptChars=\(cleanedTranscript.count) \
+                            cards=\(rewriteContext.supportingCards.count)
+                            """
+                        )
+                        return nil
+                    }
 
                     return try await openAIProvider.retrieveSuggestion(
                         for: cleanedTranscript,
@@ -299,6 +385,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                 )
             }
         case .disabled:
+            CrashReporter.logInfo("Prompt rewrite skipped provider request reason=stub-disabled")
             return nil
         case .suggest:
             let suggestedText = Self.suggestedStubText(fallback: cleanedTranscript)
@@ -311,6 +398,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
             throw PromptRewriteBackendError.providerFailure(reason: "stub-provider-failure")
         case .timeout:
             try await Task.sleep(nanoseconds: 15_000_000_000)
+            CrashReporter.logInfo("Prompt rewrite skipped provider request reason=stub-timeout")
             return nil
         }
     }
@@ -452,6 +540,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         switch providerRaw {
         case "openai":
             providerMode = .openAI
+        case "google", "gemini", "google ai studio (gemini)", "google-ai-studio-gemini":
+            providerMode = .google
         case "openrouter":
             providerMode = .openRouter
         case "groq":
@@ -517,24 +607,41 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
            !envValue.isEmpty {
             return envValue
         }
+        if providerMode == .google {
+            if let envValue = ProcessInfo.processInfo.environment["KEYSCRIBE_GOOGLE_API_KEY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !envValue.isEmpty {
+                return envValue
+            }
+            if let envValue = ProcessInfo.processInfo.environment["KEYSCRIBE_GEMINI_API_KEY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !envValue.isEmpty {
+                return envValue
+            }
+        }
 
-        let normalizedProviderSlug = providerMode.rawValue
-            .lowercased()
-            .replacingOccurrences(of: "(", with: "")
-            .replacingOccurrences(of: ")", with: "")
-            .replacingOccurrences(of: " ", with: "-")
-        let providerAccount = "prompt-rewrite-provider-api-key.\(normalizedProviderSlug)"
+        for providerAccount in keychainAccounts(for: providerMode) {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "com.keyscribe.KeyScribe",
+                kSecAttrAccount as String: providerAccount,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            var item: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &item)
+            guard status == errSecSuccess,
+                  let data = item as? Data,
+                  let value = String(data: data, encoding: .utf8) else {
+                continue
+            }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.keyscribe.KeyScribe",
-            kSecAttrAccount as String: providerAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status != errSecSuccess, providerMode == .openAI {
+        if providerMode == .openAI {
             let legacyQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: "com.keyscribe.KeyScribe",
@@ -550,14 +657,100 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                 return ""
             }
             return legacyValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        } else if status != errSecSuccess {
-            return ""
         }
-        guard let data = item as? Data,
-              let value = String(data: data, encoding: .utf8) else {
-            return ""
+        return ""
+    }
+
+    private static func keychainAccounts(for providerMode: PromptRewriteLiveProviderMode) -> [String] {
+        var slugs: [String] = []
+        let candidateRawValues = [
+            providerMode.settingsProviderMode.rawValue,
+            providerMode.rawValue
+        ]
+        for rawValue in candidateRawValues {
+            let slug = rawValue
+                .lowercased()
+                .replacingOccurrences(of: "(", with: "")
+                .replacingOccurrences(of: ")", with: "")
+                .replacingOccurrences(of: " ", with: "-")
+            if !slug.isEmpty, !slugs.contains(slug) {
+                slugs.append(slug)
+            }
         }
-        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return slugs.map { "prompt-rewrite-provider-api-key.\($0)" }
+    }
+
+    private static func memoryScope(
+        from conversationContext: PromptRewriteConversationContext?
+    ) -> MemoryScopeContext? {
+        guard let conversationContext else { return nil }
+        let surface = [
+            conversationContext.screenLabel,
+            conversationContext.fieldLabel
+        ]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " • ")
+
+        let scopeContext = MemoryScopeContext(
+            appName: conversationContext.appName,
+            bundleID: conversationContext.bundleIdentifier,
+            surfaceLabel: surface.isEmpty ? "Current Surface" : surface,
+            projectName: conversationContext.projectLabel,
+            repositoryName: nil,
+            identityKey: conversationContext.identityKey,
+            identityType: conversationContext.identityType,
+            identityLabel: conversationContext.identityLabel,
+            isCodingContext: inferCodingContext(
+                appName: conversationContext.appName,
+                bundleID: conversationContext.bundleIdentifier
+            )
+        )
+        return scopeContext
+    }
+
+    private static func inferCodingContext(appName: String, bundleID: String) -> Bool {
+        let value = "\(appName) \(bundleID)".lowercased()
+        let codingIdentifiers = [
+            "xcode", "cursor", "vscode", "jetbrains", "codex",
+            "code", "sublime", "nova", "android.studio"
+        ]
+        return codingIdentifiers.contains { value.contains($0) }
+    }
+
+    private static func ensureLocalRuntimeReadyIfNeeded(
+        configuration: PromptRewriteLiveConfiguration
+    ) async throws {
+        guard configuration.providerMode == .ollama else { return }
+
+        let runtime = LocalAIRuntimeManager.shared
+        var detection = await runtime.detect()
+        guard detection.installed else {
+            throw PromptRewriteBackendError.providerFailure(
+                reason: "Local AI runtime is unavailable. Open AI Studio -> Prompt Models -> Local AI Setup, then install or repair Local AI."
+            )
+        }
+
+        if !detection.isHealthy {
+            do {
+                detection = try await runtime.start()
+                CrashReporter.logInfo("Local AI runtime auto-started on first local rewrite request.")
+            } catch {
+                throw PromptRewriteBackendError.providerFailure(
+                    reason: "Local AI runtime is unavailable. Open AI Studio -> Prompt Models -> Local AI Setup, then install or repair Local AI."
+                )
+            }
+        }
+
+        let modelID = configuration.openAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !modelID.isEmpty {
+            let isInstalled = await runtime.isModelInstalled(modelID)
+            if !isInstalled {
+                throw PromptRewriteBackendError.providerFailure(
+                    reason: "Local model \(modelID) is not installed. Open AI Studio -> Prompt Models -> Local AI Setup to install it."
+                )
+            }
+        }
     }
 }
 
@@ -590,15 +783,23 @@ private actor OpenAIPromptRewriteProvider {
         conversationContext: PromptRewriteConversationContext?,
         conversationHistory: [PromptRewriteConversationTurn]
     ) async throws -> PromptRewriteSuggestion? {
-        guard includeMemoryContext == false || !rewriteContext.isEmpty else { return nil }
+        guard includeMemoryContext == false || !rewriteContext.isEmpty else {
+            logNilSuggestion(
+                reason: "empty-rewrite-context",
+                configuration: configuration,
+                cleanedTranscript: cleanedTranscript,
+                includeMemoryContext: includeMemoryContext,
+                rewriteContext: rewriteContext,
+                conversationHistoryCount: conversationHistory.count
+            )
+            return nil
+        }
 
         let lessonPayload = formattedLessonPayload(from: rewriteContext.lessons.prefix(8).map { $0 })
         let supportingCardPayload = formattedSupportingCardPayload(from: rewriteContext.supportingCards.prefix(4).map { $0 })
         let styleGuidance = styleGuidanceBlock(configuration: configuration)
         let conversationContextLine = conversationContextLine(from: conversationContext)
-        let conversationHistoryPayload = formattedConversationPayload(
-            from: conversationHistory.suffix(6).map { $0 }
-        )
+        let conversationHistoryPayload = formattedConversationPayload(from: conversationHistory)
         let systemPrompt: String
         let userPrompt: String
         if includeMemoryContext {
@@ -619,7 +820,11 @@ private actor OpenAIPromptRewriteProvider {
             - Apply mistake->correction lessons only when the mistake is actually present or strongly implied.
             - Use supporting cards only as secondary context after lesson matching.
             - memory_context should mention lesson provenance and validation status when relevant.
-            - suggested_text must be a fully formatted final response ready to paste.
+            - suggested_text must be a rewritten user prompt ready to paste into another AI tool.
+            - Never execute or answer the task; only rewrite the prompt text.
+            - Never ask follow-up questions, request clarification, or ask the user for more details.
+            - If the source is ambiguous, keep the original meaning and produce the best-effort cleaned rewrite without adding questions.
+            - Never use assistant lead-ins like "Sure", "I can", "Let me", or "Here's".
             - Preserve structural formatting from the original prompt when present (questions, bullet points, numbered lists, markdown sections).
             - Do not collapse list/question formatting into a single paragraph.
             - Keep the conversation flow continuous; avoid introducing disruptive meta prompts, sudden action lists, or unrelated dialogue pivots.
@@ -656,7 +861,11 @@ private actor OpenAIPromptRewriteProvider {
             - Keep user intent unchanged.
             - Do not invent new requirements.
             - If no meaningful rewrite is needed, set should_rewrite=false and suggested_text equal to the original prompt.
-            - suggested_text must be a fully formatted final response ready to paste.
+            - suggested_text must be a rewritten user prompt ready to paste into another AI tool.
+            - Never execute or answer the task; only rewrite the prompt text.
+            - Never ask follow-up questions, request clarification, or ask the user for more details.
+            - If the source is ambiguous, keep the original meaning and produce the best-effort cleaned rewrite without adding questions.
+            - Never use assistant lead-ins like "Sure", "I can", "Let me", or "Here's".
             - Preserve structural formatting from the original prompt when present (questions, bullet points, numbered lists, markdown sections).
             - Do not collapse list/question formatting into a single paragraph.
             - Set memory_context to an empty string when memory is not used.
@@ -690,7 +899,15 @@ private actor OpenAIPromptRewriteProvider {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
-            CrashReporter.logError("Prompt rewrite provider request transport failure: \(error.localizedDescription)")
+            CrashReporter.logError(
+                """
+                Prompt rewrite provider request transport failure \
+                provider=\(configuration.providerMode.rawValue) \
+                model=\(configuration.openAIModel) \
+                baseURL=\(configuration.openAIBaseURL) \
+                detail=\(error.localizedDescription)
+                """
+            )
             throw PromptRewriteBackendError.providerFailure(
                 reason: "Provider request failed: \(error.localizedDescription)"
             )
@@ -702,7 +919,16 @@ private actor OpenAIPromptRewriteProvider {
 
         if !(200...299).contains(http.statusCode) {
             let detail = providerErrorDetail(from: data) ?? "HTTP \(http.statusCode)"
-            CrashReporter.logError("Prompt rewrite provider request failed status=\(http.statusCode) detail=\(detail)")
+            CrashReporter.logError(
+                """
+                Prompt rewrite provider request failed \
+                provider=\(configuration.providerMode.rawValue) \
+                model=\(configuration.openAIModel) \
+                baseURL=\(configuration.openAIBaseURL) \
+                status=\(http.statusCode) \
+                detail=\(detail)
+                """
+            )
             throw PromptRewriteBackendError.providerFailure(
                 reason: "Provider request failed (\(http.statusCode)): \(detail)"
             )
@@ -714,13 +940,52 @@ private actor OpenAIPromptRewriteProvider {
             providerMode: configuration.providerMode,
             isStreamingCodex: isStreamingCodex
         ) else {
+            logNilSuggestion(
+                reason: "decode-model-response-nil",
+                configuration: configuration,
+                cleanedTranscript: cleanedTranscript,
+                includeMemoryContext: includeMemoryContext,
+                rewriteContext: rewriteContext,
+                conversationHistoryCount: conversationHistory.count
+            )
             return nil
         }
-        guard responsePayload.shouldRewrite else { return nil }
+        guard responsePayload.shouldRewrite else {
+            logNilSuggestion(
+                reason: "model-should-rewrite-false",
+                configuration: configuration,
+                cleanedTranscript: cleanedTranscript,
+                includeMemoryContext: includeMemoryContext,
+                rewriteContext: rewriteContext,
+                conversationHistoryCount: conversationHistory.count,
+                responsePayload: responsePayload
+            )
+            return nil
+        }
 
         let rewritten = responsePayload.suggestedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rewritten.isEmpty else { return nil }
+        guard !rewritten.isEmpty else {
+            logNilSuggestion(
+                reason: "rewritten-empty",
+                configuration: configuration,
+                cleanedTranscript: cleanedTranscript,
+                includeMemoryContext: includeMemoryContext,
+                rewriteContext: rewriteContext,
+                conversationHistoryCount: conversationHistory.count,
+                responsePayload: responsePayload
+            )
+            return nil
+        }
         if rewritten.caseInsensitiveCompare(cleanedTranscript) == .orderedSame {
+            logNilSuggestion(
+                reason: "rewritten-same-as-input",
+                configuration: configuration,
+                cleanedTranscript: cleanedTranscript,
+                includeMemoryContext: includeMemoryContext,
+                rewriteContext: rewriteContext,
+                conversationHistoryCount: conversationHistory.count,
+                responsePayload: responsePayload
+            )
             return nil
         }
 
@@ -733,6 +998,37 @@ private actor OpenAIPromptRewriteProvider {
                 )
                 : nil
         )
+    }
+
+    private func logNilSuggestion(
+        reason: String,
+        configuration: PromptRewriteLiveConfiguration,
+        cleanedTranscript: String,
+        includeMemoryContext: Bool,
+        rewriteContext: MemoryRewritePromptContext,
+        conversationHistoryCount: Int,
+        responsePayload: ResponsePayload? = nil
+    ) {
+        let mode = includeMemoryContext ? "memory" : "stateless"
+        var message = """
+        Prompt rewrite returned nil \
+        reason=\(reason) \
+        provider=\(configuration.providerMode.rawValue) \
+        model=\(configuration.openAIModel) \
+        mode=\(mode) \
+        transcriptChars=\(cleanedTranscript.count) \
+        lessons=\(rewriteContext.lessons.count) \
+        cards=\(rewriteContext.supportingCards.count) \
+        historyTurns=\(conversationHistoryCount)
+        """
+
+        if let responsePayload {
+            let suggestedChars = responsePayload.suggestedText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .count
+            message += " shouldRewrite=\(responsePayload.shouldRewrite) suggestedChars=\(suggestedChars)"
+        }
+        CrashReporter.logInfo(message)
     }
 
     private func styleGuidanceBlock(configuration: PromptRewriteLiveConfiguration) -> String {
@@ -767,11 +1063,19 @@ private actor OpenAIPromptRewriteProvider {
         formatter.formatOptions = [.withInternetDateTime]
 
         let payload = turns.map { turn in
-            [
-                "timestamp": formatter.string(from: turn.timestamp),
-                "user": snippet(turn.userText, limit: 220),
-                "assistant": snippet(turn.assistantText, limit: 220)
-            ] as [String: String]
+            var item: [String: String] = [
+                "timestamp": formatter.string(from: turn.timestamp)
+            ]
+            if turn.isSummary {
+                item["summary"] = snippet(turn.assistantText, limit: 320)
+                if let sourceTurnCount = turn.sourceTurnCount {
+                    item["summarized_turn_count"] = "\(sourceTurnCount)"
+                }
+            } else {
+                item["user"] = snippet(turn.userText, limit: 220)
+                item["assistant"] = snippet(turn.assistantText, limit: 220)
+            }
+            return item
         }
         return jsonString(for: payload)
     }
@@ -818,12 +1122,24 @@ private actor OpenAIPromptRewriteProvider {
                 "temperature": 0.2,
                 "max_tokens": 500
             ]
-        case .openAI, .openRouter, .groq, .ollama:
+        case .openAI, .google, .openRouter, .groq:
             endpoint = openAICompatibleEndpoint(from: configuration.openAIBaseURL)
             payload = [
                 "model": configuration.openAIModel,
                 "temperature": 0.2,
                 "response_format": ["type": "json_object"],
+                "messages": [
+                    ["role": "system", "content": systemPrompt],
+                    ["role": "user", "content": userPrompt]
+                ]
+            ]
+        case .ollama:
+            endpoint = openAICompatibleEndpoint(from: configuration.openAIBaseURL)
+            payload = [
+                "model": configuration.openAIModel,
+                "temperature": 0.2,
+                "response_format": ["type": "json_object"],
+                "format": "json",
                 "messages": [
                     ["role": "system", "content": systemPrompt],
                     ["role": "user", "content": userPrompt]
@@ -844,7 +1160,7 @@ private actor OpenAIPromptRewriteProvider {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 12
+        request.timeoutInterval = providerRequestTimeout(for: configuration.providerMode)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = requestBody
 
@@ -868,20 +1184,37 @@ private actor OpenAIPromptRewriteProvider {
                 request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
             }
         case (.openAI, .apiKey(let apiKey)),
+             (.google, .apiKey(let apiKey)),
              (.openRouter, .apiKey(let apiKey)),
              (.groq, .apiKey(let apiKey)):
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         case (.openAI, .none),
+             (.google, .none),
              (.openRouter, .none),
              (.groq, .none),
              (.ollama, .none):
             break
-        case (.openRouter, .oauth), (.groq, .oauth), (.ollama, .oauth):
+        case (.google, .oauth), (.openRouter, .oauth), (.groq, .oauth), (.ollama, .oauth):
             break
         case (.ollama, .apiKey):
             break
         }
         return request
+    }
+
+    private func providerRequestTimeout(for mode: PromptRewriteLiveProviderMode) -> TimeInterval {
+        let configuredTimeout = PromptRewriteService.configuredTimeout(fallback: 8)
+        let effectiveRewriteTimeout = PromptRewriteService.effectiveTimeoutSeconds(
+            baseTimeoutSeconds: configuredTimeout.seconds,
+            hasUserConfiguredTimeout: configuredTimeout.userConfigured
+        )
+
+        switch mode {
+        case .ollama:
+            return min(120, max(20, effectiveRewriteTimeout + 15))
+        case .openAI, .google, .openRouter, .groq, .anthropic:
+            return min(120, max(12, configuredTimeout.seconds + 4))
+        }
     }
 
     private func resolveCredential(for configuration: PromptRewriteLiveConfiguration) async throws -> ProviderCredential {
@@ -1244,7 +1577,25 @@ private actor OpenAIPromptRewriteProvider {
         }
 
         let cleanedContent = sanitizeModelJSONText(content)
-        if let parsed = parseJSONPayload(cleanedContent) {
+        if let parsed = parseJSONPayload(
+            cleanedContent,
+            providerMode: providerMode,
+            originalPrompt: originalPrompt
+        ) ?? parseEmbeddedJSONPayload(
+            cleanedContent,
+            providerMode: providerMode,
+            originalPrompt: originalPrompt
+        ) {
+            if shouldSuppressSuggestion(
+                parsed.suggestedText,
+                originalPrompt: originalPrompt,
+                providerMode: providerMode
+            ) {
+                CrashReporter.logWarning(
+                    "Prompt rewrite suggestion suppressed because response looked like assistant output provider=\(providerMode.rawValue)"
+                )
+                return nil
+            }
             return parsed
         }
 
@@ -1252,6 +1603,88 @@ private actor OpenAIPromptRewriteProvider {
         if fallback.isEmpty {
             return nil
         }
+
+        if providerMode == .ollama {
+            if let repairedLocalPayload = parseLooseStructuredPayload(
+                fallback,
+                providerMode: providerMode,
+                originalPrompt: originalPrompt
+            ) {
+                if shouldSuppressSuggestion(
+                    repairedLocalPayload.suggestedText,
+                    originalPrompt: originalPrompt,
+                    providerMode: providerMode
+                ) {
+                    CrashReporter.logWarning(
+                        "Prompt rewrite suppressed normalized non-JSON local model response due safety heuristics."
+                    )
+                    return nil
+                }
+                if repairedLocalPayload.shouldRewrite {
+                    CrashReporter.logInfo(
+                        "Prompt rewrite normalized non-JSON local model response into structured payload."
+                    )
+                }
+                return repairedLocalPayload
+            }
+
+            // Some local models occasionally return plain text even when JSON is requested.
+            // Accept only heavily-sanitized fallback text and keep suppression guards active.
+            guard let normalizedLocalFallback = sanitizedSuggestedText(
+                fallback,
+                providerMode: providerMode,
+                originalPrompt: originalPrompt
+            ) else {
+                CrashReporter.logWarning(
+                    "Prompt rewrite ignored non-JSON local model response after sanitization."
+                )
+                return nil
+            }
+
+            if shouldSuppressSuggestion(
+                normalizedLocalFallback,
+                originalPrompt: originalPrompt,
+                providerMode: providerMode
+            ) {
+                CrashReporter.logWarning(
+                    "Prompt rewrite suppressed non-JSON local model response due safety heuristics."
+                )
+                return nil
+            }
+
+            let shouldRewrite = normalizedLocalFallback.caseInsensitiveCompare(originalPrompt) != .orderedSame
+            if shouldRewrite {
+                CrashReporter.logInfo("Prompt rewrite accepted non-JSON local model response via fallback parsing.")
+            }
+            return ResponsePayload(
+                suggestedText: normalizedLocalFallback,
+                memoryContext: nil,
+                shouldRewrite: shouldRewrite
+            )
+        }
+
+        // Reject fallback if the content looks like raw structured data
+        // (JSON objects/arrays, conversation context markers, or internal metadata)
+        // to prevent leaking internal processing details to the user.
+        let normalizedFallback = fallback.lowercased()
+        let looksLikeRawData = fallback.hasPrefix("{") || fallback.hasPrefix("[")
+            || normalizedFallback.contains("\"suggested_text\"")
+            || normalizedFallback.contains("\"memory_context\"")
+            || normalizedFallback.contains("recent conversation turns")
+            || normalizedFallback.contains("original prompt:")
+            || normalizedFallback.contains("conversation context")
+        if looksLikeRawData {
+            return nil
+        }
+
+        if shouldSuppressSuggestion(
+            fallback,
+            originalPrompt: originalPrompt,
+            providerMode: providerMode
+        ) {
+            return nil
+        }
+
         let shouldRewrite = fallback.caseInsensitiveCompare(originalPrompt) != .orderedSame
         return ResponsePayload(
             suggestedText: fallback,
@@ -1386,7 +1819,11 @@ private actor OpenAIPromptRewriteProvider {
         return trimmed
     }
 
-    private func parseJSONPayload(_ content: String) -> ResponsePayload? {
+    private func parseJSONPayload(
+        _ content: String,
+        providerMode: PromptRewriteLiveProviderMode,
+        originalPrompt: String
+    ) -> ResponsePayload? {
         guard let data = content.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any] else {
             return nil
@@ -1394,7 +1831,7 @@ private actor OpenAIPromptRewriteProvider {
 
         let shouldRewrite = (object["should_rewrite"] as? Bool)
             ?? (object["shouldRewrite"] as? Bool)
-            ?? true
+            ?? false
         let suggested = (object["suggested_text"] as? String)
             ?? (object["suggestedText"] as? String)
             ?? (object["rewrite"] as? String)
@@ -1403,8 +1840,13 @@ private actor OpenAIPromptRewriteProvider {
         let memoryContext = (object["memory_context"] as? String)
             ?? (object["memoryContext"] as? String)
 
-        let normalizedSuggested = suggested.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedSuggested.isEmpty else { return nil }
+        guard let normalizedSuggested = sanitizedSuggestedText(
+            suggested,
+            providerMode: providerMode,
+            originalPrompt: originalPrompt
+        ) else {
+            return nil
+        }
 
         let normalizedMemoryContext = memoryContext?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1413,6 +1855,711 @@ private actor OpenAIPromptRewriteProvider {
             memoryContext: normalizedMemoryContext?.isEmpty == false ? normalizedMemoryContext : nil,
             shouldRewrite: shouldRewrite
         )
+    }
+
+    private func parseEmbeddedJSONPayload(
+        _ content: String,
+        providerMode: PromptRewriteLiveProviderMode,
+        originalPrompt: String
+    ) -> ResponsePayload? {
+        for candidate in embeddedJSONObjectCandidates(from: content) {
+            if let parsed = parseJSONPayload(
+                candidate,
+                providerMode: providerMode,
+                originalPrompt: originalPrompt
+            ) {
+                return parsed
+            }
+        }
+        return nil
+    }
+
+    private func parseLooseStructuredPayload(
+        _ content: String,
+        providerMode: PromptRewriteLiveProviderMode,
+        originalPrompt: String
+    ) -> ResponsePayload? {
+        let fields = looseStructuredPayloadFields(from: content)
+
+        var suggestedCandidate = fields["suggested_text"]
+            ?? fields["rewrite"]
+            ?? fields["suggested"]
+            ?? inferredSuggestedSection(from: content)
+
+        suggestedCandidate = suggestedCandidate?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let suggestedRaw = suggestedCandidate,
+              let normalizedSuggested = sanitizedSuggestedText(
+                suggestedRaw,
+                providerMode: providerMode,
+                originalPrompt: originalPrompt
+              ) else {
+            return nil
+        }
+
+        let parsedShouldRewrite = parseLooseBoolean(fields["should_rewrite"])
+        let shouldRewrite = parsedShouldRewrite
+            ?? (normalizedSuggested.caseInsensitiveCompare(originalPrompt) != .orderedSame)
+
+        let normalizedMemoryContext = fields["memory_context"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return ResponsePayload(
+            suggestedText: normalizedSuggested,
+            memoryContext: normalizedMemoryContext?.isEmpty == false ? normalizedMemoryContext : nil,
+            shouldRewrite: shouldRewrite
+        )
+    }
+
+    private func looseStructuredPayloadFields(from text: String) -> [String: String] {
+        let aliasMap: [String: [String]] = [
+            "should_rewrite": ["should_rewrite", "should rewrite", "shouldrewrite", "rewrite?"],
+            "suggested_text": [
+                "suggested_text",
+                "suggested text",
+                "suggested prompt",
+                "rewritten prompt",
+                "improved prompt",
+                "output"
+            ],
+            "rewrite": ["rewrite"],
+            "suggested": ["suggested"],
+            "memory_context": ["memory_context", "memory context", "memorycontext", "context"]
+        ]
+
+        var canonicalAliasLookup: [String: String] = [:]
+        for (normalizedKey, aliases) in aliasMap {
+            for alias in aliases {
+                canonicalAliasLookup[canonicalLooseFieldLabel(alias)] = normalizedKey
+            }
+        }
+
+        var fields: [String: String] = [:]
+        var currentKey: String?
+        var currentValueLines: [String] = []
+
+        func flushCurrentField() {
+            guard let activeKey = currentKey else { return }
+            let combined = currentValueLines.joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !combined.isEmpty else {
+                currentKey = nil
+                currentValueLines = []
+                return
+            }
+            if fields[activeKey] == nil {
+                fields[activeKey] = combined
+            }
+            currentKey = nil
+            currentValueLines = []
+        }
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let (key, value) = parseLooseLabeledLine(line, canonicalAliasLookup: canonicalAliasLookup) {
+                flushCurrentField()
+                currentKey = key
+                if !value.isEmpty {
+                    currentValueLines = [value]
+                } else {
+                    currentValueLines = []
+                }
+                continue
+            }
+
+            guard currentKey != nil else { continue }
+            if line.isEmpty {
+                flushCurrentField()
+                continue
+            }
+            currentValueLines.append(line)
+        }
+        flushCurrentField()
+        return fields
+    }
+
+    private func parseLooseLabeledLine(
+        _ line: String,
+        canonicalAliasLookup: [String: String]
+    ) -> (key: String, value: String)? {
+        guard !line.isEmpty else { return nil }
+        let normalizedLine = line.replacingOccurrences(
+            of: #"^\s*(?:[-*•]+\s*|\d+[\.\)]\s*)"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        guard let separatorIndex = normalizedLine.firstIndex(where: { $0 == ":" || $0 == "=" }) else {
+            return nil
+        }
+
+        let rawLabel = String(normalizedLine[..<separatorIndex])
+        let canonicalLabel = canonicalLooseFieldLabel(rawLabel)
+        guard let normalizedKey = canonicalAliasLookup[canonicalLabel] else {
+            return nil
+        }
+
+        let valueStart = normalizedLine.index(after: separatorIndex)
+        let rawValue = String(normalizedLine[valueStart...])
+        let normalizedValue = cleanedLooseFieldValue(rawValue)
+        return (normalizedKey, normalizedValue)
+    }
+
+    private func canonicalLooseFieldLabel(_ raw: String) -> String {
+        raw.lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: "", options: .regularExpression)
+    }
+
+    private func cleanedLooseFieldValue(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasSuffix(",") {
+            value.removeLast()
+            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let quotePairs: [(Character, Character)] = [
+            ("\"", "\""),
+            ("'", "'"),
+            ("`", "`")
+        ]
+        for pair in quotePairs {
+            if value.first == pair.0, value.last == pair.1, value.count >= 2 {
+                value.removeFirst()
+                value.removeLast()
+                value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return value
+    }
+
+    private func parseLooseBoolean(_ raw: String?) -> Bool? {
+        guard let raw else { return nil }
+        let normalized = cleanedLooseFieldValue(raw).lowercased()
+        switch normalized {
+        case "true", "yes", "y", "1":
+            return true
+        case "false", "no", "n", "0":
+            return false
+        default:
+            if normalized.hasPrefix("true") { return true }
+            if normalized.hasPrefix("false") { return false }
+            return nil
+        }
+    }
+
+    private func inferredSuggestedSection(from value: String) -> String? {
+        let patterns = [
+            #"(?is)\b(?:suggested(?:\s+text|\s+prompt)?|rewritten\s+prompt|improved\s+prompt)\s*:\s*(.+?)(?:\n\s*(?:original\s+prompt|memory[_\s-]*context|should[_\s-]*rewrite)\s*[:=]|$)"#
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let fullRange = NSRange(value.startIndex..<value.endIndex, in: value)
+            guard let match = regex.firstMatch(in: value, options: [], range: fullRange),
+                  match.numberOfRanges > 1,
+                  let captureRange = Range(match.range(at: 1), in: value) else {
+                continue
+            }
+            let candidate = String(value[captureRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func embeddedJSONObjectCandidates(from text: String) -> [String] {
+        var candidates: [String] = []
+
+        // Prefer fenced json blocks first when the model wraps the payload with explanations.
+        if let regex = try? NSRegularExpression(pattern: #"(?is)```json\s*(\{[\s\S]*?\})\s*```"#) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            let matches = regex.matches(in: text, options: [], range: range)
+            for match in matches {
+                guard match.numberOfRanges > 1,
+                      let captureRange = Range(match.range(at: 1), in: text) else {
+                    continue
+                }
+                let candidate = String(text[captureRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !candidate.isEmpty {
+                    candidates.append(candidate)
+                }
+            }
+        }
+
+        var depth = 0
+        var inString = false
+        var escapeNext = false
+        var objectStart: String.Index?
+
+        for index in text.indices {
+            let character = text[index]
+
+            if inString {
+                if escapeNext {
+                    escapeNext = false
+                } else if character == "\\" {
+                    escapeNext = true
+                } else if character == "\"" {
+                    inString = false
+                }
+                continue
+            }
+
+            if character == "\"" {
+                inString = true
+                continue
+            }
+
+            if character == "{" {
+                if depth == 0 {
+                    objectStart = index
+                }
+                depth += 1
+                continue
+            }
+
+            if character == "}", depth > 0 {
+                depth -= 1
+                if depth == 0, let start = objectStart {
+                    let end = text.index(after: index)
+                    let candidate = String(text[start..<end])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !candidate.isEmpty {
+                        candidates.append(candidate)
+                    }
+                    objectStart = nil
+                    if candidates.count >= 8 {
+                        break
+                    }
+                }
+            }
+        }
+
+        // Keep insertion order but remove duplicates.
+        var seen = Set<String>()
+        var deduped: [String] = []
+        for candidate in candidates where !candidate.isEmpty {
+            if seen.insert(candidate).inserted {
+                deduped.append(candidate)
+            }
+        }
+        return deduped
+    }
+
+    private func sanitizedSuggestedText(
+        _ value: String,
+        providerMode: PromptRewriteLiveProviderMode,
+        originalPrompt: String
+    ) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var sanitized = strippedContextPreamble(from: trimmed)
+        sanitized = strippedContextEchoAroundPrompt(
+            from: sanitized,
+            originalPrompt: originalPrompt
+        )
+        sanitized = strippedContextMetadataLines(
+            from: sanitized,
+            originalPrompt: originalPrompt
+        )
+        sanitized = strippedFollowUpQuestionLines(
+            from: sanitized,
+            originalPrompt: originalPrompt
+        )
+        sanitized = strippedCommandInstructionSuffix(
+            from: sanitized,
+            originalPrompt: originalPrompt
+        )
+        sanitized = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sanitized.isEmpty else { return nil }
+
+        let lowered = sanitized.lowercased()
+        let markerMatches = internalPayloadMarkerMatchCount(in: lowered)
+
+        // If the model echoed the full internal template, salvage the actual prompt body only.
+        if markerMatches >= 1 {
+            if let extractedPrompt = extractedPromptBody(from: sanitized) {
+                let normalizedExtracted = extractedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !normalizedExtracted.isEmpty {
+                    return normalizedExtracted
+                }
+            }
+
+            // Local runtime should never pass template/context payload through as final suggestion.
+            if providerMode == .ollama || markerMatches >= 2 {
+                return nil
+            }
+        }
+
+        if lowered.hasPrefix("{") || lowered.hasPrefix("[") || lowered.contains("\"role\":\"system\"") {
+            return nil
+        }
+
+        if isLikelyClarificationQuestion(sanitized, originalPrompt: originalPrompt) {
+            CrashReporter.logWarning(
+                "Prompt rewrite suggestion suppressed because response asked a follow-up/clarification question."
+            )
+            return nil
+        }
+
+        return sanitized
+    }
+
+    private func strippedCommandInstructionSuffix(from suggestion: String, originalPrompt: String) -> String {
+        if mentionsCommandInstruction(originalPrompt) {
+            return suggestion
+        }
+
+        var lines = suggestion.components(separatedBy: .newlines)
+        while let last = lines.last,
+              looksLikeCommandInstructionLine(last) {
+            lines.removeLast()
+        }
+        let output = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty else { return suggestion }
+
+        guard let regex = try? NSRegularExpression(
+            pattern: #"(?is)^(.*?)(?:[\s\n\r]+|[.!?]\s+)\s*>?\s*(?:run|execute|use)\s+(?:the\s+)?command\s*:\s*[^\n]{1,220}\s*$"#,
+            options: []
+        ) else {
+            return output
+        }
+        let fullRange = NSRange(output.startIndex..<output.endIndex, in: output)
+        guard let match = regex.firstMatch(in: output, options: [], range: fullRange),
+              match.numberOfRanges > 1,
+              let keptRange = Range(match.range(at: 1), in: output) else {
+            return output
+        }
+
+        let kept = String(output[keptRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if kept.count >= 12 {
+            return kept
+        }
+        return output
+    }
+
+    private func looksLikeCommandInstructionLine(_ line: String) -> Bool {
+        let normalized = line
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"^\s*>+\s*"#, with: "", options: .regularExpression)
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        if normalized.range(
+            of: #"^(?:run|execute|use)\s+(?:the\s+)?command\s*:"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+
+        if normalized.hasPrefix("open command palette")
+            || normalized.hasPrefix("in command palette")
+            || normalized.hasPrefix("press cmd+shift+p")
+            || normalized.hasPrefix("press command+shift+p") {
+            return true
+        }
+
+        return false
+    }
+
+    private func mentionsCommandInstruction(_ text: String) -> Bool {
+        let normalized = MemoryTextNormalizer.collapsedWhitespace(text).lowercased()
+        guard !normalized.isEmpty else { return false }
+        if normalized.contains("run the command:")
+            || normalized.contains("execute the command:")
+            || normalized.contains("use the command:")
+            || normalized.contains("command palette")
+            || normalized.contains("cmd+shift+p")
+            || normalized.contains("command+shift+p") {
+            return true
+        }
+        return false
+    }
+
+    private func strippedContextPreamble(from value: String) -> String {
+        var output = value
+        let patterns = [
+            #"(?is)^\s*(?:in|for)\s+[a-z0-9 .&'’\-]{2,80},?\s*(?:project|identity|screen|field)\s*:\s*[^\n]{0,260}\b(?:type a message|focused input)\b[,:;\-\s]*"#,
+            #"(?is)^\s*(?:microsoft\s+teams|teams)[,: ]+\s*(?:project|identity|screen|field)\s*:\s*[^\n]{0,260}\b(?:type a message|focused input)\b[,:;\-\s]*"#,
+            #"(?im)^\s*context\s*:\s*[^\n]{1,320}\n?"#
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let fullRange = NSRange(output.startIndex..<output.endIndex, in: output)
+            output = regex.stringByReplacingMatches(in: output, options: [], range: fullRange, withTemplate: "")
+        }
+        return output
+    }
+
+    private func strippedContextMetadataLines(from suggestion: String, originalPrompt: String) -> String {
+        let originalLowered = MemoryTextNormalizer.collapsedWhitespace(originalPrompt).lowercased()
+        // Preserve user-authored context labels when the original prompt explicitly uses them.
+        if originalLowered.contains("context:") || originalLowered.contains("conversation context:") {
+            return suggestion
+        }
+
+        let lines = suggestion.components(separatedBy: .newlines)
+        guard lines.count > 1 else {
+            return suggestion
+        }
+
+        var keptLines: [String] = []
+        var removedCount = 0
+        for line in lines {
+            if looksLikeContextMetadataLine(line) {
+                removedCount += 1
+                continue
+            }
+            keptLines.append(line)
+        }
+
+        guard removedCount > 0 else {
+            return suggestion
+        }
+        let joined = keptLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? suggestion : joined
+    }
+
+    private func looksLikeContextMetadataLine(_ rawLine: String) -> Bool {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return false }
+        let normalized = line
+            .replacingOccurrences(of: #"^\s*(?:[-*•]+\s*)"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = normalized.lowercased()
+
+        if lowered.range(
+            of: #"^(?:context|conversation context|app context|workspace context|current context)\s*:"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+
+        // Models sometimes emit compact metadata breadcrumbs as "Label: part > part > part".
+        if lowered.contains(":"),
+           lowered.contains(">"),
+           lowered.hasPrefix("context") {
+            return true
+        }
+
+        return false
+    }
+
+    private func strippedContextEchoAroundPrompt(from suggestion: String, originalPrompt: String) -> String {
+        let normalizedOriginal = originalPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedOriginal.isEmpty else { return suggestion }
+        guard let originalRange = suggestion.range(of: normalizedOriginal, options: [.caseInsensitive]) else {
+            return suggestion
+        }
+
+        let prefix = suggestion[..<originalRange.lowerBound].lowercased()
+        let suffix = suggestion[originalRange.upperBound...].lowercased()
+        let contextMarkers = [
+            "context:",
+            "project:",
+            "identity:",
+            "screen:",
+            "field:",
+            "type a message",
+            "current screen",
+            "focused input",
+            "microsoft teams"
+        ]
+
+        let leakedContextAroundPrompt = contextMarkers.contains(where: { marker in
+            prefix.contains(marker) || suffix.contains(marker)
+        })
+        if leakedContextAroundPrompt {
+            return normalizedOriginal
+        }
+        return suggestion
+    }
+
+    private func strippedFollowUpQuestionLines(from suggestion: String, originalPrompt: String) -> String {
+        let rawLines = suggestion.components(separatedBy: .newlines)
+        guard rawLines.count > 1 else { return suggestion }
+
+        var keptLines: [String] = []
+        var removedLines = 0
+        for rawLine in rawLines {
+            let normalizedLine = normalizeSuggestionLine(rawLine)
+            guard !normalizedLine.isEmpty else { continue }
+            if isLikelyClarificationQuestion(normalizedLine, originalPrompt: originalPrompt) {
+                removedLines += 1
+                continue
+            }
+            keptLines.append(normalizedLine)
+        }
+
+        if removedLines > 0, !keptLines.isEmpty {
+            return keptLines.joined(separator: "\n")
+        }
+        return suggestion
+    }
+
+    private func normalizeSuggestionLine(_ value: String) -> String {
+        var output = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        output = output.replacingOccurrences(
+            of: #"^\s*(?:[-*•]+\s*|\d+[\.\)]\s*)"#,
+            with: "",
+            options: .regularExpression
+        )
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isLikelyClarificationQuestion(_ suggestion: String, originalPrompt: String) -> Bool {
+        let normalizedSuggestion = MemoryTextNormalizer.collapsedWhitespace(suggestion).lowercased()
+        let normalizedOriginal = MemoryTextNormalizer.collapsedWhitespace(originalPrompt).lowercased()
+        guard !normalizedSuggestion.isEmpty else { return false }
+
+        let clarificationMarkers = [
+            "what types of information are you looking for",
+            "what type of information are you looking for",
+            "what information are you looking for",
+            "what are you looking for",
+            "are you looking for",
+            "can you provide",
+            "could you provide",
+            "would you like",
+            "do you want",
+            "please provide",
+            "please clarify",
+            "can you clarify",
+            "could you clarify",
+            "more details",
+            "more detail",
+            "which one do you mean",
+            "what kind of"
+        ]
+
+        let matchedMarkers = clarificationMarkers.filter { normalizedSuggestion.contains($0) }
+        if !matchedMarkers.isEmpty {
+            // Keep legitimate user questions that were already present in source text.
+            if matchedMarkers.contains(where: { normalizedOriginal.contains($0) }) {
+                return false
+            }
+            return true
+        }
+
+        if normalizedSuggestion.contains("?") {
+            let startsWithFollowUp = [
+                "what ",
+                "which ",
+                "can you ",
+                "could you ",
+                "would you ",
+                "do you ",
+                "are you ",
+                "please "
+            ].contains(where: { normalizedSuggestion.hasPrefix($0) })
+            if startsWithFollowUp && !normalizedOriginal.contains("?") {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func shouldSuppressSuggestion(
+        _ suggestion: String,
+        originalPrompt: String,
+        providerMode: PromptRewriteLiveProviderMode
+    ) -> Bool {
+        let normalizedSuggestion = suggestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSuggestion.isEmpty else { return true }
+
+        // If it is exactly unchanged, let the normal should_rewrite gate handle it.
+        if normalizedSuggestion.caseInsensitiveCompare(originalPrompt) == .orderedSame {
+            return false
+        }
+
+        let lowered = normalizedSuggestion.lowercased()
+        let assistantLeadIns = [
+            "sure",
+            "certainly",
+            "of course",
+            "i can",
+            "i will",
+            "i'll",
+            "let me",
+            "here's",
+            "here is",
+            "happy to help",
+            "thanks for sharing",
+            "great question"
+        ]
+        if assistantLeadIns.contains(where: { lowered.hasPrefix($0) }) {
+            return true
+        }
+
+        let markerMatches = internalPayloadMarkerMatchCount(in: lowered)
+        let looksLikeTemplateLeak = markerMatches >= 2
+            || lowered.contains("recent conversation turns (oldest -> newest)")
+            || lowered.contains("conversation context (same app/screen bucket)")
+            || lowered.contains("rewrite lessons payload (primary)")
+            || lowered.contains("supporting memory cards payload (secondary)")
+            || lowered.contains("## context\n")
+            || lowered.contains("## accomplished\n")
+            || lowered.contains("## handoff\n")
+            || lowered.contains("\"role\":\"system\"")
+            || lowered.contains("\"role\": \"system\"")
+        if looksLikeTemplateLeak {
+            return true
+        }
+
+        if isLikelyClarificationQuestion(normalizedSuggestion, originalPrompt: originalPrompt) {
+            CrashReporter.logWarning(
+                "Prompt rewrite suggestion suppressed because response asked a follow-up/clarification question provider=\(providerMode.rawValue)"
+            )
+            return true
+        }
+
+        if providerMode == .ollama {
+            if lowered.contains("how can i help")
+                || lowered.contains("can you provide more details")
+                || lowered.contains("could you provide more details")
+                || markerMatches >= 1 {
+                return true
+            }
+
+            // If local suggestion is massively larger than the source prompt, it is often leaked payload.
+            let sourceLength = max(1, originalPrompt.trimmingCharacters(in: .whitespacesAndNewlines).count)
+            if normalizedSuggestion.count > max(600, sourceLength * 4) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func internalPayloadMarkerMatchCount(in loweredText: String) -> Int {
+        let markers = [
+            "original prompt:",
+            "conversation context",
+            "same app/screen bucket",
+            "recent conversation turns",
+            "rewrite lessons payload",
+            "supporting memory cards payload"
+        ]
+        return markers.reduce(into: 0) { partial, marker in
+            if loweredText.contains(marker) {
+                partial += 1
+            }
+        }
+    }
+
+    private func extractedPromptBody(from value: String) -> String? {
+        let pattern = #"(?is)Original\s*prompt\s*:\s*(.+?)(?:\n\s*Conversation\s*context|\n\s*Recent\s*conversation\s*turns|\n\s*Rewrite\s*lessons\s*payload|\n\s*Supporting\s*memory\s*cards\s*payload|$)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return nil
+        }
+        let fullRange = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard let match = regex.firstMatch(in: value, options: [], range: fullRange),
+              match.numberOfRanges > 1,
+              let captureRange = Range(match.range(at: 1), in: value) else {
+            return nil
+        }
+        return String(value[captureRange]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func providerErrorDetail(from data: Data) -> String? {

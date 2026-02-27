@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1C1C1E"/>
+      <stop offset="100%" stop-color="#121214"/>
+    </linearGradient>
+
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#E8C560"/>
+      <stop offset="40%" stop-color="#C9A84C"/>
+      <stop offset="100%" stop-color="#A68A3A"/>
+    </linearGradient>
+
+    <radialGradient id="innerBg" cx="50%" cy="38%" r="55%">
+      <stop offset="0%" stop-color="#252220"/>
+      <stop offset="100%" stop-color="#141210"/>
+    </radialGradient>
+
+    <linearGradient id="micBody" x1="0" y1="0" x2="1" y2="0.3">
+      <stop offset="0%" stop-color="#F7E8A0"/>
+      <stop offset="30%" stop-color="#E8C560"/>
+      <stop offset="65%" stop-color="#C9A84C"/>
+      <stop offset="100%" stop-color="#A07A28"/>
+    </linearGradient>
+
+    <linearGradient id="micShadow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#A07A28" stop-opacity="0"/>
+      <stop offset="60%" stop-color="#7A5C1E" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#5A4010" stop-opacity="0.7"/>
+    </linearGradient>
+
+    <linearGradient id="grille" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#B8922E" stop-opacity="0.15"/>
+      <stop offset="50%" stop-color="#8A6E20" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#6A5218" stop-opacity="0.3"/>
+    </linearGradient>
+
+    <linearGradient id="barGold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F0D478"/>
+      <stop offset="100%" stop-color="#C9A84C"/>
+    </linearGradient>
+
+    <linearGradient id="textFade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#D4AA48" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#D4AA48" stop-opacity="0.08"/>
+    </linearGradient>
+
+    <radialGradient id="glow" cx="50%" cy="45%" r="20%">
+      <stop offset="0%" stop-color="#D4AA48" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#0F0F0F" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Full-bleed background — fills entire canvas for macOS icon mask -->
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- Circle ring — centered -->
+  <circle cx="512" cy="512" r="355" fill="none" stroke="url(#ring)" stroke-width="19"/>
+  <circle cx="512" cy="512" r="340" fill="url(#innerBg)"/>
+  <circle cx="512" cy="512" r="346" fill="none" stroke="#F0D478" stroke-width="0.75" opacity="0.1"/>
+
+  <ellipse cx="512" cy="500" rx="285" ry="260" fill="url(#glow)"/>
+
+  <!-- === MICROPHONE === -->
+  <g transform="translate(512, 500)">
+    <!-- Capsule -->
+    <path d="M-28,-40 Q-28,-66 0,-66 Q28,-66 28,-40 L28,12 Q28,38 0,38 Q-28,38 -28,12 Z"
+          fill="url(#micBody)"/>
+    <path d="M-28,-40 Q-28,-66 0,-66 Q28,-66 28,-40 L28,12 Q28,38 0,38 Q-28,38 -28,12 Z"
+          fill="url(#micShadow)"/>
+
+    <!-- Grille lines clipped to capsule -->
+    <clipPath id="micClip2">
+      <path d="M-28,-40 Q-28,-66 0,-66 Q28,-66 28,-40 L28,12 Q28,38 0,38 Q-28,38 -28,12 Z"/>
+    </clipPath>
+    <g clip-path="url(#micClip2)" opacity="0.5">
+      <line x1="-23" y1="-50" x2="23" y2="-50" stroke="url(#grille)" stroke-width="2"/>
+      <line x1="-26" y1="-38" x2="26" y2="-38" stroke="url(#grille)" stroke-width="2"/>
+      <line x1="-27" y1="-26" x2="27" y2="-26" stroke="url(#grille)" stroke-width="2"/>
+      <line x1="-27" y1="-14" x2="27" y2="-14" stroke="url(#grille)" stroke-width="2"/>
+      <line x1="-27" y1="-2"  x2="27" y2="-2"  stroke="url(#grille)" stroke-width="2"/>
+      <line x1="-27" y1="10"  x2="27" y2="10"  stroke="url(#grille)" stroke-width="2"/>
+      <line x1="-24" y1="22"  x2="24" y2="22"  stroke="url(#grille)" stroke-width="2"/>
+      <line x1="-20" y1="34"  x2="20" y2="34"  stroke="url(#grille)" stroke-width="2"/>
+    </g>
+
+    <!-- Specular highlight -->
+    <ellipse cx="-10" cy="-34" rx="6" ry="12" fill="#FFFBE6" opacity="0.18"/>
+
+    <!-- Cradle -->
+    <path d="M-38,14 C-38,64 38,64 38,14" fill="none" stroke="#C9A84C" stroke-width="8" stroke-linecap="round"/>
+
+    <!-- Stand -->
+    <rect x="-4" y="54" width="8" height="38" rx="4" fill="#C9A84C" opacity="0.7"/>
+
+    <!-- Base -->
+    <rect x="-26" y="88" width="52" height="8" rx="4" fill="#C9A84C" opacity="0.5"/>
+
+    <!-- === AI SPARKLES above mic === -->
+    <path d="M0,-104 L4,-92 L14,-88 L4,-84 L0,-72 L-4,-84 L-14,-88 L-4,-92 Z"
+          fill="#F0D478" opacity="0.85"/>
+    <path d="M34,-86 L36,-78 L43,-76 L36,-74 L34,-66 L32,-74 L25,-76 L32,-78 Z"
+          fill="#F0D478" opacity="0.55"/>
+    <path d="M-26,-78 L-25,-73 L-20,-72 L-25,-71 L-26,-66 L-27,-71 L-32,-72 L-27,-73 Z"
+          fill="#F0D478" opacity="0.4"/>
+  </g>
+
+  <!-- === LEFT: SOUND WAVE BARS === -->
+  <g transform="translate(512, 500)">
+    <rect x="-88"  y="-52" width="8"  height="104" rx="4"   fill="url(#barGold)" opacity="0.75"/>
+    <rect x="-108" y="-28" width="8"  height="56"  rx="4"   fill="url(#barGold)" opacity="0.6"/>
+    <rect x="-128" y="-42" width="7"  height="84"  rx="3.5" fill="url(#barGold)" opacity="0.5"/>
+    <rect x="-148" y="-18" width="7"  height="36"  rx="3.5" fill="url(#barGold)" opacity="0.4"/>
+    <rect x="-167" y="-32" width="7"  height="64"  rx="3.5" fill="url(#barGold)" opacity="0.32"/>
+    <rect x="-185" y="-14" width="6"  height="28"  rx="3"   fill="url(#barGold)" opacity="0.22"/>
+    <rect x="-202" y="-22" width="6"  height="44"  rx="3"   fill="url(#barGold)" opacity="0.15"/>
+  </g>
+
+  <!-- === RIGHT: TEXT LINES === -->
+  <g transform="translate(512, 500)">
+    <rect x="84"  y="-46" width="142" height="6" rx="3" fill="url(#textFade)"/>
+    <rect x="84"  y="-28" width="112" height="6" rx="3" fill="url(#textFade)" opacity="0.6"/>
+    <rect x="84"  y="-10" width="128" height="6" rx="3" fill="url(#textFade)" opacity="0.45"/>
+    <rect x="84"  y="8"   width="88"  height="6" rx="3" fill="url(#textFade)" opacity="0.35"/>
+    <rect x="84"  y="26"  width="104" height="6" rx="3" fill="url(#textFade)" opacity="0.25"/>
+    <rect x="84"  y="44"  width="70"  height="6" rx="3" fill="url(#textFade)" opacity="0.15"/>
+  </g>
+</svg>

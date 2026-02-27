@@ -30,7 +30,7 @@ enum MemorySQLiteStoreError: LocalizedError {
 }
 
 final class MemorySQLiteStore {
-    private static let schemaVersion = 3
+    private static let schemaVersion = 5
     private static let cleanupUnknownIssueKey = "issue-unassigned"
     private static let cleanupNoiseIssueKey = "issue-noise"
 
@@ -249,6 +249,133 @@ final class MemorySQLiteStore {
             created_at REAL NOT NULL
         );
         """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS memory_pattern_stats (
+            pattern_key TEXT PRIMARY KEY NOT NULL,
+            scope_key TEXT NOT NULL,
+            app_name TEXT NOT NULL,
+            bundle_id TEXT NOT NULL,
+            surface_label TEXT NOT NULL,
+            project_name TEXT,
+            repository_name TEXT,
+            occurrence_count INTEGER NOT NULL DEFAULT 0,
+            good_repeat_count INTEGER NOT NULL DEFAULT 0,
+            bad_repeat_count INTEGER NOT NULL DEFAULT 0,
+            first_seen_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            last_outcome TEXT NOT NULL DEFAULT 'neutral',
+            confidence REAL NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_pattern_scope_last_seen
+            ON memory_pattern_stats(scope_key, last_seen_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_pattern_bundle_project
+            ON memory_pattern_stats(bundle_id, project_name, last_seen_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS memory_pattern_occurrences (
+            id TEXT PRIMARY KEY NOT NULL,
+            pattern_key TEXT NOT NULL REFERENCES memory_pattern_stats(pattern_key) ON DELETE CASCADE,
+            card_id TEXT,
+            lesson_id TEXT,
+            event_timestamp REAL NOT NULL,
+            outcome TEXT NOT NULL DEFAULT 'neutral',
+            trigger TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_occurrence_pattern_time
+            ON memory_pattern_occurrences(pattern_key, event_timestamp DESC);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_threads (
+            id TEXT PRIMARY KEY NOT NULL,
+            app_name TEXT NOT NULL,
+            bundle_id TEXT NOT NULL,
+            logical_surface_key TEXT NOT NULL,
+            screen_label TEXT NOT NULL,
+            field_label TEXT NOT NULL,
+            project_key TEXT NOT NULL,
+            project_label TEXT NOT NULL,
+            identity_key TEXT NOT NULL,
+            identity_type TEXT NOT NULL,
+            identity_label TEXT NOT NULL,
+            native_thread_key TEXT NOT NULL DEFAULT '',
+            people_json TEXT NOT NULL DEFAULT '[]',
+            running_summary TEXT NOT NULL DEFAULT '',
+            total_exchange_turns INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            last_activity_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        """)
+
+        try execute(sql: """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_threads_tuple
+            ON conversation_threads(bundle_id, logical_surface_key, project_key, identity_key, native_thread_key);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_threads_last_activity
+            ON conversation_threads(last_activity_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_turns (
+            id TEXT PRIMARY KEY NOT NULL,
+            thread_id TEXT NOT NULL REFERENCES conversation_threads(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            user_text TEXT NOT NULL DEFAULT '',
+            assistant_text TEXT NOT NULL DEFAULT '',
+            normalized_text TEXT NOT NULL,
+            is_summary INTEGER NOT NULL DEFAULT 0,
+            source_turn_count INTEGER NOT NULL DEFAULT 1,
+            compaction_version INTEGER,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            turn_dedupe_key TEXT NOT NULL
+        );
+        """)
+
+        try execute(sql: """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_turns_dedupe
+            ON conversation_turns(turn_dedupe_key);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_turns_thread_created
+            ON conversation_turns(thread_id, created_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_thread_redirects (
+            old_thread_id TEXT PRIMARY KEY NOT NULL,
+            new_thread_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_tag_aliases (
+            alias_type TEXT NOT NULL,
+            alias_key TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(alias_type, alias_key)
+        );
+        """)
     }
 
     func hasTable(named tableName: String) throws -> Bool {
@@ -259,6 +386,412 @@ final class MemorySQLiteStore {
             self.readString(at: 0, in: statement) ?? ""
         })
         return !results.isEmpty
+    }
+
+    func upsertConversationThread(_ thread: ConversationThreadRecord) throws {
+        let sql = """
+        INSERT INTO conversation_threads (
+            id, app_name, bundle_id, logical_surface_key, screen_label, field_label,
+            project_key, project_label, identity_key, identity_type, identity_label,
+            native_thread_key, people_json, running_summary, total_exchange_turns,
+            created_at, last_activity_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            app_name = excluded.app_name,
+            bundle_id = excluded.bundle_id,
+            logical_surface_key = excluded.logical_surface_key,
+            screen_label = excluded.screen_label,
+            field_label = excluded.field_label,
+            project_key = excluded.project_key,
+            project_label = excluded.project_label,
+            identity_key = excluded.identity_key,
+            identity_type = excluded.identity_type,
+            identity_label = excluded.identity_label,
+            native_thread_key = excluded.native_thread_key,
+            people_json = excluded.people_json,
+            running_summary = excluded.running_summary,
+            total_exchange_turns = excluded.total_exchange_turns,
+            last_activity_at = excluded.last_activity_at,
+            updated_at = excluded.updated_at;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(thread.id, at: 1, in: statement)
+            self.bind(thread.appName, at: 2, in: statement)
+            self.bind(thread.bundleID, at: 3, in: statement)
+            self.bind(thread.logicalSurfaceKey, at: 4, in: statement)
+            self.bind(thread.screenLabel, at: 5, in: statement)
+            self.bind(thread.fieldLabel, at: 6, in: statement)
+            self.bind(thread.projectKey, at: 7, in: statement)
+            self.bind(thread.projectLabel, at: 8, in: statement)
+            self.bind(thread.identityKey, at: 9, in: statement)
+            self.bind(thread.identityType, at: 10, in: statement)
+            self.bind(thread.identityLabel, at: 11, in: statement)
+            self.bind(thread.nativeThreadKey, at: 12, in: statement)
+            self.bind(self.encodeJSON(thread.people, fallback: "[]"), at: 13, in: statement)
+            self.bind(thread.runningSummary, at: 14, in: statement)
+            self.bind(Int64(max(0, thread.totalExchangeTurns)), at: 15, in: statement)
+            self.bind(thread.createdAt.timeIntervalSince1970, at: 16, in: statement)
+            self.bind(thread.lastActivityAt.timeIntervalSince1970, at: 17, in: statement)
+            self.bind(thread.updatedAt.timeIntervalSince1970, at: 18, in: statement)
+        })
+    }
+
+    func fetchConversationThread(
+        bundleID: String,
+        logicalSurfaceKey: String,
+        projectKey: String,
+        identityKey: String,
+        nativeThreadKey: String
+    ) throws -> ConversationThreadRecord? {
+        let sql = """
+        SELECT
+            id, app_name, bundle_id, logical_surface_key, screen_label, field_label,
+            project_key, project_label, identity_key, identity_type, identity_label,
+            native_thread_key, people_json, running_summary, total_exchange_turns,
+            created_at, last_activity_at, updated_at
+        FROM conversation_threads
+        WHERE bundle_id = ?
+            AND logical_surface_key = ?
+            AND project_key = ?
+            AND identity_key = ?
+            AND native_thread_key = ?
+        LIMIT 1;
+        """
+
+        let rows: [ConversationThreadRecord] = try query(sql: sql, bind: { statement in
+            self.bind(bundleID, at: 1, in: statement)
+            self.bind(logicalSurfaceKey, at: 2, in: statement)
+            self.bind(projectKey, at: 3, in: statement)
+            self.bind(identityKey, at: 4, in: statement)
+            self.bind(nativeThreadKey, at: 5, in: statement)
+        }, mapRow: { statement in
+            ConversationThreadRecord(
+                id: self.readString(at: 0, in: statement) ?? "",
+                appName: self.readString(at: 1, in: statement) ?? "Unknown App",
+                bundleID: self.readString(at: 2, in: statement) ?? "unknown.bundle",
+                logicalSurfaceKey: self.readString(at: 3, in: statement) ?? "",
+                screenLabel: self.readString(at: 4, in: statement) ?? "Current Surface",
+                fieldLabel: self.readString(at: 5, in: statement) ?? "Focused Input",
+                projectKey: self.readString(at: 6, in: statement) ?? "project:unknown",
+                projectLabel: self.readString(at: 7, in: statement) ?? "Unknown Project",
+                identityKey: self.readString(at: 8, in: statement) ?? "identity:unknown",
+                identityType: self.readString(at: 9, in: statement) ?? "unknown",
+                identityLabel: self.readString(at: 10, in: statement) ?? "Unknown Identity",
+                nativeThreadKey: self.readString(at: 11, in: statement) ?? "",
+                people: self.decodeStringArray(from: self.readString(at: 12, in: statement) ?? "[]"),
+                runningSummary: self.readString(at: 13, in: statement) ?? "",
+                totalExchangeTurns: Int(sqlite3_column_int64(statement, 14)),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 15)),
+                lastActivityAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 16)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 17))
+            )
+        })
+        return rows.first
+    }
+
+    func fetchConversationThread(id: String) throws -> ConversationThreadRecord? {
+        let sql = """
+        SELECT
+            id, app_name, bundle_id, logical_surface_key, screen_label, field_label,
+            project_key, project_label, identity_key, identity_type, identity_label,
+            native_thread_key, people_json, running_summary, total_exchange_turns,
+            created_at, last_activity_at, updated_at
+        FROM conversation_threads
+        WHERE id = ?
+        LIMIT 1;
+        """
+
+        let rows: [ConversationThreadRecord] = try query(sql: sql, bind: { statement in
+            self.bind(id, at: 1, in: statement)
+        }, mapRow: { statement in
+            ConversationThreadRecord(
+                id: self.readString(at: 0, in: statement) ?? "",
+                appName: self.readString(at: 1, in: statement) ?? "Unknown App",
+                bundleID: self.readString(at: 2, in: statement) ?? "unknown.bundle",
+                logicalSurfaceKey: self.readString(at: 3, in: statement) ?? "",
+                screenLabel: self.readString(at: 4, in: statement) ?? "Current Surface",
+                fieldLabel: self.readString(at: 5, in: statement) ?? "Focused Input",
+                projectKey: self.readString(at: 6, in: statement) ?? "project:unknown",
+                projectLabel: self.readString(at: 7, in: statement) ?? "Unknown Project",
+                identityKey: self.readString(at: 8, in: statement) ?? "identity:unknown",
+                identityType: self.readString(at: 9, in: statement) ?? "unknown",
+                identityLabel: self.readString(at: 10, in: statement) ?? "Unknown Identity",
+                nativeThreadKey: self.readString(at: 11, in: statement) ?? "",
+                people: self.decodeStringArray(from: self.readString(at: 12, in: statement) ?? "[]"),
+                runningSummary: self.readString(at: 13, in: statement) ?? "",
+                totalExchangeTurns: Int(sqlite3_column_int64(statement, 14)),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 15)),
+                lastActivityAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 16)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 17))
+            )
+        })
+        return rows.first
+    }
+
+    func fetchConversationThreads(limit: Int = 200) throws -> [ConversationThreadRecord] {
+        let normalizedLimit = max(1, min(limit, 1_000))
+        let sql = """
+        SELECT
+            id, app_name, bundle_id, logical_surface_key, screen_label, field_label,
+            project_key, project_label, identity_key, identity_type, identity_label,
+            native_thread_key, people_json, running_summary, total_exchange_turns,
+            created_at, last_activity_at, updated_at
+        FROM conversation_threads
+        ORDER BY last_activity_at DESC
+        LIMIT ?;
+        """
+        return try query(sql: sql, bind: { statement in
+            self.bind(Int64(normalizedLimit), at: 1, in: statement)
+        }, mapRow: { statement in
+            ConversationThreadRecord(
+                id: self.readString(at: 0, in: statement) ?? "",
+                appName: self.readString(at: 1, in: statement) ?? "Unknown App",
+                bundleID: self.readString(at: 2, in: statement) ?? "unknown.bundle",
+                logicalSurfaceKey: self.readString(at: 3, in: statement) ?? "",
+                screenLabel: self.readString(at: 4, in: statement) ?? "Current Surface",
+                fieldLabel: self.readString(at: 5, in: statement) ?? "Focused Input",
+                projectKey: self.readString(at: 6, in: statement) ?? "project:unknown",
+                projectLabel: self.readString(at: 7, in: statement) ?? "Unknown Project",
+                identityKey: self.readString(at: 8, in: statement) ?? "identity:unknown",
+                identityType: self.readString(at: 9, in: statement) ?? "unknown",
+                identityLabel: self.readString(at: 10, in: statement) ?? "Unknown Identity",
+                nativeThreadKey: self.readString(at: 11, in: statement) ?? "",
+                people: self.decodeStringArray(from: self.readString(at: 12, in: statement) ?? "[]"),
+                runningSummary: self.readString(at: 13, in: statement) ?? "",
+                totalExchangeTurns: Int(sqlite3_column_int64(statement, 14)),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 15)),
+                lastActivityAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 16)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 17))
+            )
+        })
+    }
+
+    func insertConversationTurn(_ turn: ConversationTurnRecord) throws -> Bool {
+        let sql = """
+        INSERT OR IGNORE INTO conversation_turns (
+            id, thread_id, role, user_text, assistant_text, normalized_text, is_summary,
+            source_turn_count, compaction_version, metadata_json, created_at, turn_dedupe_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+
+        let changed = try executeReturningChanges(sql: sql, bind: { statement in
+            self.bind(turn.id, at: 1, in: statement)
+            self.bind(turn.threadID, at: 2, in: statement)
+            self.bind(turn.role, at: 3, in: statement)
+            self.bind(turn.userText, at: 4, in: statement)
+            self.bind(turn.assistantText, at: 5, in: statement)
+            self.bind(turn.normalizedText, at: 6, in: statement)
+            self.bind(turn.isSummary ? 1 : 0, at: 7, in: statement)
+            self.bind(Int64(max(1, turn.sourceTurnCount)), at: 8, in: statement)
+            if let compactionVersion = turn.compactionVersion {
+                self.bind(Int64(compactionVersion), at: 9, in: statement)
+            } else {
+                sqlite3_bind_null(statement, 9)
+            }
+            self.bind(self.encodeJSON(turn.metadata, fallback: "{}"), at: 10, in: statement)
+            self.bind(turn.createdAt.timeIntervalSince1970, at: 11, in: statement)
+            self.bind(turn.turnDedupeKey, at: 12, in: statement)
+        })
+        return changed > 0
+    }
+
+    func fetchConversationTurns(threadID: String, limit: Int = 200) throws -> [ConversationTurnRecord] {
+        let normalizedLimit = max(1, min(limit, 1_000))
+        let sql = """
+        SELECT
+            id, thread_id, role, user_text, assistant_text, normalized_text, is_summary,
+            source_turn_count, compaction_version, metadata_json, created_at, turn_dedupe_key
+        FROM conversation_turns
+        WHERE thread_id = ?
+        ORDER BY created_at ASC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(threadID, at: 1, in: statement)
+            self.bind(Int64(normalizedLimit), at: 2, in: statement)
+        }, mapRow: { statement in
+            let compactionVersion: Int?
+            if sqlite3_column_type(statement, 8) == SQLITE_NULL {
+                compactionVersion = nil
+            } else {
+                compactionVersion = Int(sqlite3_column_int64(statement, 8))
+            }
+            return ConversationTurnRecord(
+                id: self.readString(at: 0, in: statement) ?? "",
+                threadID: self.readString(at: 1, in: statement) ?? threadID,
+                role: self.readString(at: 2, in: statement) ?? "assistant",
+                userText: self.readString(at: 3, in: statement) ?? "",
+                assistantText: self.readString(at: 4, in: statement) ?? "",
+                normalizedText: self.readString(at: 5, in: statement) ?? "",
+                isSummary: sqlite3_column_int(statement, 6) == 1,
+                sourceTurnCount: Int(sqlite3_column_int64(statement, 7)),
+                compactionVersion: compactionVersion,
+                metadata: self.decodeStringDictionary(from: self.readString(at: 9, in: statement) ?? "{}"),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 10)),
+                turnDedupeKey: self.readString(at: 11, in: statement) ?? ""
+            )
+        })
+    }
+
+    func replaceConversationTurns(
+        threadID: String,
+        turns: [ConversationTurnRecord],
+        runningSummary: String,
+        totalExchangeTurns: Int,
+        lastActivityAt: Date,
+        updatedAt: Date = Date()
+    ) throws {
+        try execute(sql: "DELETE FROM conversation_turns WHERE thread_id = ?;", bind: { statement in
+            self.bind(threadID, at: 1, in: statement)
+        })
+
+        for turn in turns {
+            let sql = """
+            INSERT INTO conversation_turns (
+                id, thread_id, role, user_text, assistant_text, normalized_text, is_summary,
+                source_turn_count, compaction_version, metadata_json, created_at, turn_dedupe_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                role = excluded.role,
+                user_text = excluded.user_text,
+                assistant_text = excluded.assistant_text,
+                normalized_text = excluded.normalized_text,
+                is_summary = excluded.is_summary,
+                source_turn_count = excluded.source_turn_count,
+                compaction_version = excluded.compaction_version,
+                metadata_json = excluded.metadata_json,
+                created_at = excluded.created_at,
+                turn_dedupe_key = excluded.turn_dedupe_key;
+            """
+            try execute(sql: sql, bind: { statement in
+                self.bind(turn.id, at: 1, in: statement)
+                self.bind(turn.threadID, at: 2, in: statement)
+                self.bind(turn.role, at: 3, in: statement)
+                self.bind(turn.userText, at: 4, in: statement)
+                self.bind(turn.assistantText, at: 5, in: statement)
+                self.bind(turn.normalizedText, at: 6, in: statement)
+                self.bind(turn.isSummary ? 1 : 0, at: 7, in: statement)
+                self.bind(Int64(max(1, turn.sourceTurnCount)), at: 8, in: statement)
+                if let compactionVersion = turn.compactionVersion {
+                    self.bind(Int64(compactionVersion), at: 9, in: statement)
+                } else {
+                    sqlite3_bind_null(statement, 9)
+                }
+                self.bind(self.encodeJSON(turn.metadata, fallback: "{}"), at: 10, in: statement)
+                self.bind(turn.createdAt.timeIntervalSince1970, at: 11, in: statement)
+                self.bind(turn.turnDedupeKey, at: 12, in: statement)
+            })
+        }
+
+        try execute(sql: """
+        UPDATE conversation_threads
+        SET running_summary = ?,
+            total_exchange_turns = ?,
+            last_activity_at = ?,
+            updated_at = ?
+        WHERE id = ?;
+        """, bind: { statement in
+            self.bind(runningSummary, at: 1, in: statement)
+            self.bind(Int64(max(0, totalExchangeTurns)), at: 2, in: statement)
+            self.bind(lastActivityAt.timeIntervalSince1970, at: 3, in: statement)
+            self.bind(updatedAt.timeIntervalSince1970, at: 4, in: statement)
+            self.bind(threadID, at: 5, in: statement)
+        })
+    }
+
+    func deleteConversationThread(id: String) throws {
+        try execute(sql: "DELETE FROM conversation_threads WHERE id = ?;", bind: { statement in
+            self.bind(id, at: 1, in: statement)
+        })
+        try execute(sql: "DELETE FROM conversation_thread_redirects WHERE old_thread_id = ? OR new_thread_id = ?;", bind: { statement in
+            self.bind(id, at: 1, in: statement)
+            self.bind(id, at: 2, in: statement)
+        })
+    }
+
+    func clearAllConversationThreads() throws {
+        try execute(sql: "DELETE FROM conversation_turns;")
+        try execute(sql: "DELETE FROM conversation_threads;")
+        try execute(sql: "DELETE FROM conversation_thread_redirects;")
+    }
+
+    func upsertConversationThreadRedirect(
+        oldThreadID: String,
+        newThreadID: String,
+        reason: String,
+        createdAt: Date = Date()
+    ) throws {
+        try execute(sql: """
+        INSERT INTO conversation_thread_redirects (old_thread_id, new_thread_id, reason, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(old_thread_id) DO UPDATE SET
+            new_thread_id = excluded.new_thread_id,
+            reason = excluded.reason,
+            created_at = excluded.created_at;
+        """, bind: { statement in
+            self.bind(oldThreadID, at: 1, in: statement)
+            self.bind(newThreadID, at: 2, in: statement)
+            self.bind(reason, at: 3, in: statement)
+            self.bind(createdAt.timeIntervalSince1970, at: 4, in: statement)
+        })
+    }
+
+    func resolveConversationThreadRedirect(_ threadID: String) throws -> String? {
+        let sql = """
+        SELECT new_thread_id
+        FROM conversation_thread_redirects
+        WHERE old_thread_id = ?
+        LIMIT 1;
+        """
+        let rows: [String] = try query(sql: sql, bind: { statement in
+            self.bind(threadID, at: 1, in: statement)
+        }, mapRow: { statement in
+            self.readString(at: 0, in: statement) ?? ""
+        })
+        return rows.first
+    }
+
+    func upsertConversationTagAlias(
+        aliasType: String,
+        aliasKey: String,
+        canonicalKey: String,
+        updatedAt: Date = Date()
+    ) throws {
+        let sql = """
+        INSERT INTO conversation_tag_aliases (alias_type, alias_key, canonical_key, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(alias_type, alias_key) DO UPDATE SET
+            canonical_key = excluded.canonical_key,
+            updated_at = excluded.updated_at;
+        """
+        try execute(sql: sql, bind: { statement in
+            self.bind(aliasType, at: 1, in: statement)
+            self.bind(aliasKey, at: 2, in: statement)
+            self.bind(canonicalKey, at: 3, in: statement)
+            self.bind(updatedAt.timeIntervalSince1970, at: 4, in: statement)
+        })
+    }
+
+    func resolveConversationTagAlias(
+        aliasType: String,
+        aliasKey: String
+    ) throws -> String? {
+        let sql = """
+        SELECT canonical_key
+        FROM conversation_tag_aliases
+        WHERE alias_type = ?
+            AND alias_key = ?
+        LIMIT 1;
+        """
+        let rows: [String] = try query(sql: sql, bind: { statement in
+            self.bind(aliasType, at: 1, in: statement)
+            self.bind(aliasKey, at: 2, in: statement)
+        }, mapRow: { statement in
+            self.readString(at: 0, in: statement) ?? ""
+        })
+        return rows.first
     }
 
     func upsertSource(_ source: MemorySource) throws {
@@ -555,6 +1088,375 @@ final class MemorySQLiteStore {
         })
     }
 
+    func upsertPatternStats(_ stats: MemoryPatternStats) throws {
+        let sql = """
+        INSERT INTO memory_pattern_stats (
+            pattern_key, scope_key, app_name, bundle_id, surface_label,
+            project_name, repository_name, occurrence_count, good_repeat_count, bad_repeat_count,
+            first_seen_at, last_seen_at, last_outcome, confidence, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pattern_key) DO UPDATE SET
+            scope_key = excluded.scope_key,
+            app_name = excluded.app_name,
+            bundle_id = excluded.bundle_id,
+            surface_label = excluded.surface_label,
+            project_name = excluded.project_name,
+            repository_name = excluded.repository_name,
+            occurrence_count = excluded.occurrence_count,
+            good_repeat_count = excluded.good_repeat_count,
+            bad_repeat_count = excluded.bad_repeat_count,
+            first_seen_at = excluded.first_seen_at,
+            last_seen_at = excluded.last_seen_at,
+            last_outcome = excluded.last_outcome,
+            confidence = excluded.confidence,
+            metadata_json = excluded.metadata_json;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(stats.patternKey, at: 1, in: statement)
+            self.bind(stats.scopeKey, at: 2, in: statement)
+            self.bind(stats.appName, at: 3, in: statement)
+            self.bind(stats.bundleID, at: 4, in: statement)
+            self.bind(stats.surfaceLabel, at: 5, in: statement)
+            self.bind(stats.projectName, at: 6, in: statement)
+            self.bind(stats.repositoryName, at: 7, in: statement)
+            self.bind(Int64(stats.occurrenceCount), at: 8, in: statement)
+            self.bind(Int64(stats.goodRepeatCount), at: 9, in: statement)
+            self.bind(Int64(stats.badRepeatCount), at: 10, in: statement)
+            self.bind(stats.firstSeenAt.timeIntervalSince1970, at: 11, in: statement)
+            self.bind(stats.lastSeenAt.timeIntervalSince1970, at: 12, in: statement)
+            self.bind(stats.lastOutcome.rawValue, at: 13, in: statement)
+            self.bind(stats.confidence, at: 14, in: statement)
+            self.bind(self.encodeJSON(stats.metadata, fallback: "{}"), at: 15, in: statement)
+        })
+    }
+
+    func fetchPatternStats(
+        scopeKey: String? = nil,
+        limit: Int = 120
+    ) throws -> [MemoryPatternStats] {
+        let normalizedScopeKey = scopeKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedLimit = max(1, min(limit, 2000))
+        let sql = """
+        SELECT
+            pattern_key, scope_key, app_name, bundle_id, surface_label, project_name, repository_name,
+            occurrence_count, good_repeat_count, bad_repeat_count, first_seen_at, last_seen_at,
+            last_outcome, confidence, metadata_json
+        FROM memory_pattern_stats
+        WHERE (? IS NULL OR scope_key = ?)
+        ORDER BY last_seen_at DESC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(normalizedScopeKey, at: 1, in: statement)
+            self.bind(normalizedScopeKey, at: 2, in: statement)
+            self.bind(Int64(normalizedLimit), at: 3, in: statement)
+        }, mapRow: { statement in
+            let rawOutcome = self.readString(at: 12, in: statement) ?? MemoryPatternOutcome.neutral.rawValue
+            return MemoryPatternStats(
+                patternKey: self.readString(at: 0, in: statement) ?? "",
+                scopeKey: self.readString(at: 1, in: statement) ?? "",
+                appName: self.readString(at: 2, in: statement) ?? "Unknown App",
+                bundleID: self.readString(at: 3, in: statement) ?? "unknown.bundle",
+                surfaceLabel: self.readString(at: 4, in: statement) ?? "Unknown Surface",
+                projectName: self.readString(at: 5, in: statement),
+                repositoryName: self.readString(at: 6, in: statement),
+                occurrenceCount: Int(sqlite3_column_int64(statement, 7)),
+                goodRepeatCount: Int(sqlite3_column_int64(statement, 8)),
+                badRepeatCount: Int(sqlite3_column_int64(statement, 9)),
+                firstSeenAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 10)),
+                lastSeenAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 11)),
+                lastOutcome: self.patternOutcome(from: rawOutcome),
+                confidence: sqlite3_column_double(statement, 13),
+                metadata: self.decodeStringDictionary(from: self.readString(at: 14, in: statement) ?? "{}")
+            )
+        })
+    }
+
+    func fetchPatternStats(patternKey: String) throws -> MemoryPatternStats? {
+        let normalizedPatternKey = patternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPatternKey.isEmpty else { return nil }
+        return try fetchPatternStatsByKeys(patternKeys: [normalizedPatternKey]).first
+    }
+
+    func fetchPatternStatsByKeys(patternKeys: [String]) throws -> [MemoryPatternStats] {
+        let normalizedKeys = patternKeys
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !normalizedKeys.isEmpty else { return [] }
+
+        let placeholders = Array(repeating: "?", count: normalizedKeys.count).joined(separator: ", ")
+        let sql = """
+        SELECT
+            pattern_key, scope_key, app_name, bundle_id, surface_label, project_name, repository_name,
+            occurrence_count, good_repeat_count, bad_repeat_count, first_seen_at, last_seen_at,
+            last_outcome, confidence, metadata_json
+        FROM memory_pattern_stats
+        WHERE pattern_key IN (\(placeholders))
+        ORDER BY last_seen_at DESC;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            for (index, value) in normalizedKeys.enumerated() {
+                self.bind(value, at: Int32(index + 1), in: statement)
+            }
+        }, mapRow: { statement in
+            let rawOutcome = self.readString(at: 12, in: statement) ?? MemoryPatternOutcome.neutral.rawValue
+            return MemoryPatternStats(
+                patternKey: self.readString(at: 0, in: statement) ?? "",
+                scopeKey: self.readString(at: 1, in: statement) ?? "",
+                appName: self.readString(at: 2, in: statement) ?? "Unknown App",
+                bundleID: self.readString(at: 3, in: statement) ?? "unknown.bundle",
+                surfaceLabel: self.readString(at: 4, in: statement) ?? "Unknown Surface",
+                projectName: self.readString(at: 5, in: statement),
+                repositoryName: self.readString(at: 6, in: statement),
+                occurrenceCount: Int(sqlite3_column_int64(statement, 7)),
+                goodRepeatCount: Int(sqlite3_column_int64(statement, 8)),
+                badRepeatCount: Int(sqlite3_column_int64(statement, 9)),
+                firstSeenAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 10)),
+                lastSeenAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 11)),
+                lastOutcome: self.patternOutcome(from: rawOutcome),
+                confidence: sqlite3_column_double(statement, 13),
+                metadata: self.decodeStringDictionary(from: self.readString(at: 14, in: statement) ?? "{}")
+            )
+        })
+    }
+
+    func insertPatternOccurrence(_ occurrence: MemoryPatternOccurrence) throws {
+        let sql = """
+        INSERT INTO memory_pattern_occurrences (
+            id, pattern_key, card_id, lesson_id, event_timestamp, outcome, trigger, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            pattern_key = excluded.pattern_key,
+            card_id = excluded.card_id,
+            lesson_id = excluded.lesson_id,
+            event_timestamp = excluded.event_timestamp,
+            outcome = excluded.outcome,
+            trigger = excluded.trigger,
+            metadata_json = excluded.metadata_json;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(occurrence.id.uuidString, at: 1, in: statement)
+            self.bind(occurrence.patternKey, at: 2, in: statement)
+            self.bind(occurrence.cardID?.uuidString, at: 3, in: statement)
+            self.bind(occurrence.lessonID?.uuidString, at: 4, in: statement)
+            self.bind(occurrence.eventTimestamp.timeIntervalSince1970, at: 5, in: statement)
+            self.bind(occurrence.outcome.rawValue, at: 6, in: statement)
+            self.bind(occurrence.trigger.rawValue, at: 7, in: statement)
+            self.bind(self.encodeJSON(occurrence.metadata, fallback: "{}"), at: 8, in: statement)
+        })
+    }
+
+    func recordPatternOccurrence(
+        patternKey: String,
+        scope: MemoryScopeContext,
+        cardID: UUID? = nil,
+        lessonID: UUID? = nil,
+        trigger: MemoryPromotionTrigger,
+        outcome: MemoryPatternOutcome,
+        confidence: Double,
+        metadata: [String: String] = [:],
+        timestamp: Date = Date()
+    ) throws {
+        let normalizedPatternKey = patternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPatternKey.isEmpty else { return }
+
+        let existing = try fetchPatternStats(patternKey: normalizedPatternKey)
+        let occurrenceCount = (existing?.occurrenceCount ?? 0) + 1
+        let goodRepeatCount = (existing?.goodRepeatCount ?? 0) + (outcome == .good ? 1 : 0)
+        let badRepeatCount = (existing?.badRepeatCount ?? 0) + (outcome == .bad ? 1 : 0)
+        let firstSeenAt = existing?.firstSeenAt ?? timestamp
+        let lastSeenAt = timestamp
+        let mergedConfidence = min(
+            1.0,
+            max(
+                0.0,
+                existing == nil
+                    ? confidence
+                    : ((existing!.confidence * Double(max(1, existing!.occurrenceCount))) + confidence) / Double(occurrenceCount)
+            )
+        )
+        var mergedMetadata = existing?.metadata ?? [:]
+        for (key, value) in metadata {
+            let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedKey.isEmpty, !normalizedValue.isEmpty else { continue }
+            mergedMetadata[normalizedKey] = normalizedValue
+        }
+
+        let updatedStats = MemoryPatternStats(
+            patternKey: normalizedPatternKey,
+            scopeKey: scope.scopeKey,
+            appName: scope.appName,
+            bundleID: scope.bundleID,
+            surfaceLabel: scope.surfaceLabel,
+            projectName: scope.projectName,
+            repositoryName: scope.repositoryName,
+            occurrenceCount: occurrenceCount,
+            goodRepeatCount: goodRepeatCount,
+            badRepeatCount: badRepeatCount,
+            firstSeenAt: firstSeenAt,
+            lastSeenAt: lastSeenAt,
+            lastOutcome: outcome,
+            confidence: mergedConfidence,
+            metadata: mergedMetadata
+        )
+        try upsertPatternStats(updatedStats)
+
+        let occurrence = MemoryPatternOccurrence(
+            id: MemoryIdentifier.stableUUID(
+                for: "pattern-occurrence|\(normalizedPatternKey)|\(cardID?.uuidString ?? "-")|\(lessonID?.uuidString ?? "-")|\(trigger.rawValue)|\(iso8601Timestamp(timestamp))"
+            ),
+            patternKey: normalizedPatternKey,
+            cardID: cardID,
+            lessonID: lessonID,
+            eventTimestamp: timestamp,
+            outcome: outcome,
+            trigger: trigger,
+            metadata: mergedMetadata
+        )
+        try insertPatternOccurrence(occurrence)
+    }
+
+    func fetchPatternOccurrences(
+        patternKey: String,
+        limit: Int = 80
+    ) throws -> [MemoryPatternOccurrence] {
+        let normalizedPatternKey = patternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPatternKey.isEmpty else { return [] }
+        let normalizedLimit = max(1, min(limit, 2000))
+        let sql = """
+        SELECT
+            id, pattern_key, card_id, lesson_id, event_timestamp, outcome, trigger, metadata_json
+        FROM memory_pattern_occurrences
+        WHERE pattern_key = ?
+        ORDER BY event_timestamp DESC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(normalizedPatternKey, at: 1, in: statement)
+            self.bind(Int64(normalizedLimit), at: 2, in: statement)
+        }, mapRow: { statement in
+            let id = UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID()
+            let cardID = UUID(uuidString: self.readString(at: 2, in: statement) ?? "")
+            let lessonID = UUID(uuidString: self.readString(at: 3, in: statement) ?? "")
+            let outcome = self.patternOutcome(from: self.readString(at: 5, in: statement) ?? "")
+            let trigger = MemoryPromotionTrigger(rawValue: self.readString(at: 6, in: statement) ?? "")
+                ?? .manualCompaction
+            let metadata = self.decodeStringDictionary(from: self.readString(at: 7, in: statement) ?? "{}")
+
+            return MemoryPatternOccurrence(
+                id: id,
+                patternKey: self.readString(at: 1, in: statement) ?? normalizedPatternKey,
+                cardID: cardID,
+                lessonID: lessonID,
+                eventTimestamp: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
+                outcome: outcome,
+                trigger: trigger,
+                metadata: metadata
+            )
+        })
+    }
+
+    func deletePattern(patternKey: String) throws {
+        let normalizedPatternKey = patternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPatternKey.isEmpty else { return }
+        try execute(sql: "DELETE FROM memory_pattern_stats WHERE pattern_key = ?;", bind: { statement in
+            self.bind(normalizedPatternKey, at: 1, in: statement)
+        })
+    }
+
+    func purgeByTieredRetention(
+        rawEvidenceDays: Int = 30,
+        unvalidatedLessonDays: Int = 60,
+        validatedDays: Int = 365,
+        now: Date = Date()
+    ) throws -> (cardsDeleted: Int, lessonsDeleted: Int, patternsDeleted: Int, occurrencesDeleted: Int) {
+        let rawCutoff = now.addingTimeInterval(-Double(max(1, rawEvidenceDays)) * 86_400).timeIntervalSince1970
+        let unvalidatedCutoff = now.addingTimeInterval(-Double(max(1, unvalidatedLessonDays)) * 86_400).timeIntervalSince1970
+        let validatedCutoff = now.addingTimeInterval(-Double(max(1, validatedDays)) * 86_400).timeIntervalSince1970
+
+        let staleRawCardsSQL = """
+        SELECT COUNT(*)
+        FROM memory_cards
+        WHERE is_plan_content = 0
+            AND updated_at < ?
+            AND (
+                score < 0.60
+                OR lower(coalesce(json_extract(metadata_json, '$.origin'), '')) = 'conversation-history'
+            );
+        """
+        let staleRawCardsCount = try scalarInt(sql: staleRawCardsSQL, bind: { statement in
+            self.bind(rawCutoff, at: 1, in: statement)
+        })
+
+        try execute(sql: """
+        DELETE FROM memory_cards
+        WHERE is_plan_content = 0
+            AND updated_at < ?
+            AND (
+                score < 0.60
+                OR lower(coalesce(json_extract(metadata_json, '$.origin'), '')) = 'conversation-history'
+            );
+        """, bind: { statement in
+            self.bind(rawCutoff, at: 1, in: statement)
+        })
+
+        let staleUnvalidatedLessonsSQL = """
+        SELECT COUNT(*)
+        FROM memory_lessons
+        WHERE updated_at < ?
+            AND lower(coalesce(json_extract(source_metadata_json, '$.validation_state'), 'unvalidated')) = 'unvalidated';
+        """
+        let staleUnvalidatedLessonsCount = try scalarInt(sql: staleUnvalidatedLessonsSQL, bind: { statement in
+            self.bind(unvalidatedCutoff, at: 1, in: statement)
+        })
+
+        try execute(sql: """
+        DELETE FROM memory_lessons
+        WHERE updated_at < ?
+            AND lower(coalesce(json_extract(source_metadata_json, '$.validation_state'), 'unvalidated')) = 'unvalidated';
+        """, bind: { statement in
+            self.bind(unvalidatedCutoff, at: 1, in: statement)
+        })
+
+        let stalePatternsCount = try scalarInt(sql: """
+        SELECT COUNT(*)
+        FROM memory_pattern_stats
+        WHERE last_seen_at < ?;
+        """, bind: { statement in
+            self.bind(validatedCutoff, at: 1, in: statement)
+        })
+
+        try execute(sql: "DELETE FROM memory_pattern_stats WHERE last_seen_at < ?;", bind: { statement in
+            self.bind(validatedCutoff, at: 1, in: statement)
+        })
+
+        let staleOccurrencesCount = try scalarInt(sql: """
+        SELECT COUNT(*)
+        FROM memory_pattern_occurrences
+        WHERE event_timestamp < ?;
+        """, bind: { statement in
+            self.bind(validatedCutoff, at: 1, in: statement)
+        })
+
+        try execute(sql: "DELETE FROM memory_pattern_occurrences WHERE event_timestamp < ?;", bind: { statement in
+            self.bind(validatedCutoff, at: 1, in: statement)
+        })
+
+        return (
+            cardsDeleted: staleRawCardsCount,
+            lessonsDeleted: staleUnvalidatedLessonsCount,
+            patternsDeleted: stalePatternsCount,
+            occurrencesDeleted: staleOccurrencesCount
+        )
+    }
+
     func upsertFeedbackRewriteMemory(
         originalText: String,
         rewrittenText: String,
@@ -688,6 +1590,32 @@ final class MemorySQLiteStore {
         try supersedeCompetingLessons(
             with: lesson,
             reason: "Superseded by a newer user-confirmed correction.",
+            timestamp: timestamp
+        )
+
+        let scope = MemoryScopeContext(
+            appName: "KeyScribe",
+            bundleID: "com.keyscribe.feedback",
+            surfaceLabel: "Prompt Rewrite Feedback",
+            projectName: nil,
+            repositoryName: nil,
+            isCodingContext: false
+        )
+        let patternKey = MemoryIdentifier.stableHexDigest(
+            for: "pattern|\(scope.scopeKey)|\(normalizedOriginal.lowercased())|\(normalizedRewritten.lowercased())"
+        )
+        try recordPatternOccurrence(
+            patternKey: patternKey,
+            scope: scope,
+            cardID: cardID,
+            lessonID: lesson.id,
+            trigger: .manualPin,
+            outcome: .good,
+            confidence: max(0.80, normalizedConfidence),
+            metadata: [
+                "origin": "prompt-rewrite-feedback",
+                "validation_state": MemoryRewriteLessonValidationState.userConfirmed.rawValue
+            ],
             timestamp: timestamp
         )
     }
@@ -833,6 +1761,25 @@ final class MemorySQLiteStore {
             updated.sourceMetadata = metadata
 
             try upsertLesson(updated)
+
+            let scope = scopeContext(from: updated.sourceMetadata)
+            let patternKey = MemoryIdentifier.stableHexDigest(
+                for: "pattern|\(scope.scopeKey)|\(MemoryTextNormalizer.collapsedWhitespace(updated.mistakePattern).lowercased())|\(MemoryTextNormalizer.collapsedWhitespace(updated.improvedPrompt).lowercased())"
+            )
+            try recordPatternOccurrence(
+                patternKey: patternKey,
+                scope: scope,
+                cardID: updated.cardID,
+                lessonID: updated.id,
+                trigger: .manualPin,
+                outcome: .bad,
+                confidence: 0.10,
+                metadata: [
+                    "origin": "lesson-invalidation",
+                    "validation_state": MemoryRewriteLessonValidationState.invalidated.rawValue
+                ],
+                timestamp: timestamp
+            )
         }
     }
 
@@ -1258,6 +2205,8 @@ final class MemorySQLiteStore {
     }
 
     func clearIndexedMemories() throws {
+        try execute(sql: "DELETE FROM memory_pattern_occurrences;")
+        try execute(sql: "DELETE FROM memory_pattern_stats;")
         try execute(sql: """
         DELETE FROM rewrite_suggestions
         WHERE card_id IN (
@@ -1275,6 +2224,8 @@ final class MemorySQLiteStore {
     }
 
     func clearAllIndexedData() throws {
+        try execute(sql: "DELETE FROM memory_pattern_occurrences;")
+        try execute(sql: "DELETE FROM memory_pattern_stats;")
         try execute(sql: "DELETE FROM rewrite_suggestions;")
         try execute(sql: "DELETE FROM memory_lessons;")
         try execute(sql: "DELETE FROM memory_links;")
@@ -1679,6 +2630,35 @@ final class MemorySQLiteStore {
         }
     }
 
+    private func executeReturningChanges(
+        sql: String,
+        bind: ((OpaquePointer) throws -> Void)? = nil
+    ) throws -> Int {
+        try withDatabase { database in
+            var statement: OpaquePointer?
+            let prepareCode = sqlite3_prepare_v2(database, sql, -1, &statement, nil)
+            guard prepareCode == SQLITE_OK, let statement else {
+                let message = String(cString: sqlite3_errmsg(database))
+                throw MemorySQLiteStoreError.failedToPrepareStatement(sql: sql, code: prepareCode, message: message)
+            }
+            defer { sqlite3_finalize(statement) }
+
+            try bind?(statement)
+
+            var stepCode = sqlite3_step(statement)
+            while stepCode == SQLITE_ROW {
+                stepCode = sqlite3_step(statement)
+            }
+
+            guard stepCode == SQLITE_DONE else {
+                let message = String(cString: sqlite3_errmsg(database))
+                throw MemorySQLiteStoreError.failedToExecuteStatement(sql: sql, code: stepCode, message: message)
+            }
+
+            return Int(sqlite3_changes(database))
+        }
+    }
+
     private func query<T>(
         sql: String,
         bind: ((OpaquePointer) throws -> Void)? = nil,
@@ -1872,6 +2852,38 @@ final class MemorySQLiteStore {
         return ""
     }
 
+    private func scopeContext(from metadata: [String: String]) -> MemoryScopeContext {
+        let appName = metadata["app_name"] ?? metadata["app"] ?? "KeyScribe"
+        let bundleID = metadata["bundle_id"] ?? metadata["bundle"] ?? "com.keyscribe.unknown"
+        let surfaceLabel = metadata["surface_label"] ?? metadata["context_label"] ?? "Conversation"
+        let projectName = metadata["project_name"] ?? metadata["project"]
+        let repositoryName = metadata["repository_name"] ?? metadata["repository"] ?? metadata["repo"]
+        let identityKey = metadata["identity_key"] ?? metadata["identity"]
+        let identityType = metadata["identity_type"]
+        let identityLabel = metadata["identity_label"]
+        let codingSignals = [
+            bundleID.lowercased().contains("xcode"),
+            bundleID.lowercased().contains("cursor"),
+            bundleID.lowercased().contains("code"),
+            bundleID.lowercased().contains("codex"),
+            bundleID.lowercased().contains("jetbrains"),
+            bundleID.lowercased().contains("vscode"),
+            (projectName ?? "").contains("/"),
+            (repositoryName ?? "").contains("/")
+        ]
+        return MemoryScopeContext(
+            appName: appName,
+            bundleID: bundleID,
+            surfaceLabel: surfaceLabel,
+            projectName: projectName,
+            repositoryName: repositoryName,
+            identityKey: identityKey,
+            identityType: identityType,
+            identityLabel: identityLabel,
+            isCodingContext: codingSignals.contains(true)
+        )
+    }
+
     private func ensureLinkSchema() throws {
         try execute(sql: """
         CREATE TABLE IF NOT EXISTS memory_links (
@@ -1896,6 +2908,29 @@ final class MemorySQLiteStore {
     private func parseInt(_ value: String?) -> Int? {
         guard let value else { return nil }
         return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func scalarInt(
+        sql: String,
+        bind: ((OpaquePointer) throws -> Void)? = nil
+    ) throws -> Int {
+        let values: [Int64] = try query(sql: sql, bind: bind, mapRow: { statement in
+            sqlite3_column_int64(statement, 0)
+        })
+        guard let first = values.first else { return 0 }
+        return Int(first)
+    }
+
+    private func patternOutcome(from raw: String) -> MemoryPatternOutcome {
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case MemoryPatternOutcome.good.rawValue:
+            return .good
+        case MemoryPatternOutcome.bad.rawValue:
+            return .bad
+        default:
+            return .neutral
+        }
     }
 
     private func inferProjectContext(

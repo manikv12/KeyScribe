@@ -48,6 +48,7 @@ enum TranscriptionEngineType: String, CaseIterable, Identifiable {
 
 enum PromptRewriteProviderMode: String, CaseIterable, Identifiable {
     case openAI = "OpenAI"
+    case google = "Google AI Studio (Gemini)"
     case openRouter = "OpenRouter"
     case groq = "Groq"
     case anthropic = "Anthropic"
@@ -63,6 +64,8 @@ enum PromptRewriteProviderMode: String, CaseIterable, Identifiable {
         switch self {
         case .openAI:
             return "gpt-4.1-mini"
+        case .google:
+            return "gemini-3-flash-preview"
         case .openRouter:
             return "openai/gpt-4.1-mini"
         case .groq:
@@ -78,6 +81,8 @@ enum PromptRewriteProviderMode: String, CaseIterable, Identifiable {
         switch self {
         case .openAI:
             return "https://api.openai.com/v1"
+        case .google:
+            return "https://generativelanguage.googleapis.com/v1beta/openai"
         case .openRouter:
             return "https://openrouter.ai/api/v1"
         case .groq:
@@ -93,7 +98,7 @@ enum PromptRewriteProviderMode: String, CaseIterable, Identifiable {
         switch self {
         case .ollama:
             return false
-        case .openAI, .openRouter, .groq, .anthropic:
+        case .openAI, .google, .openRouter, .groq, .anthropic:
             return true
         }
     }
@@ -102,6 +107,8 @@ enum PromptRewriteProviderMode: String, CaseIterable, Identifiable {
         switch self {
         case .openAI:
             return "Uses OpenAI to analyze memory context and suggest improved prompts. Supports OAuth sign-in."
+        case .google:
+            return "Uses Google Gemini models through the Google AI Studio OpenAI-compatible API."
         case .openRouter:
             return "Uses OpenRouter-compatible models for memory-aware prompt rewrites."
         case .groq:
@@ -234,6 +241,9 @@ final class SettingsStore: ObservableObject {
         static let promptRewriteProviderMode = "KeyScribe.promptRewriteProviderMode"
         static let promptRewriteOpenAIModel = "KeyScribe.promptRewriteOpenAIModel"
         static let promptRewriteOpenAIBaseURL = "KeyScribe.promptRewriteOpenAIBaseURL"
+        static let promptRewriteModelByProvider = "KeyScribe.promptRewriteModelByProvider"
+        static let promptRewriteBaseURLByProvider = "KeyScribe.promptRewriteBaseURLByProvider"
+        static let promptRewriteRequestTimeoutSeconds = "KeyScribe.promptRewriteRequestTimeoutSeconds"
         static let promptRewriteAlwaysConvertToMarkdown = "KeyScribe.promptRewriteAlwaysConvertToMarkdown"
         static let promptRewriteStylePreset = "KeyScribe.promptRewriteStylePreset"
         static let promptRewriteCustomStyleInstructions = "KeyScribe.promptRewriteCustomStyleInstructions"
@@ -241,6 +251,11 @@ final class SettingsStore: ObservableObject {
         static let promptRewriteConversationTimeoutMinutes = "KeyScribe.promptRewriteConversationTimeoutMinutes"
         static let promptRewriteConversationTurnLimit = "KeyScribe.promptRewriteConversationTurnLimit"
         static let promptRewriteConversationPinnedContextID = "KeyScribe.promptRewriteConversationPinnedContextID"
+        static let localAISetupCompleted = "KeyScribe.localAISetupCompleted"
+        static let localAISelectedModelID = "KeyScribe.localAISelectedModelID"
+        static let localAIManagedRuntimeEnabled = "KeyScribe.localAIManagedRuntimeEnabled"
+        static let localAIRuntimeVersion = "KeyScribe.localAIRuntimeVersion"
+        static let localAILastHealthCheckEpoch = "KeyScribe.localAILastHealthCheckEpoch"
     }
 
     private enum ContinuousToggleDefaults {
@@ -252,6 +267,15 @@ final class SettingsStore: ObservableObject {
         static let keyCode: UInt16 = 9 // V
         static let modifiers: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
     }
+
+    private enum PromptRewriteRequestTimeoutDefaults {
+        static let minimumSeconds: Double = 3
+        static let maximumSeconds: Double = 120
+        static let fallbackSeconds: Double = 8
+    }
+
+    private var promptRewriteModelByProvider: [String: String] = [:]
+    private var promptRewriteBaseURLByProvider: [String: String] = [:]
 
     @Published var shortcutKeyCode: UInt16 {
         didSet {
@@ -492,7 +516,8 @@ final class SettingsStore: ObservableObject {
     @Published var promptRewriteProviderModeRawValue: String {
         didSet {
             if oldValue != promptRewriteProviderModeRawValue {
-                applyPromptRewriteProviderDefaultsIfNeeded(force: false)
+                persistPromptRewriteProviderConfiguration(forRawValue: oldValue)
+                restorePromptRewriteProviderConfiguration(for: promptRewriteProviderMode)
                 promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: promptRewriteProviderMode)
             }
             save()
@@ -501,12 +526,46 @@ final class SettingsStore: ObservableObject {
 
     @Published var promptRewriteOpenAIModel: String {
         didSet {
+            let normalized = Self.normalizedIdentifier(promptRewriteOpenAIModel)
+            if normalized != promptRewriteOpenAIModel {
+                promptRewriteOpenAIModel = normalized
+                return
+            }
+            if normalized.isEmpty {
+                promptRewriteModelByProvider.removeValue(forKey: promptRewriteProviderMode.rawValue)
+            } else {
+                promptRewriteModelByProvider[promptRewriteProviderMode.rawValue] = normalized
+            }
             save()
         }
     }
 
     @Published var promptRewriteOpenAIBaseURL: String {
         didSet {
+            let normalized = Self.normalizedIdentifier(promptRewriteOpenAIBaseURL)
+            if normalized != promptRewriteOpenAIBaseURL {
+                promptRewriteOpenAIBaseURL = normalized
+                return
+            }
+            if normalized.isEmpty {
+                promptRewriteBaseURLByProvider.removeValue(forKey: promptRewriteProviderMode.rawValue)
+            } else {
+                promptRewriteBaseURLByProvider[promptRewriteProviderMode.rawValue] = normalized
+            }
+            save()
+        }
+    }
+
+    @Published var promptRewriteRequestTimeoutSeconds: Double {
+        didSet {
+            let normalized = min(
+                PromptRewriteRequestTimeoutDefaults.maximumSeconds,
+                max(PromptRewriteRequestTimeoutDefaults.minimumSeconds, promptRewriteRequestTimeoutSeconds)
+            )
+            guard normalized == promptRewriteRequestTimeoutSeconds else {
+                promptRewriteRequestTimeoutSeconds = normalized
+                return
+            }
             save()
         }
     }
@@ -548,7 +607,7 @@ final class SettingsStore: ObservableObject {
 
     @Published var promptRewriteConversationTurnLimit: Int {
         didSet {
-            let normalized = min(10, max(1, promptRewriteConversationTurnLimit))
+            let normalized = min(50, max(1, promptRewriteConversationTurnLimit))
             guard normalized == promptRewriteConversationTurnLimit else {
                 promptRewriteConversationTurnLimit = normalized
                 return
@@ -569,6 +628,36 @@ final class SettingsStore: ObservableObject {
                 promptRewriteOpenAIAPIKey,
                 for: promptRewriteProviderMode
             )
+            save()
+        }
+    }
+
+    @Published var localAISetupCompleted: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var localAISelectedModelID: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var localAIManagedRuntimeEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var localAIRuntimeVersion: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var localAILastHealthCheckEpoch: Double {
+        didSet {
             save()
         }
     }
@@ -803,27 +892,48 @@ final class SettingsStore: ObservableObject {
         promptRewriteProviderModeRawValue = resolvedPromptRewriteProviderModeRaw
         let selectedPromptProvider = PromptRewriteProviderMode(rawValue: resolvedPromptRewriteProviderModeRaw) ?? .openAI
 
+        var modelByProvider = Self.normalizedProviderScopedStringDictionary(
+            defaults.dictionary(forKey: Keys.promptRewriteModelByProvider)
+        )
+        var baseURLByProvider = Self.normalizedProviderScopedStringDictionary(
+            defaults.dictionary(forKey: Keys.promptRewriteBaseURLByProvider)
+        )
+
         let storedOpenAIModel = defaults.string(forKey: Keys.promptRewriteOpenAIModel)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let storedOpenAIModel, !storedOpenAIModel.isEmpty {
-            promptRewriteOpenAIModel = storedOpenAIModel
-        } else {
-            promptRewriteOpenAIModel = selectedPromptProvider.defaultModel
+        if modelByProvider[selectedPromptProvider.rawValue] == nil,
+           let storedOpenAIModel,
+           !storedOpenAIModel.isEmpty {
+            modelByProvider[selectedPromptProvider.rawValue] = storedOpenAIModel
         }
+        let selectedProviderModel = modelByProvider[selectedPromptProvider.rawValue] ?? selectedPromptProvider.defaultModel
+        promptRewriteOpenAIModel = selectedProviderModel
 
         let storedOpenAIBaseURL = defaults.string(forKey: Keys.promptRewriteOpenAIBaseURL)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let storedOpenAIBaseURL, !storedOpenAIBaseURL.isEmpty {
-            promptRewriteOpenAIBaseURL = storedOpenAIBaseURL
-        } else {
-            promptRewriteOpenAIBaseURL = selectedPromptProvider.defaultBaseURL
+        if baseURLByProvider[selectedPromptProvider.rawValue] == nil,
+           let storedOpenAIBaseURL,
+           !storedOpenAIBaseURL.isEmpty {
+            baseURLByProvider[selectedPromptProvider.rawValue] = storedOpenAIBaseURL
         }
+        let selectedProviderBaseURL = baseURLByProvider[selectedPromptProvider.rawValue] ?? selectedPromptProvider.defaultBaseURL
+        promptRewriteOpenAIBaseURL = selectedProviderBaseURL
+        promptRewriteModelByProvider = modelByProvider
+        promptRewriteBaseURLByProvider = baseURLByProvider
 
         if defaults.object(forKey: Keys.promptRewriteAlwaysConvertToMarkdown) == nil {
             promptRewriteAlwaysConvertToMarkdown = false
         } else {
             promptRewriteAlwaysConvertToMarkdown = defaults.bool(forKey: Keys.promptRewriteAlwaysConvertToMarkdown)
         }
+
+        let storedPromptRewriteRequestTimeout = defaults.object(forKey: Keys.promptRewriteRequestTimeoutSeconds) == nil
+            ? PromptRewriteRequestTimeoutDefaults.fallbackSeconds
+            : defaults.double(forKey: Keys.promptRewriteRequestTimeoutSeconds)
+        promptRewriteRequestTimeoutSeconds = min(
+            PromptRewriteRequestTimeoutDefaults.maximumSeconds,
+            max(PromptRewriteRequestTimeoutDefaults.minimumSeconds, storedPromptRewriteRequestTimeout)
+        )
 
         let storedStylePreset = defaults.string(forKey: Keys.promptRewriteStylePreset)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -849,15 +959,39 @@ final class SettingsStore: ObservableObject {
         promptRewriteConversationTimeoutMinutes = min(240, max(2, storedConversationTimeout))
 
         let storedConversationTurnLimit = defaults.object(forKey: Keys.promptRewriteConversationTurnLimit) == nil
-            ? 4
+            ? 25
             : defaults.integer(forKey: Keys.promptRewriteConversationTurnLimit)
-        promptRewriteConversationTurnLimit = min(10, max(1, storedConversationTurnLimit))
+        promptRewriteConversationTurnLimit = min(50, max(1, storedConversationTurnLimit))
 
         promptRewriteConversationPinnedContextID = defaults
             .string(forKey: Keys.promptRewriteConversationPinnedContextID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: selectedPromptProvider)
+
+        if defaults.object(forKey: Keys.localAISetupCompleted) == nil {
+            localAISetupCompleted = false
+        } else {
+            localAISetupCompleted = defaults.bool(forKey: Keys.localAISetupCompleted)
+        }
+
+        localAISelectedModelID = defaults
+            .string(forKey: Keys.localAISelectedModelID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if defaults.object(forKey: Keys.localAIManagedRuntimeEnabled) == nil {
+            localAIManagedRuntimeEnabled = true
+        } else {
+            localAIManagedRuntimeEnabled = defaults.bool(forKey: Keys.localAIManagedRuntimeEnabled)
+        }
+
+        localAIRuntimeVersion = defaults
+            .string(forKey: Keys.localAIRuntimeVersion)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        localAILastHealthCheckEpoch = defaults.object(forKey: Keys.localAILastHealthCheckEpoch) == nil
+            ? 0
+            : defaults.double(forKey: Keys.localAILastHealthCheckEpoch)
 
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
@@ -950,6 +1084,9 @@ final class SettingsStore: ObservableObject {
         defaults.set(promptRewriteProviderModeRawValue, forKey: Keys.promptRewriteProviderMode)
         defaults.set(promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIModel)
         defaults.set(promptRewriteOpenAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.promptRewriteOpenAIBaseURL)
+        defaults.set(promptRewriteModelByProvider, forKey: Keys.promptRewriteModelByProvider)
+        defaults.set(promptRewriteBaseURLByProvider, forKey: Keys.promptRewriteBaseURLByProvider)
+        defaults.set(promptRewriteRequestTimeoutSeconds, forKey: Keys.promptRewriteRequestTimeoutSeconds)
         defaults.set(promptRewriteAlwaysConvertToMarkdown, forKey: Keys.promptRewriteAlwaysConvertToMarkdown)
         defaults.set(promptRewriteStylePresetRawValue, forKey: Keys.promptRewriteStylePreset)
         defaults.set(
@@ -963,6 +1100,11 @@ final class SettingsStore: ObservableObject {
             promptRewriteConversationPinnedContextID.trimmingCharacters(in: .whitespacesAndNewlines),
             forKey: Keys.promptRewriteConversationPinnedContextID
         )
+        defaults.set(localAISetupCompleted, forKey: Keys.localAISetupCompleted)
+        defaults.set(localAISelectedModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.localAISelectedModelID)
+        defaults.set(localAIManagedRuntimeEnabled, forKey: Keys.localAIManagedRuntimeEnabled)
+        defaults.set(localAIRuntimeVersion.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.localAIRuntimeVersion)
+        defaults.set(localAILastHealthCheckEpoch, forKey: Keys.localAILastHealthCheckEpoch)
 
         guard !isApplyingChanges else { return }
         onChange?()
@@ -1042,6 +1184,58 @@ final class SettingsStore: ObservableObject {
         if force || normalizedBaseURL.isEmpty {
             promptRewriteOpenAIBaseURL = mode.defaultBaseURL
         }
+    }
+
+    private func persistPromptRewriteProviderConfiguration(forRawValue rawValue: String) {
+        guard let mode = PromptRewriteProviderMode(rawValue: rawValue) else { return }
+
+        let normalizedModel = promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedModel.isEmpty {
+            promptRewriteModelByProvider.removeValue(forKey: mode.rawValue)
+        } else {
+            promptRewriteModelByProvider[mode.rawValue] = normalizedModel
+        }
+
+        let normalizedBaseURL = promptRewriteOpenAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedBaseURL.isEmpty {
+            promptRewriteBaseURLByProvider.removeValue(forKey: mode.rawValue)
+        } else {
+            promptRewriteBaseURLByProvider[mode.rawValue] = normalizedBaseURL
+        }
+    }
+
+    private func restorePromptRewriteProviderConfiguration(for mode: PromptRewriteProviderMode) {
+        let restoredModel = promptRewriteModelByProvider[mode.rawValue] ?? mode.defaultModel
+        if promptRewriteOpenAIModel != restoredModel {
+            promptRewriteOpenAIModel = restoredModel
+        }
+
+        let restoredBaseURL = promptRewriteBaseURLByProvider[mode.rawValue] ?? mode.defaultBaseURL
+        if promptRewriteOpenAIBaseURL != restoredBaseURL {
+            promptRewriteOpenAIBaseURL = restoredBaseURL
+        }
+    }
+
+    func applyLocalAIDefaults(selectedModelID: String) {
+        let normalizedModelID = selectedModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedModelID.isEmpty else { return }
+
+        promptRewriteProviderMode = .ollama
+        promptRewriteOpenAIBaseURL = PromptRewriteProviderMode.ollama.defaultBaseURL
+        promptRewriteOpenAIModel = normalizedModelID
+        promptRewriteEnabled = true
+        let memoryFeatureEnabled = ProcessInfo.processInfo.environment["KEYSCRIBE_FEATURE_AI_MEMORY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if let memoryFeatureEnabled,
+           ["1", "true", "yes", "on"].contains(memoryFeatureEnabled) {
+            memoryIndexingEnabled = true
+        }
+
+        localAISelectedModelID = normalizedModelID
+        localAISetupCompleted = true
+        localAIManagedRuntimeEnabled = true
+        localAILastHealthCheckEpoch = Date().timeIntervalSince1970
     }
 
     func isMemoryProviderEnabled(_ providerID: String) -> Bool {
@@ -1144,6 +1338,24 @@ final class SettingsStore: ObservableObject {
         return cleaned.sorted { lhs, rhs in
             lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
         }
+    }
+
+    private static func normalizedProviderScopedStringDictionary(_ values: [String: Any]?) -> [String: String] {
+        guard let values else { return [:] }
+        let validProviderIDs = Set(PromptRewriteProviderMode.allCases.map(\.rawValue))
+        var normalized: [String: String] = [:]
+        normalized.reserveCapacity(values.count)
+
+        for (rawKey, rawValue) in values {
+            let providerID = normalizedIdentifier(rawKey)
+            guard validProviderIDs.contains(providerID) else { continue }
+            guard let rawString = rawValue as? String else { continue }
+            let value = normalizedIdentifier(rawString)
+            guard !value.isEmpty else { continue }
+            normalized[providerID] = value
+        }
+
+        return normalized
     }
 
     private static let promptRewriteProviderAPIKeychainService = "com.keyscribe.KeyScribe"
@@ -1329,6 +1541,7 @@ final class SettingsStore: ObservableObject {
         var findPreserveClauses: [String] = []
         if !deleteDownloadedModels {
             findPreserveClauses.append("! -name 'Models'")
+            findPreserveClauses.append("! -name 'LocalAI'")
         }
         if !deleteMemories {
             findPreserveClauses.append("! -name 'Memory'")
@@ -1341,6 +1554,9 @@ final class SettingsStore: ObservableObject {
         if deleteDownloadedModels {
             appSupportCleanupCommands.append(
                 "rm -rf \(shellSingleQuoted("\(appSupportPath)/Models"))"
+            )
+            appSupportCleanupCommands.append(
+                "rm -rf \(shellSingleQuoted("\(appSupportPath)/LocalAI"))"
             )
         } else if deleteLearnedCorrections {
             appSupportCleanupCommands.append(

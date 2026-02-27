@@ -76,6 +76,14 @@ struct PromptRewriteModelCatalogSmokeTests {
             "Anthropic models endpoint should append /models"
         )
 
+        let googleEndpoint = PromptRewriteModelCatalogService.openAIModelsEndpoint(
+            from: "https://generativelanguage.googleapis.com/v1beta/openai"
+        )?.absoluteString
+        check(
+            googleEndpoint == "https://generativelanguage.googleapis.com/v1beta/openai/models",
+            "Google Gemini models endpoint should append /models"
+        )
+
         let ollamaEndpoint = PromptRewriteModelCatalogService.ollamaTagsEndpoint(
             from: "http://localhost:11434/v1"
         )?.absoluteString

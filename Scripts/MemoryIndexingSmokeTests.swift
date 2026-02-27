@@ -30,6 +30,7 @@ struct MemoryIndexingSmokeTests {
 
             try await runNonAIFallbackScenario(discovery: discovery, sandboxRoot: sandboxRoot)
             try await runAIBackedScenario(discovery: discovery, sandboxRoot: sandboxRoot)
+            try await runPatternAndRetentionScenario(sandboxRoot: sandboxRoot)
 
             print("PASS: Memory indexing smoke tests passed")
         } catch {
@@ -157,8 +158,13 @@ struct MemoryIndexingSmokeTests {
             options: MemoryRewriteLookupOptions(provider: .codex, includePlanContent: false, limit: 10)
         )
         check(
-            conversationCards.isEmpty,
-            "Expected plain chat/session text to remain unindexed without AI rewrite signal"
+            conversationCards.allSatisfy { card in
+                let combined = "\(card.title) \(card.summary) \(card.detail)".lowercased()
+                return !combined.contains("internal reasoning")
+                    && !combined.contains("tool_call")
+                    && !combined.contains("tool result")
+            },
+            "Expected conversation query results to exclude noisy tool/thought artifacts"
         )
 
         let noisyCards = try store.fetchCardsForRewrite(
@@ -235,6 +241,183 @@ struct MemoryIndexingSmokeTests {
         check(
             fullRebuildReport.indexedCards > 0,
             "Expected clear + rebuild from scratch to restore AI-backed cards"
+        )
+    }
+
+    private static func runPatternAndRetentionScenario(
+        sandboxRoot: URL
+    ) async throws {
+        let store = try MemorySQLiteStore(databaseURL: makeDatabaseURL(sandboxRoot, fileName: "memory-pattern.sqlite3"))
+        let hasPatternStatsTable = try store.hasTable(named: "memory_pattern_stats")
+        let hasPatternOccurrencesTable = try store.hasTable(named: "memory_pattern_occurrences")
+        check(hasPatternStatsTable, "Expected schema v4 to include memory_pattern_stats table")
+        check(hasPatternOccurrencesTable, "Expected schema v4 to include memory_pattern_occurrences table")
+
+        let oldTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let scope = MemoryScopeContext(
+            appName: "Codex",
+            bundleID: "com.openai.codex",
+            surfaceLabel: "Editor • Prompt",
+            projectName: "alpha",
+            repositoryName: "alpha-repo",
+            isCodingContext: true
+        )
+
+        try store.recordPatternOccurrence(
+            patternKey: "pattern-alpha-teh-the",
+            scope: scope,
+            cardID: nil,
+            lessonID: nil,
+            trigger: .autoCompaction,
+            outcome: .neutral,
+            confidence: 0.75,
+            metadata: ["origin": "smoke-test"],
+            timestamp: oldTimestamp
+        )
+        try store.recordPatternOccurrence(
+            patternKey: "pattern-alpha-teh-the",
+            scope: scope,
+            cardID: nil,
+            lessonID: nil,
+            trigger: .manualCompaction,
+            outcome: .good,
+            confidence: 0.9,
+            metadata: ["origin": "smoke-test"],
+            timestamp: oldTimestamp.addingTimeInterval(10)
+        )
+
+        let stats = try store.fetchPatternStats(patternKey: "pattern-alpha-teh-the")
+        check(stats != nil, "Expected recorded pattern stats to be queryable")
+        check(stats?.occurrenceCount == 2, "Expected pattern occurrence count to increment")
+        check(stats?.goodRepeatCount == 1, "Expected good repeat count to increment")
+        check(stats?.badRepeatCount == 0, "Expected bad repeat count to remain zero")
+        check(stats?.isRepeating == true, "Expected repeating flag once occurrence count reaches two")
+
+        let occurrences = try store.fetchPatternOccurrences(patternKey: "pattern-alpha-teh-the", limit: 10)
+        check(occurrences.count == 2, "Expected two persisted pattern occurrences")
+
+        try seedRetentionFixture(
+            store: store,
+            seedKey: "raw-card",
+            timestamp: oldTimestamp,
+            score: 0.2,
+            metadata: [
+                "origin": "conversation-history",
+                "validation_state": MemoryRewriteLessonValidationState.unvalidated.rawValue
+            ]
+        )
+        try seedRetentionFixture(
+            store: store,
+            seedKey: "unvalidated-lesson",
+            timestamp: oldTimestamp,
+            score: 0.95,
+            metadata: [
+                "origin": "manual-entry",
+                "validation_state": MemoryRewriteLessonValidationState.unvalidated.rawValue
+            ]
+        )
+
+        let futureNow = oldTimestamp.addingTimeInterval(400 * 86_400)
+        let purge = try store.purgeByTieredRetention(
+            rawEvidenceDays: 30,
+            unvalidatedLessonDays: 60,
+            validatedDays: 365,
+            now: futureNow
+        )
+        check(purge.cardsDeleted >= 1, "Expected tiered retention to purge stale low-signal raw cards")
+        check(purge.lessonsDeleted >= 1, "Expected tiered retention to purge stale unvalidated lessons")
+        check(purge.patternsDeleted >= 1, "Expected tiered retention to purge stale pattern stats")
+        let remainingOccurrences = try store.fetchPatternOccurrences(patternKey: "pattern-alpha-teh-the", limit: 10)
+        check(remainingOccurrences.isEmpty, "Expected stale pattern occurrences to be absent after purge")
+    }
+
+    private static func seedRetentionFixture(
+        store: MemorySQLiteStore,
+        seedKey: String,
+        timestamp: Date,
+        score: Double,
+        metadata: [String: String]
+    ) throws {
+        let sourceID = MemoryIdentifier.stableUUID(for: "source|retention|\(seedKey)")
+        let sourceFileID = MemoryIdentifier.stableUUID(for: "file|retention|\(seedKey)")
+        let eventID = MemoryIdentifier.stableUUID(for: "event|retention|\(seedKey)")
+        let cardID = MemoryIdentifier.stableUUID(for: "card|retention|\(seedKey)")
+        let lessonID = MemoryIdentifier.stableUUID(for: "lesson|retention|\(seedKey)")
+
+        try store.upsertSource(
+            MemorySource(
+                id: sourceID,
+                provider: .unknown,
+                rootPath: "internal://retention/\(seedKey)",
+                displayName: "Retention \(seedKey)",
+                discoveredAt: timestamp,
+                metadata: metadata
+            )
+        )
+        try store.upsertSourceFile(
+            MemorySourceFile(
+                id: sourceFileID,
+                sourceID: sourceID,
+                absolutePath: "retention/\(seedKey).jsonl",
+                relativePath: "retention/\(seedKey).jsonl",
+                fileHash: MemoryIdentifier.stableHexDigest(for: seedKey),
+                fileSizeBytes: 120,
+                modifiedAt: timestamp,
+                indexedAt: timestamp,
+                parseError: nil
+            )
+        )
+        try store.upsertEvent(
+            MemoryEvent(
+                id: eventID,
+                sourceID: sourceID,
+                sourceFileID: sourceFileID,
+                provider: .unknown,
+                kind: .summary,
+                title: "Retention \(seedKey)",
+                body: "teh -> the",
+                timestamp: timestamp,
+                nativeSummary: "teh -> the",
+                keywords: ["teh", "the"],
+                isPlanContent: false,
+                metadata: metadata,
+                rawPayload: nil
+            )
+        )
+        try store.upsertCard(
+            MemoryCard(
+                id: cardID,
+                sourceID: sourceID,
+                sourceFileID: sourceFileID,
+                eventID: eventID,
+                provider: .unknown,
+                title: "Retention Card \(seedKey)",
+                summary: "teh -> the",
+                detail: "teh -> the",
+                keywords: ["teh", "the"],
+                score: score,
+                createdAt: timestamp,
+                updatedAt: timestamp,
+                isPlanContent: false,
+                metadata: metadata
+            )
+        )
+        try store.upsertLesson(
+            MemoryLesson(
+                id: lessonID,
+                sourceID: sourceID,
+                sourceFileID: sourceFileID,
+                eventID: eventID,
+                cardID: cardID,
+                provider: .unknown,
+                mistakePattern: "teh",
+                improvedPrompt: "the",
+                rationale: "Retention test fixture",
+                validationConfidence: 0.4,
+                sourceMetadata: metadata,
+                createdAt: timestamp,
+                updatedAt: timestamp
+            )
         )
     }
 

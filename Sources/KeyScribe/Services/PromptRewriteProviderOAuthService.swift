@@ -7,7 +7,7 @@ extension PromptRewriteProviderMode {
         switch self {
         case .openAI, .anthropic:
             return true
-        case .openRouter, .groq, .ollama:
+        case .google, .openRouter, .groq, .ollama:
             return false
         }
     }
@@ -18,7 +18,7 @@ extension PromptRewriteProviderMode {
             return "ChatGPT Plus/Pro"
         case .anthropic:
             return "Claude Pro/Max"
-        case .openRouter, .groq, .ollama:
+        case .google, .openRouter, .groq, .ollama:
             return nil
         }
     }
@@ -372,7 +372,7 @@ actor PromptRewriteProviderOAuthService {
             let refreshed = try await refreshAnthropicSession(sessionState)
             PromptRewriteOAuthCredentialStore.storeSession(refreshed, for: .anthropic)
             return refreshed
-        case .openRouter, .groq, .ollama:
+        case .google, .openRouter, .groq, .ollama:
             throw PromptRewriteProviderOAuthError.unsupportedProvider
         }
     }

@@ -4,22 +4,40 @@ actor MemoryRewriteRetrievalService {
     static let shared = MemoryRewriteRetrievalService()
     private let minimumWordsForRewrite = 3
     private let rewriteSuggestionFetchLimit = 200
+    private let storeFactory: @Sendable () throws -> MemorySQLiteStore
 
     private var store: MemorySQLiteStore?
 
-    func retrieveSuggestion(for cleanedTranscript: String) throws -> PromptRewriteSuggestion? {
+    init(
+        storeFactory: @escaping @Sendable () throws -> MemorySQLiteStore = { try MemorySQLiteStore() }
+    ) {
+        self.storeFactory = storeFactory
+    }
+
+    func retrieveSuggestion(
+        for cleanedTranscript: String,
+        scope: MemoryScopeContext? = nil
+    ) throws -> PromptRewriteSuggestion? {
         let normalized = MemoryTextNormalizer.collapsedWhitespace(cleanedTranscript)
         guard !normalized.isEmpty else { return nil }
         guard shouldAttemptRewrite(for: normalized) else { return nil }
 
         let store = try resolvedStore()
-
-        let directStoredLessons = try prioritizedStoredLessons(
-            from: store.fetchLessonsForRewrite(
+        let candidateLessons = scopedLessons(
+            from: try store.fetchLessonsForRewrite(
                 query: normalized,
                 provider: nil,
-                limit: 24
+                limit: 80
+            ) + store.fetchLessonsForRewrite(
+                query: "",
+                provider: nil,
+                limit: rewriteSuggestionFetchLimit
             ),
+            scope: scope
+        )
+
+        let directStoredLessons = prioritizedStoredLessons(
+            from: candidateLessons,
             transcript: normalized,
             limit: 1,
             includeLowRelevance: false
@@ -34,20 +52,23 @@ actor MemoryRewriteRetrievalService {
     func fetchPromptRewriteContext(
         for cleanedTranscript: String,
         lessonLimit: Int = 8,
-        cardLimit: Int = 10
+        cardLimit: Int = 10,
+        scope: MemoryScopeContext? = nil
     ) throws -> MemoryRewritePromptContext {
         let normalized = MemoryTextNormalizer.collapsedWhitespace(cleanedTranscript)
         let store = try resolvedStore()
         let lessons = try fetchLessons(
             for: normalized,
             store: store,
-            limit: max(1, min(lessonLimit, 16))
+            limit: max(1, min(lessonLimit, 16)),
+            scope: scope
         )
         let cards = try fetchSupportingCards(
             for: normalized,
             store: store,
             lessons: lessons,
-            limit: max(1, min(cardLimit, 24))
+            limit: max(1, min(cardLimit, 24)),
+            scope: scope
         )
         return MemoryRewritePromptContext(
             lessons: lessons,
@@ -57,13 +78,15 @@ actor MemoryRewriteRetrievalService {
 
     func fetchCandidateCards(
         for cleanedTranscript: String,
-        limit: Int = 12
+        limit: Int = 12,
+        scope: MemoryScopeContext? = nil
     ) throws -> [MemoryCard] {
         let normalizedLimit = max(1, min(limit, 24))
         let context = try fetchPromptRewriteContext(
             for: cleanedTranscript,
             lessonLimit: min(8, normalizedLimit),
-            cardLimit: normalizedLimit
+            cardLimit: normalizedLimit,
+            scope: scope
         )
 
         var output = context.lessons
@@ -139,7 +162,7 @@ actor MemoryRewriteRetrievalService {
         if let store {
             return store
         }
-        let created = try MemorySQLiteStore()
+        let created = try storeFactory()
         store = created
         return created
     }
@@ -147,7 +170,8 @@ actor MemoryRewriteRetrievalService {
     private func fetchLessons(
         for normalizedTranscript: String,
         store: MemorySQLiteStore,
-        limit: Int
+        limit: Int,
+        scope: MemoryScopeContext?
     ) throws -> [MemoryRewriteLesson] {
         let matchedStoredLessons = try store.fetchLessonsForRewrite(
             query: normalizedTranscript,
@@ -161,7 +185,7 @@ actor MemoryRewriteRetrievalService {
         )
 
         let prioritized = prioritizedStoredLessons(
-            from: matchedStoredLessons + globalStoredLessons,
+            from: scopedLessons(from: matchedStoredLessons + globalStoredLessons, scope: scope),
             transcript: normalizedTranscript,
             limit: limit,
             includeLowRelevance: true
@@ -173,7 +197,8 @@ actor MemoryRewriteRetrievalService {
         for normalizedTranscript: String,
         store: MemorySQLiteStore,
         lessons: [MemoryRewriteLesson],
-        limit: Int
+        limit: Int,
+        scope: MemoryScopeContext?
     ) throws -> [MemoryCard] {
         let queries = cardSearchQueries(for: normalizedTranscript)
         var candidates: [MemoryCard] = []
@@ -188,6 +213,7 @@ actor MemoryRewriteRetrievalService {
             )
             candidates.append(contentsOf: cards)
         }
+        candidates = scopedCards(from: candidates, scope: scope)
 
         var seen = Set<String>()
         var filtered: [MemoryCard] = []
@@ -263,6 +289,265 @@ actor MemoryRewriteRetrievalService {
             }
         }
         return unique.isEmpty ? [normalized] : unique
+    }
+
+    private func scopedLessons(
+        from lessons: [MemoryLesson],
+        scope: MemoryScopeContext?
+    ) -> [MemoryLesson] {
+        guard let scope else { return lessons }
+        let strictIsolation = FeatureFlags.strictProjectIsolationEnabled && scope.isCodingContext
+
+        var sameScope: [MemoryLesson] = []
+        var sameIdentity: [MemoryLesson] = []
+        var sameProject: [MemoryLesson] = []
+        var sameApp: [MemoryLesson] = []
+
+        for lesson in lessons {
+            let metadata = normalizedMetadata(lesson.sourceMetadata)
+            if lessonMatchesScopeKey(metadata: metadata, scope: scope) {
+                sameScope.append(lesson)
+                continue
+            }
+            if hasConflictingConversationIdentity(metadata: metadata, scope: scope) {
+                continue
+            }
+            if lessonMatchesIdentity(metadata: metadata, scope: scope) {
+                sameIdentity.append(lesson)
+                continue
+            }
+            if lessonMatchesProject(metadata: metadata, scope: scope) {
+                sameProject.append(lesson)
+                continue
+            }
+            if strictIsolation && hasProjectMetadata(metadata: metadata) {
+                // In strict coding mode, cross-project entries should not join app-level fallback.
+                continue
+            }
+            if lessonMatchesApp(metadata: metadata, scope: scope) {
+                sameApp.append(lesson)
+            }
+        }
+
+        if !sameScope.isEmpty {
+            return dedupedLessons(sameScope)
+        }
+        if !sameIdentity.isEmpty {
+            return dedupedLessons(sameIdentity)
+        }
+        if strictIsolation {
+            if !sameProject.isEmpty {
+                return dedupedLessons(sameProject)
+            }
+            if !sameApp.isEmpty {
+                return dedupedLessons(sameApp)
+            }
+            return []
+        }
+        if !sameProject.isEmpty {
+            return dedupedLessons(sameProject)
+        }
+        if !sameApp.isEmpty {
+            return dedupedLessons(sameApp)
+        }
+        return dedupedLessons(lessons)
+    }
+
+    private func scopedCards(
+        from cards: [MemoryCard],
+        scope: MemoryScopeContext?
+    ) -> [MemoryCard] {
+        guard let scope else { return cards }
+        let strictIsolation = FeatureFlags.strictProjectIsolationEnabled && scope.isCodingContext
+
+        var sameScope: [MemoryCard] = []
+        var sameIdentity: [MemoryCard] = []
+        var sameProject: [MemoryCard] = []
+        var sameApp: [MemoryCard] = []
+
+        for card in cards {
+            let metadata = normalizedMetadata(card.metadata)
+            if lessonMatchesScopeKey(metadata: metadata, scope: scope) {
+                sameScope.append(card)
+                continue
+            }
+            if hasConflictingConversationIdentity(metadata: metadata, scope: scope) {
+                continue
+            }
+            if lessonMatchesIdentity(metadata: metadata, scope: scope) {
+                sameIdentity.append(card)
+                continue
+            }
+            if lessonMatchesProject(metadata: metadata, scope: scope) {
+                sameProject.append(card)
+                continue
+            }
+            if strictIsolation && hasProjectMetadata(metadata: metadata) {
+                // In strict coding mode, cross-project entries should not join app-level fallback.
+                continue
+            }
+            if lessonMatchesApp(metadata: metadata, scope: scope) {
+                sameApp.append(card)
+            }
+        }
+
+        if !sameScope.isEmpty {
+            return dedupedCards(sameScope)
+        }
+        if !sameIdentity.isEmpty {
+            return dedupedCards(sameIdentity)
+        }
+        if strictIsolation {
+            if !sameProject.isEmpty {
+                return dedupedCards(sameProject)
+            }
+            if !sameApp.isEmpty {
+                return dedupedCards(sameApp)
+            }
+            return []
+        }
+        if !sameProject.isEmpty {
+            return dedupedCards(sameProject)
+        }
+        if !sameApp.isEmpty {
+            return dedupedCards(sameApp)
+        }
+        return dedupedCards(cards)
+    }
+
+    private func lessonMatchesScopeKey(
+        metadata: [String: String],
+        scope: MemoryScopeContext
+    ) -> Bool {
+        let candidateScope = metadata["scope_key"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let candidateScope, !candidateScope.isEmpty else { return false }
+        return candidateScope.caseInsensitiveCompare(scope.scopeKey) == .orderedSame
+    }
+
+    private func lessonMatchesProject(
+        metadata: [String: String],
+        scope: MemoryScopeContext
+    ) -> Bool {
+        let scopeProject = scope.projectName?.lowercased()
+        let scopeRepository = scope.repositoryName?.lowercased()
+        guard scopeProject != nil || scopeRepository != nil else { return false }
+
+        let candidateProject = metadata["project_name"]?.lowercased() ?? metadata["project"]?.lowercased()
+        let candidateRepository = metadata["repository_name"]?.lowercased()
+            ?? metadata["repository"]?.lowercased()
+            ?? metadata["repo"]?.lowercased()
+
+        if let scopeProject, let candidateProject, scopeProject == candidateProject {
+            return true
+        }
+        if let scopeRepository, let candidateRepository, scopeRepository == candidateRepository {
+            return true
+        }
+        if let scopeProject, let candidateRepository, scopeProject == candidateRepository {
+            return true
+        }
+        if let scopeRepository, let candidateProject, scopeRepository == candidateProject {
+            return true
+        }
+        return false
+    }
+
+    private func lessonMatchesIdentity(
+        metadata: [String: String],
+        scope: MemoryScopeContext
+    ) -> Bool {
+        guard let scopeIdentity = scope.identityKey?.lowercased(),
+              !scopeIdentity.isEmpty else {
+            return false
+        }
+        let candidate = metadata["identity_key"]?.lowercased() ?? metadata["identity"]?.lowercased()
+        guard let candidate, !candidate.isEmpty else {
+            return false
+        }
+        return scopeIdentity == candidate
+    }
+
+    private func hasConflictingConversationIdentity(
+        metadata: [String: String],
+        scope: MemoryScopeContext
+    ) -> Bool {
+        guard let scopeIdentity = scope.identityKey?.lowercased(),
+              !scopeIdentity.isEmpty else {
+            return false
+        }
+        let origin = metadata["origin"]?.lowercased() ?? ""
+        guard origin == "conversation-history" else {
+            return false
+        }
+        guard let candidate = metadata["identity_key"]?.lowercased() ?? metadata["identity"]?.lowercased(),
+              !candidate.isEmpty else {
+            return false
+        }
+        return candidate != scopeIdentity
+    }
+
+    private func lessonMatchesApp(
+        metadata: [String: String],
+        scope: MemoryScopeContext
+    ) -> Bool {
+        let bundle = metadata["bundle_id"]?.lowercased() ?? metadata["bundle"]?.lowercased()
+        guard let bundle else { return false }
+        return bundle == scope.bundleID.lowercased()
+    }
+
+    private func normalizedMetadata(_ metadata: [String: String]) -> [String: String] {
+        var normalized: [String: String] = [:]
+        normalized.reserveCapacity(metadata.count)
+        for (key, value) in metadata {
+            let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let normalizedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedKey.isEmpty, !normalizedValue.isEmpty else { continue }
+            normalized[normalizedKey] = normalizedValue
+        }
+        return normalized
+    }
+
+    private func hasProjectMetadata(metadata: [String: String]) -> Bool {
+        let project = metadata["project_name"] ?? metadata["project"]
+        let repository = metadata["repository_name"] ?? metadata["repository"] ?? metadata["repo"]
+
+        if let project {
+            let normalized = project.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty {
+                return true
+            }
+        }
+        if let repository {
+            let normalized = repository.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func dedupedLessons(_ lessons: [MemoryLesson]) -> [MemoryLesson] {
+        var seen = Set<UUID>()
+        var output: [MemoryLesson] = []
+        output.reserveCapacity(lessons.count)
+        for lesson in lessons {
+            if seen.insert(lesson.id).inserted {
+                output.append(lesson)
+            }
+        }
+        return output
+    }
+
+    private func dedupedCards(_ cards: [MemoryCard]) -> [MemoryCard] {
+        var seen = Set<UUID>()
+        var output: [MemoryCard] = []
+        output.reserveCapacity(cards.count)
+        for card in cards {
+            if seen.insert(card.id).inserted {
+                output.append(card)
+            }
+        }
+        return output
     }
 
     private func shouldAttemptRewrite(for transcript: String) -> Bool {
