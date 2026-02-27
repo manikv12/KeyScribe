@@ -127,6 +127,7 @@ struct PermissionOnboardingView: View {
                 refreshPermissionSnapshot()
             }
         }
+        .tint(AppVisualTheme.accentTint)
     }
 
     @ViewBuilder

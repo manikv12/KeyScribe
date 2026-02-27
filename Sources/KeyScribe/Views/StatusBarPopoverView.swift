@@ -23,95 +23,104 @@ struct StatusBarPopoverView: View {
     @ObservedObject var viewModel: StatusBarViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            headerSection
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .padding(.bottom, 12)
+        ZStack {
+            StatusBarPopoverBackground()
 
-            if viewModel.isDictating {
-                RecordingIndicatorView(audioLevel: viewModel.currentAudioLevel)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 12)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+            VStack(alignment: .leading, spacing: 0) {
+                headerSection
+                    .padding(.horizontal, 2)
+                    .padding(.bottom, 10)
+
+                if viewModel.isDictating {
+                    RecordingIndicatorView(audioLevel: viewModel.currentAudioLevel)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .padding(.bottom, 10)
+                }
+
+                Divider().overlay(Color.white.opacity(0.08))
+                    .padding(.bottom, 8)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    sectionTitle("Quick Actions")
+                    PopoverMenuRow(
+                        icon: viewModel.isContinuousMode ? "stop.circle.fill" : "mic.circle.fill",
+                        label: viewModel.isContinuousMode ? "Stop Dictation" : "Start Dictation",
+                        shortcut: nil,
+                        iconTint: viewModel.isContinuousMode ? .red : AppVisualTheme.accentTint,
+                        isDisabled: !viewModel.permissionsReady
+                    ) {
+                        viewModel.onToggleDictation?()
+                    }
+
+                    PopoverMenuRow(
+                        icon: "doc.on.clipboard",
+                        label: "Paste Last Transcript",
+                        shortcut: "⌘⌥V",
+                        iconTint: AppVisualTheme.accentTint
+                    ) {
+                        viewModel.onPasteLastTranscript?()
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+
+                Divider().overlay(Color.white.opacity(0.08))
+                    .padding(.bottom, 8)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    sectionTitle("Open")
+                    PopoverMenuRow(
+                        icon: "clock.arrow.circlepath",
+                        label: "History",
+                        iconTint: AppVisualTheme.historyTint
+                    ) {
+                        viewModel.onOpenHistory?()
+                    }
+
+                    PopoverMenuRow(
+                        icon: "brain.head.profile",
+                        label: "AI Studio",
+                        iconTint: AppVisualTheme.aiStudioTint
+                    ) {
+                        viewModel.onOpenAIMemoryStudio?()
+                    }
+
+                    PopoverMenuRow(
+                        icon: "gearshape.fill",
+                        label: "Settings",
+                        shortcut: "⌘,",
+                        iconTint: AppVisualTheme.settingsTint
+                    ) {
+                        viewModel.onOpenSettings?()
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+
+                Divider().overlay(Color.white.opacity(0.08))
+                    .padding(.bottom, 8)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    sectionTitle("System")
+                    PopoverMenuRow(
+                        icon: "power",
+                        label: "Quit KeyScribe",
+                        iconTint: .gray
+                    ) {
+                        viewModel.onQuit?()
+                    }
+                }
+                .padding(.horizontal, 8)
             }
-
-            Divider()
-                .padding(.horizontal, 16)
-                .opacity(0.6)
-
-            VStack(spacing: 4) {
-                PopoverMenuRow(
-                    icon: viewModel.isContinuousMode ? "stop.circle.fill" : "mic.circle.fill",
-                    label: viewModel.isContinuousMode ? "Stop Dictation" : "Start Dictation",
-                    shortcut: nil,
-                    iconTint: viewModel.isContinuousMode ? .red : AppVisualTheme.accentTint,
-                    isDisabled: !viewModel.permissionsReady
-                ) {
-                    viewModel.onToggleDictation?()
-                }
-
-                PopoverMenuRow(
-                    icon: "doc.on.clipboard",
-                    label: "Paste Last Transcript",
-                    shortcut: "⌘⌥V",
-                    iconTint: AppVisualTheme.accentTint
-                ) {
-                    viewModel.onPasteLastTranscript?()
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
-
-            Divider()
-                .padding(.horizontal, 16)
-                .opacity(0.6)
-
-            VStack(spacing: 4) {
-                PopoverMenuRow(icon: "clock.arrow.circlepath", label: "History", iconTint: AppVisualTheme.accentTint) {
-                    viewModel.onOpenHistory?()
-                }
-
-                PopoverMenuRow(icon: "brain.head.profile", label: "AI Studio", iconTint: AppVisualTheme.accentTint) {
-                    viewModel.onOpenAIMemoryStudio?()
-                }
-
-                PopoverMenuRow(icon: "gearshape.fill", label: "Settings", shortcut: "⌘,", iconTint: AppVisualTheme.accentTint) {
-                    viewModel.onOpenSettings?()
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
-
-            Divider()
-                .padding(.horizontal, 16)
-                .opacity(0.6)
-
-            VStack(spacing: 4) {
-                PopoverMenuRow(
-                    icon: "power",
-                    label: "Quit KeyScribe",
-                    iconTint: .gray
-                ) {
-                    viewModel.onQuit?()
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
-            .padding(.bottom, 4)
+            .padding(12)
         }
-        .frame(width: 296)
-        .appThemedSurface(
-            cornerRadius: 16,
-            tint: AppVisualTheme.panelTint,
-            strokeOpacity: 0.18,
-            tintOpacity: 0.05
-        )
+        .frame(width: 312)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.15), lineWidth: 0.55)
+                .stroke(Color.white.opacity(0.18), lineWidth: 0.7)
         )
-        .shadow(color: .black.opacity(0.12), radius: 10, x: 0, y: 6)
+        .shadow(color: .black.opacity(0.35), radius: 18, x: 0, y: 10)
         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isDictating)
     }
 
@@ -132,13 +141,27 @@ struct StatusBarPopoverView: View {
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.95))
 
-                Text(viewModel.uiStatus.menuText)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundColor(statusPillColor)
+                HStack(spacing: 6) {
+                    Text(viewModel.uiStatus.menuText)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundColor(statusPillColor)
+                    Text("Quick Controls")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppVisualTheme.mutedText)
+                }
             }
 
             Spacer()
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .foregroundStyle(AppVisualTheme.mutedText.opacity(0.92))
+            .padding(.horizontal, 6)
     }
 
     private var statusPillColor: Color {
@@ -149,6 +172,39 @@ struct StatusBarPopoverView: View {
         case .pasteUnavailable, .accessibilityHint: return .red
         default: return .secondary
         }
+    }
+}
+
+private struct StatusBarPopoverBackground: View {
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.70)
+
+            Rectangle()
+                .fill(.regularMaterial)
+                .opacity(0.55)
+
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.06),
+                    Color.black.opacity(0.16),
+                    Color.black.opacity(0.38)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            RadialGradient(
+                colors: [
+                    Color.white.opacity(0.05),
+                    Color.clear
+                ],
+                center: .topLeading,
+                startRadius: 10,
+                endRadius: 240
+            )
+        }
+        .ignoresSafeArea()
     }
 }
 
@@ -191,26 +247,7 @@ private struct PopoverMenuRow: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(
-                        isHovered
-                            ? LinearGradient(
-                                colors: [
-                                    AppVisualTheme.rowSelection.opacity(0.42),
-                                    AppVisualTheme.rowSelection.opacity(0.26)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                            : LinearGradient(
-                                colors: [Color.clear, Color.clear],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .stroke(isHovered ? Color.white.opacity(0.24) : Color.clear, lineWidth: 0.7)
-                    )
+                    .fill(Color.white.opacity(isHovered ? 0.10 : 0.03))
             )
             .opacity(isDisabled ? 0.4 : 1)
             .contentShape(Rectangle())

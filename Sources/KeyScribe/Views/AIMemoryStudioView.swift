@@ -3,6 +3,8 @@ import SwiftUI
 
 struct AIMemoryStudioView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
+    @StateObject private var localAISetupService = LocalAISetupService.shared
 
     @State private var detectedMemoryProviders: [MemoryIndexingSettingsService.Provider] = []
     @State private var detectedMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] = []
@@ -33,6 +35,7 @@ struct AIMemoryStudioView: View {
     @State private var promptRewriteModelRequestToken = UUID()
     @State private var openAIDeviceUserCode: String?
     @State private var openAIDeviceVerificationURL: URL?
+    @State private var showLocalModelDeleteConfirmation = false
 
     @State private var memoryActionMessage: String?
     @State private var isMemoryIndexingInProgress = false
@@ -59,11 +62,21 @@ struct AIMemoryStudioView: View {
     @State private var showingProvidersSheet = false
     @State private var showingSourceFoldersSheet = false
     @State private var selectedStudioPage: StudioPage = .dashboard
+    @State private var conversationContextDetails: [PromptRewriteConversationContextDetail] = []
+    @State private var selectedConversationContextID = ""
+    @State private var conversationContextSearchQuery = ""
+    @State private var conversationActionMessage: String?
+    @State private var conversationPatternStats: [MemoryPatternStats] = []
+    @State private var selectedConversationPatternKey = ""
+    @State private var conversationPatternOccurrences: [MemoryPatternOccurrence] = []
+    @State private var showConversationContextInspectSheet = false
+    @State private var inspectedConversationContextID = ""
 
     private enum StudioPage: String, CaseIterable, Identifiable {
         case dashboard
         case connection
         case models
+        case conversationMemory
         case memorySources
         case sourceFolders
         case browser
@@ -79,6 +92,8 @@ struct AIMemoryStudioView: View {
                 return "Connect Provider"
             case .models:
                 return "Prompt Models"
+            case .conversationMemory:
+                return "Conversation Memory"
             case .memorySources:
                 return "Memory Sources"
             case .sourceFolders:
@@ -98,6 +113,8 @@ struct AIMemoryStudioView: View {
                 return "Connect each provider securely via OAuth or API key."
             case .models:
                 return "Choose the model and endpoint for prompt rewrite."
+            case .conversationMemory:
+                return "Per-screen context history, size, and compaction."
             case .memorySources:
                 return "Manage detected providers and enabled sources."
             case .sourceFolders:
@@ -117,6 +134,8 @@ struct AIMemoryStudioView: View {
                 return "bolt.badge.a"
             case .models:
                 return "cpu.fill"
+            case .conversationMemory:
+                return "text.bubble"
             case .memorySources:
                 return "square.stack.3d.up"
             case .sourceFolders:
@@ -131,50 +150,74 @@ struct AIMemoryStudioView: View {
         var tint: Color {
             switch self {
             case .dashboard:
-                return Color(red: 0.46, green: 0.69, blue: 0.97)
+                return Color(red: 0.23, green: 0.72, blue: 0.58)
             case .connection:
-                return Color(red: 0.62, green: 0.57, blue: 0.94)
+                return Color(red: 0.94, green: 0.58, blue: 0.24)
             case .models:
-                return Color(red: 0.44, green: 0.78, blue: 0.82)
+                return Color(red: 0.30, green: 0.65, blue: 0.93)
+            case .conversationMemory:
+                return Color(red: 0.58, green: 0.62, blue: 0.94)
             case .memorySources:
-                return Color(red: 0.43, green: 0.79, blue: 0.66)
+                return Color(red: 0.33, green: 0.73, blue: 0.42)
             case .sourceFolders:
-                return Color(red: 0.44, green: 0.72, blue: 0.90)
+                return Color(red: 0.25, green: 0.66, blue: 0.84)
             case .browser:
-                return Color(red: 0.52, green: 0.63, blue: 0.96)
+                return Color(red: 0.92, green: 0.49, blue: 0.34)
             case .actions:
-                return Color(red: 0.93, green: 0.67, blue: 0.39)
+                return Color(red: 0.90, green: 0.70, blue: 0.26)
+            }
+        }
+    }
+
+    private enum LocalAIWizardStep: String, CaseIterable, Identifiable {
+        case selectModel
+        case installRuntime
+        case downloadModel
+        case verify
+        case done
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .selectModel:
+                return "Select Model"
+            case .installRuntime:
+                return "Install Runtime"
+            case .downloadModel:
+                return "Download Model"
+            case .verify:
+                return "Verify"
+            case .done:
+                return "Done"
             }
         }
     }
 
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
-    private let studioSidebarWidth: CGFloat = 190
-    private let aiCorePages: [StudioPage] = [.dashboard, .connection, .models]
+    private let studioSidebarWidth: CGFloat = 244
+    private let aiCorePages: [StudioPage] = [.dashboard, .connection, .models, .conversationMemory]
 
     var body: some View {
         ZStack {
             studioBackground
-            VStack(spacing: 0) {
-                studioHeader
+            HStack(spacing: 0) {
+                studioSidebar
 
-                HStack(spacing: 0) {
-                    studioSidebar
-                    Divider()
+                Rectangle()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 1)
+                    .frame(maxHeight: .infinity)
 
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 16) {
-                            studioPageContent
-                        }
-                        .padding(18)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        studioPageContent
                     }
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .padding(.top, 34)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 12)
+            .padding(10)
         }
         .appScrollbars()
         .tint(AppVisualTheme.accentTint)
@@ -184,12 +227,48 @@ struct AIMemoryStudioView: View {
         .sheet(isPresented: $showingSourceFoldersSheet) {
             sourceFoldersSelectionSheet
         }
+        .sheet(isPresented: $showConversationContextInspectSheet) {
+            conversationContextInspectSheet
+        }
         .sheet(isPresented: $showMemoryDetailSheet) {
             memoryDetailSheet
+        }
+        .confirmationDialog(
+            "Delete Local Model?",
+            isPresented: $showLocalModelDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Model", role: .destructive) {
+                localAISetupService.deleteSelectedModel()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the selected model from local runtime storage on this Mac.")
         }
         .onAppear {
             sanitizeSelectedStudioPage()
             prepare()
+        }
+        .onChange(of: promptRewriteConversationStore.contextSummaries) { _ in
+            refreshConversationContextDetails()
+        }
+        .onChange(of: selectedStudioPage) { newValue in
+            if newValue == .conversationMemory {
+                refreshConversationContextDetails()
+            }
+        }
+        .onChange(of: showConversationContextInspectSheet) { isPresented in
+            if !isPresented {
+                inspectedConversationContextID = ""
+            }
+        }
+        .onChange(of: localAISetupService.setupState) { newValue in
+            if newValue == .ready {
+                refreshPromptRewriteModels(showMessage: true)
+            }
+        }
+        .onChange(of: settings.promptRewriteProviderModeRawValue) { _ in
+            handlePromptRewriteProviderChanged()
         }
         .onReceive(
             NotificationCenter.default.publisher(
@@ -213,54 +292,63 @@ struct AIMemoryStudioView: View {
 
     private var studioBackground: some View {
         AppSplitChromeBackground(
-            leadingPaneFraction: 0.24,
+            leadingPaneFraction: 0.31,
             leadingPaneMaxWidth: studioSidebarWidth + 26,
+            leadingPaneWidth: studioSidebarWidth + 10,
             leadingTint: AppVisualTheme.sidebarTint,
-            trailingTint: Color.black,
-            accent: AppVisualTheme.accentTint
+            trailingTint: .black,
+            accent: AppVisualTheme.accentTint,
+            leadingPaneTransparent: true
         )
     }
 
-    private var studioHeader: some View {
+    private var studioSidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 10) {
+                AppIconBadge(
+                    symbol: selectedStudioPage.iconName,
+                    tint: selectedStudioPage.tint,
+                    size: 28,
+                    symbolSize: 12,
+                    isEmphasized: true
+                )
+
+                VStack(alignment: .leading, spacing: 2) {
                     Text("AI Studio")
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
-                    Text(isMemoryFeatureEnabled
-                         ? "Configure AI providers, prompt rewrite, and memory systems."
-                         : "Configure AI providers and prompt rewrite.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.96))
+                    Text(selectedStudioPage.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(AppVisualTheme.mutedText)
+                        .lineLimit(2)
                 }
-                Spacer(minLength: 0)
-                metricPill(label: "Assistant", value: promptAssistantStateLabel, tint: promptAssistantStateTint)
             }
 
-            HStack(spacing: 8) {
-                metricPill(
+            VStack(spacing: 6) {
+                sidebarMetricRow(label: "Assistant", value: promptAssistantStateLabel, tint: promptAssistantStateTint)
+                sidebarMetricRow(
                     label: "Providers",
                     value: "\(connectedModelProviderCount)/\(PromptRewriteProviderMode.allCases.count)",
                     tint: AppVisualTheme.accentTint
                 )
+                sidebarMetricRow(
+                    label: "Contexts",
+                    value: "\(conversationContextDetails.count)",
+                    tint: AppVisualTheme.accentTint
+                )
                 if isMemoryFeatureEnabled {
-                    metricPill(
+                    sidebarMetricRow(
                         label: "Folders",
                         value: "\(enabledSourceFolderCount)/\(totalSourceFoldersForEnabledProvidersCount)",
                         tint: AppVisualTheme.accentTint
                     )
-                    metricPill(
+                    sidebarMetricRow(
                         label: "Visible",
                         value: "\(memoryBrowserVisibleCount)",
                         tint: AppVisualTheme.accentTint
                     )
                 } else {
-                    metricPill(
-                        label: "Rewrite",
-                        value: settings.promptRewriteEnabled ? "On" : "Off",
-                        tint: promptAssistantStateTint
-                    )
-                    metricPill(
+                    sidebarMetricRow(
                         label: "Model",
                         value: settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             ? settings.promptRewriteProviderMode.defaultModel
@@ -269,26 +357,14 @@ struct AIMemoryStudioView: View {
                     )
                 }
             }
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.regularMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.18), lineWidth: 0.7)
-        )
-    }
 
-    private var studioSidebar: some View {
-        VStack(alignment: .leading, spacing: 10) {
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+
             Text("Workspace")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.top, 10)
+                .padding(.leading, 2)
 
             VStack(spacing: 3) {
                 ForEach(availableStudioPages) { page in
@@ -303,10 +379,34 @@ struct AIMemoryStudioView: View {
 
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
-        .padding(.bottom, 10)
+        .padding(12)
         .frame(width: studioSidebarWidth)
         .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    @ViewBuilder
+    private func sidebarMetricRow(label: String, value: String, tint: Color) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundStyle(.primary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(tint.opacity(0.14), lineWidth: 0.7)
+        )
     }
 
     @ViewBuilder
@@ -352,6 +452,8 @@ struct AIMemoryStudioView: View {
             studioConnectionPage
         case .models:
             studioModelPage
+        case .conversationMemory:
+            studioConversationMemoryPage
         case .memorySources:
             if isMemoryFeatureEnabled { studioProvidersPage } else { studioOverviewPage }
         case .sourceFolders:
@@ -483,55 +585,6 @@ struct AIMemoryStudioView: View {
             }
             }
 
-            Text("Quick Navigation")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.leading, 2)
-
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                ForEach(availableStudioPages.filter { $0 != .dashboard }) { page in
-                    Button {
-                        selectedStudioPage = page
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: page.iconName)
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(page.tint)
-                                .frame(width: 24, height: 24)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(page.tint.opacity(0.06))
-                                )
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(page.title)
-                                    .font(.callout.weight(.medium))
-                                    .foregroundStyle(.primary)
-                                Text(page.subtitle)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(.regularMaterial)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .fill(page.tint.opacity(0.08))
-                                )
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(page.tint.opacity(0.2), lineWidth: 0.8)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-
             if let memoryActionMessage {
                 Text(memoryActionMessage)
                     .font(.caption)
@@ -550,6 +603,9 @@ struct AIMemoryStudioView: View {
 
     private var studioModelPage: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if settings.promptRewriteProviderMode == .ollama {
+                localAISetupCard
+            }
             promptModelConfigCard
         }
     }
@@ -702,6 +758,718 @@ struct AIMemoryStudioView: View {
         }
     }
 
+    private var studioConversationMemoryPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            conversationMemoryOverviewCard
+            conversationContextListCard
+            conversationLongTermPatternsCard
+        }
+    }
+
+    private var conversationMemoryOverviewCard: some View {
+        settingsCard(
+            title: "Conversation Memory",
+            subtitle: "Per-screen rewrite buckets with compaction-aware history.",
+            symbol: "text.bubble",
+            tint: AppVisualTheme.accentTint
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(
+                    "Enable conversation-aware rewrite history (app + screen)",
+                    isOn: $settings.promptRewriteConversationHistoryEnabled
+                )
+                .disabled(!settings.promptRewriteEnabled)
+
+                HStack(spacing: 8) {
+                    metricPill(
+                        label: "Contexts",
+                        value: "\(conversationContextDetails.count)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Turns",
+                        value: "\(totalConversationTurnCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Summaries",
+                        value: "\(totalConversationSummaryTurnCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Est. Tokens",
+                        value: "\(totalConversationEstimatedTokenCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                }
+
+                HStack {
+                    Text("Current timeout")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(Int(settings.promptRewriteConversationTimeoutMinutes.rounded())) min")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(
+                    value: $settings.promptRewriteConversationTimeoutMinutes,
+                    in: 2...240,
+                    step: 1
+                )
+                .disabled(!settings.promptRewriteConversationHistoryEnabled || !settings.promptRewriteEnabled)
+
+                HStack {
+                    Text("Turns kept in active prompt window")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(settings.promptRewriteConversationTurnLimit)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Spacer()
+                    Stepper(
+                        "\(settings.promptRewriteConversationTurnLimit)",
+                        value: $settings.promptRewriteConversationTurnLimit,
+                        in: 1...50
+                    )
+                    .labelsHidden()
+                }
+                .disabled(!settings.promptRewriteConversationHistoryEnabled || !settings.promptRewriteEnabled)
+
+                HStack {
+                    Text("History source")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Picker(
+                        "History source",
+                        selection: promptRewriteConversationContextSelection
+                    ) {
+                        Text("Automatic (current app/screen)").tag("auto")
+                        ForEach(promptRewriteConversationStore.contextSummaries.prefix(24)) { summary in
+                            Text("\(summary.displayName) • \(summary.turnCount) turns")
+                                .tag(summary.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(width: 360)
+                }
+                .disabled(!settings.promptRewriteConversationHistoryEnabled || !settings.promptRewriteEnabled)
+
+                HStack(spacing: 8) {
+                    Button("Start New Current Conversation") {
+                        startNewPromptRewriteConversation()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.promptRewriteConversationHistoryEnabled || !settings.promptRewriteEnabled)
+
+                    Button("Clear All Conversation History", role: .destructive) {
+                        promptRewriteConversationStore.clearAll()
+                        settings.promptRewriteConversationPinnedContextID = ""
+                        conversationActionMessage = "Cleared all conversation history."
+                        refreshConversationContextDetails()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(conversationContextDetails.isEmpty)
+                }
+
+                Text("Storage: SQLite (`memory.sqlite3`) for conversation threads + turns. JSON below is an inspector snapshot view.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                if let conversationActionMessage {
+                    Text(conversationActionMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+            }
+        }
+    }
+
+    private var conversationContextListCard: some View {
+        settingsCard(
+            title: "Context Buckets",
+            subtitle: "Inspect each screen-specific conversation and run compaction on demand.",
+            symbol: "rectangle.stack.person.crop",
+            tint: AppVisualTheme.accentTint
+        ) {
+            HStack(spacing: 8) {
+                TextField("Filter by app, screen, or field", text: $conversationContextSearchQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        refreshConversationContextDetails()
+                    }
+
+                Button("Refresh") {
+                    refreshConversationContextDetails()
+                }
+                .buttonStyle(.bordered)
+
+                Button("Compact All") {
+                    compactAllConversationContexts()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(conversationContextDetails.isEmpty)
+            }
+
+            if filteredConversationContextDetails.isEmpty {
+                emptyStateRow(
+                    title: "No conversation contexts",
+                    message: "Start rewriting prompts in different screens to build context buckets, then compact from here.",
+                    systemImage: "tray"
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(filteredConversationContextDetails) { detail in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(detail.context.displayName)
+                                        .font(.callout.weight(.semibold))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text(detail.lastUpdatedAt.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .monospacedDigit()
+                                }
+
+                                HStack(spacing: 8) {
+                                    metricPill(
+                                        label: "Turns",
+                                        value: "\(detail.totalTurnCount)",
+                                        tint: AppVisualTheme.accentTint
+                                    )
+                                    metricPill(
+                                        label: "Summaries",
+                                        value: "\(detail.summaryTurnCount)",
+                                        tint: AppVisualTheme.accentTint
+                                    )
+                                    metricPill(
+                                        label: "Est. Tokens",
+                                        value: "\(detail.estimatedTokenCount)",
+                                        tint: AppVisualTheme.accentTint
+                                    )
+                                    Spacer(minLength: 0)
+                                }
+
+                                HStack(spacing: 8) {
+                                    Button("Inspect") {
+                                        openConversationContextInspector(for: detail.id)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+
+                                    Button("Compact") {
+                                        compactConversationContext(id: detail.id)
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    Button("Clear", role: .destructive) {
+                                        clearConversationContext(id: detail.id)
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    Spacer(minLength: 0)
+                                }
+                            }
+                            .padding(10)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(.regularMaterial)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .stroke(
+                                        selectedConversationContextID == detail.id
+                                            ? AppVisualTheme.accentTint.opacity(0.24)
+                                            : Color.primary.opacity(0.08),
+                                        lineWidth: 0.7
+                                    )
+                            )
+                        }
+                    }
+                    .padding(.trailing, 2)
+                }
+                .frame(maxHeight: 320)
+            }
+        }
+    }
+
+    private var conversationLongTermPatternsCard: some View {
+        settingsCard(
+            title: "Long-term Memory Promotions",
+            subtitle: "Track promoted conversation patterns, repeats, and manual quality signals.",
+            symbol: "brain.filled.head.profile",
+            tint: AppVisualTheme.accentTint
+        ) {
+            HStack(spacing: 8) {
+                metricPill(
+                    label: "Patterns",
+                    value: "\(conversationPatternStats.count)",
+                    tint: AppVisualTheme.accentTint
+                )
+                metricPill(
+                    label: "Repeating",
+                    value: "\(conversationPatternStats.filter { $0.isRepeating }.count)",
+                    tint: AppVisualTheme.accentTint
+                )
+                metricPill(
+                    label: "Good",
+                    value: "\(conversationPatternStats.reduce(0) { $0 + $1.goodRepeatCount })",
+                    tint: AppVisualTheme.accentTint
+                )
+                metricPill(
+                    label: "Bad",
+                    value: "\(conversationPatternStats.reduce(0) { $0 + $1.badRepeatCount })",
+                    tint: AppVisualTheme.accentTint
+                )
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 8) {
+                Button("Refresh Patterns") {
+                    refreshConversationPatternStats()
+                }
+                .buttonStyle(.bordered)
+
+                Button("Purge Expired") {
+                    purgeExpiredConversationPatterns()
+                }
+                .buttonStyle(.bordered)
+
+                Spacer(minLength: 0)
+            }
+
+            if conversationPatternStats.isEmpty {
+                emptyStateRow(
+                    title: "No promoted patterns yet",
+                    message: "Patterns appear here after conversation compaction/timeout is promoted into long-term memory.",
+                    systemImage: "tray"
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(conversationPatternStats.prefix(80)) { pattern in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(pattern.appName)
+                                        .font(.callout.weight(.semibold))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    if pattern.isRepeating {
+                                        memoryEntryBadge("Repeating", tint: AppVisualTheme.accentTint)
+                                    }
+                                    Text(pattern.lastSeenAt.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .monospacedDigit()
+                                }
+
+                                Text(pattern.surfaceLabel)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+
+                                HStack(spacing: 8) {
+                                    metricPill(
+                                        label: "Seen",
+                                        value: "\(pattern.occurrenceCount)",
+                                        tint: AppVisualTheme.accentTint
+                                    )
+                                    metricPill(
+                                        label: "Good",
+                                        value: "\(pattern.goodRepeatCount)",
+                                        tint: AppVisualTheme.accentTint
+                                    )
+                                    metricPill(
+                                        label: "Bad",
+                                        value: "\(pattern.badRepeatCount)",
+                                        tint: AppVisualTheme.accentTint
+                                    )
+                                    metricPill(
+                                        label: "Confidence",
+                                        value: String(format: "%.2f", pattern.confidence),
+                                        tint: AppVisualTheme.accentTint
+                                    )
+                                    Spacer(minLength: 0)
+                                }
+
+                                HStack(spacing: 8) {
+                                    Button("Inspect") {
+                                        selectedConversationPatternKey = pattern.patternKey
+                                        refreshConversationPatternOccurrences(patternKey: pattern.patternKey)
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    Button("Mark Good") {
+                                        markConversationPattern(pattern.patternKey, outcome: .good)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+
+                                    Button("Mark Bad") {
+                                        markConversationPattern(pattern.patternKey, outcome: .bad)
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    Button("Delete Pattern", role: .destructive) {
+                                        deleteConversationPattern(pattern.patternKey)
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+
+                                if selectedConversationPatternKey == pattern.patternKey,
+                                   !conversationPatternOccurrences.isEmpty {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Occurrences")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                        ForEach(conversationPatternOccurrences.prefix(6)) { occurrence in
+                                            HStack(spacing: 8) {
+                                                Text(occurrence.outcome.rawValue.capitalized)
+                                                    .font(.caption2.weight(.semibold))
+                                                    .foregroundStyle(.secondary)
+                                                    .frame(width: 52, alignment: .leading)
+                                                Text(occurrence.trigger.rawValue)
+                                                    .font(.caption2.monospaced())
+                                                    .foregroundStyle(.tertiary)
+                                                Spacer()
+                                                Text(occurrence.eventTimestamp.formatted(date: .abbreviated, time: .shortened))
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.tertiary)
+                                                    .monospacedDigit()
+                                            }
+                                        }
+                                    }
+                                    .padding(8)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(.regularMaterial)
+                                    )
+                                }
+                            }
+                            .padding(10)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(.regularMaterial)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .stroke(
+                                        selectedConversationPatternKey == pattern.patternKey
+                                            ? AppVisualTheme.accentTint.opacity(0.24)
+                                            : Color.primary.opacity(0.08),
+                                        lineWidth: 0.7
+                                    )
+                            )
+                        }
+                    }
+                    .padding(.trailing, 2)
+                }
+                .frame(maxHeight: 420)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var conversationContextInspectSheet: some View {
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Inspect Context")
+                            .font(.headline)
+                        if let detail = inspectedConversationContextDetail {
+                            Text(detail.context.displayName)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Text(detail.context.providerContextLabel)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(2)
+                        }
+                    }
+                    Spacer()
+                    if let detail = inspectedConversationContextDetail {
+                        memoryEntryBadge(detail.context.appName, tint: AppVisualTheme.accentTint)
+                    }
+                    Button("Done") {
+                        showConversationContextInspectSheet = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
+
+                Divider()
+                    .overlay(Color.primary.opacity(0.08))
+
+                ScrollView {
+                    if let detail = inspectedConversationContextDetail {
+                        conversationContextInspectorContent(detail)
+                            .padding(18)
+                    } else {
+                        emptyStateRow(
+                            title: "Context unavailable",
+                            message: "This context may have been cleared. Close this dialog and inspect another context.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .padding(18)
+                    }
+                }
+            }
+            .padding(10)
+            .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.16)
+            .padding(10)
+        }
+        .frame(width: 860, height: 700)
+    }
+
+    private func conversationContextInspectorContent(
+        _ detail: PromptRewriteConversationContextDetail
+    ) -> some View {
+        let payload = formattedConversationContextPayload(for: detail.id)
+        let summaryTurns = detail.turns.filter(\.isSummary)
+
+        return VStack(alignment: .leading, spacing: 14) {
+            inspectorSection(
+                title: "Context Health",
+                subtitle: "Snapshot metrics and maintenance actions."
+            ) {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 130), spacing: 8)],
+                    alignment: .leading,
+                    spacing: 8
+                ) {
+                    metricPill(
+                        label: "Turns",
+                        value: "\(detail.totalTurnCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Summaries",
+                        value: "\(detail.summaryTurnCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Characters",
+                        value: "\(detail.estimatedCharacterCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Est. Tokens",
+                        value: "\(detail.estimatedTokenCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                }
+
+                HStack(spacing: 10) {
+                    Button("Compact Context") {
+                        compactConversationContext(id: detail.id)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Clear Context", role: .destructive) {
+                        clearConversationContext(id: detail.id)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Spacer(minLength: 0)
+                }
+            }
+
+            inspectorSection(
+                title: payload.isJSON ? "Context Snapshot (JSON View)" : "Context Snapshot",
+                subtitle: payload.isJSON
+                    ? "Formatted for readability."
+                    : "Raw content shown because JSON parsing failed."
+            ) {
+                jsonPayloadEditor(text: payload.text)
+
+                if !payload.isJSON {
+                    Text("Could not parse the payload as JSON. Showing raw content.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            inspectorSection(
+                title: "Compacted Summaries",
+                subtitle: "Summaries generated when older turns are compacted."
+            ) {
+                if summaryTurns.isEmpty {
+                    Text("No compacted summaries yet for this context.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 2)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            ForEach(Array(summaryTurns.enumerated()), id: \.offset) { _, turn in
+                                conversationSummaryTurnRow(turn)
+                            }
+                        }
+                        .padding(.trailing, 2)
+                    }
+                    .frame(maxHeight: 230)
+                }
+            }
+
+            inspectorSection(
+                title: "Conversation Turns",
+                subtitle: "Full timeline including exchanges and summary entries."
+            ) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(detail.turns.enumerated()), id: \.offset) { _, turn in
+                            conversationTurnRow(turn)
+                        }
+                    }
+                    .padding(.trailing, 2)
+                }
+                .frame(maxHeight: 330)
+            }
+        }
+    }
+
+    private func inspectorSection<Content: View>(
+        title: String,
+        subtitle: String? = nil,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+
+            if let subtitle,
+               !subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            content()
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.7)
+        )
+    }
+
+    private func conversationSummaryTurnRow(_ turn: PromptRewriteConversationTurn) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                memoryEntryBadge("Summary", tint: AppVisualTheme.accentTint)
+                if let sourceTurnCount = turn.sourceTurnCount {
+                    Text("from \(sourceTurnCount) earlier turn(s)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(turn.timestamp.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+
+            Text(turn.assistantText)
+                .font(.caption)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
+        )
+    }
+
+    private func conversationTurnRow(_ turn: PromptRewriteConversationTurn) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                if turn.isSummary {
+                    memoryEntryBadge("Summary", tint: AppVisualTheme.accentTint)
+                    if let sourceTurnCount = turn.sourceTurnCount {
+                        Text("from \(sourceTurnCount) earlier turn(s)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    memoryEntryBadge("Exchange", tint: AppVisualTheme.accentTint)
+                }
+                Spacer()
+                Text(turn.timestamp.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+
+            if !turn.isSummary {
+                Text("User")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(turn.userText)
+                    .font(.caption)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Text(turn.isSummary ? "Summary" : "Assistant")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(turn.assistantText)
+                .font(.caption)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
+        )
+    }
+
+    private func jsonPayloadEditor(text: String) -> some View {
+        TextEditor(text: .constant(text))
+            .font(.system(size: 12, weight: .regular, design: .monospaced))
+            .textSelection(.enabled)
+            .scrollContentBackground(.hidden)
+            .frame(minHeight: 220)
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.regularMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
+                    )
+            )
+    }
+
     private var studioActionsPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             memoryActionsCard
@@ -831,10 +1599,10 @@ struct AIMemoryStudioView: View {
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(.regularMaterial)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(Color.primary.opacity(0.18), lineWidth: 0.6)
-                        )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.14), lineWidth: 0.5)
                 )
 
                 if memoryBrowserHighSignalOnly, memoryBrowserUnfilteredEntryCount > memoryBrowserEntries.count {
@@ -1013,6 +1781,80 @@ struct AIMemoryStudioView: View {
         min(memoryBrowserEntries.count, 80)
     }
 
+    private var normalizedConversationContextQuery: String {
+        conversationContextSearchQuery
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private var filteredConversationContextDetails: [PromptRewriteConversationContextDetail] {
+        let query = normalizedConversationContextQuery
+        guard !query.isEmpty else {
+            return conversationContextDetails
+        }
+
+        return conversationContextDetails.filter { detail in
+            let haystack = [
+                detail.context.displayName,
+                detail.context.appName,
+                detail.context.screenLabel,
+                detail.context.fieldLabel,
+                detail.context.projectLabel ?? "",
+                detail.context.identityLabel ?? ""
+            ]
+                .joined(separator: " ")
+                .lowercased()
+            return haystack.contains(query)
+        }
+    }
+
+    private var selectedConversationContextDetail: PromptRewriteConversationContextDetail? {
+        guard !selectedConversationContextID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return conversationContextDetails.first { $0.id == selectedConversationContextID }
+    }
+
+    private var inspectedConversationContextDetail: PromptRewriteConversationContextDetail? {
+        let normalizedID = inspectedConversationContextID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedID.isEmpty else {
+            return nil
+        }
+        return conversationContextDetails.first { $0.id == normalizedID }
+    }
+
+    private var promptRewriteConversationContextSelection: Binding<String> {
+        Binding(
+            get: {
+                let pinned = settings.promptRewriteConversationPinnedContextID
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) else {
+                    return "auto"
+                }
+                return pinned
+            },
+            set: { selected in
+                if selected == "auto" {
+                    settings.promptRewriteConversationPinnedContextID = ""
+                } else {
+                    settings.promptRewriteConversationPinnedContextID = selected
+                }
+            }
+        )
+    }
+
+    private var totalConversationTurnCount: Int {
+        conversationContextDetails.reduce(0) { $0 + $1.totalTurnCount }
+    }
+
+    private var totalConversationSummaryTurnCount: Int {
+        conversationContextDetails.reduce(0) { $0 + $1.summaryTurnCount }
+    }
+
+    private var totalConversationEstimatedTokenCount: Int {
+        conversationContextDetails.reduce(0) { $0 + $1.estimatedTokenCount }
+    }
+
     @ViewBuilder
     private func metricPill(label: String, value: String, tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -1028,10 +1870,6 @@ struct AIMemoryStudioView: View {
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(.regularMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(tint.opacity(0.07))
-                )
         )
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -1064,14 +1902,10 @@ struct AIMemoryStudioView: View {
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(.regularMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.primary.opacity(0.05))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.primary.opacity(0.22), lineWidth: 0.7)
-                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.14), lineWidth: 0.5)
         )
     }
 
@@ -1149,17 +1983,13 @@ struct AIMemoryStudioView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? AppVisualTheme.accentTint.opacity(0.08) : Color.primary.opacity(0.06))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(.regularMaterial)
-                )
+                .fill(.regularMaterial)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(
                     isSelected ? AppVisualTheme.accentTint.opacity(0.22) : Color.primary.opacity(0.07),
-                    lineWidth: isSelected ? 1.0 : 0.8
+                    lineWidth: 0.7
                 )
         )
     }
@@ -1213,10 +2043,6 @@ struct AIMemoryStudioView: View {
                             .background(
                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                                     .fill(.regularMaterial)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(Color.primary.opacity(0.06))
-                                    )
                             )
 
                             if entry.outcomeStatus != nil || entry.attemptNumber != nil || entry.issueKey != nil {
@@ -1426,10 +2252,6 @@ struct AIMemoryStudioView: View {
                                 .background(
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                                         .fill(.regularMaterial)
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(AppVisualTheme.accentTint.opacity(0.05))
-                                        )
                                 )
                             }
                         }
@@ -1495,6 +2317,121 @@ struct AIMemoryStudioView: View {
     }
 
     @ViewBuilder
+    private var localAISetupCard: some View {
+        settingsCard(
+            title: "Local AI Setup (No Account Needed)",
+            subtitle: "Pick a model and let KeyScribe install runtime + model automatically.",
+            symbol: "shippingbox.fill",
+            tint: AppVisualTheme.accentTint
+        ) {
+            let selectedModelBinding = Binding(
+                get: { localAISetupService.selectedModelID },
+                set: { localAISetupService.selectedModelID = $0 }
+            )
+
+            Text("This guided flow sets up local prompt correction and memory extraction without API keys or OAuth.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Picker("Model", selection: selectedModelBinding) {
+                ForEach(LocalAIModelCatalog.curatedModels) { option in
+                    let label = "\(option.displayName) • \(option.sizeLabel) • \(option.performanceLabel)"
+                    Text(label).tag(option.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(maxWidth: 440, alignment: .leading)
+
+            if let selected = LocalAIModelCatalog.model(withID: localAISetupService.selectedModelID) {
+                HStack(spacing: 8) {
+                    if selected.isRecommended {
+                        Text("Recommended")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(AppVisualTheme.accentTint)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(AppVisualTheme.accentTint.opacity(0.12))
+                            )
+                    }
+                    Text(selected.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(LocalAIWizardStep.allCases) { step in
+                    localAIWizardStepRow(step)
+                }
+            }
+            .padding(.top, 4)
+
+            if let progress = localAISetupService.setupState.progressValue {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                Text("Downloading… \(Int(progress * 100))%")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(localAISetupService.statusMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                if localAISetupService.setupState.isBusy {
+                    Button("Cancel") {
+                        localAISetupService.cancel()
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    if localAIShouldShowInstallButton {
+                        Button("Install Selected Model") {
+                            localAISetupService.startSetup(modelID: localAISetupService.selectedModelID)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+
+                    switch localAISetupService.setupState {
+                    case .failed:
+                        Button("Retry") {
+                            localAISetupService.retry()
+                        }
+                        .buttonStyle(.bordered)
+                    case .ready:
+                        Button("Repair Local AI") {
+                            localAISetupService.repair()
+                        }
+                        .buttonStyle(.bordered)
+                    default:
+                        if localAISetupService.runtimeDetection.installed {
+                            Button("Repair Local AI") {
+                                localAISetupService.repair()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    if localAICanDeleteSelectedModel {
+                        Button("Delete Selected Model", role: .destructive) {
+                            showLocalModelDeleteConfirmation = true
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                Button("Refresh Status") {
+                    localAISetupService.refreshStatus()
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var promptModelConfigCard: some View {
         let mode = settings.promptRewriteProviderMode
 
@@ -1504,8 +2441,12 @@ struct AIMemoryStudioView: View {
             symbol: "cpu.fill",
             tint: AppVisualTheme.accentTint
         ) {
+            providerModeSection
+
+            Divider()
+
             HStack(spacing: 8) {
-                Text("Model Catalog")
+                Text("\(mode.displayName) Model Catalog")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -1539,6 +2480,26 @@ struct AIMemoryStudioView: View {
             TextField("Base URL", text: $settings.promptRewriteOpenAIBaseURL)
                 .textFieldStyle(.roundedBorder)
 
+            HStack {
+                Text("Rewrite request timeout")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(Int(settings.promptRewriteRequestTimeoutSeconds.rounded())) s")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Slider(
+                value: $settings.promptRewriteRequestTimeoutSeconds,
+                in: 3...120,
+                step: 1
+            )
+
+            Text("Applies to all models/providers. Increase this if local models are timing out on slower Macs.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
             Toggle("Always convert generated suggestions to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
 
             Button("Use \(mode.displayName) Defaults") {
@@ -1553,7 +2514,16 @@ struct AIMemoryStudioView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if mode == .ollama, localAISetupService.setupState != .ready {
+                Text("Local runtime is not ready yet. Use Local AI Setup above to install or repair runtime + model.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             Text("Model settings are persisted for this provider only.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Changes save automatically as you edit. No Save button is required.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -1568,14 +2538,6 @@ struct AIMemoryStudioView: View {
         }
         .pickerStyle(.menu)
         .frame(maxWidth: 320, alignment: .leading)
-        .onChange(of: settings.promptRewriteProviderModeRawValue) { _ in
-            promptRewriteShowManualAPIKey = false
-            oauthStatusMessage = nil
-            promptRewriteModelStatusMessage = nil
-            promptRewriteAvailableModels = []
-            resetOpenAIDeviceCodeState()
-            refreshPromptRewriteModels(showMessage: false)
-        }
 
         let mode = settings.promptRewriteProviderMode
         Text(mode.helpText)
@@ -1595,10 +2557,19 @@ struct AIMemoryStudioView: View {
                     .fontWeight(.medium)
             }
 
-            Text("Your credentials are stored in macOS Keychain.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
+            if mode == .ollama {
+                Text(localAISetupService.runtimeDetection.isHealthy
+                     ? "Local runtime is reachable on this Mac."
+                     : "Local runtime is not ready yet. Use Local AI Setup.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            } else {
+                Text("Your credentials are stored in macOS Keychain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
 
             Spacer(minLength: 0)
         }
@@ -1611,6 +2582,23 @@ struct AIMemoryStudioView: View {
                 oauthAuthenticationSection(for: mode)
             } else if mode.requiresAPIKey {
                 apiKeyAuthenticationSection(for: mode)
+            } else if mode == .ollama {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Local AI does not require API keys or OAuth.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if localAISetupService.setupState == .ready {
+                        Text("Runtime and model are ready for local prompt correction.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button("Open Local AI Setup") {
+                            selectedStudioPage = .models
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
             } else {
                 Text("This provider does not require authentication details in KeyScribe.")
                     .font(.caption)
@@ -1683,10 +2671,6 @@ struct AIMemoryStudioView: View {
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(.regularMaterial)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.primary.opacity(0.05))
-                        )
                 )
             }
 
@@ -1723,18 +2707,115 @@ struct AIMemoryStudioView: View {
             return hasKey ? "API key configured" : "API key missing"
         }
 
+        if mode == .ollama {
+            if localAISetupService.runtimeDetection.isHealthy {
+                return "Local AI ready"
+            }
+            if localAISetupService.runtimeDetection.installed {
+                return "Runtime needs repair"
+            }
+            return "Runtime not installed"
+        }
+
         return "No credentials required"
     }
 
     private func promptRewriteAuthStateTint(for mode: PromptRewriteProviderMode) -> Color {
         switch promptRewriteAuthStateLabel(for: mode) {
-        case "OAuth connected", "OAuth + API key", "API key configured":
+        case "OAuth connected", "OAuth + API key", "API key configured", "Local AI ready":
             return AppVisualTheme.accentTint
-        case "API key missing", "OAuth not connected":
+        case "API key missing", "OAuth not connected", "Runtime needs repair", "Runtime not installed":
             return AppVisualTheme.baseTint
         default:
             return Color.white.opacity(0.58)
         }
+    }
+
+    @ViewBuilder
+    private func localAIWizardStepRow(_ step: LocalAIWizardStep) -> some View {
+        let completed = localAIWizardStepCompleted(step)
+        let active = localAIWizardStepActive(step)
+
+        HStack(spacing: 8) {
+            Image(systemName: completed ? "checkmark.circle.fill" : (active ? "circle.dashed.inset.filled" : "circle"))
+                .foregroundStyle(
+                    completed
+                        ? AppVisualTheme.accentTint
+                        : (active ? AppVisualTheme.baseTint : Color.white.opacity(0.45))
+                )
+                .font(.caption)
+            Text(step.title)
+                .font(.caption)
+                .foregroundStyle(active || completed ? .primary : .secondary)
+            Spacer(minLength: 0)
+            if active {
+                Text("In progress")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if completed {
+                Text("Done")
+                    .font(.caption2)
+                    .foregroundStyle(AppVisualTheme.accentTint)
+            }
+        }
+    }
+
+    private func localAIWizardStepCompleted(_ step: LocalAIWizardStep) -> Bool {
+        switch step {
+        case .selectModel:
+            return !localAISetupService.selectedModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .installRuntime:
+            return localAISetupService.runtimeDetection.installed
+        case .downloadModel:
+            return localAISelectedModelInstalled
+        case .verify:
+            return localAISetupService.runtimeDetection.isHealthy && localAISelectedModelInstalled
+        case .done:
+            return localAISetupService.setupState == .ready
+        }
+    }
+
+    private func localAIWizardStepActive(_ step: LocalAIWizardStep) -> Bool {
+        switch (step, localAISetupService.setupState) {
+        case (.installRuntime, .installingRuntime):
+            return true
+        case (.downloadModel, .downloadingModel):
+            return true
+        case (.verify, .verifying):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var localAISelectedModelInstalled: Bool {
+        let selected = localAISetupService.selectedModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selected.isEmpty else { return false }
+        return localAISetupService.installedModelIDs.contains { installed in
+            let normalizedInstalled = installed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let normalizedSelected = selected.lowercased()
+            if normalizedInstalled == normalizedSelected { return true }
+            if normalizedInstalled.hasPrefix(normalizedSelected + ":") { return true }
+            if normalizedSelected.hasPrefix(normalizedInstalled + ":") { return true }
+            return false
+        }
+    }
+
+    private var localAIShouldShowInstallButton: Bool {
+        guard !localAISetupService.setupState.isBusy else { return false }
+
+        let selected = localAISetupService.selectedModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selected.isEmpty else { return false }
+
+        let selectedModelAlreadyReady = localAISetupService.runtimeDetection.isHealthy
+            && localAISelectedModelInstalled
+        return !selectedModelAlreadyReady
+    }
+
+    private var localAICanDeleteSelectedModel: Bool {
+        guard !localAISetupService.setupState.isBusy else { return false }
+        guard localAISetupService.runtimeDetection.installed else { return false }
+        return localAISelectedModelInstalled
     }
 
     @ViewBuilder
@@ -1943,6 +3024,9 @@ struct AIMemoryStudioView: View {
     private func prepare() {
         refreshOAuthConnectionState()
         refreshPromptRewriteModels(showMessage: false)
+        localAISetupService.refreshStatus()
+        refreshConversationContextDetails()
+        refreshConversationPatternStats()
         guard isMemoryFeatureEnabled else { return }
         refreshMemoryAnalytics()
         if settings.memoryProviderCatalogAutoUpdate {
@@ -1956,6 +3040,197 @@ struct AIMemoryStudioView: View {
         hydrateMemorySourcesFromSavedSettings()
         normalizeMemoryBrowserSelections()
         refreshMemoryBrowser()
+    }
+
+    private func refreshConversationContextDetails() {
+        let details = promptRewriteConversationStore.contextDetails(
+            timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes
+        )
+        conversationContextDetails = details
+        sanitizePinnedConversationContextSelection()
+
+        let normalizedInspectedID = inspectedConversationContextID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedInspectedID.isEmpty,
+           !details.contains(where: { $0.id == normalizedInspectedID }) {
+            inspectedConversationContextID = ""
+            showConversationContextInspectSheet = false
+        }
+
+        if details.contains(where: { $0.id == selectedConversationContextID }) {
+            return
+        }
+
+        if let first = details.first {
+            selectedConversationContextID = first.id
+        } else {
+            selectedConversationContextID = ""
+        }
+    }
+
+    private func refreshConversationPatternStats() {
+        Task {
+            let patterns = await ConversationMemoryPromotionService.shared.fetchPatternStats(limit: 300)
+            await MainActor.run {
+                conversationPatternStats = patterns
+                let selectedKey = selectedConversationPatternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                if selectedKey.isEmpty || !patterns.contains(where: { $0.patternKey == selectedKey }) {
+                    selectedConversationPatternKey = patterns.first?.patternKey ?? ""
+                }
+            }
+            let key = await MainActor.run {
+                selectedConversationPatternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if !key.isEmpty {
+                refreshConversationPatternOccurrences(patternKey: key)
+            }
+        }
+    }
+
+    private func refreshConversationPatternOccurrences(patternKey: String) {
+        let normalizedKey = patternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedKey.isEmpty else {
+            conversationPatternOccurrences = []
+            return
+        }
+
+        Task {
+            let occurrences = await ConversationMemoryPromotionService.shared.fetchPatternOccurrences(
+                patternKey: normalizedKey,
+                limit: 120
+            )
+            await MainActor.run {
+                conversationPatternOccurrences = occurrences
+            }
+        }
+    }
+
+    private func markConversationPattern(_ patternKey: String, outcome: MemoryPatternOutcome) {
+        let normalizedKey = patternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedKey.isEmpty else { return }
+
+        Task {
+            let succeeded = await ConversationMemoryPromotionService.shared.markPatternOutcome(
+                patternKey: normalizedKey,
+                outcome: outcome,
+                trigger: .manualPin,
+                reason: "Manually marked from AI Studio."
+            )
+            await MainActor.run {
+                conversationActionMessage = succeeded
+                    ? "Marked pattern as \(outcome.rawValue)."
+                    : "Could not mark pattern outcome."
+            }
+            refreshConversationPatternStats()
+        }
+    }
+
+    private func deleteConversationPattern(_ patternKey: String) {
+        let normalizedKey = patternKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedKey.isEmpty else { return }
+
+        Task {
+            let succeeded = await ConversationMemoryPromotionService.shared.deletePattern(patternKey: normalizedKey)
+            await MainActor.run {
+                conversationActionMessage = succeeded
+                    ? "Deleted long-term memory pattern."
+                    : "Could not delete pattern."
+            }
+            refreshConversationPatternStats()
+        }
+    }
+
+    private func purgeExpiredConversationPatterns() {
+        Task {
+            let result = await ConversationMemoryPromotionService.shared.purgeExpiredRetention()
+            await MainActor.run {
+                conversationActionMessage = "Retention purge removed \(result.cardsDeleted) cards, \(result.lessonsDeleted) lessons, \(result.patternsDeleted) patterns, \(result.occurrencesDeleted) occurrences."
+            }
+            refreshConversationPatternStats()
+        }
+    }
+
+    private func sanitizePinnedConversationContextSelection() {
+        let pinned = settings.promptRewriteConversationPinnedContextID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pinned.isEmpty else { return }
+        if !promptRewriteConversationStore.hasContext(id: pinned) {
+            settings.promptRewriteConversationPinnedContextID = ""
+        }
+    }
+
+    private func startNewPromptRewriteConversation() {
+        let pinned = settings.promptRewriteConversationPinnedContextID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) {
+            promptRewriteConversationStore.clearContext(id: pinned)
+            settings.promptRewriteConversationPinnedContextID = ""
+            conversationActionMessage = "Started a new conversation by clearing the pinned context."
+            refreshConversationContextDetails()
+            return
+        }
+
+        let fallbackApp = NSWorkspace.shared.frontmostApplication
+        let context = PromptRewriteConversationContextResolver.captureCurrentContext(
+            fallbackApp: fallbackApp
+        )
+        promptRewriteConversationStore.clearContext(id: context.id)
+        conversationActionMessage = "Started a new conversation for the current app/screen context."
+        refreshConversationContextDetails()
+    }
+
+    private func openConversationContextInspector(for id: String) {
+        selectedConversationContextID = id
+        inspectedConversationContextID = id
+        showConversationContextInspectSheet = true
+
+        if let detail = conversationContextDetails.first(where: { $0.id == id }) {
+            conversationActionMessage = "Inspecting context \(detail.context.displayName)."
+        } else {
+            conversationActionMessage = "Inspecting context \(id)."
+        }
+    }
+
+    private func compactConversationContext(id: String) {
+        guard let report = promptRewriteConversationStore.compactContext(
+            id: id,
+            keepRecentTurns: settings.promptRewriteConversationTurnLimit
+        ) else {
+            conversationActionMessage = "No older turns were available to compact for this context."
+            refreshConversationContextDetails()
+            return
+        }
+
+        conversationActionMessage = "Compacted \(report.compactedTurnCount) turn(s) in context \(report.contextID). Turns: \(report.previousTurnCount) -> \(report.newTurnCount)."
+        selectedConversationContextID = id
+        refreshConversationContextDetails()
+    }
+
+    private func compactAllConversationContexts() {
+        let reports = promptRewriteConversationStore.compactAllContexts(
+            keepRecentTurns: settings.promptRewriteConversationTurnLimit
+        )
+        guard !reports.isEmpty else {
+            conversationActionMessage = "No contexts needed compaction."
+            refreshConversationContextDetails()
+            return
+        }
+
+        let compactedTurns = reports.reduce(0) { $0 + $1.compactedTurnCount }
+        conversationActionMessage = "Compacted \(compactedTurns) turn(s) across \(reports.count) context(s)."
+        refreshConversationContextDetails()
+    }
+
+    private func clearConversationContext(id: String) {
+        promptRewriteConversationStore.clearContext(id: id)
+        if settings.promptRewriteConversationPinnedContextID == id {
+            settings.promptRewriteConversationPinnedContextID = ""
+        }
+        if inspectedConversationContextID == id {
+            inspectedConversationContextID = ""
+            showConversationContextInspectSheet = false
+        }
+        conversationActionMessage = "Cleared conversation context \(id)."
+        refreshConversationContextDetails()
     }
 
     private func sanitizeSelectedStudioPage() {
@@ -1999,7 +3274,7 @@ struct AIMemoryStudioView: View {
                         context,
                         codeInput: codeInput
                     )
-                case .openRouter, .groq, .ollama:
+                case .google, .openRouter, .groq, .ollama:
                     throw PromptRewriteProviderOAuthError.unsupportedProvider
                 }
 
@@ -2040,6 +3315,16 @@ struct AIMemoryStudioView: View {
         oauthConnectedProviders = next
     }
 
+    private func handlePromptRewriteProviderChanged() {
+        promptRewriteShowManualAPIKey = false
+        oauthStatusMessage = nil
+        promptRewriteModelStatusMessage = nil
+        promptRewriteAvailableModels = []
+        resetOpenAIDeviceCodeState()
+        localAISetupService.refreshStatus()
+        refreshPromptRewriteModels(showMessage: false)
+    }
+
     private func refreshPromptRewriteModels(showMessage: Bool) {
         let mode = settings.promptRewriteProviderMode
         let requestToken = UUID()
@@ -2078,8 +3363,16 @@ struct AIMemoryStudioView: View {
                     promptRewriteAvailableModels = result.models
                 }
 
-                if currentModel.isEmpty, let firstModel = result.models.first {
-                    settings.promptRewriteOpenAIModel = firstModel.id
+                let preferredDefaultModelID = result.models.first(where: { option in
+                    option.id.caseInsensitiveCompare(mode.defaultModel) == .orderedSame
+                })?.id
+
+                if currentModel.isEmpty {
+                    if let preferredDefaultModelID {
+                        settings.promptRewriteOpenAIModel = preferredDefaultModelID
+                    } else if let firstModel = result.models.first {
+                        settings.promptRewriteOpenAIModel = firstModel.id
+                    }
                 } else if mode == .openAI,
                           settings.hasPromptRewriteOAuthSession(for: .openAI),
                           !settings.hasPromptRewriteAPIKey(for: .openAI),
@@ -2095,7 +3388,7 @@ struct AIMemoryStudioView: View {
                 } else if !currentModel.isEmpty,
                           !currentModelExistsInCatalog,
                           let firstModel = result.models.first {
-                    settings.promptRewriteOpenAIModel = firstModel.id
+                    settings.promptRewriteOpenAIModel = preferredDefaultModelID ?? firstModel.id
                 }
 
                 if showMessage || result.source == .fallback {
@@ -2516,6 +3809,37 @@ struct AIMemoryStudioView: View {
         "\(Int((value * 100).rounded()))%"
     }
 
+    private func formattedConversationContextPayload(for id: String) -> (text: String, isJSON: Bool) {
+        let rawPayload = promptRewriteConversationStore.serializedContextJSON(id: id) ?? "{}"
+
+        if let formatted = prettyPrintedJSON(rawPayload) {
+            return (formatted, true)
+        }
+
+        let unescapedPayload = presentableMemoryText(rawPayload)
+        if unescapedPayload != rawPayload,
+           let formatted = prettyPrintedJSON(unescapedPayload) {
+            return (formatted, true)
+        }
+
+        return (unescapedPayload, false)
+    }
+
+    private func prettyPrintedJSON(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data, options: []),
+              let prettyData = try? JSONSerialization.data(
+                  withJSONObject: object,
+                  options: [.prettyPrinted, .sortedKeys]
+              ),
+              let prettyText = String(data: prettyData, encoding: .utf8) else {
+            return nil
+        }
+        return prettyText
+    }
+
     private func presentableMemoryText(_ raw: String) -> String {
         var value = raw
         value = value.replacingOccurrences(of: "\\r\\n", with: "\n")
@@ -2688,12 +4012,12 @@ struct AIMemoryStudioView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(.white.opacity(0.96))
 
                     if let subtitle {
                         Text(subtitle)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AppVisualTheme.mutedText)
                     }
                 }
 
@@ -2706,8 +4030,8 @@ struct AIMemoryStudioView: View {
         .appThemedSurface(
             cornerRadius: 12,
             tint: tint,
-            strokeOpacity: 0.17,
-            tintOpacity: 0.03
+            strokeOpacity: 0.16,
+            tintOpacity: 0.035
         )
     }
 }

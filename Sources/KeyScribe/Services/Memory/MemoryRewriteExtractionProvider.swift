@@ -224,6 +224,16 @@ private actor MemoryAILessonSynthesisProvider {
                 return false
             }
         }
+
+        if configuration.providerMode == .ollama {
+            let reachable = await isOllamaReachable(baseURL: configuration.baseURL)
+            if !reachable {
+                CrashReporter.logWarning(
+                    "Memory lesson AI check failed: local runtime unavailable. Open AI Studio > Prompt Models > Local AI Setup."
+                )
+                return false
+            }
+        }
         return true
     }
 
@@ -300,11 +310,23 @@ private actor MemoryAILessonSynthesisProvider {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            if configuration.providerMode == .ollama {
+                CrashReporter.logWarning(
+                    "Memory lesson synthesis skipped because local runtime is unavailable. Open AI Studio > Prompt Models > Local AI Setup."
+                )
+            }
             return nil
         }
 
         guard let http = response as? HTTPURLResponse else { return nil }
-        guard (200...299).contains(http.statusCode) else { return nil }
+        guard (200...299).contains(http.statusCode) else {
+            if configuration.providerMode == .ollama {
+                CrashReporter.logWarning(
+                    "Memory lesson synthesis request failed for local runtime (HTTP \(http.statusCode)). Repair Local AI in AI Studio."
+                )
+            }
+            return nil
+        }
 
         guard let parsed = decodeResponse(
             data: data,
@@ -373,7 +395,7 @@ private actor MemoryAILessonSynthesisProvider {
                 "temperature": 0.2,
                 "max_tokens": 420
             ]
-        case .openAI, .openRouter, .groq, .ollama:
+        case .openAI, .google, .openRouter, .groq, .ollama:
             endpoint = openAICompatibleEndpoint(from: configuration.baseURL)
             payload = [
                 "model": configuration.model,
@@ -397,7 +419,7 @@ private actor MemoryAILessonSynthesisProvider {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 20
+        request.timeoutInterval = lessonSynthesisRequestTimeout(for: configuration.providerMode)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
 
@@ -419,15 +441,18 @@ private actor MemoryAILessonSynthesisProvider {
                 request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
             }
         case (.openAI, .apiKey(let apiKey)),
+             (.google, .apiKey(let apiKey)),
              (.openRouter, .apiKey(let apiKey)),
              (.groq, .apiKey(let apiKey)),
              (.ollama, .apiKey(let apiKey)):
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         case (.anthropic, .none),
              (.openAI, .none),
+             (.google, .none),
              (.openRouter, .none),
              (.groq, .none),
              (.ollama, .none),
+             (.google, .oauth),
              (.openRouter, .oauth),
              (.groq, .oauth),
              (.ollama, .oauth):
@@ -435,6 +460,21 @@ private actor MemoryAILessonSynthesisProvider {
         }
 
         return request
+    }
+
+    private func lessonSynthesisRequestTimeout(for providerMode: PromptRewriteProviderMode) -> TimeInterval {
+        let defaults = UserDefaults.standard
+        let configured = defaults.object(forKey: "KeyScribe.promptRewriteRequestTimeoutSeconds") == nil
+            ? 8
+            : defaults.double(forKey: "KeyScribe.promptRewriteRequestTimeoutSeconds")
+        let normalized = min(120, max(3, configured))
+
+        switch providerMode {
+        case .ollama:
+            return min(120, max(20, normalized + 15))
+        case .openAI, .google, .openRouter, .groq, .anthropic:
+            return min(120, max(12, normalized + 4))
+        }
     }
 
     private func resolveCredential(for configuration: LiveConfiguration) async throws -> ProviderCredential {
@@ -505,6 +545,8 @@ private actor MemoryAILessonSynthesisProvider {
         switch raw {
         case "openai":
             return .openAI
+        case "google", "gemini", "google ai studio (gemini)", "google-ai-studio-gemini":
+            return .google
         case "openrouter":
             return .openRouter
         case "groq":
@@ -533,6 +575,18 @@ private actor MemoryAILessonSynthesisProvider {
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !envValue.isEmpty {
             return envValue
+        }
+        if providerMode == .google {
+            if let envValue = ProcessInfo.processInfo.environment["KEYSCRIBE_GOOGLE_API_KEY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !envValue.isEmpty {
+                return envValue
+            }
+            if let envValue = ProcessInfo.processInfo.environment["KEYSCRIBE_GEMINI_API_KEY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !envValue.isEmpty {
+                return envValue
+            }
         }
 
         let normalizedProviderSlug = providerMode.rawValue
@@ -589,6 +643,32 @@ private actor MemoryAILessonSynthesisProvider {
         guard !trimmed.isEmpty else { return nil }
         let normalizedBase = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
         return URL(string: normalizedBase + "/messages")
+    }
+
+    private func isOllamaReachable(baseURL: String) async -> Bool {
+        guard let endpoint = ollamaTagsEndpoint(from: baseURL) else { return false }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 3
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            return (200...299).contains(http.statusCode)
+        } catch {
+            return false
+        }
+    }
+
+    private func ollamaTagsEndpoint(from baseURL: String) -> URL? {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var normalizedBase = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+        if normalizedBase.hasSuffix("/v1") {
+            normalizedBase = String(normalizedBase.dropLast(3))
+        }
+        return URL(string: normalizedBase + "/api/tags")
     }
 
     private func decodeResponse(

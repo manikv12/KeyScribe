@@ -10,6 +10,9 @@ INSTALL_DIR="/Applications/${APP_NAME}.app"
 DMG_ROOT="dist/dmg-root"
 DMG_FINAL="dist/${APP_NAME}.dmg"
 DMG_VOLUME_NAME="${APP_NAME} Installer"
+PROJECT_ROOT="$(pwd)"
+APP_DIR_ABS="${PROJECT_ROOT}/${APP_DIR}"
+DIST_DIR_ABS="${PROJECT_ROOT}/dist"
 
 INSTALL_APP=false
 NO_DMG=false
@@ -74,7 +77,7 @@ if [ "$NO_DMG" = false ]; then
 
     # Use create-dmg to build a professional-looking installer with an arrow background
     # and correct icon positions
-    npx -y create-dmg "$APP_DIR" dist/ --overwrite --no-version-in-filename --icon-size 128
+    npx -y create-dmg "$APP_DIR_ABS" "$DIST_DIR_ABS/" --overwrite --no-version-in-filename --icon-size 128
 fi
 
 if [ "$INSTALL_APP" = true ]; then

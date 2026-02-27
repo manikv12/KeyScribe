@@ -169,7 +169,7 @@ actor MemoryEntryExplanationService {
                 "temperature": 0.2,
                 "max_tokens": 420
             ]
-        case .openAI, .openRouter, .groq, .ollama:
+        case .openAI, .google, .openRouter, .groq, .ollama:
             endpoint = openAICompatibleEndpoint(from: configuration.baseURL)
             payload = [
                 "model": configuration.model,
@@ -213,15 +213,18 @@ actor MemoryEntryExplanationService {
                 request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
             }
         case (.openAI, .apiKey(let apiKey)),
+             (.google, .apiKey(let apiKey)),
              (.openRouter, .apiKey(let apiKey)),
              (.groq, .apiKey(let apiKey)),
              (.ollama, .apiKey(let apiKey)):
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         case (.anthropic, .none),
              (.openAI, .none),
+             (.google, .none),
              (.openRouter, .none),
              (.groq, .none),
              (.ollama, .none),
+             (.google, .oauth),
              (.openRouter, .oauth),
              (.groq, .oauth),
              (.ollama, .oauth):
@@ -300,6 +303,8 @@ actor MemoryEntryExplanationService {
         switch raw {
         case "openai":
             return .openAI
+        case "google", "gemini", "google ai studio (gemini)", "google-ai-studio-gemini":
+            return .google
         case "openrouter":
             return .openRouter
         case "groq":
@@ -328,6 +333,18 @@ actor MemoryEntryExplanationService {
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !envValue.isEmpty {
             return envValue
+        }
+        if providerMode == .google {
+            if let envValue = ProcessInfo.processInfo.environment["KEYSCRIBE_GOOGLE_API_KEY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !envValue.isEmpty {
+                return envValue
+            }
+            if let envValue = ProcessInfo.processInfo.environment["KEYSCRIBE_GEMINI_API_KEY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !envValue.isEmpty {
+                return envValue
+            }
         }
 
         let normalizedProviderSlug = providerMode.rawValue

@@ -24,6 +24,40 @@ The app runs as a menu bar utility (`LSUIElement`), so it does not show a Dock i
   - Model downloads are explicit user actions in Settings (no background model downloads).
   - If whisper is selected and no model is installed, dictation is blocked until a model is installed.
 
+## Local AI setup for prompt correction and memory
+
+KeyScribe includes a zero-terminal local AI setup for prompt correction and memory extraction.
+
+### One-click setup (no API key / no OAuth)
+
+1. Open `Settings` -> `AI Models` -> `Open AI Studio…`
+2. Go to `Prompt Models`
+3. In `Local AI Setup (No Account Needed)`:
+   - Pick a beginner-friendly model
+   - Click `Install Selected Model`
+4. Wait for wizard steps to complete:
+   - `Select Model`
+   - `Install Runtime`
+   - `Download Model`
+   - `Verify`
+   - `Done`
+
+When setup succeeds, KeyScribe auto-configures:
+
+- Provider: `Ollama (Local)`
+- Base URL: `http://localhost:11434/v1`
+- Model: your selected local model
+- AI prompt correction: enabled
+- AI memory assistant: enabled when memory feature flag is enabled
+
+### Recovery
+
+If local AI is unavailable:
+
+- Open `AI Studio` -> `Prompt Models`
+- Click `Repair Local AI`
+- Click `Refresh Status` to confirm `Ready`
+
 ## How insertion works
 
 When a transcript is finalized (or when you trigger paste-last), KeyScribe uses this insertion flow:

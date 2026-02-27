@@ -66,9 +66,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case close
     }
 
+    private struct PromptRewriteSessionContext {
+        let conversationContext: PromptRewriteConversationContext
+        let insertionHUDContext: PromptRewriteInsertionHUDContext
+    }
+
     private struct PromptRewriteInsertionResolution {
         let insertionText: String
         let conversationContext: PromptRewriteConversationContext?
+        let insertionHUDContext: PromptRewriteInsertionHUDContext
     }
     private enum DictationFeedbackCue: CaseIterable {
         case startListening
@@ -293,6 +299,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+
+        Task { @MainActor in
+            LocalAISetupService.shared.ensureRuntimeReadyForCurrentConfiguration()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -477,9 +487,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let popover = NSPopover()
-        popover.contentSize = NSSize(width: 260, height: 10)
+        popover.contentSize = NSSize(width: 320, height: 10)
         popover.behavior = .transient
         popover.animates = true
+        popover.appearance = NSAppearance(named: .vibrantDark)
         popover.contentViewController = NSHostingController(
             rootView: StatusBarPopoverView(viewModel: statusBarViewModel)
         )
@@ -730,9 +741,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let insertionSessionContext = capturePromptRewriteSessionContext()
         let rewriteResolution: PromptRewriteInsertionResolution
         if settings.promptRewriteEnabled {
-            guard let resolved = await resolvePromptRewriteInsertionText(for: cleaned) else {
+            guard let resolved = await resolvePromptRewriteInsertionText(
+                for: cleaned,
+                insertionSessionContext: insertionSessionContext
+            ) else {
                 setUIStatus(.ready)
                 return
             }
@@ -740,7 +755,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             rewriteResolution = PromptRewriteInsertionResolution(
                 insertionText: cleaned,
-                conversationContext: nil
+                conversationContext: nil,
+                insertionHUDContext: insertionSessionContext.insertionHUDContext
             )
         }
 
@@ -757,21 +773,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         transcriptHistory.add(readyForInsert)
-        insertText(readyForInsert, trackCorrections: settings.adaptiveCorrectionsEnabled)
+        insertText(
+            readyForInsert,
+            trackCorrections: settings.adaptiveCorrectionsEnabled,
+            insertionContext: rewriteResolution.insertionHUDContext
+        )
         setUIStatus(.ready)
     }
 
     private func resolvePromptRewriteInsertionText(
-        for cleanedTranscript: String
+        for cleanedTranscript: String,
+        insertionSessionContext: PromptRewriteSessionContext
     ) async -> PromptRewriteInsertionResolution? {
         guard settings.promptRewriteEnabled else {
             return PromptRewriteInsertionResolution(
                 insertionText: cleanedTranscript,
-                conversationContext: nil
+                conversationContext: nil,
+                insertionHUDContext: insertionSessionContext.insertionHUDContext
             )
         }
 
-        let conversationRequestContext = promptRewriteConversationRequestContext()
+        let conversationRequestContext = promptRewriteConversationRequestContext(
+            for: insertionSessionContext.conversationContext,
+            userText: cleanedTranscript
+        )
         let conversationContext = conversationRequestContext?.context
         let conversationHistory = conversationRequestContext?.history ?? []
 
@@ -784,7 +809,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ) else {
                     return PromptRewriteInsertionResolution(
                         insertionText: cleanedTranscript,
-                        conversationContext: conversationContext
+                        conversationContext: conversationContext,
+                        insertionHUDContext: insertionSessionContext.insertionHUDContext
                     )
                 }
                 let suggestion = formatPromptRewriteSuggestion(rawSuggestion, originalText: cleanedTranscript)
@@ -792,7 +818,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 while true {
                     switch await presentPromptRewritePreviewDialog(
                         originalText: cleanedTranscript,
-                        suggestion: suggestion
+                        suggestion: suggestion,
+                        insertionContext: insertionSessionContext.insertionHUDContext
                     ) {
                     case .useSuggested:
                         await recordPromptRewriteFeedback(
@@ -803,7 +830,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         )
                         return PromptRewriteInsertionResolution(
                             insertionText: suggestion.suggestedText,
-                            conversationContext: conversationContext
+                            conversationContext: conversationContext,
+                            insertionHUDContext: insertionSessionContext.insertionHUDContext
                         )
                     case .editThenInsert:
                         guard let edited = presentPromptRewriteEditDialog(initialText: suggestion.suggestedText) else {
@@ -822,7 +850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         )
                         return PromptRewriteInsertionResolution(
                             insertionText: finalEdited,
-                            conversationContext: conversationContext
+                            conversationContext: conversationContext,
+                            insertionHUDContext: insertionSessionContext.insertionHUDContext
                         )
                     case .insertOriginal:
                         await recordPromptRewriteFeedback(
@@ -833,7 +862,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         )
                         return PromptRewriteInsertionResolution(
                             insertionText: cleanedTranscript,
-                            conversationContext: conversationContext
+                            conversationContext: conversationContext,
+                            insertionHUDContext: insertionSessionContext.insertionHUDContext
                         )
                     case .rejectSuggestion:
                         await recordPromptRewriteFeedback(
@@ -863,7 +893,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                     return PromptRewriteInsertionResolution(
                         insertionText: cleanedTranscript,
-                        conversationContext: conversationContext
+                        conversationContext: conversationContext,
+                        insertionHUDContext: insertionSessionContext.insertionHUDContext
                     )
                 case .close:
                     await recordPromptRewriteFeedback(
@@ -877,17 +908,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func promptRewriteConversationRequestContext() -> PromptRewriteConversationStore.RequestContext? {
+    private func promptRewriteConversationRequestContext(
+        for capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) -> PromptRewriteConversationStore.RequestContext? {
         guard settings.promptRewriteEnabled, settings.promptRewriteConversationHistoryEnabled else {
             return nil
         }
 
-        let fallbackApp = lastTargetApplication ?? lastExternalApplication
-        let capturedContext = PromptRewriteConversationContextResolver.captureCurrentContext(
-            fallbackApp: fallbackApp
-        )
         let requestContext = promptRewriteConversationStore.prepareRequestContext(
             capturedContext: capturedContext,
+            userText: userText,
             timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes,
             turnLimit: settings.promptRewriteConversationTurnLimit,
             pinnedContextID: settings.promptRewriteConversationPinnedContextID
@@ -900,6 +931,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return requestContext
+    }
+
+    private func capturePromptRewriteSessionContext() -> PromptRewriteSessionContext {
+        let fallbackApp = lastTargetApplication ?? lastExternalApplication
+        let insertionHUDContext = PromptRewriteHUDManager.shared.captureCurrentInsertionContext(
+            fallbackApp: fallbackApp
+        )
+        let conversationFallbackApp = insertionHUDContext.targetProcessIdentifier.flatMap { processID in
+            guard let app = NSRunningApplication(processIdentifier: processID), !app.isTerminated else {
+                return nil
+            }
+            return app
+        } ?? fallbackApp
+        let conversationContext = PromptRewriteConversationContextResolver.captureCurrentContext(
+            fallbackApp: conversationFallbackApp,
+            screenLabel: nil
+        )
+        return PromptRewriteSessionContext(
+            conversationContext: conversationContext,
+            insertionHUDContext: insertionHUDContext
+        )
     }
 
     private func applyAdaptiveCorrectionsIfNeeded(to text: String) -> String {
@@ -933,9 +985,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func presentPromptRewritePreviewDialog(
         originalText: String,
-        suggestion: PromptRewriteSuggestion
+        suggestion: PromptRewriteSuggestion,
+        insertionContext: PromptRewriteInsertionHUDContext
     ) async -> PromptRewritePreviewChoice {
-        await PromptRewriteHUDManager.shared.present(originalText: originalText, suggestion: suggestion)
+        await PromptRewriteHUDManager.shared.present(
+            originalText: originalText,
+            suggestion: suggestion,
+            insertionContext: insertionContext
+        )
     }
 
     private func presentPromptRewriteEditDialog(initialText: String) -> String? {
@@ -1047,6 +1104,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let serviceError = error as? PromptRewriteServiceError {
             switch serviceError {
             case let .timedOut(timeoutSeconds):
+                if settings.promptRewriteProviderMode == .ollama {
+                    return "Local model timed out after \(String(format: "%.1f", timeoutSeconds))s. Increase Rewrite request timeout in AI Studio -> Prompt Models."
+                }
                 return "Timed out after \(String(format: "%.1f", timeoutSeconds))s."
             case let .providerUnavailable(reason):
                 return reason
@@ -1097,7 +1157,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ text: String,
         forceCopyToClipboard: Bool = false,
         overrideCopyToClipboard: Bool? = nil,
-        trackCorrections: Bool = false
+        trackCorrections: Bool = false,
+        insertionContext: PromptRewriteInsertionHUDContext? = nil
     ) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard ensureAccessibilityReadyForInsertion() else { return }
@@ -1105,7 +1166,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         attemptInsertText(
             text,
             copyToClipboard: copyToClipboard,
-            attemptsRemaining: 5
+            attemptsRemaining: 5,
+            insertionContext: insertionContext
         ) { [weak self] didInsert in
             guard let self else { return }
             if didInsert {
@@ -1152,10 +1214,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    private func targetApplication(for insertionContext: PromptRewriteInsertionHUDContext?) -> NSRunningApplication? {
+        if let context = insertionContext,
+           let pid = context.targetProcessIdentifier,
+           let app = NSRunningApplication(processIdentifier: pid),
+           !app.isTerminated {
+            return app
+        }
+        return nil
+    }
+
     private func attemptInsertText(
         _ text: String,
         copyToClipboard: Bool,
         attemptsRemaining: Int,
+        insertionContext: PromptRewriteInsertionHUDContext?,
         completion: ((Bool) -> Void)? = nil
     ) {
         guard attemptsRemaining > 0 else {
@@ -1170,9 +1243,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if lastTargetApplication == nil,
-           let fallback = lastExternalApplication,
-           !fallback.isTerminated {
+        if let explicitTarget = targetApplication(for: insertionContext) {
+            lastTargetApplication = explicitTarget
+        } else if lastTargetApplication == nil,
+                  let fallback = lastExternalApplication,
+                  !fallback.isTerminated {
             lastTargetApplication = fallback
         }
 
@@ -1186,6 +1261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         text,
                         copyToClipboard: copyToClipboard,
                         attemptsRemaining: attemptsRemaining - 1,
+                        insertionContext: insertionContext,
                         completion: completion
                     )
                 }
@@ -1210,6 +1286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     text,
                     copyToClipboard: copyToClipboard,
                     attemptsRemaining: nextRetriesRemaining + 1,
+                    insertionContext: insertionContext,
                     completion: completion
                 )
             }
@@ -1467,8 +1544,8 @@ struct SettingsView: View {
             switch self {
             case .essentials: return "Daily controls and dictation feedback"
             case .shortcuts: return "Hold-to-talk and continuous toggle keys"
-            case .speech: return "Microphone, engine, timing, and text quality"
-            case .aiModels: return "whisper runtime, model library, and AI memory"
+            case .speech: return "Microphone, engine, whisper models, timing, and text quality"
+            case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
             case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
@@ -1488,17 +1565,17 @@ struct SettingsView: View {
         var tint: Color {
             switch self {
             case .essentials:
-                return Color(red: 0.44, green: 0.68, blue: 0.97)
+                return Color(red: 0.30, green: 0.58, blue: 0.95)
             case .shortcuts:
-                return Color(red: 0.59, green: 0.56, blue: 0.93)
+                return Color(red: 0.94, green: 0.58, blue: 0.24)
             case .speech:
-                return Color(red: 0.40, green: 0.78, blue: 0.72)
+                return Color(red: 0.27, green: 0.72, blue: 0.54)
             case .aiModels:
-                return Color(red: 0.45, green: 0.70, blue: 0.96)
+                return Color(red: 0.45, green: 0.56, blue: 0.92)
             case .corrections:
-                return Color(red: 0.46, green: 0.82, blue: 0.64)
+                return Color(red: 0.21, green: 0.70, blue: 0.73)
             case .about:
-                return Color(red: 0.92, green: 0.66, blue: 0.38)
+                return Color(red: 0.56, green: 0.62, blue: 0.72)
             }
         }
 
@@ -1509,9 +1586,9 @@ struct SettingsView: View {
             case .shortcuts:
                 return ["shortcut", "keyboard", "hold to talk", "continuous", "hotkey"]
             case .speech:
-                return ["recognition", "engine", "punctuation", "context", "cleanup", "delay", "text quality", "speech"]
+                return ["recognition", "engine", "punctuation", "context", "cleanup", "delay", "text quality", "speech", "whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large"]
             case .aiModels:
-                return ["whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large", "memory", "provider", "ai"]
+                return ["ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "style", "conversation", "history"]
             case .corrections:
                 return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
             case .about:
@@ -1574,6 +1651,7 @@ struct SettingsView: View {
     @StateObject private var whisperModelManager = WhisperModelManager.shared
     @StateObject private var adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
+    @StateObject private var localAISetupService = LocalAISetupService.shared
     @State private var selectedSection: SettingsSection = .essentials
     @State private var searchQuery = ""
     @State private var hoveredSection: SettingsSection?
@@ -1588,6 +1666,8 @@ struct SettingsView: View {
     @State private var showQuickReferenceTips = false
     @State private var showAppleSpeechAdvancedSettings = false
     @State private var showRecognitionAdvancedSettings = false
+    @State private var showAIPromptStyleSettings = false
+    @State private var showAIConversationHistorySettings = false
     @State private var whisperModelSearchQuery = ""
     @State private var whisperFamilyFilter = "all"
     @State private var whisperShowInstalledOnly = false
@@ -1634,16 +1714,19 @@ struct SettingsView: View {
             AppSplitChromeBackground(
                 leadingPaneFraction: 0.33,
                 leadingPaneMaxWidth: settingsSidebarWidth + 30,
+                leadingPaneWidth: settingsSidebarWidth + 10,
                 leadingTint: AppVisualTheme.sidebarTint,
-                trailingTint: Color.black,
-                accent: AppVisualTheme.accentTint
+                trailingTint: .black,
+                accent: AppVisualTheme.accentTint,
+                leadingPaneTransparent: true
             )
 
             HStack(spacing: 0) {
                 settingsSidebar
-                Divider()
-                    .overlay(Color.white.opacity(0.10))
-                    .padding(.vertical, 12)
+                Rectangle()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 1)
+                    .frame(maxHeight: .infinity)
                 settingsDetailPane
             }
             .padding(10)
@@ -1729,8 +1812,8 @@ struct SettingsView: View {
         .appThemedSurface(
             cornerRadius: 16,
             tint: section.tint,
-            strokeOpacity: 0.20,
-            tintOpacity: 0.05
+            strokeOpacity: 0.18,
+            tintOpacity: 0.035
         )
     }
 
@@ -1889,18 +1972,40 @@ struct SettingsView: View {
 
     @ViewBuilder
     private func settingsSectionHeader(for section: SettingsSection) -> some View {
-        HStack(spacing: 8) {
-            AppIconBadge(
-                symbol: section.iconName,
-                tint: section.tint,
-                size: 22,
-                symbolSize: 10
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                AppIconBadge(
+                    symbol: section.iconName,
+                    tint: section.tint,
+                    size: 22,
+                    symbolSize: 10
+                )
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(section.title) Controls")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(section.tint.opacity(0.88))
+                    Text("Section details")
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppVisualTheme.mutedText)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            LinearGradient(
+                colors: [
+                    section.tint.opacity(0.35),
+                    Color.white.opacity(0.09),
+                    Color.clear
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
             )
-            Text("Section details")
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(AppVisualTheme.mutedText)
+            .frame(height: 1)
         }
         .padding(.leading, 2)
+        .padding(.trailing, 4)
     }
 
     @ViewBuilder
@@ -2313,22 +2418,92 @@ struct SettingsView: View {
                 }
             } else {
                 settingsCard(
-                    title: "whisper.cpp",
-                    subtitle: "Model install and selection are managed in AI & Models.",
-                    symbol: "waveform.path.ecg.rectangle",
+                    title: "Model Runtime",
+                    subtitle: "Control whisper.cpp runtime options and active model.",
+                    symbol: "cpu.fill",
                     tint: AppVisualTheme.accentTint
                 ) {
-                    Text("Open AI & Models to install, delete, and switch whisper models.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    Toggle("Use Core ML encoder when available", isOn: $settings.whisperUseCoreML)
+                        .help("If installed for the selected model, Core ML can improve whisper speed on Apple Silicon.")
 
-                    HStack {
-                        Button("Open AI & Models") {
-                            selectedSection = .aiModels
+                    if settings.selectedWhisperModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("No model selected yet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Current model: \(settings.selectedWhisperModelID)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                settingsCard(
+                    title: "Model Library",
+                    subtitle: "Use focused controls first, then expand filters when you need to narrow down.",
+                    symbol: "shippingbox.fill",
+                    tint: AppVisualTheme.accentTint
+                ) {
+                    if WhisperModelCatalog.curatedModels.isEmpty {
+                        Text("No curated whisper models are configured.")
+                            .font(.callout)
+                            .foregroundStyle(AppVisualTheme.accentTint)
+                    } else {
+                        VStack(alignment: .leading, spacing: 10) {
+                            DisclosureGroup("Find a model", isExpanded: $showWhisperModelFilters) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(spacing: 10) {
+                                        TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
+                                            .textFieldStyle(.roundedBorder)
+
+                                        Toggle("Installed only", isOn: $whisperShowInstalledOnly)
+                                            .toggleStyle(.switch)
+                                            .fixedSize()
+                                    }
+
+                                    HStack(spacing: 10) {
+                                        Picker("Family", selection: $whisperFamilyFilter) {
+                                            ForEach(whisperFamilyFilterOptions, id: \.self) { family in
+                                                Text(family == "all" ? "All families" : family.capitalized)
+                                                    .tag(family)
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                        .frame(width: 180)
+
+                                        Spacer()
+                                    }
+                                }
+                                .padding(.top, 8)
+                            }
+
+                            HStack(spacing: 10) {
+                                Text("Model")
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+
+                                Picker("Model", selection: $whisperBrowserModelID) {
+                                    if filteredWhisperModels.isEmpty {
+                                        Text("No matching models").tag("")
+                                    } else {
+                                        ForEach(filteredWhisperModels) { model in
+                                            Text(model.displayName).tag(model.id)
+                                        }
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(width: 290)
+                                .disabled(filteredWhisperModels.isEmpty)
+                            }
+
+                            if let browsingModel = activeWhisperBrowserModel {
+                                whisperModelRow(for: browsingModel)
+                            } else {
+                                Text("No models match the current filters.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, 6)
+                            }
                         }
-                        .buttonStyle(.borderedProminent)
-
-                        Spacer()
                     }
                 }
             }
@@ -2406,131 +2581,15 @@ struct SettingsView: View {
         .onAppear {
             showAppleSpeechAdvancedSettings = false
             showRecognitionAdvancedSettings = false
-        }
-    }
-
-    @ViewBuilder
-    private var aiModelsSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .aiModels)
-
-            if settings.transcriptionEngine != .whisperCpp {
-                settingsCard(
-                    title: "whisper.cpp Required",
-                    subtitle: "Model install and selection are only used with whisper.cpp.",
-                    symbol: "exclamationmark.triangle.fill",
-                    tint: AppVisualTheme.accentTint
-                ) {
-                    Text("Switch the transcription engine to whisper.cpp to manage local models.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-
-                    Button("Switch to whisper.cpp") {
-                        settings.transcriptionEngine = .whisperCpp
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-            } else {
-                settingsCard(
-                    title: "Model Runtime",
-                    symbol: "cpu.fill",
-                    tint: AppVisualTheme.accentTint
-                ) {
-                    Toggle("Use Core ML encoder when available", isOn: $settings.whisperUseCoreML)
-                        .help("If installed for the selected model, Core ML can improve whisper speed on Apple Silicon.")
-
-                    if settings.selectedWhisperModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("No model selected yet.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("Current model: \(settings.selectedWhisperModelID)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                    settingsCard(
-                        title: "Model Library",
-                        subtitle: "Use focused controls first, then expand filters when you need to narrow down.",
-                        symbol: "shippingbox.fill",
-                        tint: AppVisualTheme.accentTint
-                    ) {
-                    if WhisperModelCatalog.curatedModels.isEmpty {
-                        Text("No curated whisper models are configured.")
-                            .font(.callout)
-                            .foregroundStyle(AppVisualTheme.accentTint)
-                    } else {
-                        VStack(alignment: .leading, spacing: 10) {
-                            DisclosureGroup("Find a model", isExpanded: $showWhisperModelFilters) {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack(spacing: 10) {
-                                        TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
-                                            .textFieldStyle(.roundedBorder)
-
-                                        Toggle("Installed only", isOn: $whisperShowInstalledOnly)
-                                            .toggleStyle(.switch)
-                                            .fixedSize()
-                                    }
-
-                                    HStack(spacing: 10) {
-                                        Picker("Family", selection: $whisperFamilyFilter) {
-                                            ForEach(whisperFamilyFilterOptions, id: \.self) { family in
-                                                Text(family == "all" ? "All families" : family.capitalized)
-                                                    .tag(family)
-                                            }
-                                        }
-                                        .pickerStyle(.menu)
-                                        .frame(width: 180)
-
-                                        Spacer()
-                                    }
-                                }
-                                .padding(.top, 8)
-                            }
-
-                            HStack(spacing: 10) {
-                                Text("Model")
-                                    .font(.callout.weight(.medium))
-                                Spacer()
-
-                                Picker("Model", selection: $whisperBrowserModelID) {
-                                    if filteredWhisperModels.isEmpty {
-                                        Text("No matching models").tag("")
-                                    } else {
-                                        ForEach(filteredWhisperModels) { model in
-                                            Text(model.displayName).tag(model.id)
-                                        }
-                                    }
-                                }
-                                .pickerStyle(.menu)
-                                .frame(width: 290)
-                                .disabled(filteredWhisperModels.isEmpty)
-                            }
-
-                            if let browsingModel = activeWhisperBrowserModel {
-                                whisperModelRow(for: browsingModel)
-                            } else {
-                                Text("No models match the current filters.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.vertical, 6)
-                            }
-                        }
-                    }
-                }
+            if settings.transcriptionEngine == .whisperCpp {
+                refreshWhisperModelBrowserState()
+                showWhisperModelFilters = false
             }
-
-            aiMemoryAssistantCard
-            aiProviderStatusCard
-        }
-        .onAppear {
-            refreshWhisperModelBrowserState()
-            showWhisperModelFilters = false
         }
         .onChange(of: settings.transcriptionEngineRawValue) { _ in
             if settings.transcriptionEngine == .whisperCpp {
                 refreshWhisperModelBrowserState()
+                showWhisperModelFilters = false
             }
         }
         .onChange(of: whisperModelSearchQuery) { _ in
@@ -2556,10 +2615,25 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var aiModelsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .aiModels)
+
+            aiMemoryAssistantCard
+            aiProviderStatusCard
+        }
+        .onAppear {
+            showAIPromptStyleSettings = false
+            showAIConversationHistorySettings = false
+            localAISetupService.refreshStatus()
+        }
+    }
+
+    @ViewBuilder
     private var aiMemoryAssistantCard: some View {
         settingsCard(
             title: "AI Prompt Assistant",
-            subtitle: "Enable prompt rewrite assistance and choose formatting behavior.",
+            subtitle: "Core toggles first, with style and history controls in collapsible groups.",
             symbol: "brain.head.profile",
             tint: AppVisualTheme.accentTint
         ) {
@@ -2567,114 +2641,110 @@ struct SettingsView: View {
             if FeatureFlags.aiMemoryEnabled {
                 Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
             }
-            Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
 
-            HStack {
-                Text("Rewrite style")
-                    .font(.callout.weight(.medium))
-                Spacer()
-                Picker("Rewrite style", selection: $settings.promptRewriteStylePresetRawValue) {
-                    ForEach(PromptRewriteStylePreset.allCases) { preset in
-                        Text(preset.rawValue).tag(preset.rawValue)
-                    }
-                }
-                .pickerStyle(.menu)
-                .frame(width: 220)
-                .labelsHidden()
-                .disabled(!settings.promptRewriteEnabled)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Custom style instructions (optional)")
-                    .font(.callout.weight(.medium))
-                TextEditor(text: $settings.promptRewriteCustomStyleInstructions)
-                    .frame(height: 88)
-                    .font(.callout)
-                    .disabled(!settings.promptRewriteEnabled)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(Color.primary.opacity(0.15), lineWidth: 1)
-                    )
-                Text("Examples: \"Sound like a principal architect\", \"Write as a senior iOS engineer\", \"Keep tone concise and formal\".")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            Toggle(
-                "Enable conversation-aware rewrite history (app + screen)",
-                isOn: $settings.promptRewriteConversationHistoryEnabled
-            )
-            .disabled(!settings.promptRewriteEnabled)
-
-            if settings.promptRewriteConversationHistoryEnabled {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Conversation timeout")
-                            .font(.callout.weight(.medium))
-                        Spacer()
-                        Text("\(Int(settings.promptRewriteConversationTimeoutMinutes.rounded())) min")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(
-                        value: $settings.promptRewriteConversationTimeoutMinutes,
-                        in: 2...180,
-                        step: 1
-                    )
-                    .disabled(!settings.promptRewriteEnabled)
+            DisclosureGroup("Style & formatting", isExpanded: $showAIPromptStyleSettings) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
 
                     HStack {
-                        Text("Turns kept per context")
+                        Text("Rewrite style")
                             .font(.callout.weight(.medium))
                         Spacer()
-                        Stepper(
-                            "\(settings.promptRewriteConversationTurnLimit)",
-                            value: $settings.promptRewriteConversationTurnLimit,
-                            in: 1...10
-                        )
-                        .labelsHidden()
-                        Text("\(settings.promptRewriteConversationTurnLimit)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    HStack {
-                        Text("History source")
-                            .font(.callout.weight(.medium))
-                        Spacer()
-                        Picker(
-                            "History source",
-                            selection: promptRewriteConversationContextSelection
-                        ) {
-                            Text("Automatic (current app/screen)").tag("auto")
-                            ForEach(promptRewriteConversationStore.contextSummaries.prefix(12)) { summary in
-                                Text("\(summary.displayName) • \(summary.turnCount) turns")
-                                    .tag(summary.id)
+                        Picker("Rewrite style", selection: $settings.promptRewriteStylePresetRawValue) {
+                            ForEach(PromptRewriteStylePreset.allCases) { preset in
+                                Text(preset.rawValue).tag(preset.rawValue)
                             }
                         }
                         .pickerStyle(.menu)
-                        .frame(width: 360)
+                        .frame(width: 220)
+                        .labelsHidden()
                     }
 
-                    HStack(spacing: 8) {
-                        Button("Start New Conversation") {
-                            startNewPromptRewriteConversation()
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button("Clear All Conversation History") {
-                            promptRewriteConversationStore.clearAll()
-                            settings.promptRewriteConversationPinnedContextID = ""
-                        }
-                        .buttonStyle(.bordered)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Custom style instructions (optional)")
+                            .font(.callout.weight(.medium))
+                        TextEditor(text: $settings.promptRewriteCustomStyleInstructions)
+                            .frame(height: 88)
+                            .font(.callout)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                            )
+                        Text("Examples: \"Sound like a principal architect\", \"Write as a senior iOS engineer\", \"Keep tone concise and formal\".")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
-
-                    Text("Only a small rolling history is kept per app/screen context for rewrite continuity. This is separate from indexed memory cards.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
                 }
-                .disabled(!settings.promptRewriteEnabled)
+                .padding(.top, 8)
             }
+            .disabled(!settings.promptRewriteEnabled)
+
+            DisclosureGroup("Conversation-aware history", isExpanded: $showAIConversationHistorySettings) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(
+                        "Enable conversation-aware rewrite history (app + screen)",
+                        isOn: $settings.promptRewriteConversationHistoryEnabled
+                    )
+
+                    if settings.promptRewriteConversationHistoryEnabled {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Conversation timeout")
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+                                Text("\(Int(settings.promptRewriteConversationTimeoutMinutes.rounded())) min")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Slider(
+                                value: $settings.promptRewriteConversationTimeoutMinutes,
+                                in: 2...240,
+                                step: 1
+                            )
+
+                            HStack {
+                                Text("Turns kept per context")
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+                                Stepper(
+                                    "\(settings.promptRewriteConversationTurnLimit)",
+                                    value: $settings.promptRewriteConversationTurnLimit,
+                                    in: 1...50
+                                )
+                                .labelsHidden()
+                                Text("\(settings.promptRewriteConversationTurnLimit)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            HStack {
+                                Text("History source")
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+                                Picker(
+                                    "History source",
+                                    selection: promptRewriteConversationContextSelection
+                                ) {
+                                    Text("Automatic (current app/screen)").tag("auto")
+                                    ForEach(promptRewriteConversationStore.contextSummaries.prefix(12)) { summary in
+                                        Text("\(summary.displayName) • \(summary.turnCount) turns")
+                                            .tag(summary.id)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .labelsHidden()
+                                .frame(width: 360)
+                            }
+
+                            Text("Use AI Memory Studio to manage rewrite conversation buckets (start new / clear history).")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.top, 8)
+            }
+            .disabled(!settings.promptRewriteEnabled)
 
             Text("Current rewrite provider: \(settings.promptRewriteProviderMode.displayName)")
                 .font(.caption)
@@ -2689,7 +2759,7 @@ struct SettingsView: View {
     private var aiProviderStatusCard: some View {
         settingsCard(
             title: "Provider Connection Status",
-            subtitle: "Open AI Studio for full provider setup and prompt model controls.",
+            subtitle: "Open AI Studio for OAuth and API-key provider setup plus prompt model controls.",
             symbol: "network.badge.shield.half.filled",
             tint: AppVisualTheme.accentTint
         ) {
@@ -2707,6 +2777,23 @@ struct SettingsView: View {
                         .foregroundStyle(settings.hasPromptRewriteOAuthSession(for: .anthropic) ? AppVisualTheme.accentTint : .secondary)
                 }
                 HStack {
+                    Text("Google Gemini")
+                    Spacer()
+                    Text(settings.hasPromptRewriteAPIKey(for: .google) ? "API key set" : "API key missing")
+                        .foregroundStyle(settings.hasPromptRewriteAPIKey(for: .google) ? AppVisualTheme.accentTint : .secondary)
+                }
+                HStack {
+                    Text("Local AI (Ollama)")
+                    Spacer()
+                    Text(localAISetupStatusLabel)
+                        .foregroundStyle(localAISetupService.isReady ? AppVisualTheme.accentTint : .secondary)
+                }
+                if settings.localAISetupCompleted {
+                    Text("Model: \(settings.localAISelectedModelID.isEmpty ? "(not selected)" : settings.localAISelectedModelID)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
                     Spacer()
                     Button("Open AI Studio…") {
                         cancelShortcutCapture()
@@ -2715,6 +2802,28 @@ struct SettingsView: View {
                     .buttonStyle(.borderedProminent)
                 }
             }
+        }
+    }
+
+    private var localAISetupStatusLabel: String {
+        switch localAISetupService.setupState {
+        case .ready:
+            return "Ready"
+        case .installingRuntime:
+            return "Installing runtime"
+        case .downloadingModel:
+            return "Downloading model"
+        case .verifying:
+            return "Verifying"
+        case .failed:
+            return "Needs repair"
+        case .waitingForModelSelection:
+            return "Select model"
+        case .idle:
+            if localAISetupService.runtimeDetection.installed {
+                return localAISetupService.runtimeDetection.isHealthy ? "Runtime installed" : "Runtime unavailable"
+            }
+            return "Not installed"
         }
     }
 
@@ -3658,8 +3767,8 @@ struct SettingsView: View {
         .appThemedSurface(
             cornerRadius: 14,
             tint: tint,
-            strokeOpacity: 0.18,
-            tintOpacity: 0.04
+            strokeOpacity: 0.17,
+            tintOpacity: 0.035
         )
     }
 
@@ -3707,8 +3816,8 @@ struct SettingsView: View {
         .appThemedSurface(
             cornerRadius: 14,
             tint: tint,
-            strokeOpacity: 0.18,
-            tintOpacity: 0.04
+            strokeOpacity: 0.17,
+            tintOpacity: 0.035
         )
     }
 
@@ -3841,22 +3950,6 @@ struct SettingsView: View {
         }
     }
 
-    private func startNewPromptRewriteConversation() {
-        let pinned = settings.promptRewriteConversationPinnedContextID
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) {
-            promptRewriteConversationStore.clearContext(id: pinned)
-            settings.promptRewriteConversationPinnedContextID = ""
-            return
-        }
-
-        let frontmost = NSWorkspace.shared.frontmostApplication
-        let context = PromptRewriteConversationContextResolver.captureCurrentContext(
-            fallbackApp: frontmost
-        )
-        promptRewriteConversationStore.clearContext(id: context.id)
-    }
-
     private var trimmedSearchQuery: String {
         searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
@@ -3882,8 +3975,8 @@ struct SettingsView: View {
             .init(section: .speech, title: "Finalize delay", detail: "Control speed vs stability before insertion", keywords: ["delay", "finalize", "timing"]),
             .init(section: .speech, title: "Cleanup mode", detail: "Light or aggressive text cleanup", keywords: ["cleanup", "mode"]),
             .init(section: .speech, title: "Custom phrases", detail: "Add names, acronyms, and domain language", keywords: ["phrases", "vocabulary", "context"]),
-            .init(section: .aiModels, title: "whisper model install", detail: "Download and manage all whisper.cpp models", keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]),
-            .init(section: .aiModels, title: "whisper Core ML", detail: "Use Core ML encoder when available", keywords: ["core ml", "ane", "whisper", "speed"]),
+            .init(section: .speech, title: "whisper model install", detail: "Download and manage all whisper.cpp models", keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]),
+            .init(section: .speech, title: "whisper Core ML", detail: "Use Core ML encoder when available", keywords: ["core ml", "ane", "whisper", "speed"]),
             .init(section: .corrections, title: "Adaptive corrections", detail: "Learn from your quick word/phrase fixes", keywords: ["adaptive", "learned", "corrections", "backspace"]),
             .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
             .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
@@ -3894,7 +3987,7 @@ struct SettingsView: View {
             .init(section: .aiModels, title: "Conversation-aware rewrite history", detail: "Opt in to rolling history scoped by app and screen", keywords: ["conversation", "history", "context", "app", "screen", "rewrite"]),
             .init(section: .aiModels, title: "Rewrite conversation timeout", detail: "Expire conversation buckets after inactivity", keywords: ["timeout", "expire", "conversation", "history", "minutes"]),
             .init(section: .aiModels, title: "Rewrite history source switch", detail: "Pin to a saved context or use automatic app/screen context", keywords: ["switch", "pin", "context", "history", "conversation"]),
-            .init(section: .aiModels, title: "Provider connection status", detail: "See OAuth connection status for OpenAI and Anthropic", keywords: ["provider", "oauth", "openai", "anthropic", "connection"]),
+            .init(section: .aiModels, title: "Provider connection status", detail: "See OAuth and API key status for OpenAI, Anthropic, and Google Gemini", keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]),
             .init(section: .aiModels, title: "Open AI Studio", detail: "Launch dedicated AI page for provider and prompt model controls", keywords: ["ai", "studio", "providers", "models", "rewrite"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),

@@ -92,7 +92,11 @@ actor PromptRewriteModelCatalogService {
                 )
             }
             do {
-                let remoteModels = try await fetchOpenAICompatibleModels(endpoint: endpoint, credential: credential)
+                let remoteModels = try await fetchOpenAICompatibleModels(
+                    endpoint: endpoint,
+                    credential: credential,
+                    providerMode: providerMode
+                )
                 var models = preferOpenAIOAuthCatalog
                     ? Self.openAIOAuthCompatibleModels(remoteModels)
                     : Self.rewriteFriendlyModels(remoteModels, providerMode: .openAI)
@@ -128,6 +132,56 @@ actor PromptRewriteModelCatalogService {
                     )
                 )
             }
+        case .google:
+            guard isAPIKeyCredential(credential) else {
+                return PromptRewriteModelFetchResult(
+                    models: fallbackCatalogModels,
+                    source: .fallback,
+                    message: "Add Google API key to load live Gemini models."
+                )
+            }
+            guard let endpoint = Self.openAIModelsEndpoint(from: baseURL) else {
+                return PromptRewriteModelFetchResult(
+                    models: fallbackCatalogModels,
+                    source: .fallback,
+                    message: "Invalid Google AI Studio base URL."
+                )
+            }
+            do {
+                let remoteModels = try await fetchOpenAICompatibleModels(
+                    endpoint: endpoint,
+                    credential: credential,
+                    providerMode: providerMode
+                )
+                let models = Self.rewriteFriendlyModels(remoteModels, providerMode: .google)
+                if !models.isEmpty {
+                    cacheModels(models, for: providerMode)
+                    return PromptRewriteModelFetchResult(
+                        models: models,
+                        source: .remote,
+                        message: "Loaded \(models.count) Google Gemini models."
+                    )
+                }
+                return PromptRewriteModelFetchResult(
+                    models: fallbackCatalogModels,
+                    source: .fallback,
+                    message: fallbackMessage(
+                        providerName: "Google Gemini",
+                        fallbackCount: fallbackCatalogModels.count,
+                        failureReason: "Google returned no rewrite-suitable Gemini models."
+                    )
+                )
+            } catch {
+                return PromptRewriteModelFetchResult(
+                    models: fallbackCatalogModels,
+                    source: .fallback,
+                    message: fallbackMessage(
+                        providerName: "Google Gemini",
+                        fallbackCount: fallbackCatalogModels.count,
+                        failureReason: "Could not load Google Gemini models: \(error.localizedDescription)"
+                    )
+                )
+            }
         case .openRouter:
             guard isAPIKeyCredential(credential) else {
                 return PromptRewriteModelFetchResult(
@@ -144,7 +198,11 @@ actor PromptRewriteModelCatalogService {
                 )
             }
             do {
-                let models = try await fetchOpenAICompatibleModels(endpoint: endpoint, credential: credential)
+                let models = try await fetchOpenAICompatibleModels(
+                    endpoint: endpoint,
+                    credential: credential,
+                    providerMode: providerMode
+                )
                 if !models.isEmpty {
                     cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
@@ -181,7 +239,11 @@ actor PromptRewriteModelCatalogService {
                 )
             }
             do {
-                let models = try await fetchOpenAICompatibleModels(endpoint: endpoint, credential: credential)
+                let models = try await fetchOpenAICompatibleModels(
+                    endpoint: endpoint,
+                    credential: credential,
+                    providerMode: providerMode
+                )
                 if !models.isEmpty {
                     cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
@@ -218,7 +280,11 @@ actor PromptRewriteModelCatalogService {
                 )
             }
             do {
-                let models = try await fetchAnthropicModels(endpoint: endpoint, credential: credential)
+                let models = try await fetchAnthropicModels(
+                    endpoint: endpoint,
+                    credential: credential,
+                    providerMode: providerMode
+                )
                 if !models.isEmpty {
                     cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
@@ -247,8 +313,13 @@ actor PromptRewriteModelCatalogService {
                     message: "Invalid Ollama base URL."
                 )
             }
+            var openAIError: Error?
             do {
-                let models = try await fetchOpenAICompatibleModels(endpoint: openAIEndpoint, credential: .none)
+                let models = try await fetchOpenAICompatibleModels(
+                    endpoint: openAIEndpoint,
+                    credential: .none,
+                    providerMode: providerMode
+                )
                 if !models.isEmpty {
                     cacheModels(models, for: providerMode)
                     return PromptRewriteModelFetchResult(
@@ -258,6 +329,7 @@ actor PromptRewriteModelCatalogService {
                     )
                 }
             } catch {
+                openAIError = error
                 // Fall through to /api/tags fallback endpoint.
             }
 
@@ -276,7 +348,7 @@ actor PromptRewriteModelCatalogService {
                     return PromptRewriteModelFetchResult(
                         models: fallbackCatalogModels,
                         source: .fallback,
-                        message: "Could not load Ollama models: \(error.localizedDescription)"
+                        message: localRuntimeCatalogFailureMessage(for: error)
                     )
                 }
             }
@@ -284,7 +356,7 @@ actor PromptRewriteModelCatalogService {
             return PromptRewriteModelFetchResult(
                 models: fallbackCatalogModels,
                 source: .fallback,
-                message: "Could not load Ollama models."
+                message: localRuntimeCatalogFailureMessage(for: openAIError)
             )
         }
     }
@@ -297,6 +369,8 @@ actor PromptRewriteModelCatalogService {
         switch providerMode {
         case .openAI:
             providerID = "openai"
+        case .google:
+            providerID = "google"
         case .openRouter:
             providerID = "openrouter"
         case .groq:
@@ -307,14 +381,17 @@ actor PromptRewriteModelCatalogService {
             providerID = "ollama"
         }
 
-        let models = await fetchModelsDevProviderModels(providerID: providerID)
+        let models = Self.mergeModelOptions(
+            primary: await fetchModelsDevProviderModels(providerID: providerID),
+            secondary: Self.fallbackModels(for: providerMode)
+        )
         if providerMode == .openAI {
             if preferOpenAIOAuthCatalog {
                 return Self.openAIOAuthCompatibleModels(models)
             }
             return Self.rewriteFriendlyModels(models, providerMode: providerMode)
         }
-        return models
+        return Self.rewriteFriendlyModels(models, providerMode: providerMode)
     }
 
     private func fallbackMessage(
@@ -326,6 +403,33 @@ actor PromptRewriteModelCatalogService {
             return "\(failureReason) Showing \(fallbackCount) fallback catalog models."
         }
         return "\(failureReason) No fallback catalog models were available."
+    }
+
+    private func localRuntimeCatalogFailureMessage(for error: Error?) -> String {
+        guard let error else {
+            return "Could not load local models. Open AI Studio -> Prompt Models -> Local AI Setup and install or repair Local AI."
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            let localRuntimeCodes = [
+                NSURLErrorCannotConnectToHost,
+                NSURLErrorCannotFindHost,
+                NSURLErrorDNSLookupFailed,
+                NSURLErrorNetworkConnectionLost,
+                NSURLErrorNotConnectedToInternet,
+                NSURLErrorTimedOut
+            ]
+            if localRuntimeCodes.contains(nsError.code) {
+                return "Local AI runtime is not reachable. Open AI Studio -> Prompt Models -> Local AI Setup and install or repair Local AI."
+            }
+        }
+
+        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.isEmpty {
+            return "Could not load local models. Open AI Studio -> Prompt Models -> Local AI Setup and repair Local AI."
+        }
+        return "Could not load local models: \(detail). Open AI Studio -> Prompt Models -> Local AI Setup."
     }
 
     private func cacheModels(_ models: [PromptRewriteModelOption], for providerMode: PromptRewriteProviderMode) {
@@ -357,7 +461,7 @@ actor PromptRewriteModelCatalogService {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.timeoutInterval = 12
+        request.timeoutInterval = modelCatalogRequestTimeout(for: nil)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         do {
@@ -459,11 +563,12 @@ actor PromptRewriteModelCatalogService {
 
     private func fetchOpenAICompatibleModels(
         endpoint: URL,
-        credential: Credential
+        credential: Credential,
+        providerMode: PromptRewriteProviderMode
     ) async throws -> [PromptRewriteModelOption] {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 12
+        request.timeoutInterval = modelCatalogRequestTimeout(for: providerMode)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         switch credential {
@@ -490,11 +595,12 @@ actor PromptRewriteModelCatalogService {
 
     private func fetchAnthropicModels(
         endpoint: URL,
-        credential: Credential
+        credential: Credential,
+        providerMode: PromptRewriteProviderMode
     ) async throws -> [PromptRewriteModelOption] {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 12
+        request.timeoutInterval = modelCatalogRequestTimeout(for: providerMode)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         switch credential {
@@ -528,7 +634,7 @@ actor PromptRewriteModelCatalogService {
     private func fetchOllamaTags(endpoint: URL) async throws -> [PromptRewriteModelOption] {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 12
+        request.timeoutInterval = modelCatalogRequestTimeout(for: .ollama)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, response) = try await session.data(for: request)
@@ -567,6 +673,26 @@ actor PromptRewriteModelCatalogService {
             return plainText
         }
         return nil
+    }
+
+    private func configuredPromptRewriteTimeoutSeconds() -> TimeInterval {
+        let defaults = UserDefaults.standard
+        let rawTimeout = defaults.object(forKey: "KeyScribe.promptRewriteRequestTimeoutSeconds") == nil
+            ? 8
+            : defaults.double(forKey: "KeyScribe.promptRewriteRequestTimeoutSeconds")
+        return min(120, max(3, rawTimeout))
+    }
+
+    private func modelCatalogRequestTimeout(for providerMode: PromptRewriteProviderMode?) -> TimeInterval {
+        let base = configuredPromptRewriteTimeoutSeconds()
+        switch providerMode {
+        case .ollama:
+            return min(120, max(10, base + 2))
+        case .openAI, .google, .openRouter, .groq, .anthropic:
+            return min(120, max(8, base))
+        case .none:
+            return min(120, max(8, base))
+        }
     }
 
     private static func normalizedBaseURL(from rawValue: String) -> String? {
@@ -683,19 +809,33 @@ actor PromptRewriteModelCatalogService {
         _ options: [PromptRewriteModelOption],
         providerMode: PromptRewriteProviderMode
     ) -> [PromptRewriteModelOption] {
-        guard providerMode == .openAI else { return options }
-
-        let filtered = options.filter { option in
-            let modelID = option.id.lowercased()
-            if modelID.contains("codex") { return false }
-            if modelID.contains("embedding") { return false }
-            if modelID.contains("moderation") { return false }
-            if modelID.contains("transcribe") || modelID.contains("whisper") { return false }
-            if modelID.contains("tts") || modelID.contains("audio") { return false }
-            return modelID.hasPrefix("gpt") || modelID.hasPrefix("o1") || modelID.hasPrefix("o3") || modelID.hasPrefix("o4")
+        switch providerMode {
+        case .openAI:
+            let filtered = options.filter { option in
+                let modelID = option.id.lowercased()
+                if modelID.contains("codex") { return false }
+                if modelID.contains("embedding") { return false }
+                if modelID.contains("moderation") { return false }
+                if modelID.contains("transcribe") || modelID.contains("whisper") { return false }
+                if modelID.contains("tts") || modelID.contains("audio") { return false }
+                return modelID.hasPrefix("gpt") || modelID.hasPrefix("o1") || modelID.hasPrefix("o3") || modelID.hasPrefix("o4")
+            }
+            return filtered.isEmpty ? options : filtered
+        case .google:
+            let filtered = options.filter { option in
+                let modelID = option.id.lowercased()
+                if !modelID.hasPrefix("gemini") { return false }
+                if modelID.contains("embedding") { return false }
+                if modelID.contains("vision") { return false }
+                if modelID.contains("image") { return false }
+                if modelID.contains("audio") { return false }
+                if modelID.contains("tts") { return false }
+                return true
+            }
+            return filtered.isEmpty ? options : filtered
+        case .openRouter, .groq, .anthropic, .ollama:
+            return options
         }
-
-        return filtered.isEmpty ? options : filtered
     }
 
     private static let openAIOAuthPreferredModelIDs: [String] = [
@@ -755,6 +895,48 @@ actor PromptRewriteModelCatalogService {
         secondary: [PromptRewriteModelOption]
     ) -> [PromptRewriteModelOption] {
         normalizeModelOptions(primary + secondary)
+    }
+
+    static func fallbackModels(for providerMode: PromptRewriteProviderMode) -> [PromptRewriteModelOption] {
+        let modelIDs: [String]
+        switch providerMode {
+        case .openAI:
+            modelIDs = [
+                "gpt-4.1-mini",
+                "gpt-4.1",
+                "gpt-4o-mini"
+            ]
+        case .google:
+            modelIDs = [
+                "gemini-3-flash-preview",
+                "gemini-3-pro-preview",
+                "gemini-3.1-pro-preview"
+            ]
+        case .openRouter:
+            modelIDs = [
+                "openai/gpt-4.1-mini",
+                "anthropic/claude-3.5-sonnet"
+            ]
+        case .groq:
+            modelIDs = [
+                "llama-3.3-70b-versatile",
+                "qwen/qwen3-32b"
+            ]
+        case .anthropic:
+            modelIDs = [
+                "claude-3-5-sonnet-latest",
+                "claude-3-7-sonnet-latest"
+            ]
+        case .ollama:
+            modelIDs = [
+                "qwen2.5:3b",
+                "llama3.2:3b",
+                "gemma2:2b",
+                "llama3.1",
+                "qwen2.5-coder:14b"
+            ]
+        }
+        return buildModelOptions(ids: modelIDs)
     }
 
     private func isAPIKeyCredential(_ credential: Credential) -> Bool {
