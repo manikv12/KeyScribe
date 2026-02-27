@@ -56,7 +56,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.isOpaque = false
             window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
             window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
@@ -112,7 +112,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.isOpaque = false
             window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
             window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
@@ -160,7 +160,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.isOpaque = false
             window.backgroundColor = .clear
             window.toolbarStyle = .unifiedCompact
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
             window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
@@ -229,7 +229,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             panel.titlebarAppearsTransparent = true
             panel.isOpaque = false
             panel.backgroundColor = .clear
-            panel.isMovableByWindowBackground = true
+            panel.isMovableByWindowBackground = false
             panel.toolbarStyle = .unifiedCompact
             panel.contentViewController = hostingController
             panel.isFloatingPanel = false

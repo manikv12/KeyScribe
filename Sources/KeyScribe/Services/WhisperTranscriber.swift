@@ -14,6 +14,7 @@ final class WhisperTranscriber: NSObject {
     private let audioEngine = AVAudioEngine()
     private let sampleQueue = DispatchQueue(label: "KeyScribe.WhisperSamples")
     private var transcriptionQueue = DispatchQueue(label: "KeyScribe.WhisperTranscription")
+    private var transcriptionQueueGeneration = 0
     private let finalizeWatchdogTimeoutSeconds: TimeInterval = 180
 
     private var granted = false
@@ -31,6 +32,8 @@ final class WhisperTranscriber: NSObject {
     private var biasPhrases: [String] = []
     private var pendingStopWorkItem: DispatchWorkItem?
     private var activeFinalizeRunID: String?
+    private var cachedWhisperContext: OpaquePointer?
+    private var cachedWhisperContextKey: WhisperContextCacheKey?
 
     private let modelManager = WhisperModelManager.shared
     private let whisperSampleRate: Float = 16_000
@@ -46,6 +49,12 @@ final class WhisperTranscriber: NSObject {
     private struct DecodedSegment {
         let text: String
         let noSpeechProbability: Float
+    }
+
+    private struct WhisperContextCacheKey: Equatable {
+        let modelPath: String
+        let useCoreML: Bool
+        let queueGeneration: Int
     }
 
     override init() {
@@ -76,12 +85,21 @@ final class WhisperTranscriber: NSObject {
 
     func applyWhisperSettings(selectedModelID: String, useCoreML: Bool) {
         if Thread.isMainThread {
+            let settingsChanged = self.selectedModelID != selectedModelID || self.useCoreML != useCoreML
             self.selectedModelID = selectedModelID
             self.useCoreML = useCoreML
+            if settingsChanged {
+                releaseCachedWhisperContextAsync()
+            }
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.selectedModelID = selectedModelID
-                self?.useCoreML = useCoreML
+                guard let self else { return }
+                let settingsChanged = self.selectedModelID != selectedModelID || self.useCoreML != useCoreML
+                self.selectedModelID = selectedModelID
+                self.useCoreML = useCoreML
+                if settingsChanged {
+                    self.releaseCachedWhisperContextAsync()
+                }
             }
         }
     }
@@ -382,6 +400,7 @@ final class WhisperTranscriber: NSObject {
         let selectedModelID = self.selectedModelID
         let sampleCount = samplesToTranscribe.count
         let startTime = Date()
+        let queueGeneration = transcriptionQueueGeneration
         activeFinalizeRunID = runID
 
         if shouldForceCPUForStability, useCoreML {
@@ -400,7 +419,7 @@ final class WhisperTranscriber: NSObject {
             self.activeFinalizeRunID = nil
             self.isTranscribing = false
             self.restoreMicSelection()
-            self.transcriptionQueue = DispatchQueue(label: "KeyScribe.WhisperTranscription")
+            self.resetTranscriptionQueueAfterTimeout()
             self.updateStatus("Whisper finalize timed out and was reset. Try again.")
             CrashReporter.logError("Whisper finalize timed out and transcription queue was reset run=\(runID) model=\(selectedModelID)")
         }
@@ -415,7 +434,8 @@ final class WhisperTranscriber: NSObject {
                 language: "en",
                 threadCount: threadCount,
                 useCoreML: shouldUseCoreML,
-                prompt: prompt
+                prompt: prompt,
+                queueGeneration: queueGeneration
             )
 
             DispatchQueue.main.async {
@@ -469,18 +489,16 @@ final class WhisperTranscriber: NSObject {
         language: String,
         threadCount: Int,
         useCoreML: Bool,
-        prompt: String?
+        prompt: String?,
+        queueGeneration: Int
     ) -> Result<String, Error> {
-        var contextParams = whisper_context_default_params()
-        contextParams.use_gpu = useCoreML
-        // flash_attn has shown instability on some small/medium runs in production.
-        contextParams.flash_attn = false
-
-        guard let ctx = whisper_init_from_file_with_params(modelURL.path, contextParams) else {
+        let contextKey = WhisperContextCacheKey(
+            modelPath: modelURL.path,
+            useCoreML: useCoreML,
+            queueGeneration: queueGeneration
+        )
+        guard let ctx = resolvedWhisperContext(for: contextKey) else {
             return .failure(NSError(domain: "WhisperTranscriber", code: 2001, userInfo: [NSLocalizedDescriptionKey: "Failed to load whisper model"]))
-        }
-        defer {
-            whisper_free(ctx)
         }
 
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
@@ -539,6 +557,50 @@ final class WhisperTranscriber: NSObject {
 
         let transcript = filteredTranscript(from: segments)
         return .success(transcript)
+    }
+
+    private func resolvedWhisperContext(for key: WhisperContextCacheKey) -> OpaquePointer? {
+        if let cachedWhisperContext, cachedWhisperContextKey == key {
+            return cachedWhisperContext
+        }
+
+        invalidateCachedWhisperContext(freeContext: true)
+
+        var contextParams = whisper_context_default_params()
+        contextParams.use_gpu = key.useCoreML
+        // flash_attn has shown instability on some small/medium runs in production.
+        contextParams.flash_attn = false
+
+        guard let createdContext = whisper_init_from_file_with_params(key.modelPath, contextParams) else {
+            return nil
+        }
+
+        cachedWhisperContext = createdContext
+        cachedWhisperContextKey = key
+        return createdContext
+    }
+
+    private func invalidateCachedWhisperContext(freeContext: Bool) {
+        if freeContext, let cachedWhisperContext {
+            whisper_free(cachedWhisperContext)
+        }
+        cachedWhisperContext = nil
+        cachedWhisperContextKey = nil
+    }
+
+    private func releaseCachedWhisperContextAsync() {
+        let queue = transcriptionQueue
+        queue.async { [weak self] in
+            self?.invalidateCachedWhisperContext(freeContext: true)
+        }
+    }
+
+    private func resetTranscriptionQueueAfterTimeout() {
+        transcriptionQueueGeneration += 1
+        // The timed-out run may still be executing in the old queue. Drop references without
+        // freeing so the new queue never reuses that context concurrently.
+        invalidateCachedWhisperContext(freeContext: false)
+        transcriptionQueue = DispatchQueue(label: "KeyScribe.WhisperTranscription")
     }
 
     private func convert(

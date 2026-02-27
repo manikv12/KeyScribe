@@ -252,17 +252,22 @@ final class PromptRewriteConversationStore: ObservableObject {
 
     private let maxStoredContexts = 24
     private let maxStoredTurnsPerContext = 120
-    private let maxRelevantExchangeTurnsForPrompt = 6
+    private let maxRelevantExchangeTurnsForPrompt = 4
     private let autoCompactionExchangeThreshold = 40
     private let autoCompactionRetainedExchangeTurns = 8
-    private let maxPromptContextCharacters = 2_500
+    private let maxPromptContextCharacters = 1_800
     private let compactionVersion = 1
+    private let sqliteStartupThreadScanMultiplier = 4
+    private let sqliteStartupThreadScanHardLimit = 120
+    private let duplicateMergeThreadScanMultiplier = 4
+    private let duplicateMergeThreadScanHardLimit = 120
     private let sqliteStoreFactory: () throws -> MemorySQLiteStore
     private let tagInferenceService: ConversationTagInferenceService
 
     private var contextsByID: [String: StoredContext] = [:]
     private var contextIDByTuple: [ConversationThreadTupleKey: String] = [:]
     private var sqliteStore: MemorySQLiteStore?
+    private var pendingDuplicateMergeContextIDs: Set<String> = []
 
     private init(
         sqliteStoreFactory: @escaping () throws -> MemorySQLiteStore = { try MemorySQLiteStore() },
@@ -347,11 +352,11 @@ final class PromptRewriteConversationStore: ObservableObject {
                     tags: inferred,
                     threadID: thread.id
                 )
-                let loadedTurns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: 300)) ?? [])
+                let loadedTurns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
                     .compactMap(conversationTurn(from:))
                 let loaded = StoredContext(
                     context: resolvedLoadedContext,
-                    turns: loadedTurns,
+                    turns: Array(loadedTurns.suffix(maxStoredTurnsPerContext)),
                     lastUpdatedAt: thread.lastActivityAt,
                     tupleKey: tupleKey,
                     totalExchangeTurns: max(thread.totalExchangeTurns, loadedTurns.filter { !$0.isSummary }.count)
@@ -436,6 +441,7 @@ final class PromptRewriteConversationStore: ObservableObject {
             tags: inferredTags,
             threadID: threadID
         )
+        let isNewContext = contextsByID[threadID] == nil
 
         var stored = contextsByID[threadID] ?? StoredContext(
             context: resolvedContext,
@@ -472,6 +478,9 @@ final class PromptRewriteConversationStore: ObservableObject {
 
         contextsByID[threadID] = stored
         contextIDByTuple[tupleKey] = threadID
+        if isNewContext {
+            pendingDuplicateMergeContextIDs.insert(threadID)
+        }
         let removedContextIDs = trimStoredContextsIfNeeded()
         persistContext(stored)
         for removedID in removedContextIDs {
@@ -485,6 +494,7 @@ final class PromptRewriteConversationStore: ObservableObject {
         guard !normalizedID.isEmpty else { return }
         guard let removed = contextsByID.removeValue(forKey: normalizedID) else { return }
         contextIDByTuple.removeValue(forKey: removed.tupleKey)
+        pendingDuplicateMergeContextIDs.remove(normalizedID)
         deleteContextFromSQLite(id: normalizedID)
         refreshSummaries()
     }
@@ -493,6 +503,7 @@ final class PromptRewriteConversationStore: ObservableObject {
         guard !contextsByID.isEmpty else { return }
         contextsByID.removeAll()
         contextIDByTuple.removeAll()
+        pendingDuplicateMergeContextIDs.removeAll()
         clearAllContextsInSQLite()
         refreshSummaries()
     }
@@ -1048,6 +1059,7 @@ final class PromptRewriteConversationStore: ObservableObject {
                 contextIDByTuple.removeValue(forKey: stored.tupleKey)
             }
             contextsByID.removeValue(forKey: id)
+            pendingDuplicateMergeContextIDs.remove(id)
             deleteContextFromSQLite(id: id)
         }
         refreshSummaries()
@@ -1068,6 +1080,7 @@ final class PromptRewriteConversationStore: ObservableObject {
                 contextIDByTuple.removeValue(forKey: stored.tupleKey)
             }
             contextsByID.removeValue(forKey: id)
+            pendingDuplicateMergeContextIDs.remove(id)
             removed.append(id)
         }
         return removed
@@ -1098,20 +1111,26 @@ final class PromptRewriteConversationStore: ObservableObject {
         guard FeatureFlags.conversationTupleSQLiteEnabled else {
             contextsByID = [:]
             contextIDByTuple = [:]
+            pendingDuplicateMergeContextIDs = []
             return
         }
         guard let store = resolvedSQLiteStore() else {
             contextsByID = [:]
             contextIDByTuple = [:]
+            pendingDuplicateMergeContextIDs = []
             return
         }
 
-        let threadRows = (try? store.fetchConversationThreads(limit: 500)) ?? []
+        let startupThreadLimit = min(
+            sqliteStartupThreadScanHardLimit,
+            max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
+        )
+        let threadRows = (try? store.fetchConversationThreads(limit: startupThreadLimit)) ?? []
         var nextContexts: [String: StoredContext] = [:]
         var nextTupleMap: [ConversationThreadTupleKey: String] = [:]
 
         for thread in threadRows {
-            let turns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: 300)) ?? [])
+            let turns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
                 .compactMap(conversationTurn(from:))
             let tags = ConversationTupleTags(
                 projectKey: thread.projectKey,
@@ -1190,7 +1209,7 @@ final class PromptRewriteConversationStore: ObservableObject {
             )
             nextContexts[thread.id] = StoredContext(
                 context: canonicalContext,
-                turns: turns,
+                turns: Array(turns.suffix(maxStoredTurnsPerContext)),
                 lastUpdatedAt: thread.lastActivityAt,
                 tupleKey: tupleKey,
                 totalExchangeTurns: max(
@@ -1201,13 +1220,26 @@ final class PromptRewriteConversationStore: ObservableObject {
             nextTupleMap[tupleKey] = thread.id
         }
 
+        if nextContexts.count > maxStoredContexts {
+            let keepIDs = Set(
+                nextContexts.values
+                    .sorted { lhs, rhs in lhs.lastUpdatedAt > rhs.lastUpdatedAt }
+                    .prefix(maxStoredContexts)
+                    .map { $0.context.id }
+            )
+            nextContexts = nextContexts.filter { keepIDs.contains($0.key) }
+            nextTupleMap = nextTupleMap.filter { keepIDs.contains($0.value) }
+        }
+
         contextsByID = nextContexts
         contextIDByTuple = nextTupleMap
+        pendingDuplicateMergeContextIDs = []
     }
 
     private func persistContext(_ stored: StoredContext) {
         guard FeatureFlags.conversationTupleSQLiteEnabled else { return }
         guard let store = resolvedSQLiteStore() else { return }
+        let shouldCheckForDuplicateThreads = pendingDuplicateMergeContextIDs.contains(stored.context.id)
 
         let runningSummary = stored.turns.reversed().first(where: \.isSummary)?.assistantText ?? ""
         let exchangeTurnCount = max(stored.totalExchangeTurns, stored.turns.filter { !$0.isSummary }.count)
@@ -1249,7 +1281,10 @@ final class PromptRewriteConversationStore: ObservableObject {
                 lastActivityAt: stored.lastUpdatedAt,
                 updatedAt: Date()
             )
-            try mergeDuplicateThreadsIfNeeded(for: stored.context.id, tupleKey: stored.tupleKey)
+            if shouldCheckForDuplicateThreads {
+                try mergeDuplicateThreadsIfNeeded(for: stored.context.id, tupleKey: stored.tupleKey)
+                pendingDuplicateMergeContextIDs.remove(stored.context.id)
+            }
         } catch {
             // Best-effort persistence to avoid blocking rewrite flow.
         }
@@ -1283,7 +1318,11 @@ final class PromptRewriteConversationStore: ObservableObject {
         tupleKey: ConversationThreadTupleKey
     ) throws {
         guard let store = resolvedSQLiteStore() else { return }
-        let threads = try store.fetchConversationThreads(limit: 500)
+        let duplicateMergeScanLimit = min(
+            duplicateMergeThreadScanHardLimit,
+            max(maxStoredContexts, maxStoredContexts * duplicateMergeThreadScanMultiplier)
+        )
+        let threads = try store.fetchConversationThreads(limit: duplicateMergeScanLimit)
         let duplicates = threads.filter {
             $0.id != canonicalThreadID
                 && $0.bundleID.caseInsensitiveCompare(tupleKey.bundleID) == .orderedSame
@@ -1301,6 +1340,7 @@ final class PromptRewriteConversationStore: ObservableObject {
             )
             try store.deleteConversationThread(id: duplicate.id)
             contextsByID.removeValue(forKey: duplicate.id)
+            pendingDuplicateMergeContextIDs.remove(duplicate.id)
         }
     }
 

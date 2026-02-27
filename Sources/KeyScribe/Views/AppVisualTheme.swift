@@ -1,31 +1,34 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 enum AppVisualTheme {
-    static let baseTint = Color(red: 0.24, green: 0.20, blue: 0.34)
-    static let accentTint = Color(red: 0.35, green: 0.58, blue: 0.95)
-    static let canvasBase = Color(red: 0.09, green: 0.08, blue: 0.15)
-    static let canvasDeep = Color(red: 0.04, green: 0.04, blue: 0.08)
-    static let sidebarTint = Color(red: 0.17, green: 0.14, blue: 0.23)
-    static let panelTint = Color(red: 0.13, green: 0.11, blue: 0.20)
-    static let rowSelection = Color(red: 0.29, green: 0.33, blue: 0.39)
-    static let historyTint = Color(red: 0.54, green: 0.61, blue: 0.57)
-    static let aiStudioTint = Color(red: 0.60, green: 0.64, blue: 0.71)
-    static let settingsTint = Color(red: 0.84, green: 0.47, blue: 0.40)
+    private static var palette: ColorPalette { SettingsStore.shared.colorTheme.palette }
+    static var baseTint: Color { palette.baseTint }
+    static var accentTint: Color { palette.accentTint }
+    static var canvasBase: Color { palette.canvasBase }
+    static var canvasDeep: Color { palette.canvasDeep }
+    static var sidebarTint: Color { palette.sidebarTint }
+    static var panelTint: Color { palette.panelTint }
+    static var rowSelection: Color { palette.rowSelection }
+    static var historyTint: Color { palette.historyTint }
+    static var aiStudioTint: Color { palette.aiStudioTint }
+    static var settingsTint: Color { palette.settingsTint }
     static let mutedText = Color.white.opacity(0.68)
 
     static func glassTokens(style: AppChromeStyle, reduceTransparency: Bool) -> AppGlassTokens {
         let materialEnabled = !reduceTransparency
+        let p = palette
 
         switch style {
         case .glassHighContrast:
             return AppGlassTokens(
-                canvasBase: Color(red: 0.10, green: 0.09, blue: 0.16),
-                canvasDeep: Color(red: 0.04, green: 0.04, blue: 0.09),
-                surfaceTop: Color(red: 0.18, green: 0.15, blue: 0.27),
-                surfaceBottom: Color(red: 0.08, green: 0.08, blue: 0.16),
-                glowRed: Color(red: 0.88, green: 0.30, blue: 0.37).opacity(materialEnabled ? 0.26 : 0.18),
-                glowBlue: Color(red: 0.19, green: 0.42, blue: 0.95).opacity(materialEnabled ? 0.23 : 0.16),
+                canvasBase: p.canvasBase,
+                canvasDeep: p.canvasDeep,
+                surfaceTop: p.surfaceTop,
+                surfaceBottom: p.surfaceBottom,
+                glowRed: p.glowWarm.opacity(materialEnabled ? 0.20 : 0.14),
+                glowBlue: p.glowCool.opacity(materialEnabled ? 0.25 : 0.18),
                 strokeTop: Color.white.opacity(materialEnabled ? 0.20 : 0.14),
                 strokeMid: Color.white.opacity(materialEnabled ? 0.07 : 0.05),
                 strokeBottom: Color.black.opacity(materialEnabled ? 0.30 : 0.34),
@@ -43,12 +46,12 @@ enum AppVisualTheme {
             )
         case .classic:
             return AppGlassTokens(
-                canvasBase: canvasBase,
-                canvasDeep: canvasDeep,
-                surfaceTop: Color(red: 0.20, green: 0.16, blue: 0.26),
-                surfaceBottom: Color(red: 0.10, green: 0.10, blue: 0.18),
-                glowRed: Color(red: 0.84, green: 0.26, blue: 0.34).opacity(materialEnabled ? 0.15 : 0.10),
-                glowBlue: Color(red: 0.21, green: 0.45, blue: 0.95).opacity(materialEnabled ? 0.14 : 0.09),
+                canvasBase: p.canvasBase,
+                canvasDeep: p.canvasDeep,
+                surfaceTop: p.surfaceTop,
+                surfaceBottom: p.surfaceBottom,
+                glowRed: p.glowWarm.opacity(materialEnabled ? 0.10 : 0.07),
+                glowBlue: p.glowCool.opacity(materialEnabled ? 0.16 : 0.10),
                 strokeTop: Color.white.opacity(materialEnabled ? 0.16 : 0.11),
                 strokeMid: Color.white.opacity(materialEnabled ? 0.05 : 0.03),
                 strokeBottom: Color.black.opacity(materialEnabled ? 0.24 : 0.28),
@@ -736,36 +739,39 @@ private struct AppSidebarSurfaceModifier: ViewModifier {
 }
 
 extension View {
+    @MainActor
     func appThemedSurface(
         cornerRadius: CGFloat = 12,
-        tint: Color = AppVisualTheme.baseTint,
+        tint: Color? = nil,
         strokeOpacity: Double = 0.14,
         tintOpacity: Double = 0.02
     ) -> some View {
         modifier(
             AppThemedSurfaceModifier(
                 cornerRadius: cornerRadius,
-                tint: tint,
+                tint: tint ?? AppVisualTheme.baseTint,
                 strokeOpacity: strokeOpacity,
                 tintOpacity: tintOpacity
             )
         )
     }
 
+    @MainActor
     func appSidebarSurface(
         cornerRadius: CGFloat = 16,
-        tint: Color = AppVisualTheme.sidebarTint
+        tint: Color? = nil
     ) -> some View {
         modifier(
             AppSidebarSurfaceModifier(
                 cornerRadius: cornerRadius,
-                tint: tint
+                tint: tint ?? AppVisualTheme.sidebarTint
             )
         )
     }
 
-    func appScrollbars(tint: Color = AppVisualTheme.baseTint) -> some View {
-        background(AppScrollBarTintView(tint: tint))
+    @MainActor
+    func appScrollbars(tint: Color? = nil) -> some View {
+        background(AppScrollBarTintView(tint: tint ?? AppVisualTheme.baseTint))
     }
 }
 

@@ -344,6 +344,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         waveform.hide()
         windowCoordinator?.closeAllWindows()
         windowCoordinator = nil
+
+        let runtimeShutdownGroup = DispatchGroup()
+        runtimeShutdownGroup.enter()
+        Task.detached(priority: .userInitiated) {
+            await LocalAIRuntimeManager.shared.stop()
+            runtimeShutdownGroup.leave()
+        }
+        _ = runtimeShutdownGroup.wait(timeout: .now() + 1.5)
+
         isDictating = false
         dictationInputMode = .idle
     }
@@ -2250,6 +2259,27 @@ struct SettingsView: View {
                 tint: AppVisualTheme.accentTint,
                 isExpanded: $showWaveformAppearanceSettings
             ) {
+                Picker("Color Theme", selection: $settings.colorThemeRawValue) {
+                    ForEach(ColorTheme.allCases) { theme in
+                        Text(theme.displayName).tag(theme.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .help("Choose the overall color palette for the app.")
+
+                HStack(spacing: 6) {
+                    let p = settings.colorTheme.palette
+                    Circle().fill(p.accentTint).frame(width: 14, height: 14)
+                    Circle().fill(p.historyTint).frame(width: 14, height: 14)
+                    Circle().fill(p.baseTint).frame(width: 14, height: 14)
+                    Text("Theme preview")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Divider()
+                    .padding(.vertical, 6)
+
                 Picker("Interface Style", selection: $settings.appChromeStyleRawValue) {
                     ForEach(AppChromeStyle.allCases) { style in
                         Text(style.rawValue).tag(style.rawValue)
@@ -3841,14 +3871,16 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    @MainActor
     private func settingsCard<Content: View>(
         title: String,
         subtitle: String? = nil,
         symbol: String? = nil,
-        tint: Color = AppVisualTheme.accentTint,
+        tint: Color? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let tint = tint ?? AppVisualTheme.accentTint
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 if let symbol {
                     AppIconBadge(
@@ -3885,15 +3917,17 @@ struct SettingsView: View {
         )
     }
 
+    @MainActor
     @ViewBuilder
     private func settingsDisclosureCard<Content: View>(
         title: String,
         subtitle: String? = nil,
         symbol: String? = nil,
-        tint: Color = AppVisualTheme.accentTint,
+        tint: Color? = nil,
         isExpanded: Binding<Bool>,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
+        let tint = tint ?? AppVisualTheme.accentTint
         VStack(alignment: .leading, spacing: 10) {
             DisclosureGroup(isExpanded: isExpanded) {
                 VStack(alignment: .leading, spacing: 10) {

@@ -349,8 +349,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                     let scope = Self.memoryScope(from: conversationContext)
                     let rewriteContext = try await retrievalService.fetchPromptRewriteContext(
                         for: cleanedTranscript,
-                        lessonLimit: 8,
-                        cardLimit: 8,
+                        lessonLimit: 6,
+                        cardLimit: 4,
                         scope: scope
                     )
                     // Do not pay a provider round-trip unless we have an actual rewrite lesson match.
@@ -806,7 +806,7 @@ private actor OpenAIPromptRewriteProvider {
             return nil
         }
 
-        let lessonPayload = formattedLessonPayload(from: rewriteContext.lessons.prefix(8).map { $0 })
+        let lessonPayload = formattedLessonPayload(from: rewriteContext.lessons.prefix(6).map { $0 })
         let supportingCardPayload = formattedSupportingCardPayload(from: rewriteContext.supportingCards.prefix(4).map { $0 })
         let styleGuidance = styleGuidanceBlock(configuration: configuration)
         let conversationContextLine = conversationContextLine(from: conversationContext)

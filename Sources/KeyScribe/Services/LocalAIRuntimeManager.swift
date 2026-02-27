@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 struct LocalAIRuntimeDetection: Equatable {
     let installed: Bool
@@ -69,6 +70,7 @@ actor LocalAIRuntimeManager: LocalAIRuntimeManaging {
 
     private let session: URLSession
     private var runtimeProcess: Process?
+    private var runtimeExecutablePath: String?
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -173,6 +175,7 @@ actor LocalAIRuntimeManager: LocalAIRuntimeManaging {
         }
 
         self.runtimeProcess = process
+        self.runtimeExecutablePath = executableURL.path
 
         let becameHealthy = await waitForHealth(timeoutSeconds: 25)
         guard becameHealthy else {
@@ -202,9 +205,46 @@ actor LocalAIRuntimeManager: LocalAIRuntimeManaging {
     }
 
     func stop() async {
+        let ownedRuntimePID = runtimeProcess.map { Int32($0.processIdentifier) }
+        let processTable = Self.captureProcessTable()
+        let ownedChildPIDs = ownedRuntimePID.map { Self.descendantPIDs(of: $0, from: processTable) } ?? []
+
         if let runtimeProcess, runtimeProcess.isRunning {
             runtimeProcess.terminate()
         }
+
+        if !ownedChildPIDs.isEmpty {
+            Self.sendSignal(SIGTERM, to: ownedChildPIDs)
+        }
+
+        var ownedPIDsToVerify = ownedChildPIDs
+        if let ownedRuntimePID {
+            ownedPIDsToVerify.append(ownedRuntimePID)
+        }
+
+        if !ownedPIDsToVerify.isEmpty {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            let stillRunningOwned = ownedPIDsToVerify.filter(Self.isProcessRunning)
+            if !stillRunningOwned.isEmpty {
+                Self.sendSignal(SIGKILL, to: stillRunningOwned)
+            }
+        }
+
+        if let runtimeExecutablePath {
+            let orphanedRunners = Self.orphanedRunnerPIDs(
+                executablePath: runtimeExecutablePath,
+                from: Self.captureProcessTable()
+            )
+            if !orphanedRunners.isEmpty {
+                Self.sendSignal(SIGTERM, to: orphanedRunners)
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                let stillRunningOrphans = orphanedRunners.filter(Self.isProcessRunning)
+                if !stillRunningOrphans.isEmpty {
+                    Self.sendSignal(SIGKILL, to: stillRunningOrphans)
+                }
+            }
+        }
+
         runtimeProcess = nil
     }
 
@@ -525,6 +565,103 @@ actor LocalAIRuntimeManager: LocalAIRuntimeManaging {
         }
 
         return false
+    }
+
+    private struct ProcessTableEntry {
+        let pid: Int32
+        let parentPID: Int32
+        let command: String
+    }
+
+    private static func captureProcessTable() -> [ProcessTableEntry] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axo", "pid=,ppid=,command=", "-ww"]
+
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return [] }
+
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            guard let text = String(data: data, encoding: .utf8) else { return [] }
+
+            return text
+                .split(whereSeparator: \.isNewline)
+                .compactMap { line in
+                    let parts = line.split(
+                        maxSplits: 2,
+                        omittingEmptySubsequences: true,
+                        whereSeparator: { $0 == " " || $0 == "\t" }
+                    )
+                    guard parts.count == 3,
+                          let pid = Int32(parts[0]),
+                          let parentPID = Int32(parts[1]) else {
+                        return nil
+                    }
+
+                    return ProcessTableEntry(
+                        pid: pid,
+                        parentPID: parentPID,
+                        command: String(parts[2])
+                    )
+                }
+        } catch {
+            return []
+        }
+    }
+
+    private static func descendantPIDs(of rootPID: Int32, from processTable: [ProcessTableEntry]) -> [Int32] {
+        var childrenByParent: [Int32: [Int32]] = [:]
+        for entry in processTable {
+            childrenByParent[entry.parentPID, default: []].append(entry.pid)
+        }
+
+        var discovered: [Int32] = []
+        var queue: [Int32] = [rootPID]
+        var visited: Set<Int32> = [rootPID]
+
+        while !queue.isEmpty {
+            let current = queue.removeFirst()
+            let children = childrenByParent[current] ?? []
+            for child in children where !visited.contains(child) {
+                visited.insert(child)
+                discovered.append(child)
+                queue.append(child)
+            }
+        }
+
+        return discovered
+    }
+
+    private static func sendSignal(_ signal: Int32, to pids: [Int32]) {
+        for pid in Set(pids) where pid > 1 {
+            _ = Darwin.kill(pid, signal)
+        }
+    }
+
+    private static func isProcessRunning(_ pid: Int32) -> Bool {
+        guard pid > 1 else { return false }
+        if Darwin.kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+
+    private static func orphanedRunnerPIDs(
+        executablePath: String,
+        from processTable: [ProcessTableEntry]
+    ) -> [Int32] {
+        processTable.compactMap { entry in
+            guard entry.parentPID == 1 else { return nil }
+            guard entry.command.contains(executablePath) else { return nil }
+            guard entry.command.contains(" runner ") || entry.command.hasSuffix(" runner") else { return nil }
+            return entry.pid
+        }
     }
 
     private static func errorMessage(from data: Data) -> String? {
