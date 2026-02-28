@@ -207,6 +207,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectedModelID: settings.selectedWhisperModelID,
             useCoreML: settings.whisperUseCoreML
         )
+        transcriber.applyWhisperContextRetentionSettings(
+            autoUnloadIdleContext: settings.whisperAutoUnloadIdleContextEnabled,
+            idleContextUnloadDelaySeconds: settings.whisperIdleContextUnloadSeconds
+        )
         transcriber.setTranscriptionEngine(settings.transcriptionEngine)
 
         postInsertCorrectionMonitor.onCorrectionDetected = { [weak self] result in
@@ -535,6 +539,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         transcriber.applyWhisperSettings(
             selectedModelID: settings.selectedWhisperModelID,
             useCoreML: settings.whisperUseCoreML
+        )
+        transcriber.applyWhisperContextRetentionSettings(
+            autoUnloadIdleContext: settings.whisperAutoUnloadIdleContextEnabled,
+            idleContextUnloadDelaySeconds: settings.whisperIdleContextUnloadSeconds
         )
         transcriber.setTranscriptionEngine(settings.transcriptionEngine)
         if !settings.adaptiveCorrectionsEnabled {
@@ -1022,6 +1030,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
 
+        while let clarificationPrompt = promptRewriteConversationStore.nextClarificationPrompt(
+            capturedContext: capturedContext,
+            userText: userText
+        ) {
+            let decision = presentConversationClarificationPrompt(clarificationPrompt)
+            if decision == .dismiss {
+                break
+            }
+            promptRewriteConversationStore.applyClarificationDecision(
+                decision,
+                for: clarificationPrompt
+            )
+        }
+
         let requestContext = promptRewriteConversationStore.prepareRequestContext(
             capturedContext: capturedContext,
             userText: userText,
@@ -1037,6 +1059,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return requestContext
+    }
+
+    private func presentConversationClarificationPrompt(
+        _ prompt: ConversationClarificationPrompt
+    ) -> ConversationClarificationDecision {
+        guard let candidate = prompt.primaryCandidate else {
+            return .dismiss
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        switch prompt.kind {
+        case .projectExact:
+            alert.messageText = "Link matching project?"
+        case .projectAmbiguous:
+            alert.messageText = "Link similar project?"
+        case .personExact:
+            alert.messageText = "Link matching person?"
+        case .personAmbiguous:
+            alert.messageText = "Link similar person?"
+        }
+
+        let currentLabel = prompt.currentLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidateLabel = candidate.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let left = currentLabel.isEmpty ? prompt.currentKey : currentLabel
+        let right = candidateLabel.isEmpty ? candidate.canonicalKey : candidateLabel
+        let appLabel = candidate.appName.isEmpty ? candidate.bundleIdentifier : candidate.appName
+        let relationshipText = prompt.kind.isExact ? "matches" : "looks close to"
+        alert.informativeText = "\"\(left)\" \(relationshipText) \"\(right)\" in \(appLabel)."
+
+        alert.addButton(withTitle: "Link")
+        alert.addButton(withTitle: "Keep Separate")
+        alert.addButton(withTitle: "Dismiss")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .link
+        case .alertSecondButtonReturn:
+            return .keepSeparate
+        default:
+            return .dismiss
+        }
     }
 
     private func capturePromptRewriteSessionContext() -> PromptRewriteSessionContext {
@@ -2568,6 +2632,20 @@ struct SettingsView: View {
                 ) {
                     Toggle("Use Core ML encoder when available", isOn: $settings.whisperUseCoreML)
                         .help("If installed for the selected model, Core ML can improve whisper speed on Apple Silicon.")
+
+                    Toggle("Release model after idle", isOn: $settings.whisperAutoUnloadIdleContextEnabled)
+                        .help("Frees whisper context memory when dictation is inactive.")
+
+                    if settings.whisperAutoUnloadIdleContextEnabled {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Idle unload delay: \(Int(settings.whisperIdleContextUnloadSeconds.rounded())) sec")
+                                .font(.callout.weight(.medium))
+                            Slider(value: $settings.whisperIdleContextUnloadSeconds, in: 30...3600, step: 30)
+                            Text("Lower values free memory sooner; higher values keep whisper warm for faster restarts.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
 
                     if settings.selectedWhisperModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text("No model selected yet.")
@@ -4124,6 +4202,7 @@ struct SettingsView: View {
             .init(section: .speech, title: "Custom phrases", detail: "Add names, acronyms, and domain language", keywords: ["phrases", "vocabulary", "context"]),
             .init(section: .speech, title: "whisper model install", detail: "Download and manage all whisper.cpp models", keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]),
             .init(section: .speech, title: "whisper Core ML", detail: "Use Core ML encoder when available", keywords: ["core ml", "ane", "whisper", "speed"]),
+            .init(section: .speech, title: "whisper idle unload", detail: "Unload whisper context after inactivity to reduce memory", keywords: ["memory", "idle", "unload", "whisper", "context"]),
             .init(section: .corrections, title: "Adaptive corrections", detail: "Learn from your quick word/phrase fixes", keywords: ["adaptive", "learned", "corrections", "backspace"]),
             .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
             .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),

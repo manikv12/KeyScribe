@@ -422,6 +422,8 @@ final class SettingsStore: ObservableObject {
         static let transcriptionEngine = "KeyScribe.transcriptionEngine"
         static let selectedWhisperModelID = "KeyScribe.selectedWhisperModelID"
         static let whisperUseCoreML = "KeyScribe.whisperUseCoreML"
+        static let whisperAutoUnloadIdleContextEnabled = "KeyScribe.whisperAutoUnloadIdleContextEnabled"
+        static let whisperIdleContextUnloadSeconds = "KeyScribe.whisperIdleContextUnloadSeconds"
         static let adaptiveCorrectionsEnabled = "KeyScribe.adaptiveCorrectionsEnabled"
         static let playCorrectionLearnedSound = "KeyScribe.playCorrectionLearnedSound"
         static let dictationStartSoundName = "KeyScribe.dictationStartSoundName"
@@ -471,6 +473,12 @@ final class SettingsStore: ObservableObject {
         static let minimumSeconds: Double = 3
         static let maximumSeconds: Double = 120
         static let fallbackSeconds: Double = 8
+    }
+
+    private enum WhisperContextRetentionDefaults {
+        static let minimumSeconds: Double = 30
+        static let maximumSeconds: Double = 3600
+        static let fallbackSeconds: Double = 8 * 60
     }
 
     private var promptRewriteModelByProvider: [String: String] = [:]
@@ -610,6 +618,26 @@ final class SettingsStore: ObservableObject {
 
     @Published var whisperUseCoreML: Bool {
         didSet {
+            save()
+        }
+    }
+
+    @Published var whisperAutoUnloadIdleContextEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var whisperIdleContextUnloadSeconds: Double {
+        didSet {
+            let normalized = min(
+                WhisperContextRetentionDefaults.maximumSeconds,
+                max(WhisperContextRetentionDefaults.minimumSeconds, whisperIdleContextUnloadSeconds)
+            )
+            guard normalized == whisperIdleContextUnloadSeconds else {
+                whisperIdleContextUnloadSeconds = normalized
+                return
+            }
             save()
         }
     }
@@ -1027,6 +1055,20 @@ final class SettingsStore: ObservableObject {
             whisperUseCoreML = defaults.bool(forKey: Keys.whisperUseCoreML)
         }
 
+        if defaults.object(forKey: Keys.whisperAutoUnloadIdleContextEnabled) == nil {
+            whisperAutoUnloadIdleContextEnabled = true
+        } else {
+            whisperAutoUnloadIdleContextEnabled = defaults.bool(forKey: Keys.whisperAutoUnloadIdleContextEnabled)
+        }
+
+        let storedWhisperContextUnloadDelaySeconds = defaults.object(forKey: Keys.whisperIdleContextUnloadSeconds) == nil
+            ? WhisperContextRetentionDefaults.fallbackSeconds
+            : defaults.double(forKey: Keys.whisperIdleContextUnloadSeconds)
+        whisperIdleContextUnloadSeconds = min(
+            WhisperContextRetentionDefaults.maximumSeconds,
+            max(WhisperContextRetentionDefaults.minimumSeconds, storedWhisperContextUnloadDelaySeconds)
+        )
+
         if defaults.object(forKey: Keys.adaptiveCorrectionsEnabled) == nil {
             adaptiveCorrectionsEnabled = true
         } else {
@@ -1293,6 +1335,8 @@ final class SettingsStore: ObservableObject {
         defaults.set(transcriptionEngineRawValue, forKey: Keys.transcriptionEngine)
         defaults.set(selectedWhisperModelID, forKey: Keys.selectedWhisperModelID)
         defaults.set(whisperUseCoreML, forKey: Keys.whisperUseCoreML)
+        defaults.set(whisperAutoUnloadIdleContextEnabled, forKey: Keys.whisperAutoUnloadIdleContextEnabled)
+        defaults.set(whisperIdleContextUnloadSeconds, forKey: Keys.whisperIdleContextUnloadSeconds)
         defaults.set(adaptiveCorrectionsEnabled, forKey: Keys.adaptiveCorrectionsEnabled)
         defaults.set(playCorrectionLearnedSound, forKey: Keys.playCorrectionLearnedSound)
         defaults.set(dictationStartSoundName, forKey: Keys.dictationStartSoundName)
