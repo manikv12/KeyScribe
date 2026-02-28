@@ -376,6 +376,35 @@ final class MemorySQLiteStore {
             PRIMARY KEY(alias_type, alias_key)
         );
         """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_disambiguation_rules (
+            id TEXT PRIMARY KEY NOT NULL,
+            rule_type TEXT NOT NULL,
+            app_pair_key TEXT NOT NULL,
+            subject_key TEXT NOT NULL,
+            context_scope_key TEXT,
+            decision TEXT NOT NULL,
+            canonical_key TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        """)
+
+        try execute(sql: """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_disambiguation_scope
+            ON conversation_disambiguation_rules(
+                rule_type,
+                app_pair_key,
+                subject_key,
+                ifnull(context_scope_key, '')
+            );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_disambiguation_subject
+            ON conversation_disambiguation_rules(rule_type, app_pair_key, subject_key, updated_at DESC);
+        """)
     }
 
     func hasTable(named tableName: String) throws -> Bool {
@@ -792,6 +821,130 @@ final class MemorySQLiteStore {
             self.readString(at: 0, in: statement) ?? ""
         })
         return rows.first
+    }
+
+    func conversationDisambiguationAppPairKey(
+        _ firstAppKey: String,
+        _ secondAppKey: String
+    ) -> String {
+        let normalizedPair = [
+            normalizeLookupKey(firstAppKey),
+            normalizeLookupKey(secondAppKey)
+        ]
+        .filter { !$0.isEmpty }
+        .sorted()
+        return normalizedPair.joined(separator: "|")
+    }
+
+    func upsertConversationDisambiguationRule(_ rule: ConversationDisambiguationRuleRecord) throws {
+        let normalizedID = normalizeLookupKey(rule.id)
+        guard !normalizedID.isEmpty else { return }
+
+        let normalizedAppPairKey = normalizeAppPairKey(rule.appPairKey)
+        let normalizedSubjectKey = normalizeLookupKey(rule.subjectKey)
+        guard !normalizedAppPairKey.isEmpty, !normalizedSubjectKey.isEmpty else { return }
+
+        let sql = """
+        INSERT INTO conversation_disambiguation_rules (
+            id, rule_type, app_pair_key, subject_key, context_scope_key, decision, canonical_key, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT DO UPDATE SET
+            rule_type = excluded.rule_type,
+            app_pair_key = excluded.app_pair_key,
+            subject_key = excluded.subject_key,
+            context_scope_key = excluded.context_scope_key,
+            decision = excluded.decision,
+            canonical_key = excluded.canonical_key,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(normalizedID, at: 1, in: statement)
+            self.bind(rule.ruleType.rawValue, at: 2, in: statement)
+            self.bind(normalizedAppPairKey, at: 3, in: statement)
+            self.bind(normalizedSubjectKey, at: 4, in: statement)
+            self.bind(self.normalizeLookupOptional(rule.contextScopeKey), at: 5, in: statement)
+            self.bind(rule.decision.rawValue, at: 6, in: statement)
+            self.bind(self.normalizeLookupOptional(rule.canonicalKey), at: 7, in: statement)
+            self.bind(rule.createdAt.timeIntervalSince1970, at: 8, in: statement)
+            self.bind(rule.updatedAt.timeIntervalSince1970, at: 9, in: statement)
+        })
+    }
+
+    func fetchConversationDisambiguationRule(
+        ruleType: ConversationDisambiguationRuleType,
+        appPairKey: String,
+        subjectKey: String,
+        contextScopeKey: String?
+    ) throws -> ConversationDisambiguationRuleRecord? {
+        let normalizedAppPairKey = normalizeAppPairKey(appPairKey)
+        let normalizedSubjectKey = normalizeLookupKey(subjectKey)
+        guard !normalizedAppPairKey.isEmpty, !normalizedSubjectKey.isEmpty else { return nil }
+        let normalizedContextScopeKey = normalizeLookupOptional(contextScopeKey)
+
+        let sql = """
+        SELECT
+            id, rule_type, app_pair_key, subject_key, context_scope_key, decision, canonical_key, created_at, updated_at
+        FROM conversation_disambiguation_rules
+        WHERE rule_type = ?
+            AND app_pair_key = ?
+            AND subject_key = ?
+            AND (
+                (? IS NULL AND context_scope_key IS NULL)
+                OR context_scope_key = ?
+            )
+        ORDER BY updated_at DESC
+        LIMIT 1;
+        """
+
+        let rows: [ConversationDisambiguationRuleRecord] = try query(sql: sql, bind: { statement in
+            self.bind(ruleType.rawValue, at: 1, in: statement)
+            self.bind(normalizedAppPairKey, at: 2, in: statement)
+            self.bind(normalizedSubjectKey, at: 3, in: statement)
+            self.bind(normalizedContextScopeKey, at: 4, in: statement)
+            self.bind(normalizedContextScopeKey, at: 5, in: statement)
+        }, mapRow: { statement in
+            self.conversationDisambiguationRule(from: statement)
+        })
+
+        return rows.first
+    }
+
+    func fetchConversationDisambiguationRules(
+        ruleType: ConversationDisambiguationRuleType,
+        appPairKey: String,
+        subjectKey: String
+    ) throws -> [ConversationDisambiguationRuleRecord] {
+        let normalizedAppPairKey = normalizeAppPairKey(appPairKey)
+        let normalizedSubjectKey = normalizeLookupKey(subjectKey)
+        guard !normalizedAppPairKey.isEmpty, !normalizedSubjectKey.isEmpty else { return [] }
+
+        let sql = """
+        SELECT
+            id, rule_type, app_pair_key, subject_key, context_scope_key, decision, canonical_key, created_at, updated_at
+        FROM conversation_disambiguation_rules
+        WHERE rule_type = ?
+            AND app_pair_key = ?
+            AND subject_key = ?
+        ORDER BY updated_at DESC;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(ruleType.rawValue, at: 1, in: statement)
+            self.bind(normalizedAppPairKey, at: 2, in: statement)
+            self.bind(normalizedSubjectKey, at: 3, in: statement)
+        }, mapRow: { statement in
+            self.conversationDisambiguationRule(from: statement)
+        })
+    }
+
+    func deleteConversationDisambiguationRule(id: String) throws {
+        let normalizedID = normalizeLookupKey(id)
+        guard !normalizedID.isEmpty else { return }
+        try execute(sql: "DELETE FROM conversation_disambiguation_rules WHERE id = ?;", bind: { statement in
+            self.bind(normalizedID, at: 1, in: statement)
+        })
     }
 
     func upsertSource(_ source: MemorySource) throws {
@@ -2903,6 +3056,51 @@ final class MemorySQLiteStore {
         CREATE INDEX IF NOT EXISTS idx_memory_links_from_confidence
             ON memory_links(from_card_id, confidence DESC, updated_at DESC);
         """)
+    }
+
+    private func conversationDisambiguationRule(from statement: OpaquePointer) -> ConversationDisambiguationRuleRecord {
+        let ruleType = ConversationDisambiguationRuleType(
+            rawValue: self.readString(at: 1, in: statement) ?? ""
+        ) ?? .person
+        let decision = ConversationDisambiguationDecision(
+            rawValue: self.readString(at: 5, in: statement) ?? ""
+        ) ?? .separate
+
+        return ConversationDisambiguationRuleRecord(
+            id: self.readString(at: 0, in: statement) ?? "",
+            ruleType: ruleType,
+            appPairKey: self.readString(at: 2, in: statement) ?? "",
+            subjectKey: self.readString(at: 3, in: statement) ?? "",
+            contextScopeKey: self.readString(at: 4, in: statement),
+            decision: decision,
+            canonicalKey: self.readString(at: 6, in: statement),
+            createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 7)),
+            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 8))
+        )
+    }
+
+    private func normalizeLookupKey(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private func normalizeLookupOptional(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = normalizeLookupKey(value)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func normalizeAppPairKey(_ value: String) -> String {
+        let normalized = value
+            .split(separator: "|")
+            .map { normalizeLookupKey(String($0)) }
+            .filter { !$0.isEmpty }
+
+        if normalized.count >= 2 {
+            return normalized.sorted().joined(separator: "|")
+        }
+        return normalizeLookupKey(value)
     }
 
     private func parseInt(_ value: String?) -> Int? {

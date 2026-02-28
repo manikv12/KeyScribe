@@ -25,6 +25,8 @@ final class SpeechTranscriber: NSObject {
     private struct WhisperSettings {
         var selectedModelID = ""
         var useCoreML = true
+        var autoUnloadIdleContext = true
+        var idleContextUnloadDelaySeconds: TimeInterval = 8 * 60
         var finalizeDelaySeconds: TimeInterval = 0.35
         var biasPhrases: [String] = []
     }
@@ -115,6 +117,17 @@ final class SpeechTranscriber: NSObject {
         }
     }
 
+    func applyWhisperContextRetentionSettings(autoUnloadIdleContext: Bool, idleContextUnloadDelaySeconds: TimeInterval) {
+        performOnMain {
+            self.lastWhisperSettings.autoUnloadIdleContext = autoUnloadIdleContext
+            self.lastWhisperSettings.idleContextUnloadDelaySeconds = idleContextUnloadDelaySeconds
+            self.whisperTranscriber.applyContextRetentionSettings(
+                autoUnloadIdleContext: autoUnloadIdleContext,
+                idleContextUnloadDelaySeconds: idleContextUnloadDelaySeconds
+            )
+        }
+    }
+
     @discardableResult
     func startRecording() -> Bool {
         if Thread.isMainThread {
@@ -167,6 +180,10 @@ final class SpeechTranscriber: NSObject {
             whisperTranscriber.applyWhisperSettings(
                 selectedModelID: lastWhisperSettings.selectedModelID,
                 useCoreML: lastWhisperSettings.useCoreML
+            )
+            whisperTranscriber.applyContextRetentionSettings(
+                autoUnloadIdleContext: lastWhisperSettings.autoUnloadIdleContext,
+                idleContextUnloadDelaySeconds: lastWhisperSettings.idleContextUnloadDelaySeconds
             )
             whisperTranscriber.applyBiasPhrases(lastWhisperSettings.biasPhrases)
             whisperTranscriber.applyFinalizeDelaySeconds(lastWhisperSettings.finalizeDelaySeconds)

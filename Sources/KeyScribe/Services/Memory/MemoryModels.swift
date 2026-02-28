@@ -417,6 +417,28 @@ struct ConversationTurnRecord: Codable, Hashable, Identifiable {
     let turnDedupeKey: String
 }
 
+enum ConversationDisambiguationRuleType: String, Codable, Hashable {
+    case person
+    case project
+}
+
+enum ConversationDisambiguationDecision: String, Codable, Hashable {
+    case link
+    case separate
+}
+
+struct ConversationDisambiguationRuleRecord: Codable, Hashable, Identifiable {
+    let id: String
+    let ruleType: ConversationDisambiguationRuleType
+    let appPairKey: String
+    let subjectKey: String
+    let contextScopeKey: String?
+    let decision: ConversationDisambiguationDecision
+    let canonicalKey: String?
+    let createdAt: Date
+    let updatedAt: Date
+}
+
 struct RewriteSuggestion: Codable, Hashable, Identifiable {
     let id: UUID
     let cardID: UUID

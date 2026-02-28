@@ -16,6 +16,8 @@ final class WhisperTranscriber: NSObject {
     private var transcriptionQueue = DispatchQueue(label: "KeyScribe.WhisperTranscription")
     private var transcriptionQueueGeneration = 0
     private let finalizeWatchdogTimeoutSeconds: TimeInterval = 180
+    private var autoUnloadIdleContext = true
+    private var contextIdleReleaseDelaySeconds: TimeInterval = 8 * 60
 
     private var granted = false
     private(set) var isRecording = false
@@ -31,6 +33,7 @@ final class WhisperTranscriber: NSObject {
     private var finalizeDelaySeconds: TimeInterval = 0.35
     private var biasPhrases: [String] = []
     private var pendingStopWorkItem: DispatchWorkItem?
+    private var pendingContextReleaseWorkItem: DispatchWorkItem?
     private var activeFinalizeRunID: String?
     private var cachedWhisperContext: OpaquePointer?
     private var cachedWhisperContextKey: WhisperContextCacheKey?
@@ -100,6 +103,22 @@ final class WhisperTranscriber: NSObject {
                 if settingsChanged {
                     self.releaseCachedWhisperContextAsync()
                 }
+            }
+        }
+    }
+
+    func applyContextRetentionSettings(autoUnloadIdleContext: Bool, idleContextUnloadDelaySeconds: TimeInterval) {
+        if Thread.isMainThread {
+            setContextRetentionSettings(
+                autoUnloadIdleContext: autoUnloadIdleContext,
+                idleContextUnloadDelaySeconds: idleContextUnloadDelaySeconds
+            )
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.setContextRetentionSettings(
+                    autoUnloadIdleContext: autoUnloadIdleContext,
+                    idleContextUnloadDelaySeconds: idleContextUnloadDelaySeconds
+                )
             }
         }
     }
@@ -178,6 +197,8 @@ final class WhisperTranscriber: NSObject {
 
     @discardableResult
     private func startRecordingOnMain() -> Bool {
+        cancelScheduledContextRelease()
+
         guard granted else {
             requestMicrophonePermissionOnMain(promptIfNeeded: true)
             updateStatus("Permissions missing")
@@ -288,6 +309,7 @@ final class WhisperTranscriber: NSObject {
             CrashReporter.logInfo(
                 "Whisper recording started model=\(selectedModelID) coreml=\(useCoreML) autoMic=\(autoDetectMicrophone)"
             )
+            prewarmWhisperContextIfNeeded()
             return true
         } catch {
             inputNode.removeTap(onBus: 0)
@@ -337,6 +359,7 @@ final class WhisperTranscriber: NSObject {
 
     private func completeStopRecording(emitFinalText: Bool) {
         pendingStopWorkItem = nil
+        cancelScheduledContextRelease()
 
         guard let modelURL = modelManager.installedModelURL(for: selectedModelID) else {
             isRecording = false
@@ -372,6 +395,7 @@ final class WhisperTranscriber: NSObject {
             restoreMicSelection()
             updateStatus("Ready")
             CrashReporter.logInfo("Whisper finalize skipped: no audio samples captured")
+            scheduleContextReleaseAfterIdle()
             return
         }
 
@@ -383,6 +407,7 @@ final class WhisperTranscriber: NSObject {
             CrashReporter.logInfo(
                 "Whisper finalize skipped: speech gate rejected audio model=\(selectedModelID) reason=\(speechGate.reason) samples=\(samplesToTranscribe.count)"
             )
+            scheduleContextReleaseAfterIdle()
             return
         }
 
@@ -479,6 +504,8 @@ final class WhisperTranscriber: NSObject {
                         "Whisper finalize failed run=\(runID) model=\(selectedModelID) duration=\(elapsedText)s error=\(error.localizedDescription)"
                     )
                 }
+
+                self.scheduleContextReleaseAfterIdle()
             }
         }
     }
@@ -592,6 +619,65 @@ final class WhisperTranscriber: NSObject {
         let queue = transcriptionQueue
         queue.async { [weak self] in
             self?.invalidateCachedWhisperContext(freeContext: true)
+        }
+    }
+
+    private func prewarmWhisperContextIfNeeded() {
+        guard let modelURL = modelManager.installedModelURL(for: selectedModelID) else {
+            return
+        }
+
+        let shouldForceCPUForStability = selectedModelID.hasPrefix("small") || selectedModelID.hasPrefix("medium")
+        let hasCoreMLEncoder = modelManager.installedCoreMLDirectoryURL(for: selectedModelID) != nil
+        let shouldUseCoreML = useCoreML && hasCoreMLEncoder && !shouldForceCPUForStability
+        let queueGeneration = transcriptionQueueGeneration
+        let contextKey = WhisperContextCacheKey(
+            modelPath: modelURL.path,
+            useCoreML: shouldUseCoreML,
+            queueGeneration: queueGeneration
+        )
+
+        let queue = transcriptionQueue
+        queue.async { [weak self] in
+            guard let self else { return }
+            _ = self.resolvedWhisperContext(for: contextKey)
+        }
+    }
+
+    private func cancelScheduledContextRelease() {
+        pendingContextReleaseWorkItem?.cancel()
+        pendingContextReleaseWorkItem = nil
+    }
+
+    private func scheduleContextReleaseAfterIdle() {
+        guard autoUnloadIdleContext else {
+            cancelScheduledContextRelease()
+            return
+        }
+
+        cancelScheduledContextRelease()
+        let delay = max(5, contextIdleReleaseDelaySeconds)
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard !self.isRecording, !self.isTranscribing else { return }
+            self.releaseCachedWhisperContextAsync()
+            CrashReporter.logInfo("Whisper context released after idle window (\(Int(delay))s)")
+        }
+        pendingContextReleaseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func setContextRetentionSettings(autoUnloadIdleContext: Bool, idleContextUnloadDelaySeconds: TimeInterval) {
+        self.autoUnloadIdleContext = autoUnloadIdleContext
+        self.contextIdleReleaseDelaySeconds = max(5, idleContextUnloadDelaySeconds)
+
+        if !autoUnloadIdleContext {
+            cancelScheduledContextRelease()
+            return
+        }
+
+        if !isRecording, !isTranscribing, cachedWhisperContext != nil {
+            scheduleContextReleaseAfterIdle()
         }
     }
 
@@ -876,6 +962,8 @@ final class WhisperTranscriber: NSObject {
     func applyMicrophoneSettings(autoDetect: Bool, microphoneUID: String) {}
 
     func applyWhisperSettings(selectedModelID: String, useCoreML: Bool) {}
+
+    func applyContextRetentionSettings(autoUnloadIdleContext: Bool, idleContextUnloadDelaySeconds: TimeInterval) {}
 
     func applyBiasPhrases(_ phrases: [String]) {}
 
