@@ -303,7 +303,9 @@ final class PromptRewriteConversationStore: ObservableObject {
 
     private let maxStoredContexts = 24
     private let maxStoredTurnsPerContext = 120
-    private let maxRelevantExchangeTurnsForPrompt = 4
+    private let maxRelevantExchangeTurnsForPrompt = 5
+    private let minRecentExchangeTurnsForPrompt = 3
+    private let maxRecentExchangeTurnsForPrompt = 5
     private let autoCompactionExchangeThreshold = 40
     private let autoCompactionRetainedExchangeTurns = 8
     private let maxPromptContextCharacters = 1_800
@@ -1424,50 +1426,93 @@ final class PromptRewriteConversationStore: ObservableObject {
             return Array(turns.filter { !$0.isSummary }.suffix(1))
         }
 
-        let latestSummary = turns.reversed().first(where: \.isSummary)
-        let nonSummaryBudget = max(1, normalizedLimit - (latestSummary == nil ? 0 : 1))
         let nonSummaryTurns = turns.filter { !$0.isSummary }
+        guard !nonSummaryTurns.isEmpty else {
+            return Array(turns.suffix(normalizedLimit))
+        }
+
+        let normalizedUserText = collapsedWhitespace(userText).lowercased()
         let queryTokens = Set(
             MemoryTextNormalizer.keywords(
-                from: collapsedWhitespace(userText).lowercased(),
+                from: normalizedUserText,
                 limit: 16
             )
         )
+        let shortOrAmbiguousInput = normalizedUserText.count < 56 || queryTokens.count <= 4
 
-        let ranked = nonSummaryTurns.enumerated().map { index, turn -> (turn: PromptRewriteConversationTurn, score: Double) in
-            let recencyScore = Double(index + 1) / Double(max(1, nonSummaryTurns.count))
-            let turnTokens = Set(
-                MemoryTextNormalizer.keywords(
-                    from: "\(turn.userText) \(turn.assistantText)".lowercased(),
-                    limit: 24
+        let latestSummary = turns.reversed().first(where: \.isSummary)
+        let minimumRecentTurns = min(minRecentExchangeTurnsForPrompt, nonSummaryTurns.count)
+        let canIncludeSummary = latestSummary != nil && (normalizedLimit - 1) >= minimumRecentTurns
+        let summaryTurn = canIncludeSummary ? latestSummary : nil
+        let nonSummaryBudget = max(1, normalizedLimit - (summaryTurn == nil ? 0 : 1))
+
+        var selectedNonSummary: [PromptRewriteConversationTurn]
+        var protectedRecentTurns: [PromptRewriteConversationTurn]
+
+        if nonSummaryTurns.count <= nonSummaryBudget {
+            selectedNonSummary = nonSummaryTurns
+            protectedRecentTurns = Array(
+                nonSummaryTurns.suffix(
+                    min(maxRecentExchangeTurnsForPrompt, nonSummaryTurns.count)
                 )
             )
-            let overlapScore: Double
-            if queryTokens.isEmpty {
-                overlapScore = 0
-            } else {
-                let shared = queryTokens.intersection(turnTokens).count
-                overlapScore = Double(shared) / Double(max(1, queryTokens.count))
-            }
-            return (turn: turn, score: (overlapScore * 0.65) + (recencyScore * 0.35))
-        }
+        } else {
+            let cappedRecentWindow = min(
+                maxRecentExchangeTurnsForPrompt,
+                nonSummaryBudget,
+                nonSummaryTurns.count
+            )
+            let minimumRecentWindow = min(minRecentExchangeTurnsForPrompt, cappedRecentWindow)
+            let preferredRecentWindow = shortOrAmbiguousInput
+                ? cappedRecentWindow
+                : max(minimumRecentWindow, min(cappedRecentWindow, 4))
+            let indexedTurns = Array(nonSummaryTurns.enumerated())
+            let recentIndexed = Array(indexedTurns.suffix(preferredRecentWindow))
+            let recentIndices = Set(recentIndexed.map(\.offset))
+            let recentTurns = recentIndexed.map(\.element)
+            let additionalBudget = max(0, nonSummaryBudget - recentTurns.count)
 
-        let selectedNonSummary = ranked
-            .sorted {
-                if $0.score == $1.score {
-                    return $0.turn.timestamp < $1.turn.timestamp
+            let additionalTurns = indexedTurns
+                .filter { !recentIndices.contains($0.offset) }
+                .map { index, turn -> (turn: PromptRewriteConversationTurn, score: Double) in
+                    let recencyScore = Double(index + 1) / Double(max(1, nonSummaryTurns.count))
+                    let turnTokens = Set(
+                        MemoryTextNormalizer.keywords(
+                            from: "\(turn.userText) \(turn.assistantText)".lowercased(),
+                            limit: 24
+                        )
+                    )
+                    let overlapScore: Double
+                    if queryTokens.isEmpty {
+                        overlapScore = 0
+                    } else {
+                        let shared = queryTokens.intersection(turnTokens).count
+                        overlapScore = Double(shared) / Double(max(1, queryTokens.count))
+                    }
+                    // Keep continuity first, then fill older context using relevance and recency.
+                    return (turn: turn, score: (overlapScore * 0.6) + (recencyScore * 0.4))
                 }
-                return $0.score > $1.score
-            }
-            .prefix(nonSummaryBudget)
-            .map(\.turn)
-            .sorted { lhs, rhs in
+                .sorted {
+                    if $0.score == $1.score {
+                        return $0.turn.timestamp < $1.turn.timestamp
+                    }
+                    return $0.score > $1.score
+                }
+                .prefix(additionalBudget)
+                .map(\.turn)
+
+            selectedNonSummary = (recentTurns + additionalTurns).sorted { lhs, rhs in
                 lhs.timestamp < rhs.timestamp
             }
+            if selectedNonSummary.count > nonSummaryBudget {
+                selectedNonSummary = Array(selectedNonSummary.suffix(nonSummaryBudget))
+            }
+            protectedRecentTurns = recentTurns
+        }
 
         var output: [PromptRewriteConversationTurn] = []
-        if let latestSummary {
-            output.append(latestSummary)
+        if let summaryTurn {
+            output.append(summaryTurn)
         }
         output.append(contentsOf: selectedNonSummary)
 
@@ -1477,7 +1522,12 @@ final class PromptRewriteConversationStore: ObservableObject {
 
         while estimatedContextCharacters(output) > maxPromptContextCharacters,
               output.count > 1 {
-            if let index = output.firstIndex(where: { !$0.isSummary }) {
+            if let index = output.firstIndex(where: { candidate in
+                guard !candidate.isSummary else { return false }
+                return !protectedRecentTurns.contains(candidate)
+            }) {
+                output.remove(at: index)
+            } else if let index = output.firstIndex(where: { !$0.isSummary }) {
                 output.remove(at: index)
             } else {
                 break
@@ -2416,12 +2466,16 @@ enum PromptRewriteConversationContextResolver {
             ?? frontmostFocusedWindowTitle()
         let documentPath = windowElement.flatMap { axStringAttribute(kAXDocumentAttribute as CFString, from: $0) }
         let documentLabel = documentPath.flatMap(deriveDocumentLabel)
-        let codexContextLabel = codexContextLabel(
+        let appSpecificContextLabel = codexContextLabel(
+            app: app,
+            windowElement: windowElement,
+            fallbackWindowTitle: windowTitle
+        ) ?? antigravityContextLabel(
             app: app,
             windowElement: windowElement,
             fallbackWindowTitle: windowTitle
         )
-        let resolvedWindowTitle = codexContextLabel ?? windowTitle
+        let resolvedWindowTitle = appSpecificContextLabel ?? windowTitle
 
         return FocusMetadata(
             windowTitle: normalizedLabel(resolvedWindowTitle),
@@ -2434,6 +2488,12 @@ enum PromptRewriteConversationContextResolver {
         let text: String
         let role: String
         let selected: Bool
+    }
+
+    private struct AXLabelEntry {
+        let label: String
+        let role: String
+        let element: AXUIElement
     }
 
     private static func codexContextLabel(
@@ -2466,6 +2526,143 @@ enum PromptRewriteConversationContextResolver {
         return segments.joined(separator: " | ")
     }
 
+    private static func antigravityContextLabel(
+        app: NSRunningApplication?,
+        windowElement: AXUIElement?,
+        fallbackWindowTitle: String?
+    ) -> String? {
+        guard isAntigravityApp(app), let windowElement else { return nil }
+        let inferred = inferAntigravityProjectAndThread(
+            from: windowElement,
+            fallbackWindowTitle: fallbackWindowTitle
+        )
+        var segments: [String] = []
+        if let project = inferred.project,
+           !project.isEmpty {
+            segments.append("Project: \(project)")
+        }
+        if let thread = inferred.thread,
+           !thread.isEmpty {
+            segments.append("Thread: \(thread)")
+        }
+        guard !segments.isEmpty else { return nil }
+        CrashReporter.logInfo(
+            """
+            Antigravity context inferred \
+            project=\(inferred.project ?? "nil") \
+            thread=\(inferred.thread ?? "nil")
+            """
+        )
+        return segments.joined(separator: " | ")
+    }
+
+    private static func inferAntigravityProjectAndThread(
+        from windowElement: AXUIElement,
+        fallbackWindowTitle: String?
+    ) -> (project: String?, thread: String?) {
+        let textNodes = collectTextNodes(from: windowElement, limit: 1200)
+        let allTexts = textNodes.map(\.text)
+
+        var project = antigravityProjectFromWindowTitle(fallbackWindowTitle)
+        if project == nil {
+            project = allTexts.compactMap(antigravityProjectFromWindowTitle).first
+        }
+
+        let headingThread = textNodes.first {
+            $0.role.caseInsensitiveCompare("AXHeading") == .orderedSame &&
+                looksLikeAntigravityThreadTitle($0.text, project: project)
+        }?.text
+        let fallbackThread = textNodes.first {
+            ($0.role.caseInsensitiveCompare("AXStaticText") == .orderedSame ||
+                $0.role.caseInsensitiveCompare("AXHeading") == .orderedSame) &&
+                looksLikeAntigravityThreadTitle($0.text, project: project)
+        }?.text
+
+        return (project, headingThread ?? fallbackThread)
+    }
+
+    private static func antigravityProjectFromWindowTitle(_ value: String?) -> String? {
+        guard let normalizedValue = normalizedLabel(value) else { return nil }
+        let separators = [" — ", " – "]
+        for separator in separators where normalizedValue.contains(separator) {
+            let segments = normalizedValue
+                .components(separatedBy: separator)
+                .map {
+                    $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+                }
+                .filter { !$0.isEmpty }
+            guard segments.count >= 2 else { continue }
+            let candidate = segments[0]
+            guard !isAntigravityControlLabel(candidate) else { continue }
+            if let normalized = normalizedProjectName(candidate) {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private static func looksLikeAntigravityThreadTitle(_ value: String, project: String?) -> Bool {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !normalized.isEmpty else { return false }
+        guard normalized.count >= 4, normalized.count <= 110 else { return false }
+
+        let lowered = normalized.lowercased()
+        if let project, normalized.caseInsensitiveCompare(project) == .orderedSame {
+            return false
+        }
+        if isAntigravityControlLabel(normalized) {
+            return false
+        }
+        if lowered.hasPrefix("keyscribe (git)") {
+            return false
+        }
+        if lowered.hasPrefix("the editor is not accessible") || lowered.hasPrefix("warning:") {
+            return false
+        }
+        if lowered.range(of: #"^[a-z0-9._-]+\.(md|txt|swift|json|yaml|yml)$"#, options: .regularExpression) != nil {
+            return false
+        }
+        if lowered.range(of: #".+[—–-].+[—–-].+"#, options: .regularExpression) != nil {
+            return false
+        }
+        if lowered.contains("documents/personalprojects/") || lowered.contains("/") || lowered.contains("~") {
+            return false
+        }
+        return true
+    }
+
+    private static func isAntigravityControlLabel(_ value: String) -> Bool {
+        let lowered = value.lowercased()
+        let blockedExact: Set<String> = [
+            "antigravity",
+            "open agent manager",
+            "folders",
+            "agent",
+            "new thread",
+            "threads",
+            "skills",
+            "automations",
+            "switch to agent manager",
+            "code with agent",
+            "edit code inline",
+            "task.md",
+            "unknown project",
+            "unknown identity"
+        ]
+        if blockedExact.contains(lowered) {
+            return true
+        }
+        if lowered.hasPrefix("project:")
+            || lowered.hasPrefix("thread:")
+            || lowered.hasPrefix("worked for ")
+            || lowered.hasPrefix("toggle ")
+            || lowered.hasPrefix("start new thread") {
+            return true
+        }
+        return false
+    }
+
     private static func inferCodexProjectAndThread(
         from windowElement: AXUIElement,
         fallbackWindowTitle: String?
@@ -2476,11 +2673,19 @@ enum PromptRewriteConversationContextResolver {
             .filter { $0.selected }
             .map(\.text)
 
-        var project = allTexts.compactMap(projectName(fromCodexText:)).first
-        let threadFromSelected = selectedTexts.first {
-            looksLikeCodexThreadTitle($0, project: project)
+        let topBarSelection = inferCodexTopBarSelection(from: windowElement)
+        let sidebarSelection = inferCodexSidebarSelection(from: windowElement)
+        var project = topBarSelection?.project ?? sidebarSelection?.project
+        var thread = topBarSelection?.thread ?? sidebarSelection?.thread
+
+        if project == nil {
+            project = allTexts.compactMap(projectName(fromCodexText:)).first
         }
-        var thread = threadFromSelected
+        if thread == nil {
+            thread = selectedTexts.first {
+                looksLikeCodexThreadTitle($0, project: project)
+            }
+        }
 
         if let fallbackWindowTitle = normalizedLabel(fallbackWindowTitle),
            let fromWindow = codexThreadFromWindowTitle(
@@ -2494,6 +2699,245 @@ enum PromptRewriteConversationContextResolver {
         }
 
         return (project, thread)
+    }
+
+    private static func inferCodexTopBarSelection(
+        from windowElement: AXUIElement
+    ) -> (project: String?, thread: String?)? {
+        guard let controlsGroup = codexTopBarControlsGroup(from: windowElement) else {
+            return nil
+        }
+        let entries = codexDirectChildLabels(of: controlsGroup)
+        let project = codexProjectFromTopBarControls(entries)
+        let thread = codexThreadNearTopBarControls(controlsGroup, project: project)
+        if project == nil, thread == nil {
+            return nil
+        }
+        return (project, thread)
+    }
+
+    private static func codexTopBarControlsGroup(from windowElement: AXUIElement) -> AXUIElement? {
+        var queue: [AXUIElement] = [windowElement]
+        var cursor = 0
+
+        while cursor < queue.count, cursor < 2400 {
+            let element = queue[cursor]
+            cursor += 1
+
+            let role = axStringAttribute(kAXRoleAttribute as CFString, from: element) ?? ""
+            if role.caseInsensitiveCompare("AXGroup") == .orderedSame {
+                let entries = codexDirectChildLabels(of: element)
+                let hasThreadActions = entries.contains {
+                    $0.role.caseInsensitiveCompare("AXPopUpButton") == .orderedSame &&
+                        $0.label.caseInsensitiveCompare("Thread actions") == .orderedSame
+                }
+                let hasOpen = entries.contains {
+                    $0.role.caseInsensitiveCompare("AXButton") == .orderedSame &&
+                        $0.label.caseInsensitiveCompare("Open") == .orderedSame
+                }
+                let hasCommit = entries.contains {
+                    $0.role.caseInsensitiveCompare("AXButton") == .orderedSame &&
+                        $0.label.caseInsensitiveCompare("Commit") == .orderedSame
+                }
+                if hasThreadActions && hasOpen && hasCommit {
+                    return element
+                }
+            }
+
+            let children = axElementsAttribute(kAXChildrenAttribute as CFString, from: element)
+            if !children.isEmpty, queue.count < 2400 {
+                queue.append(contentsOf: children.prefix(max(0, 2400 - queue.count)))
+            }
+        }
+
+        return nil
+    }
+
+    private static func codexDirectChildLabels(of element: AXUIElement) -> [AXLabelEntry] {
+        let children = axElementsAttribute(kAXChildrenAttribute as CFString, from: element)
+        var entries: [AXLabelEntry] = []
+        entries.reserveCapacity(children.count * 2)
+
+        for child in children {
+            let role = axStringAttribute(kAXRoleAttribute as CFString, from: child) ?? ""
+            let labels = [
+                axStringAttribute(kAXTitleAttribute as CFString, from: child),
+                axStringValueAttribute(kAXValueAttribute as CFString, from: child),
+                axStringAttribute(kAXDescriptionAttribute as CFString, from: child)
+            ]
+                .compactMap(normalizedLabel)
+            var seen = Set<String>()
+            for label in labels {
+                let key = label.lowercased()
+                if seen.insert(key).inserted {
+                    entries.append(AXLabelEntry(label: label, role: role, element: child))
+                }
+            }
+        }
+
+        return entries
+    }
+
+    private static func codexProjectFromTopBarControls(_ entries: [AXLabelEntry]) -> String? {
+        if let threadActionsIndex = entries.firstIndex(where: {
+            $0.label.caseInsensitiveCompare("Thread actions") == .orderedSame
+        }), threadActionsIndex > 0 {
+            for index in stride(from: threadActionsIndex - 1, through: 0, by: -1) {
+                let entry = entries[index]
+                guard entry.role.caseInsensitiveCompare("AXButton") == .orderedSame else { continue }
+                if let candidate = codexNormalizedTopBarProjectCandidate(entry.label) {
+                    return candidate
+                }
+            }
+        }
+
+        for entry in entries where entry.role.caseInsensitiveCompare("AXButton") == .orderedSame {
+            if let candidate = codexNormalizedTopBarProjectCandidate(entry.label) {
+                return candidate
+            }
+        }
+
+        return nil
+    }
+
+    private static func codexNormalizedTopBarProjectCandidate(_ value: String) -> String? {
+        if isCodexToolbarControlLabel(value) {
+            return nil
+        }
+        return normalizedProjectName(value)
+    }
+
+    private static func codexThreadNearTopBarControls(
+        _ controlsGroup: AXUIElement,
+        project: String?
+    ) -> String? {
+        guard let parent = axElementAttribute(kAXParentAttribute as CFString, from: controlsGroup) else {
+            return nil
+        }
+        let siblings = axElementsAttribute(kAXChildrenAttribute as CFString, from: parent)
+        for sibling in siblings where !CFEqual(sibling, controlsGroup) {
+            let nodes = collectTextNodes(from: sibling, limit: 120)
+            for node in nodes {
+                if isCodexToolbarControlLabel(node.text) {
+                    continue
+                }
+                if looksLikeCodexThreadTitle(node.text, project: project) {
+                    return node.text
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func inferCodexSidebarSelection(
+        from windowElement: AXUIElement
+    ) -> (project: String?, thread: String?)? {
+        var queue: [AXUIElement] = [windowElement]
+        var cursor = 0
+        var bestProject: String?
+
+        while cursor < queue.count, cursor < 2200 {
+            let element = queue[cursor]
+            cursor += 1
+
+            if isCodexActiveSidebarRow(element) {
+                let inferredProject = codexProjectFromActiveSidebarRow(element)
+                let inferredThread = codexThreadFromActiveSidebarRow(element, project: inferredProject)
+                if let inferredProject {
+                    bestProject = bestProject ?? inferredProject
+                }
+                if let inferredThread {
+                    return (inferredProject ?? bestProject, inferredThread)
+                }
+            }
+
+            let children = axElementsAttribute(kAXChildrenAttribute as CFString, from: element)
+            if !children.isEmpty, queue.count < 2200 {
+                queue.append(contentsOf: children.prefix(max(0, 2200 - queue.count)))
+            }
+        }
+
+        if let bestProject {
+            return (bestProject, nil)
+        }
+        return nil
+    }
+
+    private static func isCodexActiveSidebarRow(_ element: AXUIElement) -> Bool {
+        let classList = axStringAttribute("AXDOMClassList" as CFString, from: element)?
+            .lowercased() ?? ""
+        guard classList.contains("active-selection-background") else {
+            return false
+        }
+        return classList.contains("cursor-interaction")
+    }
+
+    private static func codexThreadFromActiveSidebarRow(
+        _ activeRow: AXUIElement,
+        project: String?
+    ) -> String? {
+        let rowTexts = collectTextNodes(from: activeRow, limit: 180).map(\.text)
+        for text in rowTexts {
+            let lowered = text.lowercased()
+            if lowered == "archive thread"
+                || lowered == "pin thread"
+                || lowered == "unpin thread"
+                || lowered.hasPrefix("archive thread")
+                || lowered.hasPrefix("project actions for")
+                || lowered.hasPrefix("start new thread in")
+                || lowered.range(of: #"^\d+\s*[smhdw]$"#, options: .regularExpression) != nil {
+                continue
+            }
+            if looksLikeCodexThreadTitle(text, project: project) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    private static func codexProjectFromActiveSidebarRow(_ activeRow: AXUIElement) -> String? {
+        var node: AXUIElement? = activeRow
+        var depth = 0
+
+        while depth < 12, let current = node,
+              let parent = axElementAttribute(kAXParentAttribute as CFString, from: current) {
+            let parentDescription = normalizedLabel(
+                axStringAttribute(kAXDescriptionAttribute as CFString, from: parent)
+            )
+            if let parentDescription,
+               let fromAutomationsLabel = firstRegexCapture(
+                   pattern: #"(?i)\bautomations\s+in\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+                   in: parentDescription
+               ),
+               let normalized = normalizedProjectName(fromAutomationsLabel) {
+                return normalized
+            }
+
+            let classList = axStringAttribute("AXDOMClassList" as CFString, from: parent)?
+                .lowercased() ?? ""
+            if classList.contains("group/cwd") {
+                let candidateValues = [
+                    axStringAttribute(kAXDescriptionAttribute as CFString, from: parent),
+                    axStringAttribute(kAXTitleAttribute as CFString, from: parent),
+                    axStringValueAttribute(kAXValueAttribute as CFString, from: parent)
+                ]
+                    .compactMap(normalizedLabel)
+                for candidate in candidateValues {
+                    let lowered = candidate.lowercased()
+                    if lowered == "automation folders" || lowered == "threads" || lowered == "pinned threads" {
+                        continue
+                    }
+                    if let normalized = normalizedProjectName(candidate) {
+                        return normalized
+                    }
+                }
+            }
+
+            node = parent
+            depth += 1
+        }
+
+        return nil
     }
 
     private static func collectTextNodes(from root: AXUIElement, limit: Int) -> [AXTextNode] {
@@ -2603,6 +3047,15 @@ enum PromptRewriteConversationContextResolver {
         if let project, normalized.caseInsensitiveCompare(project) == .orderedSame {
             return false
         }
+        if lowered == "archive thread"
+            || lowered == "pin thread"
+            || lowered == "unpin thread"
+            || lowered.hasPrefix("archive thread")
+            || lowered.hasPrefix("project actions for")
+            || lowered.hasPrefix("start new thread in")
+            || lowered.range(of: #"^\d+\s*[smhdw]$"#, options: .regularExpression) != nil {
+            return false
+        }
         let blocked: Set<String> = [
             "new thread",
             "threads",
@@ -2617,6 +3070,40 @@ enum PromptRewriteConversationContextResolver {
             return false
         }
         return normalized.count >= 4
+    }
+
+    private static func isCodexToolbarControlLabel(_ value: String) -> Bool {
+        let lowered = value.lowercased()
+        let blocked: Set<String> = [
+            "codex",
+            "thread actions",
+            "set up a run action",
+            "open",
+            "commit",
+            "secondary action",
+            "toggle terminal",
+            "toggle diff panel",
+            "pop out",
+            "new thread",
+            "automations",
+            "skills",
+            "settings"
+        ]
+        if blocked.contains(lowered) {
+            return true
+        }
+        if lowered.hasPrefix("toggle ")
+            || lowered.hasPrefix("project actions for")
+            || lowered.hasPrefix("start new thread in") {
+            return true
+        }
+        if lowered.range(of: #"^[+\-]?\d+$"#, options: .regularExpression) != nil {
+            return true
+        }
+        if lowered.range(of: #"^\d+\s*[smhdw]$"#, options: .regularExpression) != nil {
+            return true
+        }
+        return false
     }
 
     private static func codexThreadFromWindowTitle(_ title: String, project: String?) -> String? {
@@ -2685,6 +3172,15 @@ enum PromptRewriteConversationContextResolver {
             return true
         }
         return appName == "codex" || appName.contains("codex")
+    }
+
+    private static func isAntigravityApp(_ app: NSRunningApplication?) -> Bool {
+        let bundleID = app?.bundleIdentifier?.lowercased() ?? ""
+        let appName = app?.localizedName?.lowercased() ?? ""
+        if bundleID == "com.google.antigravity" {
+            return true
+        }
+        return appName == "antigravity" || appName.contains("antigravity") || bundleID.contains("antigravity")
     }
 
     private static func frontmostFocusedWindowTitle() -> String? {

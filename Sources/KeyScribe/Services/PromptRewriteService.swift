@@ -847,6 +847,7 @@ private actor OpenAIPromptRewriteProvider {
             - Preserve structural formatting from the original prompt when present (questions, bullet points, numbered lists, markdown sections).
             - Do not collapse list/question formatting into a single paragraph.
             - Keep the conversation flow continuous; avoid introducing disruptive meta prompts, sudden action lists, or unrelated dialogue pivots.
+            - Use the most recent 3-5 same-context turns to resolve references and entity continuity (for example, "Obsidian" and "Obsidian vault"), but avoid dragging in unrelated older context.
             - When same-context history is provided, continue naturally without restarting the dialogue, but do not answer prior questions.
             \(styleGuidance)
             """
@@ -897,6 +898,7 @@ private actor OpenAIPromptRewriteProvider {
             - Do not collapse list/question formatting into a single paragraph.
             - Set memory_context to an empty string when memory is not used.
             - Keep the conversation flow continuous; avoid introducing disruptive meta prompts, sudden action lists, or unrelated dialogue pivots.
+            - Use the most recent 3-5 same-context turns to resolve references and entity continuity (for example, "Obsidian" and "Obsidian vault"), but avoid dragging in unrelated older context.
             - When same-context history is provided, continue naturally without restarting the dialogue, but do not answer prior questions.
             \(styleGuidance)
             """
@@ -1862,8 +1864,11 @@ private actor OpenAIPromptRewriteProvider {
             return nil
         }
 
-        let shouldRewrite = (object["should_rewrite"] as? Bool)
-            ?? (object["shouldRewrite"] as? Bool)
+        let parsedShouldRewrite = parseBooleanValue(object["should_rewrite"])
+            ?? parseBooleanValue(object["shouldRewrite"])
+            ?? parseBooleanValue(object["rewrite"])
+            ?? parseBooleanValue(object["needs_rewrite"])
+            ?? parseBooleanValue(object["shouldRewritePrompt"])
             ?? false
         let suggested = (object["suggested_text"] as? String)
             ?? (object["suggestedText"] as? String)
@@ -1883,10 +1888,18 @@ private actor OpenAIPromptRewriteProvider {
 
         let normalizedMemoryContext = memoryContext?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        var resolvedShouldRewrite = parsedShouldRewrite
+        if !resolvedShouldRewrite, providerMode == .ollama,
+           normalizedSuggested.caseInsensitiveCompare(originalPrompt) != .orderedSame {
+            // Local models frequently return inconsistent boolean flags.
+            // If suggestion text differs, prefer the rewritten content.
+            resolvedShouldRewrite = true
+        }
+
         return ResponsePayload(
             suggestedText: normalizedSuggested,
             memoryContext: normalizedMemoryContext?.isEmpty == false ? normalizedMemoryContext : nil,
-            shouldRewrite: shouldRewrite
+            shouldRewrite: resolvedShouldRewrite
         )
     }
 
@@ -2078,6 +2091,20 @@ private actor OpenAIPromptRewriteProvider {
             if normalized.hasPrefix("false") { return false }
             return nil
         }
+    }
+
+    private func parseBooleanValue(_ raw: Any?) -> Bool? {
+        guard let raw else { return nil }
+        if let bool = raw as? Bool {
+            return bool
+        }
+        if let number = raw as? NSNumber {
+            return number.intValue != 0
+        }
+        if let string = raw as? String {
+            return parseLooseBoolean(string)
+        }
+        return nil
     }
 
     private func inferredSuggestedSection(from value: String) -> String? {

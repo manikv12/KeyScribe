@@ -229,6 +229,16 @@ final class ConversationTagInferenceService {
             people = extractMentionHandles(from: supplementalText)
         }
 
+        if let explicitThreadLabel = firstMatch(
+            pattern: #"(?i)\bthread\s*[:\-]\s*([a-z0-9][a-z0-9 .,_'’()\-]{2,120})\b"#,
+            in: primaryText
+        ) {
+            let normalizedThread = collapseWhitespace(explicitThreadLabel)
+            let key = "thread:\(slug(normalizedThread))"
+            let resolvedNativeThreadKey = nativeThreadKey.isEmpty ? key : nativeThreadKey
+            return (key, .channel, normalizedThread, people, resolvedNativeThreadKey)
+        }
+
         if isTeamsApp(bundleID: bundleID, appName: appName),
            let teamsIdentity = inferTeamsIdentity(from: primaryText) {
             let keyPrefix = teamsIdentity.type == .person ? "person" : "channel"

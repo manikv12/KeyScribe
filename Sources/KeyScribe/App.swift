@@ -6,6 +6,7 @@ import SwiftUI
 
 extension Notification.Name {
     static let keyScribeOpenAIMemoryStudio = Notification.Name("KeyScribe.openAIMemoryStudio")
+    static let keyScribeOpenSettings = Notification.Name("KeyScribe.openSettings")
 }
 
 @main
@@ -48,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var accessibilityTrustObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
     private var aiStudioRequestObserver: NSObjectProtocol?
+    private var settingsRequestObserver: NSObjectProtocol?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var permissionsReady = false
     private var didRequestStartupPermissionPrompt = false
@@ -314,6 +316,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        settingsRequestObserver = NotificationCenter.default.addObserver(
+            forName: .keyScribeOpenSettings,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.windowCoordinator?.openSettingsWindow()
+            }
+        }
+
         updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
 
         Task { @MainActor in
@@ -333,6 +345,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let aiStudioRequestObserver {
             NotificationCenter.default.removeObserver(aiStudioRequestObserver)
             self.aiStudioRequestObserver = nil
+        }
+        if let settingsRequestObserver {
+            NotificationCenter.default.removeObserver(settingsRequestObserver)
+            self.settingsRequestObserver = nil
         }
         adaptiveCorrectionObserver?.cancel()
         adaptiveCorrectionObserver = nil
@@ -791,8 +807,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolution.insertionText)
         if settings.promptRewriteEnabled,
-           settings.promptRewriteConversationHistoryEnabled,
-           let conversationContext = rewriteResolution.conversationContext {
+           let conversationContext = rewriteResolution.conversationContext,
+           settings.isPromptRewriteConversationHistoryEnabled(forContextID: conversationContext.id) {
             promptRewriteConversationStore.recordTurn(
                 originalText: cleaned,
                 finalText: readyForInsert,
@@ -1056,6 +1072,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !pinnedID.isEmpty, !requestContext.usesPinnedContext {
             settings.promptRewriteConversationPinnedContextID = ""
+        }
+
+        if !settings.isPromptRewriteConversationHistoryEnabled(forContextID: requestContext.context.id) {
+            return PromptRewriteConversationStore.RequestContext(
+                context: requestContext.context,
+                history: [],
+                usesPinnedContext: requestContext.usesPinnedContext
+            )
         }
 
         return requestContext
@@ -2906,6 +2930,17 @@ struct SettingsView: View {
                         "Enable conversation-aware rewrite history (app + screen)",
                         isOn: $settings.promptRewriteConversationHistoryEnabled
                     )
+                    Toggle(
+                        "Share coding conversation history across apps when project matches",
+                        isOn: $settings.promptRewriteCrossIDEConversationSharingEnabled
+                    )
+                    .disabled(!settings.promptRewriteConversationHistoryEnabled)
+
+                    Text(
+                        "When enabled, coding apps (Codex, Antigravity, VS Code, Cursor, Xcode, JetBrains) can reuse the same history bucket for the same project."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
 
                     if settings.promptRewriteConversationHistoryEnabled {
                         VStack(alignment: .leading, spacing: 8) {
@@ -2955,6 +2990,17 @@ struct SettingsView: View {
                                 .pickerStyle(.menu)
                                 .labelsHidden()
                                 .frame(width: 360)
+                            }
+
+                            if let pinnedHistoryToggle = promptRewritePinnedConversationHistoryToggle {
+                                Toggle(
+                                    "Use pinned context history for AI tips",
+                                    isOn: pinnedHistoryToggle
+                                )
+                                .toggleStyle(.switch)
+                                Text("Turn this off to keep AI tips enabled but ignore conversation history for the selected pinned context.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                             }
 
                             Text("Use AI Memory Studio to manage rewrite conversation buckets (start new / clear history).")
@@ -4162,6 +4208,23 @@ struct SettingsView: View {
                 } else {
                     settings.promptRewriteConversationPinnedContextID = selected
                 }
+            }
+        )
+    }
+
+    private var promptRewritePinnedConversationHistoryToggle: Binding<Bool>? {
+        let pinned = settings.promptRewriteConversationPinnedContextID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) else {
+            return nil
+        }
+
+        return Binding(
+            get: {
+                settings.isPromptRewriteConversationHistoryEnabled(forContextID: pinned)
+            },
+            set: { isEnabled in
+                settings.setPromptRewriteConversationHistoryEnabled(isEnabled, forContextID: pinned)
             }
         )
     }

@@ -7,6 +7,7 @@ enum FeatureFlags {
     private static let strictProjectIsolationEnvironmentKey = "KEYSCRIBE_FEATURE_STRICT_PROJECT_ISOLATION"
     private static let conversationTupleSQLiteEnvironmentKey = "KEYSCRIBE_FEATURE_CONVERSATION_TUPLE_SQLITE"
     private static let crossIDEConversationSharingEnvironmentKey = "KEYSCRIBE_FEATURE_CROSS_IDE_CONVERSATION_SHARING"
+    private static let crossIDEConversationSharingDefaultsKey = "KeyScribe.promptRewriteCrossIDEConversationSharingEnabled"
 
     static var aiMemoryEnabled: Bool {
         guard let raw = ProcessInfo.processInfo.environment[aiMemoryEnvironmentKey]?
@@ -47,18 +48,28 @@ enum FeatureFlags {
     }
 
     static var crossIDEConversationSharingEnabled: Bool {
-        boolFlag(
-            environmentKey: crossIDEConversationSharingEnvironmentKey,
-            defaultValue: false
-        )
+        if let environmentOverride = boolValueFromEnvironment(crossIDEConversationSharingEnvironmentKey) {
+            return environmentOverride
+        }
+        if UserDefaults.standard.object(forKey: crossIDEConversationSharingDefaultsKey) != nil {
+            return UserDefaults.standard.bool(forKey: crossIDEConversationSharingDefaultsKey)
+        }
+        return false
     }
 
     private static func boolFlag(environmentKey: String, defaultValue: Bool) -> Bool {
+        guard let parsed = boolValueFromEnvironment(environmentKey) else {
+            return defaultValue
+        }
+        return parsed
+    }
+
+    private static func boolValueFromEnvironment(_ environmentKey: String) -> Bool? {
         guard let raw = ProcessInfo.processInfo.environment[environmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased(),
               !raw.isEmpty else {
-            return defaultValue
+            return nil
         }
         if ["1", "true", "yes", "on"].contains(raw) {
             return true
@@ -66,6 +77,6 @@ enum FeatureFlags {
         if ["0", "false", "no", "off"].contains(raw) {
             return false
         }
-        return defaultValue
+        return nil
     }
 }

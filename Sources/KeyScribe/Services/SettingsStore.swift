@@ -452,6 +452,8 @@ final class SettingsStore: ObservableObject {
         static let promptRewriteConversationTimeoutMinutes = "KeyScribe.promptRewriteConversationTimeoutMinutes"
         static let promptRewriteConversationTurnLimit = "KeyScribe.promptRewriteConversationTurnLimit"
         static let promptRewriteConversationPinnedContextID = "KeyScribe.promptRewriteConversationPinnedContextID"
+        static let promptRewriteConversationHistoryDisabledContextIDs = "KeyScribe.promptRewriteConversationHistoryDisabledContextIDs"
+        static let promptRewriteCrossIDEConversationSharingEnabled = "KeyScribe.promptRewriteCrossIDEConversationSharingEnabled"
         static let localAISetupCompleted = "KeyScribe.localAISetupCompleted"
         static let localAISelectedModelID = "KeyScribe.localAISelectedModelID"
         static let localAIManagedRuntimeEnabled = "KeyScribe.localAIManagedRuntimeEnabled"
@@ -861,6 +863,23 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var promptRewriteConversationHistoryDisabledContextIDs: [String] {
+        didSet {
+            let normalized = Self.normalizedStringList(promptRewriteConversationHistoryDisabledContextIDs)
+            guard normalized == promptRewriteConversationHistoryDisabledContextIDs else {
+                promptRewriteConversationHistoryDisabledContextIDs = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var promptRewriteCrossIDEConversationSharingEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
     @Published var promptRewriteOpenAIAPIKey: String {
         didSet {
             Self.storePromptRewriteProviderAPIKey(
@@ -1234,6 +1253,16 @@ final class SettingsStore: ObservableObject {
             .string(forKey: Keys.promptRewriteConversationPinnedContextID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
+        promptRewriteConversationHistoryDisabledContextIDs = Self.normalizedStringList(
+            defaults.stringArray(forKey: Keys.promptRewriteConversationHistoryDisabledContextIDs) ?? []
+        )
+
+        if defaults.object(forKey: Keys.promptRewriteCrossIDEConversationSharingEnabled) == nil {
+            promptRewriteCrossIDEConversationSharingEnabled = false
+        } else {
+            promptRewriteCrossIDEConversationSharingEnabled = defaults.bool(forKey: Keys.promptRewriteCrossIDEConversationSharingEnabled)
+        }
+
         promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: selectedPromptProvider)
 
         if defaults.object(forKey: Keys.localAISetupCompleted) == nil {
@@ -1370,6 +1399,14 @@ final class SettingsStore: ObservableObject {
         defaults.set(
             promptRewriteConversationPinnedContextID.trimmingCharacters(in: .whitespacesAndNewlines),
             forKey: Keys.promptRewriteConversationPinnedContextID
+        )
+        defaults.set(
+            Self.normalizedStringList(promptRewriteConversationHistoryDisabledContextIDs),
+            forKey: Keys.promptRewriteConversationHistoryDisabledContextIDs
+        )
+        defaults.set(
+            promptRewriteCrossIDEConversationSharingEnabled,
+            forKey: Keys.promptRewriteCrossIDEConversationSharingEnabled
         )
         defaults.set(localAISetupCompleted, forKey: Keys.localAISetupCompleted)
         defaults.set(localAISelectedModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.localAISelectedModelID)
@@ -1517,6 +1554,26 @@ final class SettingsStore: ObservableObject {
         localAISetupCompleted = true
         localAIManagedRuntimeEnabled = true
         localAILastHealthCheckEpoch = Date().timeIntervalSince1970
+    }
+
+    func isPromptRewriteConversationHistoryEnabled(forContextID contextID: String) -> Bool {
+        guard promptRewriteConversationHistoryEnabled else { return false }
+        let normalizedID = Self.normalizedIdentifier(contextID)
+        guard !normalizedID.isEmpty else { return true }
+        return !promptRewriteConversationHistoryDisabledContextIDs.contains(normalizedID)
+    }
+
+    func setPromptRewriteConversationHistoryEnabled(_ isEnabled: Bool, forContextID contextID: String) {
+        let normalizedID = Self.normalizedIdentifier(contextID)
+        guard !normalizedID.isEmpty else { return }
+
+        var updated = Set(promptRewriteConversationHistoryDisabledContextIDs)
+        if isEnabled {
+            updated.remove(normalizedID)
+        } else {
+            updated.insert(normalizedID)
+        }
+        promptRewriteConversationHistoryDisabledContextIDs = Self.normalizedStringList(Array(updated))
     }
 
     func isMemoryProviderEnabled(_ providerID: String) -> Bool {

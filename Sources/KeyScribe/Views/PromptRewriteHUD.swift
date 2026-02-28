@@ -106,6 +106,8 @@ final class PromptRewriteHUDManager {
         let key: PromptRewriteHUDSessionKey
         var insertionContext: PromptRewriteInsertionHUDContext
         let window: NSPanel
+        var manualOffset: CGSize = .zero
+        var dragBaseManualOffset: CGSize?
 
         init(key: PromptRewriteHUDSessionKey, insertionContext: PromptRewriteInsertionHUDContext) {
             self.key = key
@@ -166,7 +168,7 @@ final class PromptRewriteHUDManager {
             hosting.view.frame = NSRect(origin: .zero, size: PromptRewriteHUDLayout.loadingSize)
         }
 
-        let frame = loadingFrame(for: session.insertionContext)
+        let frame = loadingFrame(for: session.insertionContext, manualOffset: session.manualOffset)
         session.window.alphaValue = 1
         session.window.setFrame(frame, display: true)
         session.window.orderFrontRegardless()
@@ -532,8 +534,39 @@ final class PromptRewriteHUDManager {
         PromptRewriteLoadingView(
             onPause: { [weak self] in
                 self?.requestLoadingBypass(for: key)
+            },
+            onDragChanged: { [weak self] translation in
+                self?.updateLoadingDrag(translation, for: key, ended: false)
+            },
+            onDragEnded: { [weak self] translation in
+                self?.updateLoadingDrag(translation, for: key, ended: true)
             }
         )
+    }
+
+    private func updateLoadingDrag(
+        _ translation: CGSize,
+        for key: PromptRewriteHUDSessionKey,
+        ended: Bool
+    ) {
+        guard let session = loadingSessions[key], session.window.isVisible else { return }
+
+        if session.dragBaseManualOffset == nil {
+            session.dragBaseManualOffset = session.manualOffset
+        }
+        let baseOffset = session.dragBaseManualOffset ?? .zero
+        let windowDelta = CGSize(width: translation.width, height: -translation.height)
+        session.manualOffset = CGSize(
+            width: baseOffset.width + windowDelta.width,
+            height: baseOffset.height + windowDelta.height
+        )
+
+        let frame = loadingFrame(for: session.insertionContext, manualOffset: session.manualOffset)
+        session.window.setFrame(frame, display: true)
+
+        if ended {
+            session.dragBaseManualOffset = nil
+        }
     }
 
     private func requestLoadingBypass(for key: PromptRewriteHUDSessionKey) {
@@ -548,7 +581,7 @@ final class PromptRewriteHUDManager {
         loading.window.alphaValue = 1
     }
 
-    private func loadingFrame(for context: PromptRewriteInsertionHUDContext) -> NSRect {
+    private func loadingFrame(for context: PromptRewriteInsertionHUDContext, manualOffset: CGSize = .zero) -> NSRect {
         let size = PromptRewriteHUDLayout.loadingSize
         let anchorRect = context.anchorRect
         let anchorPoint = NSPoint(x: anchorRect.midX, y: anchorRect.midY)
@@ -564,8 +597,13 @@ final class PromptRewriteHUDManager {
         let maxX = visibleFrame.maxX - size.width - PromptRewriteHUDLayout.screenMargin
         let minY = visibleFrame.minY + PromptRewriteHUDLayout.screenMargin
         let maxY = visibleFrame.maxY - size.height - PromptRewriteHUDLayout.screenMargin
-        let clampedX = min(max(proposedX, minX), maxX)
-        let clampedY = min(max(proposedY, minY), maxY)
+        let baseX = min(max(proposedX, minX), maxX)
+        let baseY = min(max(proposedY, minY), maxY)
+        
+        let translatedX = baseX + manualOffset.width
+        let translatedY = baseY + manualOffset.height
+        let clampedX = min(max(translatedX, minX), maxX)
+        let clampedY = min(max(translatedY, minY), maxY)
         return NSRect(x: clampedX, y: clampedY, width: size.width, height: size.height)
     }
 
@@ -1009,6 +1047,8 @@ private struct PromptRewriteDiscussionPage: Identifiable, Equatable {
 
 private struct PromptRewriteLoadingView: View {
     let onPause: () -> Void
+    var onDragChanged: ((CGSize) -> Void)? = nil
+    var onDragEnded: ((CGSize) -> Void)? = nil
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
@@ -1038,6 +1078,16 @@ private struct PromptRewriteLoadingView: View {
         .padding(.vertical, 7)
         .background {
             PromptRewriteGlassSurface(cornerRadius: 14)
+                .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .gesture(
+                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { value in
+                            onDragChanged?(value.translation)
+                        }
+                        .onEnded { value in
+                            onDragEnded?(value.translation)
+                        }
+                )
         }
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
@@ -1201,17 +1251,7 @@ private struct PromptRewriteHUDView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             PromptRewriteGlassSurface(cornerRadius: PromptRewriteHUDLayout.cornerRadius)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: PromptRewriteHUDLayout.cornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: PromptRewriteHUDLayout.cornerRadius, style: .continuous)
-                .stroke(.clear, lineWidth: 0)
-        )
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(Color.clear)
-                .frame(height: 30)
-                .contentShape(Rectangle())
+                .contentShape(RoundedRectangle(cornerRadius: PromptRewriteHUDLayout.cornerRadius, style: .continuous))
                 .gesture(
                     DragGesture(minimumDistance: 1, coordinateSpace: .global)
                         .onChanged { value in
@@ -1222,6 +1262,11 @@ private struct PromptRewriteHUDView: View {
                         }
                 )
         }
+        .clipShape(RoundedRectangle(cornerRadius: PromptRewriteHUDLayout.cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: PromptRewriteHUDLayout.cornerRadius, style: .continuous)
+                .stroke(.clear, lineWidth: 0)
+        )
         .overlay(alignment: bubbleEdge == .bottom ? .bottom : .top) {
             bubbleTail
                 .offset(x: bubbleOffsetX, y: bubbleEdge == .bottom ? 6 : -6)

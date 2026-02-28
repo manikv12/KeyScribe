@@ -28,11 +28,19 @@ enum LocalAIModelCatalog {
             isRecommended: false
         ),
         LocalAIModelOption(
+            id: "gemma3:4b",
+            displayName: "Gemma 3 4B",
+            sizeLabel: "~8.6 GB",
+            performanceLabel: "Balanced",
+            summary: "Newer Gemma generation with stronger quality while still fitting consumer laptops.",
+            isRecommended: false
+        ),
+        LocalAIModelOption(
             id: "gemma2:2b",
             displayName: "Gemma 2 2B",
             sizeLabel: "~1.6 GB",
             performanceLabel: "Very Fast",
-            summary: "Smallest download option. Faster startup with modest quality tradeoffs.",
+            summary: "Smallest legacy download option. Faster startup with modest quality tradeoffs.",
             isRecommended: false
         )
     ]
@@ -43,5 +51,22 @@ enum LocalAIModelCatalog {
 
     static func model(withID modelID: String) -> LocalAIModelOption? {
         curatedModels.first { $0.id.caseInsensitiveCompare(modelID) == .orderedSame }
+    }
+
+    static func mergedWithWebsiteModels(_ websiteModels: [LocalAIModelOption]) -> [LocalAIModelOption] {
+        var merged = curatedModels
+        var seenIDs = Set(merged.map { $0.id.lowercased() })
+
+        for model in websiteModels {
+            let normalizedID = model.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalizedID.isEmpty else { continue }
+            guard seenIDs.insert(normalizedID).inserted else { continue }
+            merged.append(model)
+        }
+        return merged
+    }
+
+    static func model(withID modelID: String, in options: [LocalAIModelOption]) -> LocalAIModelOption? {
+        options.first { $0.id.caseInsensitiveCompare(modelID) == .orderedSame }
     }
 }

@@ -56,6 +56,9 @@ final class LocalAISetupService: ObservableObject {
     @Published private(set) var runtimeDetection: LocalAIRuntimeDetection
     @Published private(set) var installedModelIDs: [String]
     @Published private(set) var lastFailureMessage: String?
+    @Published private(set) var modelOptions: [LocalAIModelOption]
+    @Published private(set) var isRefreshingWebsiteCatalog = false
+    @Published private(set) var websiteCatalogStatusMessage: String?
     @Published var selectedModelID: String {
         didSet {
             let normalized = selectedModelID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -65,24 +68,29 @@ final class LocalAISetupService: ObservableObject {
     }
 
     private let runtimeManager: LocalAIRuntimeManaging
+    private let websiteCatalog: LocalAIWebsiteModelCatalogFetching
     private let settings: SettingsStore
     private var setupTask: Task<Void, Never>?
 
     init(
         runtimeManager: LocalAIRuntimeManaging = LocalAIRuntimeManager.shared,
+        websiteCatalog: LocalAIWebsiteModelCatalogFetching = LocalAIWebsiteModelCatalogService(),
         settings: SettingsStore? = nil
     ) {
         self.runtimeManager = runtimeManager
+        self.websiteCatalog = websiteCatalog
         self.settings = settings ?? SettingsStore.shared
 
         let storedModel = self.settings.localAISelectedModelID
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let initialModel = storedModel.isEmpty ? LocalAIModelCatalog.recommendedModel.id : storedModel
 
+        self.modelOptions = LocalAIModelCatalog.curatedModels
         self.selectedModelID = initialModel
         self.runtimeDetection = .unavailable
         self.installedModelIDs = []
         self.lastFailureMessage = nil
+        self.websiteCatalogStatusMessage = nil
         if initialModel.isEmpty {
             self.setupState = .waitingForModelSelection
             self.statusMessage = "Select a model to start local AI setup."
@@ -90,6 +98,7 @@ final class LocalAISetupService: ObservableObject {
             self.setupState = .idle
             self.statusMessage = "Choose Install to set up local AI."
         }
+        ensureModelOptionExists(initialModel)
     }
 
     deinit {
@@ -112,6 +121,64 @@ final class LocalAISetupService: ObservableObject {
         }
     }
 
+    func refreshModelCatalogFromWebsite() {
+        guard !isRefreshingWebsiteCatalog else { return }
+        isRefreshingWebsiteCatalog = true
+        websiteCatalogStatusMessage = "Fetching latest small models from ollama.com (catalog + family tags)..."
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let websiteModels = try await websiteCatalog.fetchSmallModelOptions(limit: 12)
+                await MainActor.run {
+                    self.modelOptions = LocalAIModelCatalog.mergedWithWebsiteModels(websiteModels)
+                    self.isRefreshingWebsiteCatalog = false
+
+                    let curatedCount = LocalAIModelCatalog.curatedModels.count
+                    let addedCount = max(0, self.modelOptions.count - curatedCount)
+                    if websiteModels.isEmpty {
+                        self.websiteCatalogStatusMessage = "No small website models matched the filter. Showing curated catalog."
+                    } else if addedCount > 0 {
+                        self.websiteCatalogStatusMessage = "Fetched latest website catalog. Added \(addedCount) new small-model options."
+                    } else {
+                        self.websiteCatalogStatusMessage = "Fetched latest website catalog. No additional small models beyond curated options."
+                    }
+                }
+            } catch {
+                let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                await MainActor.run {
+                    self.isRefreshingWebsiteCatalog = false
+                    if detail.isEmpty {
+                        self.websiteCatalogStatusMessage = "Could not fetch website catalog. Showing curated catalog."
+                    } else {
+                        self.websiteCatalogStatusMessage = "Could not fetch website catalog: \(detail)"
+                    }
+                }
+            }
+        }
+    }
+
+    func modelOption(for modelID: String) -> LocalAIModelOption? {
+        LocalAIModelCatalog.model(withID: modelID, in: modelOptions)
+    }
+
+    private func ensureModelOptionExists(_ modelID: String) {
+        let normalizedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedModelID.isEmpty else { return }
+        guard modelOption(for: normalizedModelID) == nil else { return }
+
+        modelOptions.append(
+            LocalAIModelOption(
+                id: normalizedModelID,
+                displayName: normalizedModelID,
+                sizeLabel: "Unknown",
+                performanceLabel: "Unknown",
+                summary: "Existing model from your local configuration.",
+                isRecommended: false
+            )
+        )
+    }
+
     func ensureRuntimeReadyForCurrentConfiguration() {
         guard !setupState.isBusy else { return }
         guard settings.promptRewriteProviderMode == .ollama else { return }
@@ -120,6 +187,7 @@ final class LocalAISetupService: ObservableObject {
         let rememberedModel = settings.localAISelectedModelID.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedModel = providerModel.isEmpty ? rememberedModel : providerModel
         if !resolvedModel.isEmpty {
+            ensureModelOptionExists(resolvedModel)
             selectedModelID = resolvedModel
             settings.localAISelectedModelID = resolvedModel
         }
@@ -160,7 +228,7 @@ final class LocalAISetupService: ObservableObject {
             return
         }
 
-        if LocalAIModelCatalog.model(withID: normalizedModelID) == nil {
+        if modelOption(for: normalizedModelID) == nil {
             setupState = .failed(message: "Selected model is not available in the local AI catalog.")
             statusMessage = "Choose one of the listed beginner-friendly models."
             return

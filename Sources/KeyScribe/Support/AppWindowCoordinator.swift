@@ -84,6 +84,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         centerWindowOnActiveScreen(window)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
+        aiStudioWindowController?.close()
         onStatusUpdate(.ready)
     }
 
@@ -188,6 +189,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         centerWindowOnActiveScreen(window)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
+        settingsWindowController?.close()
         onStatusUpdate(.ready)
     }
 

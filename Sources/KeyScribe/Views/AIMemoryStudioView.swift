@@ -74,7 +74,6 @@ struct AIMemoryStudioView: View {
 
     private enum StudioPage: String, CaseIterable, Identifiable {
         case dashboard
-        case connection
         case models
         case conversationMemory
         case memorySources
@@ -88,10 +87,8 @@ struct AIMemoryStudioView: View {
             switch self {
             case .dashboard:
                 return "Overview"
-            case .connection:
-                return "Connect Provider"
             case .models:
-                return "Prompt Models"
+                return "Provider & Models"
             case .conversationMemory:
                 return "Conversation Memory"
             case .memorySources:
@@ -109,10 +106,8 @@ struct AIMemoryStudioView: View {
             switch self {
             case .dashboard:
                 return "Big-picture status and quick actions."
-            case .connection:
-                return "Connect each provider securely via OAuth or API key."
             case .models:
-                return "Choose the model and endpoint for prompt rewrite."
+                return "Connect provider securely and choose the prompt model."
             case .conversationMemory:
                 return "Per-screen context history, size, and compaction."
             case .memorySources:
@@ -130,8 +125,6 @@ struct AIMemoryStudioView: View {
             switch self {
             case .dashboard:
                 return "square.grid.2x2"
-            case .connection:
-                return "bolt.badge.a"
             case .models:
                 return "cpu.fill"
             case .conversationMemory:
@@ -151,8 +144,6 @@ struct AIMemoryStudioView: View {
             switch self {
             case .dashboard:
                 return Color(red: 0.23, green: 0.72, blue: 0.58)
-            case .connection:
-                return Color(red: 0.94, green: 0.58, blue: 0.24)
             case .models:
                 return Color(red: 0.30, green: 0.65, blue: 0.93)
             case .conversationMemory:
@@ -196,7 +187,7 @@ struct AIMemoryStudioView: View {
 
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let studioSidebarWidth: CGFloat = 244
-    private let aiCorePages: [StudioPage] = [.dashboard, .connection, .models, .conversationMemory]
+    private let aiCorePages: [StudioPage] = [.dashboard, .models, .conversationMemory]
 
     var body: some View {
         ZStack {
@@ -304,6 +295,23 @@ struct AIMemoryStudioView: View {
 
     private var studioSidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Button {
+                NotificationCenter.default.post(name: .keyScribeOpenSettings, object: nil)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.left")
+                        .font(.caption2.weight(.bold))
+                    Text("Settings")
+                        .font(.caption.weight(.medium))
+                }
+                .foregroundStyle(AppVisualTheme.mutedText)
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.bottom, 4)
+
             HStack(spacing: 10) {
                 AppIconBadge(
                     symbol: selectedStudioPage.iconName,
@@ -448,8 +456,6 @@ struct AIMemoryStudioView: View {
         switch selectedStudioPage {
         case .dashboard:
             studioOverviewPage
-        case .connection:
-            studioConnectionPage
         case .models:
             studioModelPage
         case .conversationMemory:
@@ -595,14 +601,9 @@ struct AIMemoryStudioView: View {
         }
     }
 
-    private var studioConnectionPage: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            providerConnectionCard
-        }
-    }
-
     private var studioModelPage: some View {
         VStack(alignment: .leading, spacing: 14) {
+            providerConnectionCard
             if settings.promptRewriteProviderMode == .ollama {
                 localAISetupCard
             }
@@ -780,6 +781,18 @@ struct AIMemoryStudioView: View {
                 )
                 .disabled(!settings.promptRewriteEnabled)
 
+                Toggle(
+                    "Share coding conversation history across apps when project matches",
+                    isOn: $settings.promptRewriteCrossIDEConversationSharingEnabled
+                )
+                .disabled(!settings.promptRewriteConversationHistoryEnabled || !settings.promptRewriteEnabled)
+
+                Text(
+                    "When enabled, coding apps (Codex, Antigravity, VS Code, Cursor, Xcode, JetBrains) can reuse one conversation bucket for the same project."
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
                 HStack(spacing: 8) {
                     metricPill(
                         label: "Contexts",
@@ -935,6 +948,9 @@ struct AIMemoryStudioView: View {
                                         .font(.callout.weight(.semibold))
                                         .lineLimit(1)
                                     Spacer()
+                                    if !settings.isPromptRewriteConversationHistoryEnabled(forContextID: detail.id) {
+                                        memoryEntryBadge("History Off", tint: Color.orange)
+                                    }
                                     Text(detail.lastUpdatedAt.formatted(date: .abbreviated, time: .shortened))
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
@@ -959,6 +975,13 @@ struct AIMemoryStudioView: View {
                                     )
                                     Spacer(minLength: 0)
                                 }
+
+                                Toggle(
+                                    "Use history for AI tips",
+                                    isOn: promptRewriteConversationHistoryBinding(for: detail.id)
+                                )
+                                .toggleStyle(.switch)
+                                .font(.caption)
 
                                 HStack(spacing: 8) {
                                     Button("Inspect") {
@@ -1286,6 +1309,17 @@ struct AIMemoryStudioView: View {
 
                     Spacer(minLength: 0)
                 }
+
+                Toggle(
+                    "Use history for AI tips in this context",
+                    isOn: promptRewriteConversationHistoryBinding(for: detail.id)
+                )
+                .toggleStyle(.switch)
+                .font(.caption)
+
+                Text("When off, AI tips still run, but this context's conversation history is excluded from prompt generation.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             inspectorSection(
@@ -1843,6 +1877,19 @@ struct AIMemoryStudioView: View {
         )
     }
 
+    private func promptRewriteConversationHistoryBinding(for contextID: String) -> Binding<Bool> {
+        Binding(
+            get: {
+                settings.isPromptRewriteConversationHistoryEnabled(forContextID: contextID)
+            },
+            set: { isEnabled in
+                settings.setPromptRewriteConversationHistoryEnabled(isEnabled, forContextID: contextID)
+                let state = isEnabled ? "ON" : "OFF"
+                conversationActionMessage = "Context history for AI tips is now \(state) for \(contextID)."
+            }
+        )
+    }
+
     private var totalConversationTurnCount: Int {
         conversationContextDetails.reduce(0) { $0 + $1.totalTurnCount }
     }
@@ -2334,7 +2381,7 @@ struct AIMemoryStudioView: View {
                 .foregroundStyle(.secondary)
 
             Picker("Model", selection: selectedModelBinding) {
-                ForEach(LocalAIModelCatalog.curatedModels) { option in
+                ForEach(localAISetupService.modelOptions) { option in
                     let label = "\(option.displayName) • \(option.sizeLabel) • \(option.performanceLabel)"
                     Text(label).tag(option.id)
                 }
@@ -2342,7 +2389,26 @@ struct AIMemoryStudioView: View {
             .pickerStyle(.menu)
             .frame(maxWidth: 440, alignment: .leading)
 
-            if let selected = LocalAIModelCatalog.model(withID: localAISetupService.selectedModelID) {
+            HStack(spacing: 8) {
+                Button(localAISetupService.isRefreshingWebsiteCatalog ? "Fetching Website Models..." : "Fetch Latest from Website") {
+                    localAISetupService.refreshModelCatalogFromWebsite()
+                }
+                .buttonStyle(.bordered)
+                .disabled(localAISetupService.isRefreshingWebsiteCatalog || localAISetupService.setupState.isBusy)
+
+                if localAISetupService.isRefreshingWebsiteCatalog {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if let websiteCatalogStatusMessage = localAISetupService.websiteCatalogStatusMessage {
+                Text(websiteCatalogStatusMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let selected = localAISetupService.modelOption(for: localAISetupService.selectedModelID) {
                 HStack(spacing: 8) {
                     if selected.isRecommended {
                         Text("Recommended")
@@ -2414,19 +2480,51 @@ struct AIMemoryStudioView: View {
                             .buttonStyle(.bordered)
                         }
                     }
-
-                    if localAICanDeleteSelectedModel {
-                        Button("Delete Selected Model", role: .destructive) {
-                            showLocalModelDeleteConfirmation = true
-                        }
-                        .buttonStyle(.bordered)
-                    }
                 }
 
                 Button("Refresh Status") {
                     localAISetupService.refreshStatus()
                 }
                 .buttonStyle(.bordered)
+            }
+
+            if !localAISetupService.installedModelIDs.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Installed Models")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    
+                    ForEach(localAISetupService.installedModelIDs, id: \.self) { modelID in
+                        HStack(spacing: 8) {
+                            Text(modelID)
+                                .font(.caption2.monospaced())
+                            
+                            Spacer()
+                            
+                            if !localAISetupService.setupState.isBusy {
+                                Button {
+                                    localAISetupService.selectedModelID = modelID
+                                    showLocalModelDeleteConfirmation = true
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .foregroundStyle(.red.opacity(0.8))
+                                }
+                                .buttonStyle(.plain)
+                                .help("Uninstall model")
+                            }
+                        }
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(AppVisualTheme.adaptiveMaterialFill())
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+                        )
+                    }
+                }
+                .padding(.top, 4)
             }
         }
     }
@@ -2441,10 +2539,6 @@ struct AIMemoryStudioView: View {
             symbol: "cpu.fill",
             tint: AppVisualTheme.accentTint
         ) {
-            providerModeSection
-
-            Divider()
-
             HStack(spacing: 8) {
                 Text("\(mode.displayName) Model Catalog")
                     .font(.caption)
@@ -3321,7 +3415,13 @@ struct AIMemoryStudioView: View {
         promptRewriteModelStatusMessage = nil
         promptRewriteAvailableModels = []
         resetOpenAIDeviceCodeState()
-        localAISetupService.refreshStatus()
+        
+        if settings.promptRewriteProviderMode == .ollama {
+            localAISetupService.ensureRuntimeReadyForCurrentConfiguration()
+        } else {
+            localAISetupService.refreshStatus()
+        }
+        
         refreshPromptRewriteModels(showMessage: false)
     }
 

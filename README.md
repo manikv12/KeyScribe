@@ -34,6 +34,7 @@ KeyScribe includes a zero-terminal local AI setup for prompt correction and memo
 2. Go to `Prompt Models`
 3. In `Local AI Setup (No Account Needed)`:
    - Pick a beginner-friendly model
+   - Optional: click `Fetch Latest from Website` to pull additional small-model options from `ollama.com`
    - Click `Install Selected Model`
 4. Wait for wizard steps to complete:
    - `Select Model`

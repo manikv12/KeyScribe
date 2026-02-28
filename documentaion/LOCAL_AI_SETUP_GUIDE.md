@@ -15,6 +15,7 @@ You do not need to connect OpenAI, Anthropic, or any other cloud provider for th
 4. Open the **Prompt Models** page.
 5. In **Local AI Setup (No Account Needed)**:
    - choose a model from the list,
+   - optionally click **Fetch Latest from Website** to pull additional small-model options from `ollama.com`,
    - click **Install Selected Model**.
 6. Wait until the setup step list shows **Done**.
 

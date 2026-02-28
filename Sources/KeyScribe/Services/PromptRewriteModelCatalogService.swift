@@ -931,6 +931,7 @@ actor PromptRewriteModelCatalogService {
             modelIDs = [
                 "qwen2.5:3b",
                 "llama3.2:3b",
+                "gemma3:4b",
                 "gemma2:2b",
                 "llama3.1",
                 "qwen2.5-coder:14b"
