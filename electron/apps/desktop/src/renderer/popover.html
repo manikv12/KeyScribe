@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KeyScribe Popover</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body class="popover-page">
+    <main class="shell shell--popover" aria-labelledby="popover-title">
+      <header class="popover-header">
+        <h1 id="popover-title">Dictation</h1>
+        <p class="muted">Quick runtime controls.</p>
+      </header>
+
+      <section class="panel panel--compact" aria-labelledby="popover-runtime-title">
+        <h2 id="popover-runtime-title">Runtime Status</h2>
+        <p id="popover-runtime-status" class="status-badge status-badge--idle">Checking runtime...</p>
+        <p id="popover-runtime-detail" class="muted">Loading status details...</p>
+        <div class="actions actions--tight">
+          <button id="popover-start-dictation" type="button">Start</button>
+          <button id="popover-stop-dictation" type="button" class="button button--ghost">Stop</button>
+          <button id="popover-open-settings" type="button" class="button button--secondary">
+            Settings
+          </button>
+        </div>
+      </section>
+
+      <section class="panel panel--compact" aria-labelledby="popover-transcript-title">
+        <div class="panel-heading">
+          <h2 id="popover-transcript-title">Transcript Preview</h2>
+          <button id="popover-refresh-preview" type="button" class="button button--ghost">
+            Refresh
+          </button>
+        </div>
+        <p id="popover-transcript-preview" class="transcript-preview transcript-preview--placeholder">
+          Loading transcript preview...
+        </p>
+      </section>
+
+      <p id="popover-status" class="status" aria-live="polite">Ready.</p>
+    </main>
+    <script type="module" src="/src/popover.ts"></script>
+  </body>
+</html>

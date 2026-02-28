@@ -1,0 +1,16 @@
+node_modules
+*.log
+.env
+.env.*
+dist
+coverage
+.vite
+builder-debug.yml
+builder-effective-config.yaml
+apps/*/dist
+apps/*/dist-electron
+apps/*/dist-types
+apps/*/out
+packages/*/dist
+*.tsbuildinfo
+native/target

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KeyScribe</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="shell shell--dashboard">
+      <header>
+        <h1>KeyScribe Desktop</h1>
+        <p class="muted">Runtime visibility and quick dictation controls.</p>
+      </header>
+
+      <section class="panel" aria-labelledby="app-info-title">
+        <h2 id="app-info-title">App Info</h2>
+        <p id="app-info">Loading app info...</p>
+        <p id="app-build" class="muted">Loading build details...</p>
+      </section>
+
+      <section class="panel" aria-labelledby="runtime-status-title">
+        <h2 id="runtime-status-title">Runtime Status</h2>
+        <p id="runtime-ping">Checking runtime ping...</p>
+        <p id="runtime-capabilities" class="muted">Loading runtime capabilities...</p>
+        <div class="actions">
+          <button id="refresh-runtime-status" type="button" class="button button--ghost">
+            Refresh Runtime Status
+          </button>
+          <button id="open-settings" type="button" class="button button--secondary">
+            Open Settings Window
+          </button>
+        </div>
+        <p id="status" class="status" aria-live="polite">Runtime actions will report here.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="dictation-controls-title">
+        <h2 id="dictation-controls-title">Dictation Controls</h2>
+        <p id="dictation-state">Loading dictation status...</p>
+        <div class="actions">
+          <button id="start-dictation" type="button">Start Dictation</button>
+          <button id="stop-dictation" type="button" class="button button--ghost">
+            Stop Dictation
+          </button>
+        </div>
+        <p id="dictation-detail" class="muted" aria-live="polite">Awaiting runtime response...</p>
+        <label class="field-label" for="insert-text-input">Insert Text</label>
+        <div class="actions actions--stretch">
+          <input
+            id="insert-text-input"
+            type="text"
+            placeholder="Type text to insert via runtime bridge"
+            autocomplete="off"
+          />
+          <button id="insert-text" type="button" class="button button--secondary">Insert</button>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="transcript-history-title">
+        <h2 id="transcript-history-title">Transcript History</h2>
+        <div class="actions">
+          <button id="refresh-history" type="button" class="button button--ghost">Refresh History</button>
+          <button id="clear-history" type="button" class="button button--ghost">Clear History</button>
+        </div>
+        <p id="transcript-summary" class="muted">Loading transcript history...</p>
+        <ul id="transcript-history" class="transcript-list">
+          <li class="transcript-item transcript-item--placeholder">No transcript entries yet.</li>
+        </ul>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

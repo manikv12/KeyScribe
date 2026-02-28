@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KeyScribe Settings</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="shell shell--settings">
+      <h1>Settings</h1>
+      <p id="settings-info">Loading environment details...</p>
+      <section class="panel" aria-labelledby="shortcut-title">
+        <h2 id="shortcut-title">Keyboard Shortcuts</h2>
+        <label class="field-label" for="shortcut-start-stop">Start / Stop Recording</label>
+        <input id="shortcut-start-stop" type="text" autocomplete="off" />
+
+        <label class="field-label" for="shortcut-toggle-main">Toggle Main Window</label>
+        <input id="shortcut-toggle-main" type="text" autocomplete="off" />
+
+        <label class="field-label" for="shortcut-open-settings">Open Settings</label>
+        <input id="shortcut-open-settings" type="text" autocomplete="off" />
+
+        <div class="actions">
+          <button id="save-shortcuts" type="button">Save Shortcuts</button>
+          <button id="reload-shortcuts" type="button" class="button button--ghost">Reload</button>
+        </div>
+        <p id="settings-status" class="status" aria-live="polite">Loading shortcuts...</p>
+      </section>
+      <section class="panel panel--models" aria-labelledby="model-title">
+        <div class="panel-heading">
+          <h2 id="model-title">Speech Models</h2>
+          <button id="refresh-models" type="button" class="button button--ghost">
+            Refresh Model List
+          </button>
+        </div>
+        <p class="muted">
+          Select which local model should be used for dictation. Download a model first, then
+          select it for runtime use.
+        </p>
+        <ul id="model-list" class="model-list" aria-live="polite">
+          <li class="model-item model-item--placeholder">Loading model catalog...</li>
+        </ul>
+        <p id="models-status" class="status" aria-live="polite">Loading model catalog...</p>
+      </section>
+    </main>
+    <script type="module" src="/src/settings.ts"></script>
+  </body>
+</html>

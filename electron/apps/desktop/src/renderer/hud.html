@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KeyScribe HUD</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body class="hud-page">
+    <main class="hud-shell" aria-labelledby="hud-status">
+      <div class="hud-row">
+        <p id="hud-status" class="hud-status" aria-live="polite">Checking dictation status...</p>
+        <button id="hud-stop-dictation" type="button" class="button button--danger">Stop</button>
+      </div>
+
+      <div
+        id="hud-meter"
+        class="hud-meter"
+        role="progressbar"
+        aria-label="Audio level indicator"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="0"
+      >
+        <div id="hud-meter-fill" class="hud-meter__fill"></div>
+      </div>
+
+      <p id="hud-detail" class="hud-detail">Awaiting runtime response...</p>
+    </main>
+    <script type="module" src="/src/hud.ts"></script>
+  </body>
+</html>
