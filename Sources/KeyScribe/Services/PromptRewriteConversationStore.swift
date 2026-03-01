@@ -525,17 +525,31 @@ final class PromptRewriteConversationStore: ObservableObject {
            promptRewriteConversationHistoryEnabled,
            let store {
             let crossIDESharingEnabled = promptRewriteCrossIDEConversationSharingEnabled
-            let scopeKey = scopeKeyForExpiredHandoff(
+            let scopeKeys = scopeKeysForExpiredHandoffLookup(
                 context: resolvedContext,
                 crossIDESharingEnabled: crossIDESharingEnabled
             )
             let bundleIDConstraint = crossIDESharingEnabled
                 ? nil
                 : resolvedContext.bundleIdentifier
-            if let expiredRecord = try? store.fetchLatestExpiredConversationContext(
-                scopeKey: scopeKey,
-                bundleIDConstraint: bundleIDConstraint
-            ) {
+            var expiredRecord: ExpiredConversationContextRecord?
+            for scopeKey in scopeKeys {
+                guard let candidate = try? store.fetchLatestExpiredConversationContext(
+                    scopeKey: scopeKey,
+                    bundleIDConstraint: bundleIDConstraint
+                ) else {
+                    continue
+                }
+                if let existing = expiredRecord {
+                    if candidate.expiredAt > existing.expiredAt {
+                        expiredRecord = candidate
+                    }
+                } else {
+                    expiredRecord = candidate
+                }
+            }
+
+            if let expiredRecord {
                 let handoffHistory = expiredHandoffHistory(
                     from: expiredRecord,
                     limit: normalizedRequestTurnLimit
@@ -2464,15 +2478,65 @@ final class PromptRewriteConversationStore: ObservableObject {
         crossIDESharingEnabled: Bool
     ) -> String {
         let normalizedBundleID = collapsedWhitespace(context.bundleIdentifier).lowercased()
-        let normalizedSurfaceKey: String
-        let logicalSurface = collapsedWhitespace(context.logicalSurfaceKey).lowercased()
-        if !logicalSurface.isEmpty {
-            normalizedSurfaceKey = logicalSurface
-        } else {
-            let fallbackSeed = "\(context.screenLabel)|\(context.fieldLabel)|\(normalizedBundleID)"
-            normalizedSurfaceKey = "surface-\(MemoryIdentifier.stableHexDigest(for: fallbackSeed).prefix(24))"
+        let normalizedSurfaceKey = normalizedExpiredHandoffSurfaceKey(
+            context: context,
+            normalizedBundleID: normalizedBundleID
+        )
+
+        let projectKey = contextLinkingKey(context.projectKey)
+        let identityKey = contextLinkingKey(context.identityKey)
+
+        if let projectKey, let identityKey {
+            if crossIDESharingEnabled {
+                return "expired-scope|project=\(projectKey)|identity=\(identityKey)"
+            }
+            return "expired-scope|bundle=\(normalizedBundleID)|project=\(projectKey)|identity=\(identityKey)"
         }
 
+        if let projectKey {
+            if crossIDESharingEnabled {
+                return "expired-scope|project=\(projectKey)|identity=unknown"
+            }
+            return "expired-scope|bundle=\(normalizedBundleID)|project=\(projectKey)|identity=unknown"
+        }
+
+        if let identityKey {
+            if crossIDESharingEnabled {
+                return "expired-scope|project=unknown|identity=\(identityKey)"
+            }
+            return "expired-scope|bundle=\(normalizedBundleID)|project=unknown|identity=\(identityKey)"
+        }
+
+        return "expired-scope|bundle=\(normalizedBundleID)|surface=\(normalizedSurfaceKey)"
+    }
+
+    private func scopeKeysForExpiredHandoffLookup(
+        context: PromptRewriteConversationContext,
+        crossIDESharingEnabled: Bool
+    ) -> [String] {
+        let primary = scopeKeyForExpiredHandoff(
+            context: context,
+            crossIDESharingEnabled: crossIDESharingEnabled
+        )
+        let legacy = legacyScopeKeyForExpiredHandoff(
+            context: context,
+            crossIDESharingEnabled: crossIDESharingEnabled
+        )
+        if legacy.caseInsensitiveCompare(primary) == .orderedSame {
+            return [primary]
+        }
+        return [primary, legacy]
+    }
+
+    private func legacyScopeKeyForExpiredHandoff(
+        context: PromptRewriteConversationContext,
+        crossIDESharingEnabled: Bool
+    ) -> String {
+        let normalizedBundleID = collapsedWhitespace(context.bundleIdentifier).lowercased()
+        let normalizedSurfaceKey = normalizedExpiredHandoffSurfaceKey(
+            context: context,
+            normalizedBundleID: normalizedBundleID
+        )
         let projectKey = contextLinkingKey(context.projectKey)
         let identityKey = contextLinkingKey(context.identityKey)
         if let projectKey, let identityKey {
@@ -2482,6 +2546,18 @@ final class PromptRewriteConversationStore: ObservableObject {
             return "expired-scope|bundle=\(normalizedBundleID)|project=\(projectKey)|identity=\(identityKey)"
         }
         return "expired-scope|bundle=\(normalizedBundleID)|surface=\(normalizedSurfaceKey)"
+    }
+
+    private func normalizedExpiredHandoffSurfaceKey(
+        context: PromptRewriteConversationContext,
+        normalizedBundleID: String
+    ) -> String {
+        let logicalSurface = collapsedWhitespace(context.logicalSurfaceKey).lowercased()
+        if !logicalSurface.isEmpty {
+            return logicalSurface
+        }
+        let fallbackSeed = "\(context.screenLabel)|\(context.fieldLabel)|\(normalizedBundleID)"
+        return "surface-\(MemoryIdentifier.stableHexDigest(for: fallbackSeed).prefix(24))"
     }
 
     private func expiredHandoffHistory(
@@ -3515,6 +3591,27 @@ final class PromptRewriteConversationStore: ObservableObject {
 }
 
 enum PromptRewriteConversationContextResolver {
+    private static let antigravityTextNodeScanLimit = 480
+    private static let codexTextNodeScanLimit = 480
+    private static let codexTopBarTraversalLimit = 1200
+    private static let codexSidebarTraversalLimit = 1200
+    private static let telegramTextNodeScanLimit = 900
+    private static let genericFocusedFieldRoles: Set<String> = [
+        "axtextarea",
+        "axtextfield",
+        "axsearchfield",
+        "axcombobox"
+    ]
+    private static let heavyAXValueRoles: Set<String> = [
+        "axtextarea",
+        "axtextfield",
+        "axsearchfield",
+        "axcombobox",
+        "axwebarea",
+        "axdocument",
+        "axscrollarea"
+    ]
+
     static func captureCurrentContext(
         fallbackApp: NSRunningApplication?,
         screenLabel: String? = nil
@@ -3618,26 +3715,42 @@ enum PromptRewriteConversationContextResolver {
         let identifier = axStringAttribute(kAXIdentifierAttribute as CFString, from: focusedElement)
         let description = axStringAttribute(kAXDescriptionAttribute as CFString, from: focusedElement)
         let placeholder = axStringAttribute(kAXPlaceholderValueAttribute as CFString, from: focusedElement)
+        let normalizedRole = normalizedAXRole(role)
 
-        let fieldComponents = [title, placeholder, identifier, description, role]
+        var fieldCandidates: [String?] = [title, placeholder, identifier]
+        if !isGenericFocusedFieldRole(normalizedRole) {
+            fieldCandidates.append(description)
+            fieldCandidates.append(role)
+        }
+        let fieldComponents = fieldCandidates
             .compactMap(normalizedLabel)
             .filter { !$0.isEmpty }
-        let fieldLabel: String?
+        let resolvedFieldLabel: String?
         if let first = fieldComponents.first {
             if let subrole = normalizedLabel(subrole), !subrole.isEmpty,
                !first.localizedCaseInsensitiveContains(subrole) {
-                fieldLabel = "\(first) (\(subrole))"
+                resolvedFieldLabel = "\(first) (\(subrole))"
             } else {
-                fieldLabel = first
+                resolvedFieldLabel = first
             }
-        } else if let role = normalizedLabel(role), !role.isEmpty {
+        } else if !isGenericFocusedFieldRole(normalizedRole),
+                  let role = normalizedLabel(role),
+                  !role.isEmpty {
             if let subrole = normalizedLabel(subrole), !subrole.isEmpty {
-                fieldLabel = "\(role) (\(subrole))"
+                resolvedFieldLabel = "\(role) (\(subrole))"
             } else {
-                fieldLabel = role
+                resolvedFieldLabel = role
             }
         } else {
+            resolvedFieldLabel = nil
+        }
+
+        let fieldLabel: String?
+        if let resolvedFieldLabel,
+           isGenericAXRoleLabel(resolvedFieldLabel) {
             fieldLabel = nil
+        } else {
+            fieldLabel = resolvedFieldLabel
         }
 
         let windowElement = axElementAttribute(kAXWindowAttribute as CFString, from: focusedElement)
@@ -3760,7 +3873,7 @@ enum PromptRewriteConversationContextResolver {
         from windowElement: AXUIElement,
         fallbackWindowTitle: String?
     ) -> (project: String?, thread: String?) {
-        let textNodes = collectTextNodes(from: windowElement, limit: 1200)
+        let textNodes = collectTextNodes(from: windowElement, limit: antigravityTextNodeScanLimit)
         let allTexts = textNodes.map(\.text)
 
         var project = antigravityProjectFromWindowTitle(fallbackWindowTitle)
@@ -3867,12 +3980,6 @@ enum PromptRewriteConversationContextResolver {
         from windowElement: AXUIElement,
         fallbackWindowTitle: String?
     ) -> (project: String?, thread: String?) {
-        let textNodes = collectTextNodes(from: windowElement, limit: 1200)
-        let allTexts = textNodes.map(\.text)
-        let selectedTexts = textNodes
-            .filter { $0.selected }
-            .map(\.text)
-
         let topBarSelection = inferCodexTopBarSelection(from: windowElement)
         let sidebarSelection = inferCodexSidebarSelection(from: windowElement)
         var project = preferredCodexProjectCandidate(
@@ -3881,16 +3988,26 @@ enum PromptRewriteConversationContextResolver {
         )
         var thread = topBarSelection?.thread ?? sidebarSelection?.thread
 
+        var cachedTextNodes: [AXTextNode]?
+        func textNodes() -> [AXTextNode] {
+            if let cachedTextNodes {
+                return cachedTextNodes
+            }
+            let fetched = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
+            cachedTextNodes = fetched
+            return fetched
+        }
+
         if project == nil {
+            let allTexts = textNodes().map(\.text)
             project = allTexts.compactMap(codexProjectFromControlLabel).first
-        }
-        if project == nil {
             project = allTexts.compactMap(codexProjectFromPathLikeLabel).first
-        }
-        if project == nil {
             project = allTexts.compactMap(projectName(fromCodexText:)).first
         }
         if thread == nil {
+            let selectedTexts = textNodes()
+                .filter { $0.selected }
+                .map(\.text)
             thread = selectedTexts.first {
                 looksLikeCodexThreadTitle($0, project: project)
             }
@@ -3944,10 +4061,11 @@ enum PromptRewriteConversationContextResolver {
     }
 
     private static func codexTopBarControlsGroup(from windowElement: AXUIElement) -> AXUIElement? {
+        let traversalLimit = codexTopBarTraversalLimit
         var queue: [AXUIElement] = [windowElement]
         var cursor = 0
 
-        while cursor < queue.count, cursor < 2400 {
+        while cursor < queue.count, cursor < traversalLimit {
             let element = queue[cursor]
             cursor += 1
 
@@ -3984,8 +4102,8 @@ enum PromptRewriteConversationContextResolver {
             }
 
             let children = axElementsAttribute(kAXChildrenAttribute as CFString, from: element)
-            if !children.isEmpty, queue.count < 2400 {
-                queue.append(contentsOf: children.prefix(max(0, 2400 - queue.count)))
+            if !children.isEmpty, queue.count < traversalLimit {
+                queue.append(contentsOf: children.prefix(max(0, traversalLimit - queue.count)))
             }
         }
 
@@ -3999,9 +4117,12 @@ enum PromptRewriteConversationContextResolver {
 
         for child in children {
             let role = axStringAttribute(kAXRoleAttribute as CFString, from: child) ?? ""
+            let value = shouldReadAXValueAttribute(forRole: role)
+                ? axStringValueAttribute(kAXValueAttribute as CFString, from: child)
+                : nil
             let labels = [
                 axStringAttribute(kAXTitleAttribute as CFString, from: child),
-                axStringValueAttribute(kAXValueAttribute as CFString, from: child),
+                value,
                 axStringAttribute(kAXDescriptionAttribute as CFString, from: child)
             ]
                 .compactMap(normalizedLabel)
@@ -4158,11 +4279,12 @@ enum PromptRewriteConversationContextResolver {
     private static func inferCodexSidebarSelection(
         from windowElement: AXUIElement
     ) -> (project: String?, thread: String?)? {
+        let traversalLimit = codexSidebarTraversalLimit
         var queue: [AXUIElement] = [windowElement]
         var cursor = 0
         var bestProject: String?
 
-        while cursor < queue.count, cursor < 2200 {
+        while cursor < queue.count, cursor < traversalLimit {
             let element = queue[cursor]
             cursor += 1
 
@@ -4178,8 +4300,8 @@ enum PromptRewriteConversationContextResolver {
             }
 
             let children = axElementsAttribute(kAXChildrenAttribute as CFString, from: element)
-            if !children.isEmpty, queue.count < 2200 {
-                queue.append(contentsOf: children.prefix(max(0, 2200 - queue.count)))
+            if !children.isEmpty, queue.count < traversalLimit {
+                queue.append(contentsOf: children.prefix(max(0, traversalLimit - queue.count)))
             }
         }
 
@@ -4244,8 +4366,7 @@ enum PromptRewriteConversationContextResolver {
             if classList.contains("group/cwd") {
                 let candidateValues = [
                     axStringAttribute(kAXDescriptionAttribute as CFString, from: parent),
-                    axStringAttribute(kAXTitleAttribute as CFString, from: parent),
-                    axStringValueAttribute(kAXValueAttribute as CFString, from: parent)
+                    axStringAttribute(kAXTitleAttribute as CFString, from: parent)
                 ]
                     .compactMap(normalizedLabel)
                 for candidate in candidateValues {
@@ -4280,9 +4401,12 @@ enum PromptRewriteConversationContextResolver {
 
             let role = axStringAttribute(kAXRoleAttribute as CFString, from: element) ?? ""
             let selected = axBoolAttribute(kAXSelectedAttribute as CFString, from: element) ?? false
+            let value = shouldReadAXValueAttribute(forRole: role)
+                ? axStringValueAttribute(kAXValueAttribute as CFString, from: element)
+                : nil
             let values = [
                 axStringAttribute(kAXTitleAttribute as CFString, from: element),
-                axStringValueAttribute(kAXValueAttribute as CFString, from: element),
+                value,
                 axStringAttribute(kAXDescriptionAttribute as CFString, from: element),
                 axStringAttribute(kAXHelpAttribute as CFString, from: element)
             ]
@@ -4594,7 +4718,7 @@ enum PromptRewriteConversationContextResolver {
             return fromWindowTitle
         }
 
-        let textNodes = collectTextNodes(from: windowElement, limit: 1800)
+        let textNodes = collectTextNodes(from: windowElement, limit: telegramTextNodeScanLimit)
         if textNodes.isEmpty {
             return nil
         }
@@ -4853,6 +4977,37 @@ enum PromptRewriteConversationContextResolver {
             return attributed.string
         }
         return nil
+    }
+
+    private static func normalizedAXRole(_ role: String?) -> String {
+        role?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+    }
+
+    private static func isGenericFocusedFieldRole(_ role: String) -> Bool {
+        genericFocusedFieldRoles.contains(role)
+    }
+
+    private static func isGenericAXRoleLabel(_ label: String) -> Bool {
+        let normalized = label
+            .replacingOccurrences(of: "(", with: " ")
+            .replacingOccurrences(of: ")", with: " ")
+        let compact = collapsedWhitespace(normalized).lowercased()
+        if genericFocusedFieldRoles.contains(compact) {
+            return true
+        }
+        return genericFocusedFieldRoles.contains { role in
+            compact.hasPrefix("\(role) ")
+        }
+    }
+
+    private static func shouldReadAXValueAttribute(forRole role: String) -> Bool {
+        let normalizedRole = normalizedAXRole(role)
+        guard !normalizedRole.isEmpty else {
+            return true
+        }
+        return !heavyAXValueRoles.contains(normalizedRole)
     }
 
     private static func axBoolAttribute(_ attribute: CFString, from element: AXUIElement) -> Bool? {
