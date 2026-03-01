@@ -85,9 +85,13 @@ jobs:
           DMG_FILE="dist/KeyScribe.dmg"
           DMG_SIZE=$(stat -f%z "$DMG_FILE")
           DOWNLOAD_URL="https://github.com/manikv12/KeyScribe/releases/download/${{ github.ref_name }}/KeyScribe.dmg"
+          SPARKLE_KEY_FILE="$(mktemp)"
+          trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
+          printf "%s" "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
+          chmod 600 "$SPARKLE_KEY_FILE"
 
           # Sign the DMG with Sparkle's EdDSA key
-          SIGNATURE=$(/tmp/sparkle/bin/sign_update "$DMG_FILE" --ed-key-file <(echo "$SPARKLE_PRIVATE_KEY"))
+          SIGNATURE=$(/tmp/sparkle/bin/sign_update "$DMG_FILE" --ed-key-file "$SPARKLE_KEY_FILE")
 
           # Generate appcast.xml
           cat > dist/appcast.xml <<EOF
