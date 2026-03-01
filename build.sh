@@ -66,6 +66,12 @@ if [ -z "$SPARKLE_FRAMEWORK" ]; then
 fi
 cp -R "$SPARKLE_FRAMEWORK" "$APP_DIR/Contents/Frameworks/"
 
+echo "Configuring runtime search paths..."
+APP_BINARY="$APP_DIR/Contents/MacOS/${APP_EXECUTABLE}"
+if ! otool -l "$APP_BINARY" | grep -q "@executable_path/../Frameworks"; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BINARY"
+fi
+
 echo "Copying Info.plist and resources..."
 cp Resources/Info.plist "$APP_DIR/Contents/"
 cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
