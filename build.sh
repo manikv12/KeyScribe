@@ -44,6 +44,7 @@ echo "Creating macOS App Bundle at ${APP_DIR}..."
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/Frameworks"
 
 echo "Copying executable..."
 cp ".build/release/${APP_EXECUTABLE}" "$APP_DIR/Contents/MacOS/"
@@ -57,6 +58,14 @@ if [ -z "$WHISPER_MACOS_FRAMEWORK" ]; then
 fi
 cp -R "$WHISPER_MACOS_FRAMEWORK" "$APP_DIR/Contents/MacOS/"
 
+echo "Embedding Sparkle framework..."
+SPARKLE_FRAMEWORK="$(find .build/artifacts -type d -name 'Sparkle.framework' | head -n 1 || true)"
+if [ -z "$SPARKLE_FRAMEWORK" ]; then
+    echo "Failed to locate Sparkle.framework in .build/artifacts"
+    exit 1
+fi
+cp -R "$SPARKLE_FRAMEWORK" "$APP_DIR/Contents/Frameworks/"
+
 echo "Copying Info.plist and resources..."
 cp Resources/Info.plist "$APP_DIR/Contents/"
 cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
@@ -64,8 +73,15 @@ cp Resources/AppIcon.png "$APP_DIR/Contents/Resources/"
 
 echo "Applying code signature..."
 if [ -n "${DEVELOPER_ID:-}" ]; then
+    SIGN_ID="Developer ID Application: $DEVELOPER_ID"
     echo "  Signing with Developer ID: $DEVELOPER_ID"
-    codesign --force --deep --options runtime --entitlements Resources/KeyScribe.entitlements --sign "Developer ID Application: $DEVELOPER_ID" "$APP_DIR"
+
+    # Sign Sparkle's nested XPC services individually first
+    for xpc in "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/"*.xpc; do
+        [ -d "$xpc" ] && codesign --force --options runtime --sign "$SIGN_ID" "$xpc"
+    done
+
+    codesign --force --deep --options runtime --entitlements Resources/KeyScribe.entitlements --sign "$SIGN_ID" "$APP_DIR"
 else
     echo "  No DEVELOPER_ID set — using ad-hoc signature."
     echo "  (Set DEVELOPER_ID env var for distribution-ready signing)"
