@@ -9,6 +9,17 @@ enum FeatureFlags {
     private static let crossIDEConversationSharingEnvironmentKey = "KEYSCRIBE_FEATURE_CROSS_IDE_CONVERSATION_SHARING"
     private static let crossIDEConversationSharingDefaultsKey = "KeyScribe.promptRewriteCrossIDEConversationSharingEnabled"
 
+    enum CrossIDEConversationSharingSource: String {
+        case env
+        case userDefault = "user-default"
+        case fallback
+    }
+
+    struct CrossIDEConversationSharingResolution {
+        let enabled: Bool
+        let source: CrossIDEConversationSharingSource
+    }
+
     static var aiMemoryEnabled: Bool {
         guard let raw = ProcessInfo.processInfo.environment[aiMemoryEnvironmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -48,13 +59,34 @@ enum FeatureFlags {
     }
 
     static var crossIDEConversationSharingEnabled: Bool {
-        if let environmentOverride = boolValueFromEnvironment(crossIDEConversationSharingEnvironmentKey) {
-            return environmentOverride
+        crossIDEConversationSharingResolution().enabled
+    }
+
+    static func crossIDEConversationSharingResolution(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard
+    ) -> CrossIDEConversationSharingResolution {
+        if let environmentOverride = boolValueFromEnvironment(
+            crossIDEConversationSharingEnvironmentKey,
+            environment: environment
+        ) {
+            return CrossIDEConversationSharingResolution(
+                enabled: environmentOverride,
+                source: .env
+            )
         }
-        if UserDefaults.standard.object(forKey: crossIDEConversationSharingDefaultsKey) != nil {
-            return UserDefaults.standard.bool(forKey: crossIDEConversationSharingDefaultsKey)
+
+        if defaults.object(forKey: crossIDEConversationSharingDefaultsKey) != nil {
+            return CrossIDEConversationSharingResolution(
+                enabled: defaults.bool(forKey: crossIDEConversationSharingDefaultsKey),
+                source: .userDefault
+            )
         }
-        return false
+
+        return CrossIDEConversationSharingResolution(
+            enabled: true,
+            source: .fallback
+        )
     }
 
     private static func boolFlag(environmentKey: String, defaultValue: Bool) -> Bool {
@@ -64,8 +96,11 @@ enum FeatureFlags {
         return parsed
     }
 
-    private static func boolValueFromEnvironment(_ environmentKey: String) -> Bool? {
-        guard let raw = ProcessInfo.processInfo.environment[environmentKey]?
+    private static func boolValueFromEnvironment(
+        _ environmentKey: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool? {
+        guard let raw = environment[environmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased(),
               !raw.isEmpty else {

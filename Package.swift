@@ -25,6 +25,11 @@ let package = Package(
         .binaryTarget(
             name: "whisper",
             path: "Vendor/Whisper/whisper.xcframework"
+        ),
+        .testTarget(
+            name: "KeyScribeTests",
+            dependencies: ["KeyScribe"],
+            path: "Tests/KeyScribeTests"
         )
     ]
 )

@@ -387,17 +387,19 @@ final class SettingsStore: ObservableObject {
         "Submarine",
         "Tink"
     ]
-        static let defaultDictationStartSoundName = "Ping"
-        static let defaultDictationStopSoundName = "Glass"
-        static let defaultDictationProcessingSoundName = "Ping"
-        static let defaultDictationPastedSoundName = "Pop"
-        static let defaultDictationCorrectionLearnedSoundName = "Purr"
-        static let defaultDictationFeedbackVolume: Double = 0.10
+    static let defaultDictationStartSoundName = "Ping"
+    static let defaultDictationStopSoundName = "Glass"
+    static let defaultDictationProcessingSoundName = "Ping"
+    static let defaultDictationPastedSoundName = "Pop"
+    static let defaultDictationCorrectionLearnedSoundName = "Purr"
+    static let defaultDictationFeedbackVolume: Double = 0.10
+    nonisolated static let crossIDEConversationSharingMigrationDefaultsKey =
+        "KeyScribe.migration.crossIDEConversationSharingDefaultedV1"
 
-        private let defaults = UserDefaults.standard
-        private var isApplyingChanges = false
-        private var pendingOnChangeWorkItem: DispatchWorkItem?
-        private static let onChangeDebounceSeconds: TimeInterval = 0.14
+    private let defaults = UserDefaults.standard
+    private var isApplyingChanges = false
+    private var pendingOnChangeWorkItem: DispatchWorkItem?
+    private static let onChangeDebounceSeconds: TimeInterval = 0.14
 
     private enum Keys {
         static let shortcutKeyCode = "KeyScribe.shortcutKeyCode"
@@ -457,6 +459,7 @@ final class SettingsStore: ObservableObject {
         static let promptRewriteConversationPinnedContextID = "KeyScribe.promptRewriteConversationPinnedContextID"
         static let promptRewriteConversationHistoryDisabledContextIDs = "KeyScribe.promptRewriteConversationHistoryDisabledContextIDs"
         static let promptRewriteCrossIDEConversationSharingEnabled = "KeyScribe.promptRewriteCrossIDEConversationSharingEnabled"
+        static let promptRewriteCrossIDEConversationSharingDefaultedMigrationV1 = SettingsStore.crossIDEConversationSharingMigrationDefaultsKey
         static let localAISetupCompleted = "KeyScribe.localAISetupCompleted"
         static let localAISelectedModelID = "KeyScribe.localAISelectedModelID"
         static let localAIManagedRuntimeEnabled = "KeyScribe.localAIManagedRuntimeEnabled"
@@ -935,6 +938,55 @@ final class SettingsStore: ObservableObject {
     /// Called whenever user-facing settings change. The app can subscribe and reconfigure features.
     var onChange: (() -> Void)?
 
+    struct CrossIDEConversationSharingBootstrapState {
+        let settingEnabled: Bool
+        let runtimeEnabled: Bool
+        let source: String
+        let migrationApplied: Bool
+    }
+
+    static func resolveCrossIDEConversationSharingBootstrap(
+        defaults: UserDefaults = .standard,
+        featureResolution: FeatureFlags.CrossIDEConversationSharingResolution? = nil
+    ) -> CrossIDEConversationSharingBootstrapState {
+        let resolvedFeature = featureResolution
+            ?? FeatureFlags.crossIDEConversationSharingResolution(defaults: defaults)
+        let migrationSentinelKey = Keys.promptRewriteCrossIDEConversationSharingDefaultedMigrationV1
+        let sharingDefaultsKey = Keys.promptRewriteCrossIDEConversationSharingEnabled
+        let hasMigrationSentinel = defaults.object(forKey: migrationSentinelKey) != nil
+        let environmentHardOff = resolvedFeature.source == .env && resolvedFeature.enabled == false
+
+        if !hasMigrationSentinel && !environmentHardOff {
+            defaults.set(true, forKey: sharingDefaultsKey)
+            defaults.set(true, forKey: migrationSentinelKey)
+            return CrossIDEConversationSharingBootstrapState(
+                settingEnabled: true,
+                runtimeEnabled: true,
+                source: "migration",
+                migrationApplied: true
+            )
+        }
+
+        let settingEnabled: Bool
+        if defaults.object(forKey: sharingDefaultsKey) == nil {
+            settingEnabled = environmentHardOff ? false : true
+            if !environmentHardOff {
+                defaults.set(settingEnabled, forKey: sharingDefaultsKey)
+            }
+        } else {
+            settingEnabled = defaults.bool(forKey: sharingDefaultsKey)
+        }
+
+        let runtimeResolution = featureResolution
+            ?? FeatureFlags.crossIDEConversationSharingResolution(defaults: defaults)
+        return CrossIDEConversationSharingBootstrapState(
+            settingEnabled: settingEnabled,
+            runtimeEnabled: runtimeResolution.enabled,
+            source: runtimeResolution.source.rawValue,
+            migrationApplied: false
+        )
+    }
+
     private init() {
         isApplyingChanges = true
 
@@ -1291,11 +1343,14 @@ final class SettingsStore: ObservableObject {
             defaults.stringArray(forKey: Keys.promptRewriteConversationHistoryDisabledContextIDs) ?? []
         )
 
-        if defaults.object(forKey: Keys.promptRewriteCrossIDEConversationSharingEnabled) == nil {
-            promptRewriteCrossIDEConversationSharingEnabled = false
-        } else {
-            promptRewriteCrossIDEConversationSharingEnabled = defaults.bool(forKey: Keys.promptRewriteCrossIDEConversationSharingEnabled)
-        }
+        let crossIDEBootstrap = Self.resolveCrossIDEConversationSharingBootstrap(defaults: defaults)
+        promptRewriteCrossIDEConversationSharingEnabled = crossIDEBootstrap.settingEnabled
+        CrashReporter.logInfo(
+            "Cross-IDE conversation sharing resolved source=\(crossIDEBootstrap.source) " +
+            "runtimeEnabled=\(crossIDEBootstrap.runtimeEnabled) " +
+            "settingEnabled=\(crossIDEBootstrap.settingEnabled) " +
+            "migrationApplied=\(crossIDEBootstrap.migrationApplied)"
+        )
 
         promptRewriteOpenAIAPIKey = selectedPromptProviderAPIKey
 

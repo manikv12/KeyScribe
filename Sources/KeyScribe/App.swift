@@ -740,6 +740,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         let insertionText: String
         let conversationContext: PromptRewriteConversationContext?
         let insertionHUDContext: PromptRewriteInsertionHUDContext
+        // Preserve user-requested original text (for example Esc in rewrite HUD)
+        // without applying adaptive correction post-processing.
+        let preserveInsertionText: Bool
+
+        init(
+            insertionText: String,
+            conversationContext: PromptRewriteConversationContext?,
+            insertionHUDContext: PromptRewriteInsertionHUDContext,
+            preserveInsertionText: Bool = false
+        ) {
+            self.insertionText = insertionText
+            self.conversationContext = conversationContext
+            self.insertionHUDContext = insertionHUDContext
+            self.preserveInsertionText = preserveInsertionText
+        }
     }
 
     private struct SettingsApplySnapshot: Equatable {
@@ -1638,7 +1653,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             )
         }
 
-        let readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolution.insertionText)
+        let readyForInsert: String
+        if rewriteResolution.preserveInsertionText {
+            readyForInsert = rewriteResolution.insertionText
+        } else {
+            readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolution.insertionText)
+        }
         if settings.promptRewriteEnabled,
            let conversationContext = rewriteResolution.conversationContext,
            settings.isPromptRewriteConversationHistoryEnabled(forContextID: conversationContext.id) {
@@ -1839,7 +1859,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                         return PromptRewriteInsertionResolution(
                             insertionText: cleanedTranscript,
                             conversationContext: conversationContext,
-                            insertionHUDContext: insertionSessionContext.insertionHUDContext
+                            insertionHUDContext: insertionSessionContext.insertionHUDContext,
+                            preserveInsertionText: true
                         )
                     case .rejectSuggestion:
                         await recordPromptRewriteFeedback(
@@ -1870,7 +1891,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     return PromptRewriteInsertionResolution(
                         insertionText: cleanedTranscript,
                         conversationContext: conversationContext,
-                        insertionHUDContext: insertionSessionContext.insertionHUDContext
+                        insertionHUDContext: insertionSessionContext.insertionHUDContext,
+                        preserveInsertionText: true
                     )
                 case .close:
                     await recordPromptRewriteFeedback(

@@ -308,6 +308,9 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let maxRecentExchangeTurnsForPrompt = 5
     private let primaryPromptHistoryTurnBudget = 3
     private let linkedPromptHistoryTurnBudget = 2
+    private let browserHistoryPinnedRecentTurns = 2
+    private let browserHistoryMinimumContextTurns = 3
+    private let browserHistoryKeywordLimit = 24
     private let autoCompactionExchangeThreshold = 40
     private let autoCompactionRetainedExchangeTurns = 8
     private let maxPromptContextCharacters = 1_800
@@ -1777,6 +1780,10 @@ final class PromptRewriteConversationStore: ObservableObject {
         for context: PromptRewriteConversationContext,
         excludingContextID: String
     ) -> [String] {
+        if isBrowserContext(context) {
+            // Browser tabs/windows are now consolidated into one thread.
+            return []
+        }
         let projectKey = contextLinkingKey(context.projectKey)
         let identityKey = contextLinkingKey(context.identityKey)
         guard projectKey != nil || identityKey != nil else {
@@ -1877,6 +1884,7 @@ final class PromptRewriteConversationStore: ObservableObject {
         guard let stored = contextsByID[contextID] else { return [] }
         return selectedTurnsForPrompt(
             from: stored.turns,
+            context: stored.context,
             limit: limit,
             userText: userText
         )
@@ -1884,6 +1892,7 @@ final class PromptRewriteConversationStore: ObservableObject {
 
     private func selectedTurnsForPrompt(
         from turns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext,
         limit: Int,
         userText: String
     ) -> [PromptRewriteConversationTurn] {
@@ -1891,7 +1900,17 @@ final class PromptRewriteConversationStore: ObservableObject {
             normalizedTurnLimit(limit),
             maxRelevantExchangeTurnsForPrompt + 1
         )
-        guard turns.count > normalizedLimit else { return turns }
+        guard turns.count > normalizedLimit else {
+            if isBrowserContext(context) {
+                return filteredBrowserPromptHistory(
+                    turns,
+                    context: context,
+                    userText: userText,
+                    limit: normalizedLimit
+                )
+            }
+            return turns
+        }
 
         if normalizedLimit <= 1 {
             return Array(turns.filter { !$0.isSummary }.suffix(1))
@@ -2005,7 +2024,152 @@ final class PromptRewriteConversationStore: ObservableObject {
             }
         }
 
+        if isBrowserContext(context) {
+            return filteredBrowserPromptHistory(
+                output,
+                context: context,
+                userText: userText,
+                limit: normalizedLimit
+            )
+        }
         return output
+    }
+
+    private func filteredBrowserPromptHistory(
+        _ turns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext,
+        userText: String,
+        limit: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedLimit = normalizedTurnLimit(limit)
+        guard normalizedLimit > 0, !turns.isEmpty else {
+            return []
+        }
+
+        let exchangeTurns = turns.filter { !$0.isSummary }
+        guard !exchangeTurns.isEmpty else {
+            return Array(turns.suffix(normalizedLimit))
+        }
+
+        let latestSummary = turns.reversed().first(where: \.isSummary)
+        let normalizedUserText = collapsedWhitespace(userText).lowercased()
+        let queryTokens = Set(
+            MemoryTextNormalizer.keywords(
+                from: normalizedUserText,
+                limit: browserHistoryKeywordLimit
+            )
+        )
+        let contextDescriptor = [
+            context.projectLabel ?? "",
+            context.identityLabel ?? "",
+            context.screenLabel,
+            context.fieldLabel
+        ]
+            .map(collapsedWhitespace)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .lowercased()
+        let contextTokens = Set(
+            MemoryTextNormalizer.keywords(
+                from: contextDescriptor,
+                limit: browserHistoryKeywordLimit
+            )
+        )
+
+        let pinnedCount = min(browserHistoryPinnedRecentTurns, exchangeTurns.count)
+        let pinnedRecent = Array(exchangeTurns.suffix(pinnedCount))
+        var selected = pinnedRecent
+        var selectedKeys = Set(selected.map(mergedPromptHistoryDedupeKey(for:)))
+        let includeSummary = latestSummary != nil && queryTokens.count <= 2
+        let exchangeBudget = max(1, normalizedLimit - (includeSummary ? 1 : 0))
+
+        if selected.count < exchangeBudget {
+            let candidatePool = exchangeTurns.dropLast(pinnedCount)
+                .enumerated()
+                .map { offset, turn -> (turn: PromptRewriteConversationTurn, queryOverlap: Double, contextOverlap: Double, recency: Double, score: Double) in
+                    let turnTokens = Set(
+                        MemoryTextNormalizer.keywords(
+                            from: "\(turn.userText) \(turn.assistantText)".lowercased(),
+                            limit: browserHistoryKeywordLimit
+                        )
+                    )
+                    let queryOverlap = tokenOverlapRatio(queryTokens, turnTokens)
+                    let contextOverlap = tokenOverlapRatio(contextTokens, turnTokens)
+                    let recency = Double(offset + 1) / Double(max(1, exchangeTurns.count))
+                    let score = (queryOverlap * 0.7) + (contextOverlap * 0.2) + (recency * 0.1)
+                    return (
+                        turn: turn,
+                        queryOverlap: queryOverlap,
+                        contextOverlap: contextOverlap,
+                        recency: recency,
+                        score: score
+                    )
+                }
+                .sorted { lhs, rhs in
+                    if lhs.score == rhs.score {
+                        return lhs.turn.timestamp > rhs.turn.timestamp
+                    }
+                    return lhs.score > rhs.score
+                }
+
+            for candidate in candidatePool {
+                guard selected.count < exchangeBudget else { break }
+                if queryTokens.isEmpty {
+                    // Without a query anchor, prefer very recent browser turns and
+                    // turns that share screen/domain keywords with the active page.
+                    if candidate.contextOverlap == 0, candidate.recency < 0.8 {
+                        continue
+                    }
+                } else if candidate.queryOverlap == 0, candidate.contextOverlap == 0 {
+                    continue
+                }
+
+                let dedupeKey = mergedPromptHistoryDedupeKey(for: candidate.turn)
+                if selectedKeys.insert(dedupeKey).inserted {
+                    selected.append(candidate.turn)
+                }
+            }
+        }
+
+        let minimumExchangeTurns = min(exchangeBudget, browserHistoryMinimumContextTurns)
+        if selected.count < minimumExchangeTurns {
+            for turn in exchangeTurns.reversed() {
+                guard selected.count < minimumExchangeTurns else { break }
+                let dedupeKey = mergedPromptHistoryDedupeKey(for: turn)
+                if selectedKeys.insert(dedupeKey).inserted {
+                    selected.append(turn)
+                }
+            }
+        }
+
+        selected.sort { lhs, rhs in lhs.timestamp < rhs.timestamp }
+        if selected.count > exchangeBudget {
+            selected = Array(selected.suffix(exchangeBudget))
+        }
+
+        var output: [PromptRewriteConversationTurn] = selected
+        if includeSummary, let latestSummary, output.count < normalizedLimit {
+            output.insert(latestSummary, at: 0)
+        }
+        if output.count > normalizedLimit {
+            output = Array(output.suffix(normalizedLimit))
+        }
+        return output
+    }
+
+    private func tokenOverlapRatio(_ lhs: Set<String>, _ rhs: Set<String>) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else {
+            return 0
+        }
+        let shared = lhs.intersection(rhs).count
+        return Double(shared) / Double(max(1, lhs.count))
+    }
+
+    private func isBrowserContext(_ context: PromptRewriteConversationContext) -> Bool {
+        tagInferenceService.isBrowserContext(
+            bundleID: context.bundleIdentifier,
+            appName: context.appName
+        )
     }
 
     private func autoCompactContextIfNeeded(_ stored: inout StoredContext) {
@@ -2311,11 +2475,16 @@ final class PromptRewriteConversationStore: ObservableObject {
             return
         }
 
-        let startupThreadLimit = min(
-            sqliteStartupThreadScanHardLimit,
-            max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
-        )
-        let threadRows = (try? store.fetchConversationThreads(limit: startupThreadLimit)) ?? []
+        let threadRows: [ConversationThreadRecord]
+        if let allThreads = try? store.fetchAllConversationThreads() {
+            threadRows = allThreads
+        } else {
+            let startupThreadLimit = min(
+                sqliteStartupThreadScanHardLimit,
+                max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
+            )
+            threadRows = (try? store.fetchConversationThreads(limit: startupThreadLimit)) ?? []
+        }
         var nextContexts: [String: StoredContext] = [:]
         var nextTupleMap: [ConversationThreadTupleKey: String] = [:]
 
@@ -2628,11 +2797,16 @@ final class PromptRewriteConversationStore: ObservableObject {
         tupleKey: ConversationThreadTupleKey
     ) throws {
         guard let store = resolvedSQLiteStore() else { return }
-        let duplicateMergeScanLimit = min(
-            duplicateMergeThreadScanHardLimit,
-            max(maxStoredContexts, maxStoredContexts * duplicateMergeThreadScanMultiplier)
-        )
-        let threads = try store.fetchConversationThreads(limit: duplicateMergeScanLimit)
+        let threads: [ConversationThreadRecord]
+        if let allThreads = try? store.fetchAllConversationThreads() {
+            threads = allThreads
+        } else {
+            let duplicateMergeScanLimit = min(
+                duplicateMergeThreadScanHardLimit,
+                max(maxStoredContexts, maxStoredContexts * duplicateMergeThreadScanMultiplier)
+            )
+            threads = try store.fetchConversationThreads(limit: duplicateMergeScanLimit)
+        }
         let duplicates = threads.filter {
             $0.id != canonicalThreadID
                 && $0.bundleID.caseInsensitiveCompare(tupleKey.bundleID) == .orderedSame
@@ -3066,6 +3240,10 @@ enum PromptRewriteConversationContextResolver {
             app: app,
             windowElement: windowElement,
             fallbackWindowTitle: windowTitle
+        ) ?? telegramContextLabel(
+            app: app,
+            windowElement: windowElement,
+            fallbackWindowTitle: windowTitle
         )
         let resolvedWindowTitle = appSpecificContextLabel ?? windowTitle
 
@@ -3146,6 +3324,22 @@ enum PromptRewriteConversationContextResolver {
             """
         )
         return segments.joined(separator: " | ")
+    }
+
+    private static func telegramContextLabel(
+        app: NSRunningApplication?,
+        windowElement: AXUIElement?,
+        fallbackWindowTitle: String?
+    ) -> String? {
+        guard isTelegramApp(app), let windowElement else { return nil }
+        guard let chat = inferTelegramChatName(
+            from: windowElement,
+            fallbackWindowTitle: fallbackWindowTitle
+        ) else {
+            return nil
+        }
+        CrashReporter.logInfo("Telegram context inferred chat=\(chat)")
+        return "Chat: \(chat)"
     }
 
     private static func inferAntigravityProjectAndThread(
@@ -3781,6 +3975,150 @@ enum PromptRewriteConversationContextResolver {
         return normalizedLabel(captured)
     }
 
+    private static func inferTelegramChatName(
+        from windowElement: AXUIElement,
+        fallbackWindowTitle: String?
+    ) -> String? {
+        if let fromWindowTitle = telegramChatFromWindowTitle(fallbackWindowTitle) {
+            return fromWindowTitle
+        }
+
+        let textNodes = collectTextNodes(from: windowElement, limit: 1800)
+        if textNodes.isEmpty {
+            return nil
+        }
+
+        let selectedCandidates = textNodes
+            .filter(\.selected)
+            .map(\.text)
+            .compactMap(telegramNormalizedChatCandidate)
+        if let selected = selectedCandidates.first {
+            return selected
+        }
+
+        let headingCandidates = textNodes
+            .filter { $0.role.caseInsensitiveCompare("AXHeading") == .orderedSame }
+            .map(\.text)
+            .compactMap(telegramNormalizedChatCandidate)
+        if let heading = headingCandidates.first {
+            return heading
+        }
+
+        let topCandidates = Array(textNodes.prefix(220))
+            .map(\.text)
+            .compactMap(telegramNormalizedChatCandidate)
+        return topCandidates.first
+    }
+
+    private static func telegramChatFromWindowTitle(_ value: String?) -> String? {
+        guard let normalizedValue = normalizedLabel(value) else { return nil }
+        let loweredFull = normalizedValue.lowercased()
+        let appSuffixes = ["telegram @ mac", "telegram desktop", "telegram"]
+
+        for suffix in appSuffixes where loweredFull.hasSuffix(suffix) {
+            let cut = normalizedValue.index(normalizedValue.endIndex, offsetBy: -suffix.count)
+            let candidate = String(normalizedValue[..<cut])
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            if let normalized = telegramNormalizedChatCandidate(candidate) {
+                return normalized
+            }
+        }
+
+        let separators = [" — ", " – ", " - ", " | "]
+        for separator in separators where normalizedValue.contains(separator) {
+            let segments = normalizedValue
+                .components(separatedBy: separator)
+                .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)) }
+                .filter { !$0.isEmpty }
+            for segment in segments {
+                let lowered = segment.lowercased()
+                if lowered.contains("telegram") {
+                    continue
+                }
+                if let normalized = telegramNormalizedChatCandidate(segment) {
+                    return normalized
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private static func telegramNormalizedChatCandidate(_ value: String) -> String? {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        guard looksLikeTelegramChatLabel(normalized) else { return nil }
+        return normalized
+    }
+
+    private static func looksLikeTelegramChatLabel(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        guard value.count >= 2, value.count <= 84 else { return false }
+
+        let lowered = value.lowercased()
+        let blockedExact: Set<String> = [
+            "telegram",
+            "telegram @ mac",
+            "chats",
+            "all chats",
+            "archived chats",
+            "saved messages",
+            "search",
+            "settings",
+            "contacts",
+            "calls",
+            "new message",
+            "compose",
+            "attach",
+            "message",
+            "chat",
+            "type a message",
+            "forwarded message",
+            "unknown chat"
+        ]
+        if blockedExact.contains(lowered) {
+            return false
+        }
+
+        if lowered.contains("axtextarea")
+            || lowered.contains("axtextfield")
+            || lowered.contains("axbutton")
+            || lowered.contains("axgroup")
+            || lowered.contains("telegram @ mac") {
+            return false
+        }
+
+        if lowered.hasPrefix("last seen")
+            || lowered.hasPrefix("typing")
+            || lowered.hasPrefix("online")
+            || lowered.hasPrefix("mute")
+            || lowered.hasPrefix("unmute")
+            || lowered.hasPrefix("mark as")
+            || lowered.hasPrefix("delete")
+            || lowered.hasPrefix("pin")
+            || lowered.hasPrefix("unpin")
+            || lowered.hasPrefix("archive")
+            || lowered.hasPrefix("edit")
+            || lowered.hasPrefix("reply") {
+            return false
+        }
+
+        if lowered.range(of: #"^\d+\s+(?:unread|message|messages|members|member)$"#, options: .regularExpression) != nil {
+            return false
+        }
+
+        if lowered.contains("http://") || lowered.contains("https://") {
+            return false
+        }
+
+        let words = value.split(separator: " ").count
+        if words > 8 {
+            return false
+        }
+
+        return true
+    }
+
     private static func isCodexApp(_ app: NSRunningApplication?) -> Bool {
         let bundleID = app?.bundleIdentifier?.lowercased() ?? ""
         let appName = app?.localizedName?.lowercased() ?? ""
@@ -3797,6 +4135,15 @@ enum PromptRewriteConversationContextResolver {
             return true
         }
         return appName == "antigravity" || appName.contains("antigravity") || bundleID.contains("antigravity")
+    }
+
+    private static func isTelegramApp(_ app: NSRunningApplication?) -> Bool {
+        let bundleID = app?.bundleIdentifier?.lowercased() ?? ""
+        let appName = app?.localizedName?.lowercased() ?? ""
+        if bundleID == "ru.keepcoder.telegram" || bundleID.hasPrefix("ru.keepcoder.telegram.") {
+            return true
+        }
+        return appName == "telegram" || appName.contains("telegram") || bundleID.contains("telegram")
     }
 
     private static func frontmostFocusedWindowTitle() -> String? {
