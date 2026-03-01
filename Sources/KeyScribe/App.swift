@@ -1768,6 +1768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                         insertionText: cleanedTranscript,
                         conversationContext: conversationContext,
                         insertionHUDContext: insertionSessionContext.insertionHUDContext,
+                        preserveInsertionText: true,
                         forceTargetRefocusBeforeInsert: true
                     )
                 }

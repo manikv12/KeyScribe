@@ -981,6 +981,7 @@ final class MemorySQLiteStore {
         FROM conversation_expired_contexts
         WHERE scope_key = ?
             AND consumed_at IS NULL
+            AND delete_after_at > ?
             AND (? IS NULL OR bundle_id = ?)
         ORDER BY expired_at DESC
         LIMIT 1;
@@ -988,8 +989,9 @@ final class MemorySQLiteStore {
 
         let rows: [ExpiredConversationContextRecord] = try query(sql: sql, bind: { statement in
             self.bind(normalizedScopeKey, at: 1, in: statement)
-            self.bind(normalizedBundleConstraint, at: 2, in: statement)
+            self.bind(Date().timeIntervalSince1970, at: 2, in: statement)
             self.bind(normalizedBundleConstraint, at: 3, in: statement)
+            self.bind(normalizedBundleConstraint, at: 4, in: statement)
         }, mapRow: { statement in
             self.expiredConversationContext(from: statement)
         })

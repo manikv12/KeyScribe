@@ -65,7 +65,7 @@ private enum PromptRewriteHUDLayout {
     static let screenMargin: CGFloat = 8
     static let anchorGap: CGFloat = 14
     static let cornerRadius: CGFloat = 26
-    static let loadingSize = NSSize(width: 460, height: 286)
+    static let loadingSize = NSSize(width: 420, height: 170)
     static let loadingOffsetY: CGFloat = 16
 }
 
@@ -654,9 +654,9 @@ final class PromptRewriteHUDManager {
         let proposedX = anchorRect.midX - (size.width * 0.5)
         let proposedY = anchorRect.midY + PromptRewriteHUDLayout.loadingOffsetY
         let minX = visibleFrame.minX + PromptRewriteHUDLayout.screenMargin
-        let maxX = visibleFrame.maxX - size.width - PromptRewriteHUDLayout.screenMargin
+        let maxX = max(minX, visibleFrame.maxX - size.width - PromptRewriteHUDLayout.screenMargin)
         let minY = visibleFrame.minY + PromptRewriteHUDLayout.screenMargin
-        let maxY = visibleFrame.maxY - size.height - PromptRewriteHUDLayout.screenMargin
+        let maxY = max(minY, visibleFrame.maxY - size.height - PromptRewriteHUDLayout.screenMargin)
         let baseX = min(max(proposedX, minX), maxX)
         let baseY = min(max(proposedY, minY), maxY)
         
@@ -1123,37 +1123,6 @@ private struct PromptRewriteDiscussionPage: Identifiable, Equatable {
 }
 
 private struct PromptRewriteLoadingView: View {
-    private enum Stage: Int, CaseIterable {
-        case prepare
-        case generate
-        case finalize
-
-        var title: String {
-            switch self {
-            case .prepare:
-                return "Prepare"
-            case .generate:
-                return "Generate"
-            case .finalize:
-                return "Finalize"
-            }
-        }
-
-        static func from(step: String) -> Stage {
-            let normalized = step.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if normalized.contains("final") || normalized.contains("restoring") || normalized.contains("paused") {
-                return .finalize
-            }
-            if normalized.contains("send")
-                || normalized.contains("receiv")
-                || normalized.contains("normaliz")
-                || normalized.contains("response") {
-                return .generate
-            }
-            return .prepare
-        }
-    }
-
     @ObservedObject var model: PromptRewriteLoadingStateModel
     let onPause: () -> Void
     var onDragChanged: ((CGSize) -> Void)? = nil
@@ -1168,48 +1137,15 @@ private struct PromptRewriteLoadingView: View {
         let normalized = state.transcription.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return "Transcription will appear here." }
         let words = normalized.split(whereSeparator: \.isWhitespace)
-        if words.count <= 42 {
+        if words.count <= 24 {
             return normalized
         }
-        return words.prefix(42).joined(separator: " ") + "…"
+        return words.prefix(24).joined(separator: " ") + "…"
     }
 
     private var stepText: String {
         let normalized = state.currentStep.trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty ? "Preparing rewrite request" : normalized
-    }
-
-    private var aiSummaryText: String {
-        let normalized = state.aiGenerationSummary.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else {
-            return state.aiSuggestionsEnabled
-                ? "AI suggestions are active for this request."
-                : "AI suggestions are not active for this request."
-        }
-        return normalized
-    }
-
-    private var runtimeSummaryText: String? {
-        guard let runtime = state.aiRuntimeSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !runtime.isEmpty else {
-            return nil
-        }
-        return runtime
-    }
-
-    private var stage: Stage {
-        Stage.from(step: stepText)
-    }
-
-    private var nextStepText: String {
-        switch stage {
-        case .prepare:
-            return "Generate a rewrite suggestion"
-        case .generate:
-            return "Finalize confidence and insertion path"
-        case .finalize:
-            return "Insert text into the active app"
-        }
     }
 
     var body: some View {
@@ -1218,52 +1154,36 @@ private struct PromptRewriteLoadingView: View {
             reduceTransparency: reduceTransparency
         )
 
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .center, spacing: 10) {
                 AppIconBadge(
                     symbol: "waveform.and.sparkles",
                     tint: AppVisualTheme.accentTint,
-                    size: 24,
-                    symbolSize: 10,
+                    size: 20,
+                    symbolSize: 9,
                     isEmphasized: true
                 )
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("AI Rewrite In Progress")
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                    Text("Refining Your Prompt")
+                        .font(.system(size: 13.5, weight: .bold, design: .rounded))
                         .foregroundStyle(Color.white.opacity(0.95))
-                    Text("Live status while your transcript is refined")
-                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.white.opacity(0.70))
+                    PromptRewriteWordFlowText(
+                        text: stepText,
+                        font: .system(size: 11, weight: .medium, design: .rounded),
+                        foregroundColor: Color.white.opacity(0.70),
+                        wordsPerSecond: 9,
+                        lineLimit: 1
+                    )
                 }
 
                 Spacer(minLength: 8)
-
-                PromptRewriteLoadingStatePill(
-                    title: state.aiSuggestionsEnabled ? "AI Active" : "AI Off",
-                    isActive: state.aiSuggestionsEnabled
-                )
-
-                if let runtimeSummaryText {
-                    Text(runtimeSummaryText)
-                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.white.opacity(0.46))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(Color.white.opacity(0.06))
-                        )
-                        .help("Rewrite runtime")
-                }
 
                 Button(action: onPause) {
                     Image(systemName: "pause.fill")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(Color.white.opacity(0.96))
-                        .frame(width: 19, height: 19)
+                        .frame(width: 18, height: 18)
                         .background(
                             Circle()
                                 .fill(Color.red.opacity(0.90))
@@ -1274,55 +1194,39 @@ private struct PromptRewriteLoadingView: View {
             }
 
             PromptRewriteActivityBar()
-                .frame(height: 4)
+                .frame(height: 3)
                 .padding(.top, -1)
 
-            HStack(spacing: 8) {
-                ForEach(Stage.allCases, id: \.self) { candidate in
-                    let isCompleted = candidate.rawValue < stage.rawValue
-                    let isActive = candidate == stage
-                    PromptRewriteStageChip(
-                        title: candidate.title,
-                        isActive: isActive,
-                        isCompleted: isCompleted
-                    )
-                }
-            }
-
-            HStack(spacing: 8) {
-                PromptRewriteNowNextCard(
-                    title: "Now",
-                    icon: "bolt.fill",
-                    text: stepText,
-                    wordsPerSecond: 10
-                )
-                PromptRewriteNowNextCard(
-                    title: "Next",
-                    icon: "arrow.turn.down.right",
-                    text: nextStepText,
-                    wordsPerSecond: 9
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Transcript")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.64))
+                PromptRewriteWordFlowText(
+                    text: transcriptPreview,
+                    font: .system(size: 12, weight: .medium, design: .rounded),
+                    foregroundColor: Color.white.opacity(0.92),
+                    wordsPerSecond: 10,
+                    lineLimit: 2
                 )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-
-            PromptRewriteLoadingBlock(
-                title: "Captured Transcript",
-                iconName: "waveform.badge.mic",
-                text: transcriptPreview,
-                wordsPerSecond: 11,
-                lineLimit: 2
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(tokens.surfaceBottom.opacity(0.36))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(tokens.strokeTop.opacity(0.40), lineWidth: 0.8)
+                    )
             )
 
-            PromptRewriteLoadingBlock(
-                title: state.aiSuggestionsEnabled ? "What AI Is Doing" : "Suggestion Status",
-                iconName: state.aiSuggestionsEnabled ? "wand.and.stars" : "power",
-                text: aiSummaryText,
-                wordsPerSecond: 8,
-                lineLimit: 3
-            )
+            Text("Esc pauses AI and uses original text")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.white.opacity(0.56))
         }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
         .background {
             ZStack {
                 PromptRewriteGlassSurface(cornerRadius: 20)
@@ -1566,14 +1470,25 @@ private struct PromptRewriteWordFlowText: View {
     }
 
     var body: some View {
-        TimelineView(.periodic(from: animationStart, by: 1.0 / 30.0)) { timeline in
-            Text(displayText(at: timeline.date))
-                .font(font)
-                .foregroundStyle(foregroundColor)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .lineLimit(lineLimit)
-                .animation(.easeOut(duration: 0.16), value: words)
+        Group {
+            if reduceMotion {
+                Text(normalizedText)
+                    .font(font)
+                    .foregroundStyle(foregroundColor)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(lineLimit)
+            } else {
+                TimelineView(.periodic(from: animationStart, by: 1.0 / 30.0)) { timeline in
+                    Text(displayText(at: timeline.date))
+                        .font(font)
+                        .foregroundStyle(foregroundColor)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(lineLimit)
+                        .animation(.easeOut(duration: 0.16), value: words)
+                }
+            }
         }
         .onAppear {
             rebuildWordTimeline(for: normalizedText)

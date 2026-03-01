@@ -944,7 +944,7 @@ struct AIMemoryStudioView: View {
                 }
 
                 HStack(alignment: .top, spacing: 8) {
-                    Text("Last promotion decision")
+                    Text("Last archive status")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()

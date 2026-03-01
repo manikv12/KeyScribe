@@ -2447,6 +2447,18 @@ final class PromptRewriteConversationStore: ObservableObject {
         SettingsStore.shared.promptRewriteCrossIDEConversationSharingEnabled
     }
 
+    private var promptRewriteEnabled: Bool {
+        SettingsStore.shared.promptRewriteEnabled
+    }
+
+    private var canRunExpiredSummaryAIEnrichment: Bool {
+        FeatureFlags.aiMemoryEnabled
+            && FeatureFlags.conversationLongTermMemoryEnabled
+            && FeatureFlags.conversationAutoPromotionEnabled
+            && promptRewriteEnabled
+            && promptRewriteConversationHistoryEnabled
+    }
+
     private func scopeKeyForExpiredHandoff(
         context: PromptRewriteConversationContext,
         crossIDESharingEnabled: Bool
@@ -2572,8 +2584,25 @@ final class PromptRewriteConversationStore: ObservableObject {
         return date.addingTimeInterval(Double(expiredSummaryRetentionDays * 24 * 60 * 60))
     }
 
+    private func memoryProviderKindForExpiredHandoff(_ record: ExpiredConversationContextRecord) -> MemoryProviderKind {
+        let appName = record.metadata["app_name"] ?? ""
+        let combined = "\(record.bundleID) \(appName)".lowercased()
+        if combined.contains("codex") { return .codex }
+        if combined.contains("opencode") { return .opencode }
+        if combined.contains("claude") || combined.contains("anthropic") { return .claude }
+        if combined.contains("copilot") || combined.contains("github") { return .copilot }
+        if combined.contains("cursor") { return .cursor }
+        if combined.contains("kimi") { return .kimi }
+        if combined.contains("gemini") || combined.contains("google") { return .gemini }
+        if combined.contains("windsurf") { return .windsurf }
+        if combined.contains("codeium") { return .codeium }
+        return .unknown
+    }
+
     private func enqueueExpiredSummaryAIEnrichment(record: ExpiredConversationContextRecord) {
+        guard canRunExpiredSummaryAIEnrichment else { return }
         let timeoutSeconds = max(1, expiredSummaryAITimeoutSeconds)
+        let providerKind = memoryProviderKindForExpiredHandoff(record)
         let recordID = record.id
         let fallbackSummary = record.summaryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !fallbackSummary.isEmpty else { return }
@@ -2585,6 +2614,11 @@ final class PromptRewriteConversationStore: ObservableObject {
         let metadata = record.metadata
 
         Task.detached(priority: .utility) {
+            let hasAIAccess = await StubMemoryRewriteExtractionProvider.shared.hasAIBackedIndexingAccess(
+                for: providerKind
+            )
+            guard hasAIAccess else { return }
+
             let enriched = await StubMemoryRewriteExtractionProvider.shared.summarizeConversationHandoff(
                 summarySeed: fallbackSummary,
                 recentTurns: enrichmentTurns,
@@ -2691,6 +2725,30 @@ final class PromptRewriteConversationStore: ObservableObject {
                             crossIDESharingEnabled: crossIDESharingEnabled
                         )
                         expiredScopeKey = scopeKey
+                        var expiredMetadata: [String: String] = [
+                            "app_name": stored.context.appName,
+                            "screen_label": stored.context.screenLabel,
+                            "field_label": stored.context.fieldLabel,
+                            "logical_surface_key": stored.context.logicalSurfaceKey,
+                            "ai_summary_timeout_seconds": "\(expiredSummaryAITimeoutSeconds)",
+                            "retention_days": "\(expiredSummaryRetentionDays)"
+                        ]
+                        if let projectLabel = stored.context.projectLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !projectLabel.isEmpty {
+                            expiredMetadata["project_label"] = projectLabel
+                        }
+                        if let identityLabel = stored.context.identityLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !identityLabel.isEmpty {
+                            expiredMetadata["identity_label"] = identityLabel
+                        }
+                        if let identityType = stored.context.identityType?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !identityType.isEmpty {
+                            expiredMetadata["identity_type"] = identityType
+                        }
+                        if let nativeThreadKey = stored.context.nativeThreadKey?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !nativeThreadKey.isEmpty {
+                            expiredMetadata["native_thread_key"] = nativeThreadKey
+                        }
                         let expiredRecord = ExpiredConversationContextRecord(
                             id: expiredContextRecordID(
                                 scopeKey: scopeKey,
@@ -2713,14 +2771,7 @@ final class PromptRewriteConversationStore: ObservableObject {
                             deleteAfterAt: expiredContextDeleteAfterDate(from: now),
                             consumedAt: nil,
                             consumedByThreadID: nil,
-                            metadata: [
-                                "app_name": stored.context.appName,
-                                "screen_label": stored.context.screenLabel,
-                                "field_label": stored.context.fieldLabel,
-                                "logical_surface_key": stored.context.logicalSurfaceKey,
-                                "ai_summary_timeout_seconds": "\(expiredSummaryAITimeoutSeconds)",
-                                "retention_days": "\(expiredSummaryRetentionDays)"
-                            ]
+                            metadata: expiredMetadata
                         )
                         try? store.upsertExpiredConversationContext(expiredRecord)
                         enqueueExpiredSummaryAIEnrichment(record: expiredRecord)
@@ -3824,9 +3875,15 @@ enum PromptRewriteConversationContextResolver {
 
         let topBarSelection = inferCodexTopBarSelection(from: windowElement)
         let sidebarSelection = inferCodexSidebarSelection(from: windowElement)
-        var project = topBarSelection?.project ?? sidebarSelection?.project
+        var project = sidebarSelection?.project ?? topBarSelection?.project
         var thread = topBarSelection?.thread ?? sidebarSelection?.thread
 
+        if project == nil {
+            project = allTexts.compactMap(codexProjectFromControlLabel).first
+        }
+        if project == nil {
+            project = allTexts.compactMap(codexProjectFromPathLikeLabel).first
+        }
         if project == nil {
             project = allTexts.compactMap(projectName(fromCodexText:)).first
         }
@@ -3845,6 +3902,11 @@ enum PromptRewriteConversationContextResolver {
             if project == nil {
                 project = codexProjectFromWindowTitle(fallbackWindowTitle, thread: fromWindow)
             }
+        }
+
+        if project == nil,
+           let fallbackWindowTitle = normalizedLabel(fallbackWindowTitle) {
+            project = projectName(fromCodexText: fallbackWindowTitle)
         }
 
         return (project, thread)
@@ -3945,14 +4007,21 @@ enum PromptRewriteConversationContextResolver {
         }), threadActionsIndex > 0 {
             for index in stride(from: threadActionsIndex - 1, through: 0, by: -1) {
                 let entry = entries[index]
+                guard codexRoleSupportsProjectSelection(entry.role) else { continue }
                 if let candidate = codexNormalizedTopBarProjectCandidate(entry.label) {
                     return candidate
                 }
             }
         }
 
-        for entry in entries {
+        for entry in entries where codexRoleSupportsProjectSelection(entry.role) {
             if let candidate = codexNormalizedTopBarProjectCandidate(entry.label) {
+                return candidate
+            }
+        }
+
+        for entry in entries {
+            if let candidate = codexProjectFromControlLabel(entry.label) {
                 return candidate
             }
         }
@@ -3960,11 +4029,55 @@ enum PromptRewriteConversationContextResolver {
         return nil
     }
 
+    private static func codexRoleSupportsProjectSelection(_ role: String) -> Bool {
+        let normalized = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "axbutton"
+            || normalized == "axpopupbutton"
+            || normalized == "axmenubutton"
+            || normalized == "axcombobox"
+    }
+
     private static func codexNormalizedTopBarProjectCandidate(_ value: String) -> String? {
+        if let fromControl = codexProjectFromControlLabel(value) {
+            return fromControl
+        }
         if isCodexToolbarControlLabel(value) {
             return nil
         }
+        if let fromPath = codexProjectFromPathLikeLabel(value) {
+            return fromPath
+        }
         return normalizedProjectName(value)
+    }
+
+    private static func codexProjectFromControlLabel(_ value: String) -> String? {
+        let controlPatterns = [
+            #"(?i)\b(?:start new thread in|project actions for|automations in)\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+            #"(?i)\b(?:working directory|cwd|folder)\s*[:\-]\s*([^\n]{2,180})$"#
+        ]
+        for pattern in controlPatterns {
+            guard let captured = firstRegexCapture(pattern: pattern, in: value) else { continue }
+            if let fromPath = codexProjectFromPathLikeLabel(captured) {
+                return fromPath
+            }
+            if let normalized = normalizedProjectName(captured) {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private static func codexProjectFromPathLikeLabel(_ value: String) -> String? {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !normalized.isEmpty else { return nil }
+        let looksLikePath = normalized.hasPrefix("/")
+            || normalized.hasPrefix("~")
+            || normalized.hasPrefix("file://")
+            || normalized.range(of: #"^[A-Za-z]:\\\\"#, options: .regularExpression) != nil
+        guard looksLikePath else { return nil }
+        guard let label = deriveDocumentLabel(from: normalized) else { return nil }
+        return normalizedProjectName(label)
     }
 
     private static func codexThreadNearTopBarControls(
@@ -4087,7 +4200,9 @@ enum PromptRewriteConversationContextResolver {
                     if lowered == "automation folders" || lowered == "threads" || lowered == "pinned threads" {
                         continue
                     }
-                    if let normalized = normalizedProjectName(candidate) {
+                    if let normalized = codexProjectFromControlLabel(candidate)
+                        ?? codexProjectFromPathLikeLabel(candidate)
+                        ?? normalizedProjectName(candidate) {
                         return normalized
                     }
                 }
@@ -4176,6 +4291,12 @@ enum PromptRewriteConversationContextResolver {
     }
 
     private static func projectName(fromCodexText text: String) -> String? {
+        if let fromControl = codexProjectFromControlLabel(text) {
+            return fromControl
+        }
+        if let fromPath = codexProjectFromPathLikeLabel(text) {
+            return fromPath
+        }
         if let captured = firstRegexCapture(
             pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
             in: text
@@ -4195,6 +4316,12 @@ enum PromptRewriteConversationContextResolver {
         let normalized = collapsedWhitespace(value)
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
         guard !normalized.isEmpty else { return nil }
+        if let captured = firstRegexCapture(
+            pattern: #"(?i)^(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})$"#,
+            in: normalized
+        ) {
+            return normalizedProjectName(captured)
+        }
         let lowered = normalized.lowercased()
         let blocked: Set<String> = [
             "thread",
@@ -4202,7 +4329,9 @@ enum PromptRewriteConversationContextResolver {
             "current thread",
             "codex",
             "unknown",
-            "unknown project"
+            "unknown project",
+            "unknown workspace",
+            "unknown identity"
         ]
         if blocked.contains(lowered) {
             return nil
