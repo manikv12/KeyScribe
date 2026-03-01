@@ -235,6 +235,24 @@ final class ConversationTagInferenceService {
         )
     }
 
+    func shouldSuppressUnknownCodingHistory(
+        bundleID: String,
+        appName: String,
+        projectKey: String,
+        identityKey: String
+    ) -> Bool {
+        guard isCodingWorkspaceApp(bundleID: bundleID, appName: appName) else {
+            return false
+        }
+        let normalizedProject = collapseWhitespace(projectKey)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let normalizedIdentity = collapseWhitespace(identityKey)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalizedProject == "project:unknown" && normalizedIdentity == "identity:unknown"
+    }
+
     private func isCrossIDECodingProjectContext(
         bundleID: String,
         appName: String,
