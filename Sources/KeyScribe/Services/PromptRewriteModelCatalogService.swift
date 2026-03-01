@@ -63,6 +63,12 @@ actor PromptRewriteModelCatalogService {
         let credential = credentialResolution.credential
         let credentialMessage = credentialResolution.message
         let preferOpenAIOAuthCatalog = providerMode == .openAI && hasOpenAIOAuth && !hasOpenAIAPIKey
+        let effectiveBaseURL: String
+        if providerMode == .openAI && preferOpenAIOAuthCatalog {
+            effectiveBaseURL = PromptRewriteProviderMode.openAI.defaultBaseURL
+        } else {
+            effectiveBaseURL = baseURL
+        }
 
         let discoveredFallbackModels = await fallbackModels(
             for: providerMode,
@@ -72,7 +78,11 @@ actor PromptRewriteModelCatalogService {
             cacheModels(discoveredFallbackModels, for: providerMode)
         }
         let fallbackCatalogModels = discoveredFallbackModels.isEmpty
-            ? cachedModels(for: providerMode)
+            ? Self.providerSpecificFallbackCatalogModels(
+                cachedModels(for: providerMode),
+                providerMode: providerMode,
+                preferOpenAIOAuthCatalog: preferOpenAIOAuthCatalog
+            )
             : discoveredFallbackModels
 
         switch providerMode {
@@ -84,7 +94,7 @@ actor PromptRewriteModelCatalogService {
                     message: credentialMessage ?? "Connect OpenAI to load live models."
                 )
             }
-            guard let endpoint = Self.openAIModelsEndpoint(from: baseURL) else {
+            guard let endpoint = Self.openAIModelsEndpoint(from: effectiveBaseURL) else {
                 return PromptRewriteModelFetchResult(
                     models: fallbackCatalogModels,
                     source: .fallback,
@@ -385,13 +395,11 @@ actor PromptRewriteModelCatalogService {
             primary: await fetchModelsDevProviderModels(providerID: providerID),
             secondary: Self.fallbackModels(for: providerMode)
         )
-        if providerMode == .openAI {
-            if preferOpenAIOAuthCatalog {
-                return Self.openAIOAuthCompatibleModels(models)
-            }
-            return Self.rewriteFriendlyModels(models, providerMode: providerMode)
-        }
-        return Self.rewriteFriendlyModels(models, providerMode: providerMode)
+        return Self.providerSpecificFallbackCatalogModels(
+            models,
+            providerMode: providerMode,
+            preferOpenAIOAuthCatalog: preferOpenAIOAuthCatalog
+        )
     }
 
     private func fallbackMessage(
@@ -812,30 +820,83 @@ actor PromptRewriteModelCatalogService {
         switch providerMode {
         case .openAI:
             let filtered = options.filter { option in
-                let modelID = option.id.lowercased()
-                if modelID.contains("codex") { return false }
-                if modelID.contains("embedding") { return false }
-                if modelID.contains("moderation") { return false }
-                if modelID.contains("transcribe") || modelID.contains("whisper") { return false }
-                if modelID.contains("tts") || modelID.contains("audio") { return false }
-                return modelID.hasPrefix("gpt") || modelID.hasPrefix("o1") || modelID.hasPrefix("o3") || modelID.hasPrefix("o4")
+                isOpenAIRewriteFriendlyModelID(option.id)
             }
             return filtered.isEmpty ? options : filtered
         case .google:
             let filtered = options.filter { option in
-                let modelID = option.id.lowercased()
-                if !modelID.hasPrefix("gemini") { return false }
-                if modelID.contains("embedding") { return false }
-                if modelID.contains("vision") { return false }
-                if modelID.contains("image") { return false }
-                if modelID.contains("audio") { return false }
-                if modelID.contains("tts") { return false }
-                return true
+                isGoogleRewriteFriendlyModelID(option.id)
             }
             return filtered.isEmpty ? options : filtered
         case .openRouter, .groq, .anthropic, .ollama:
             return options
         }
+    }
+
+    private static func providerSpecificFallbackCatalogModels(
+        _ options: [PromptRewriteModelOption],
+        providerMode: PromptRewriteProviderMode,
+        preferOpenAIOAuthCatalog: Bool
+    ) -> [PromptRewriteModelOption] {
+        switch providerMode {
+        case .openAI:
+            if preferOpenAIOAuthCatalog {
+                let oauthCompatible = normalizeModelOptions(
+                    options.filter { isOpenAIOAuthCompatibleModelID($0.id) }
+                )
+                if !oauthCompatible.isEmpty {
+                    return oauthCompatible
+                }
+                return buildModelOptions(ids: [defaultOpenAIOAuthModelID])
+            }
+
+            let rewriteFriendly = normalizeModelOptions(
+                options.filter { isOpenAIRewriteFriendlyModelID($0.id) }
+            )
+            if !rewriteFriendly.isEmpty {
+                return rewriteFriendly
+            }
+            return fallbackModels(for: .openAI)
+
+        case .google:
+            let rewriteFriendly = normalizeModelOptions(
+                options.filter { isGoogleRewriteFriendlyModelID($0.id) }
+            )
+            if !rewriteFriendly.isEmpty {
+                return rewriteFriendly
+            }
+            return fallbackModels(for: .google)
+
+        case .openRouter, .groq, .anthropic, .ollama:
+            if options.isEmpty {
+                return fallbackModels(for: providerMode)
+            }
+            return normalizeModelOptions(options)
+        }
+    }
+
+    private static func isOpenAIRewriteFriendlyModelID(_ modelID: String) -> Bool {
+        let normalized = modelID.lowercased()
+        if normalized.contains("codex") { return false }
+        if normalized.contains("embedding") { return false }
+        if normalized.contains("moderation") { return false }
+        if normalized.contains("transcribe") || normalized.contains("whisper") { return false }
+        if normalized.contains("tts") || normalized.contains("audio") { return false }
+        return normalized.hasPrefix("gpt")
+            || normalized.hasPrefix("o1")
+            || normalized.hasPrefix("o3")
+            || normalized.hasPrefix("o4")
+    }
+
+    private static func isGoogleRewriteFriendlyModelID(_ modelID: String) -> Bool {
+        let normalized = modelID.lowercased()
+        if !normalized.hasPrefix("gemini") { return false }
+        if normalized.contains("embedding") { return false }
+        if normalized.contains("vision") { return false }
+        if normalized.contains("image") { return false }
+        if normalized.contains("audio") { return false }
+        if normalized.contains("tts") { return false }
+        return true
     }
 
     private static let openAIOAuthPreferredModelIDs: [String] = [

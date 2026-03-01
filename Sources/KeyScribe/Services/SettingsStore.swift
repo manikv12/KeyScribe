@@ -396,6 +396,8 @@ final class SettingsStore: ObservableObject {
 
         private let defaults = UserDefaults.standard
         private var isApplyingChanges = false
+        private var pendingOnChangeWorkItem: DispatchWorkItem?
+        private static let onChangeDebounceSeconds: TimeInterval = 0.14
 
     private enum Keys {
         static let shortcutKeyCode = "KeyScribe.shortcutKeyCode"
@@ -433,6 +435,7 @@ final class SettingsStore: ObservableObject {
         static let dictationCorrectionLearnedSoundName = "KeyScribe.dictationCorrectionLearnedSoundName"
         static let dictationFeedbackVolume = "KeyScribe.dictationFeedbackVolume"
         static let promptRewriteEnabled = "KeyScribe.promptRewriteEnabled"
+        static let promptRewriteAutoInsertEnabled = "KeyScribe.promptRewriteAutoInsertEnabled"
         static let memoryIndexingEnabled = "KeyScribe.memoryIndexingEnabled"
         static let memoryProviderCatalogAutoUpdate = "KeyScribe.memoryProviderCatalogAutoUpdate"
         static let memoryDetectedProviderIDs = "KeyScribe.memoryDetectedProviderIDs"
@@ -693,6 +696,12 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var promptRewriteEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var promptRewriteAutoInsertEnabled: Bool {
         didSet {
             save()
         }
@@ -1135,6 +1144,12 @@ final class SettingsStore: ObservableObject {
             promptRewriteEnabled = defaults.bool(forKey: Keys.promptRewriteEnabled)
         }
 
+        if defaults.object(forKey: Keys.promptRewriteAutoInsertEnabled) == nil {
+            promptRewriteAutoInsertEnabled = false
+        } else {
+            promptRewriteAutoInsertEnabled = defaults.bool(forKey: Keys.promptRewriteAutoInsertEnabled)
+        }
+
         if defaults.object(forKey: Keys.memoryIndexingEnabled) == nil {
             memoryIndexingEnabled = false
         } else {
@@ -1177,6 +1192,9 @@ final class SettingsStore: ObservableObject {
         }
         promptRewriteProviderModeRawValue = resolvedPromptRewriteProviderModeRaw
         let selectedPromptProvider = PromptRewriteProviderMode(rawValue: resolvedPromptRewriteProviderModeRaw) ?? .openAI
+        let selectedPromptProviderAPIKey = Self.loadPromptRewriteProviderAPIKey(for: selectedPromptProvider)
+        let selectedPromptProviderHasOAuthSession = selectedPromptProvider.supportsOAuthSignIn
+            && PromptRewriteOAuthCredentialStore.loadSession(for: selectedPromptProvider) != nil
 
         var modelByProvider = Self.normalizedProviderScopedStringDictionary(
             defaults.dictionary(forKey: Keys.promptRewriteModelByProvider)
@@ -1185,25 +1203,41 @@ final class SettingsStore: ObservableObject {
             defaults.dictionary(forKey: Keys.promptRewriteBaseURLByProvider)
         )
 
+        // One-time migration path for pre-provider-scoped settings:
+        // only consult legacy global keys when there is no scoped entry yet
+        // and no scoped map exists for that field.
+        let shouldMigrateLegacyModel = modelByProvider[selectedPromptProvider.rawValue] == nil
+            && modelByProvider.isEmpty
         let storedOpenAIModel = defaults.string(forKey: Keys.promptRewriteOpenAIModel)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if modelByProvider[selectedPromptProvider.rawValue] == nil,
+        if shouldMigrateLegacyModel,
            let storedOpenAIModel,
            !storedOpenAIModel.isEmpty {
             modelByProvider[selectedPromptProvider.rawValue] = storedOpenAIModel
         }
         let selectedProviderModel = modelByProvider[selectedPromptProvider.rawValue] ?? selectedPromptProvider.defaultModel
-        promptRewriteOpenAIModel = selectedProviderModel
 
+        let shouldMigrateLegacyBaseURL = baseURLByProvider[selectedPromptProvider.rawValue] == nil
+            && baseURLByProvider.isEmpty
         let storedOpenAIBaseURL = defaults.string(forKey: Keys.promptRewriteOpenAIBaseURL)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if baseURLByProvider[selectedPromptProvider.rawValue] == nil,
+        if shouldMigrateLegacyBaseURL,
            let storedOpenAIBaseURL,
            !storedOpenAIBaseURL.isEmpty {
             baseURLByProvider[selectedPromptProvider.rawValue] = storedOpenAIBaseURL
         }
         let selectedProviderBaseURL = baseURLByProvider[selectedPromptProvider.rawValue] ?? selectedPromptProvider.defaultBaseURL
-        promptRewriteOpenAIBaseURL = selectedProviderBaseURL
+        let sanitizedPromptProviderConfiguration = Self.sanitizedPromptRewriteProviderConfiguration(
+            mode: selectedPromptProvider,
+            model: selectedProviderModel,
+            baseURL: selectedProviderBaseURL,
+            hasOAuthSession: selectedPromptProviderHasOAuthSession,
+            hasAPIKey: !selectedPromptProviderAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+        modelByProvider[selectedPromptProvider.rawValue] = sanitizedPromptProviderConfiguration.model
+        baseURLByProvider[selectedPromptProvider.rawValue] = sanitizedPromptProviderConfiguration.baseURL
+        promptRewriteOpenAIModel = sanitizedPromptProviderConfiguration.model
+        promptRewriteOpenAIBaseURL = sanitizedPromptProviderConfiguration.baseURL
         promptRewriteModelByProvider = modelByProvider
         promptRewriteBaseURLByProvider = baseURLByProvider
 
@@ -1263,7 +1297,7 @@ final class SettingsStore: ObservableObject {
             promptRewriteCrossIDEConversationSharingEnabled = defaults.bool(forKey: Keys.promptRewriteCrossIDEConversationSharingEnabled)
         }
 
-        promptRewriteOpenAIAPIKey = Self.loadPromptRewriteProviderAPIKey(for: selectedPromptProvider)
+        promptRewriteOpenAIAPIKey = selectedPromptProviderAPIKey
 
         if defaults.object(forKey: Keys.localAISetupCompleted) == nil {
             localAISetupCompleted = false
@@ -1375,6 +1409,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(dictationCorrectionLearnedSoundName, forKey: Keys.dictationCorrectionLearnedSoundName)
         defaults.set(dictationFeedbackVolume, forKey: Keys.dictationFeedbackVolume)
         defaults.set(promptRewriteEnabled, forKey: Keys.promptRewriteEnabled)
+        defaults.set(promptRewriteAutoInsertEnabled, forKey: Keys.promptRewriteAutoInsertEnabled)
         defaults.set(memoryIndexingEnabled, forKey: Keys.memoryIndexingEnabled)
         defaults.set(memoryProviderCatalogAutoUpdate, forKey: Keys.memoryProviderCatalogAutoUpdate)
         defaults.set(Self.normalizedStringList(memoryDetectedProviderIDs), forKey: Keys.memoryDetectedProviderIDs)
@@ -1414,8 +1449,23 @@ final class SettingsStore: ObservableObject {
         defaults.set(localAIRuntimeVersion.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.localAIRuntimeVersion)
         defaults.set(localAILastHealthCheckEpoch, forKey: Keys.localAILastHealthCheckEpoch)
 
+        scheduleOnChangeNotificationIfNeeded()
+    }
+
+    private func scheduleOnChangeNotificationIfNeeded() {
         guard !isApplyingChanges else { return }
-        onChange?()
+        pendingOnChangeWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingOnChangeWorkItem = nil
+            self.onChange?()
+        }
+        pendingOnChangeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.onChangeDebounceSeconds,
+            execute: workItem
+        )
     }
 
     var shortcutModifierFlags: NSEvent.ModifierFlags {
@@ -1524,13 +1574,23 @@ final class SettingsStore: ObservableObject {
 
     private func restorePromptRewriteProviderConfiguration(for mode: PromptRewriteProviderMode) {
         let restoredModel = promptRewriteModelByProvider[mode.rawValue] ?? mode.defaultModel
-        if promptRewriteOpenAIModel != restoredModel {
-            promptRewriteOpenAIModel = restoredModel
-        }
-
         let restoredBaseURL = promptRewriteBaseURLByProvider[mode.rawValue] ?? mode.defaultBaseURL
-        if promptRewriteOpenAIBaseURL != restoredBaseURL {
-            promptRewriteOpenAIBaseURL = restoredBaseURL
+        let hasOAuthSession = mode.supportsOAuthSignIn && hasPromptRewriteOAuthSession(for: mode)
+        let hasAPIKey = mode.requiresAPIKey && hasPromptRewriteAPIKey(for: mode)
+        let sanitizedConfiguration = Self.sanitizedPromptRewriteProviderConfiguration(
+            mode: mode,
+            model: restoredModel,
+            baseURL: restoredBaseURL,
+            hasOAuthSession: hasOAuthSession,
+            hasAPIKey: hasAPIKey
+        )
+        promptRewriteModelByProvider[mode.rawValue] = sanitizedConfiguration.model
+        promptRewriteBaseURLByProvider[mode.rawValue] = sanitizedConfiguration.baseURL
+        if promptRewriteOpenAIModel != sanitizedConfiguration.model {
+            promptRewriteOpenAIModel = sanitizedConfiguration.model
+        }
+        if promptRewriteOpenAIBaseURL != sanitizedConfiguration.baseURL {
+            promptRewriteOpenAIBaseURL = sanitizedConfiguration.baseURL
         }
     }
 
@@ -1694,6 +1754,34 @@ final class SettingsStore: ObservableObject {
         }
 
         return normalized
+    }
+
+    private static func sanitizedPromptRewriteProviderConfiguration(
+        mode: PromptRewriteProviderMode,
+        model: String,
+        baseURL: String,
+        hasOAuthSession: Bool,
+        hasAPIKey: Bool
+    ) -> (model: String, baseURL: String) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        var resolvedModel = trimmedModel.isEmpty ? mode.defaultModel : trimmedModel
+        var resolvedBaseURL = trimmedBaseURL.isEmpty ? mode.defaultBaseURL : trimmedBaseURL
+
+        guard mode == .openAI else {
+            return (resolvedModel, resolvedBaseURL)
+        }
+
+        let usingOpenAIOAuthOnly = hasOAuthSession && !hasAPIKey
+        guard usingOpenAIOAuthOnly else {
+            return (resolvedModel, resolvedBaseURL)
+        }
+
+        resolvedBaseURL = mode.defaultBaseURL
+        if !PromptRewriteModelCatalogService.isOpenAIOAuthCompatibleModelID(resolvedModel) {
+            resolvedModel = PromptRewriteModelCatalogService.defaultOpenAIOAuthModelID
+        }
+        return (resolvedModel, resolvedBaseURL)
     }
 
     private static let promptRewriteProviderAPIKeychainService = "com.keyscribe.KeyScribe"

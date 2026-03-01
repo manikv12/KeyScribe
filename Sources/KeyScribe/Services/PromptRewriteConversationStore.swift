@@ -306,6 +306,8 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let maxRelevantExchangeTurnsForPrompt = 5
     private let minRecentExchangeTurnsForPrompt = 3
     private let maxRecentExchangeTurnsForPrompt = 5
+    private let primaryPromptHistoryTurnBudget = 3
+    private let linkedPromptHistoryTurnBudget = 2
     private let autoCompactionExchangeThreshold = 40
     private let autoCompactionRetainedExchangeTurns = 8
     private let maxPromptContextCharacters = 1_800
@@ -316,6 +318,13 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let duplicateMergeThreadScanHardLimit = 120
     private let clarificationSimilarityThreshold = 0.92
     private let clarificationCandidateLimit = 3
+    private let mappingRuleIDPrefixManual = "map-manual-"
+    private let mappingRuleIDPrefixAI = "map-ai-"
+    private let mappingRuleIDPrefixDeterministic = "map-deterministic-"
+    private let mappingRuleIDPrefixLegacy = "disambiguation-"
+    private let aliasMappingIDPrefix = "tag-alias|"
+    private let redirectWriteFlagUserDefaultsKey = "feature.conversation.redirectWrites.enabled"
+    private let redirectWriteFlagEnvironmentKey = "KEYSCRIBE_CONVERSATION_REDIRECT_WRITES_ENABLED"
     private let sqliteStoreFactory: () throws -> MemorySQLiteStore
     private let tagInferenceService: ConversationTagInferenceService
 
@@ -366,12 +375,32 @@ final class PromptRewriteConversationStore: ObservableObject {
         pinnedContextID: String?
     ) -> RequestContext {
         pruneStaleContexts(timeoutMinutes: timeoutMinutes)
+        let store = resolvedSQLiteStore()
+        let normalizedRequestTurnLimit = normalizedTurnLimit(turnLimit)
 
         let normalizedPinnedID = pinnedContextID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let pinnedContext: StoredContext?
+        let resolvedPinnedID: String?
         if let normalizedPinnedID, !normalizedPinnedID.isEmpty {
-            pinnedContext = contextsByID[normalizedPinnedID]
+            resolvedPinnedID = resolvedConversationThreadIDWithRedirect(
+                normalizedPinnedID,
+                store: store
+            )
+        } else {
+            resolvedPinnedID = nil
+        }
+        let pinnedContext: StoredContext?
+        if let resolvedPinnedID, !resolvedPinnedID.isEmpty {
+            if let inMemoryPinned = contextsByID[resolvedPinnedID] {
+                pinnedContext = inMemoryPinned
+            } else if let store {
+                pinnedContext = loadStoredContextFromSQLite(
+                    threadID: resolvedPinnedID,
+                    store: store
+                )
+            } else {
+                pinnedContext = nil
+            }
         } else {
             pinnedContext = nil
         }
@@ -384,7 +413,11 @@ final class PromptRewriteConversationStore: ObservableObject {
         if let pinnedContext {
             resolvedContext = pinnedContext.context
             usesPinnedContext = true
-            history = promptHistory(for: resolvedContext.id, limit: normalizedTurnLimit(turnLimit), userText: userText)
+            history = mergedRequestHistory(
+                for: resolvedContext,
+                limit: normalizedRequestTurnLimit,
+                userText: userText
+            )
             resolutionSource = "pinned"
             resolvedTupleKey = pinnedContext.tupleKey
         } else {
@@ -398,8 +431,15 @@ final class PromptRewriteConversationStore: ObservableObject {
                 capturedContext: capturedContext,
                 tags: inferred
             )
-            if let existingID = contextIDByTuple[tupleKey],
-               var existing = contextsByID[existingID] {
+            let resolvedExistingID = contextIDByTuple[tupleKey].map {
+                resolvedConversationThreadIDWithRedirect(
+                    $0,
+                    store: store
+                )
+            }
+            if let resolvedExistingID, !resolvedExistingID.isEmpty,
+               var existing = contextsByID[resolvedExistingID] {
+                contextIDByTuple[tupleKey] = resolvedExistingID
                 let refreshedContext = tupleContext(
                     baseContext: capturedContext,
                     tupleKey: tupleKey,
@@ -408,16 +448,16 @@ final class PromptRewriteConversationStore: ObservableObject {
                 )
                 existing.context = refreshedContext
                 existing.tupleKey = tupleKey
-                contextsByID[existingID] = existing
+                contextsByID[resolvedExistingID] = existing
                 resolvedContext = refreshedContext
-                history = promptHistory(
-                    for: resolvedContext.id,
-                    limit: normalizedTurnLimit(turnLimit),
+                history = mergedRequestHistory(
+                    for: resolvedContext,
+                    limit: normalizedRequestTurnLimit,
                     userText: userText
                 )
                 resolutionSource = "in-memory"
                 resolvedTupleKey = tupleKey
-            } else if let store = resolvedSQLiteStore(),
+            } else if let store,
                       let thread = try? store.fetchConversationThread(
                           bundleID: tupleKey.bundleID,
                           logicalSurfaceKey: tupleKey.logicalSurfaceKey,
@@ -425,30 +465,40 @@ final class PromptRewriteConversationStore: ObservableObject {
                           identityKey: tupleKey.identityKey,
                           nativeThreadKey: tupleKey.nativeThreadKey
                       ) {
+                let redirectedThreadID = resolvedConversationThreadIDWithRedirect(
+                    thread.id,
+                    store: store
+                )
+                let resolvedThread = (redirectedThreadID.caseInsensitiveCompare(thread.id) == .orderedSame)
+                    ? thread
+                    : ((try? store.fetchConversationThread(id: redirectedThreadID)) ?? thread)
                 let resolvedLoadedContext = tupleContext(
                     baseContext: capturedContext,
                     tupleKey: tupleKey,
                     tags: inferred,
-                    threadID: thread.id
+                    threadID: resolvedThread.id
                 )
-                let loadedTurns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
+                let loadedTurns = ((try? store.fetchConversationTurns(threadID: resolvedThread.id, limit: maxStoredTurnsPerContext)) ?? [])
                     .compactMap(conversationTurn(from:))
                 let loaded = StoredContext(
                     context: resolvedLoadedContext,
                     turns: Array(loadedTurns.suffix(maxStoredTurnsPerContext)),
-                    lastUpdatedAt: thread.lastActivityAt,
+                    lastUpdatedAt: resolvedThread.lastActivityAt,
                     tupleKey: tupleKey,
-                    totalExchangeTurns: max(thread.totalExchangeTurns, loadedTurns.filter { !$0.isSummary }.count)
+                    totalExchangeTurns: max(
+                        resolvedThread.totalExchangeTurns,
+                        loadedTurns.filter { !$0.isSummary }.count
+                    )
                 )
-                contextsByID[thread.id] = loaded
-                contextIDByTuple[tupleKey] = thread.id
+                contextsByID[resolvedThread.id] = loaded
+                contextIDByTuple[tupleKey] = resolvedThread.id
                 resolvedContext = resolvedLoadedContext
-                history = promptHistory(
-                    for: resolvedContext.id,
-                    limit: normalizedTurnLimit(turnLimit),
+                history = mergedRequestHistory(
+                    for: resolvedContext,
+                    limit: normalizedRequestTurnLimit,
                     userText: userText
                 )
-                resolutionSource = "sqlite"
+                resolutionSource = (resolvedThread.id == thread.id) ? "sqlite" : "sqlite-redirect"
                 resolvedTupleKey = tupleKey
             } else {
                 let threadID = tagInferenceService.threadID(for: tupleKey)
@@ -557,7 +607,8 @@ final class PromptRewriteConversationStore: ObservableObject {
 
     func applyClarificationDecision(
         _ decision: ConversationClarificationDecision,
-        for prompt: ConversationClarificationPrompt
+        for prompt: ConversationClarificationPrompt,
+        source: ConversationContextMappingSource = .manual
     ) {
         guard decision != .dismiss else {
             return
@@ -590,44 +641,29 @@ final class PromptRewriteConversationStore: ObservableObject {
         )
         let contextScopeKey = prompt.kind.isExact ? nil : normalizedCandidateKey
         let ruleType = clarificationRuleType(for: axis)
-        let now = Date()
-        let ruleID = disambiguationRuleID(
-            ruleType: ruleType,
-            appPairKey: appPairKey,
-            subjectKey: subjectKey,
-            contextScopeKey: contextScopeKey
-        )
 
         switch decision {
         case .dismiss:
             return
         case .keepSeparate:
-            try? store.upsertConversationDisambiguationRule(
-                ConversationDisambiguationRuleRecord(
-                    id: ruleID,
-                    ruleType: ruleType,
-                    appPairKey: appPairKey,
-                    subjectKey: subjectKey,
-                    contextScopeKey: contextScopeKey,
-                    decision: .separate,
-                    canonicalKey: nil,
-                    createdAt: now,
-                    updatedAt: now
-                )
+            upsertContextMappingDecision(
+                mappingType: ruleType,
+                appPairKey: appPairKey,
+                subjectKey: subjectKey,
+                contextScopeKey: contextScopeKey,
+                decision: .separate,
+                canonicalKey: nil,
+                source: source
             )
         case .link:
-            try? store.upsertConversationDisambiguationRule(
-                ConversationDisambiguationRuleRecord(
-                    id: ruleID,
-                    ruleType: ruleType,
-                    appPairKey: appPairKey,
-                    subjectKey: subjectKey,
-                    contextScopeKey: contextScopeKey,
-                    decision: .link,
-                    canonicalKey: normalizedCandidateKey,
-                    createdAt: now,
-                    updatedAt: now
-                )
+            upsertContextMappingDecision(
+                mappingType: ruleType,
+                appPairKey: appPairKey,
+                subjectKey: subjectKey,
+                contextScopeKey: contextScopeKey,
+                decision: .link,
+                canonicalKey: normalizedCandidateKey,
+                source: source
             )
             try? store.upsertConversationTagAlias(
                 aliasType: axis.aliasType,
@@ -635,6 +671,164 @@ final class PromptRewriteConversationStore: ObservableObject {
                 canonicalKey: normalizedCandidateKey
             )
         }
+    }
+
+    func fetchContextMappings(limit: Int = 400) -> [ConversationContextMappingRow] {
+        guard let store = resolvedSQLiteStore() else {
+            return []
+        }
+
+        let normalizedLimit = max(1, min(limit, 2_000))
+        let rules = (try? store.fetchConversationDisambiguationRules(limit: normalizedLimit)) ?? []
+        let aliases = (try? store.fetchConversationTagAliases(limit: normalizedLimit)) ?? []
+
+        var rows = rules.map { rule in
+            ConversationContextMappingRow(
+                id: rule.id,
+                mappingType: rule.ruleType.rawValue,
+                appPairKey: rule.appPairKey,
+                subjectKey: rule.subjectKey,
+                contextScopeKey: rule.contextScopeKey,
+                decision: rule.decision,
+                canonicalKey: rule.canonicalKey,
+                source: mappingSource(forRuleID: rule.id),
+                updatedAt: rule.updatedAt
+            )
+        }
+
+        rows.append(contentsOf: aliases.map { alias in
+            ConversationContextMappingRow(
+                id: tagAliasMappingID(aliasType: alias.aliasType, aliasKey: alias.aliasKey),
+                mappingType: "alias:\(alias.aliasType)",
+                appPairKey: "global",
+                subjectKey: alias.aliasKey,
+                contextScopeKey: nil,
+                decision: .link,
+                canonicalKey: alias.canonicalKey,
+                source: .legacy,
+                updatedAt: alias.updatedAt
+            )
+        })
+
+        rows.sort { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.id < rhs.id
+        }
+        if rows.count > normalizedLimit {
+            rows = Array(rows.prefix(normalizedLimit))
+        }
+        return rows
+    }
+
+    func upsertContextMappingDecision(
+        mappingType: ConversationDisambiguationRuleType,
+        appPairKey: String,
+        subjectKey: String,
+        contextScopeKey: String?,
+        decision: ConversationDisambiguationDecision,
+        canonicalKey: String?,
+        source: ConversationContextMappingSource
+    ) {
+        guard let store = resolvedSQLiteStore() else {
+            return
+        }
+
+        let normalizedAppPairKey = normalizedDisambiguationAppPairKey(appPairKey)
+        let normalizedSubjectKey = normalizedClarificationKey(subjectKey)
+        let normalizedScopeKey = normalizedClarificationOptionalKey(contextScopeKey)
+        let normalizedCanonicalKey = normalizedClarificationOptionalKey(canonicalKey)
+        let resolvedCanonicalKey = (decision == .link) ? normalizedCanonicalKey : nil
+
+        guard !normalizedAppPairKey.isEmpty, !normalizedSubjectKey.isEmpty else {
+            return
+        }
+
+        let ruleID = disambiguationRuleID(
+            ruleType: mappingType,
+            appPairKey: normalizedAppPairKey,
+            subjectKey: normalizedSubjectKey,
+            contextScopeKey: normalizedScopeKey,
+            source: source
+        )
+        let existing = try? store.fetchConversationDisambiguationRule(
+            ruleType: mappingType,
+            appPairKey: normalizedAppPairKey,
+            subjectKey: normalizedSubjectKey,
+            contextScopeKey: normalizedScopeKey
+        )
+        if let existing,
+           existing.id.caseInsensitiveCompare(ruleID) != .orderedSame {
+            try? store.deleteConversationDisambiguationRule(id: existing.id)
+        }
+
+        let now = Date()
+        try? store.upsertConversationDisambiguationRule(
+            ConversationDisambiguationRuleRecord(
+                id: ruleID,
+                ruleType: mappingType,
+                appPairKey: normalizedAppPairKey,
+                subjectKey: normalizedSubjectKey,
+                contextScopeKey: normalizedScopeKey,
+                decision: decision,
+                canonicalKey: resolvedCanonicalKey,
+                createdAt: existing?.createdAt ?? now,
+                updatedAt: now
+            )
+        )
+    }
+
+    func removeContextMapping(id: String) {
+        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedID.isEmpty else {
+            return
+        }
+        guard let store = resolvedSQLiteStore() else {
+            return
+        }
+
+        if let aliasComponents = decodeTagAliasMappingID(normalizedID) {
+            try? store.deleteConversationTagAlias(
+                aliasType: aliasComponents.aliasType,
+                aliasKey: aliasComponents.aliasKey
+            )
+            return
+        }
+
+        try? store.deleteConversationDisambiguationRule(id: normalizedID)
+    }
+
+    func resolveLinkedContextIDs(for context: PromptRewriteConversationContext) -> [String] {
+        if contextsByID[context.id] == nil,
+           let store = resolvedSQLiteStore() {
+            _ = loadStoredContextFromSQLite(threadID: context.id, store: store)
+        }
+        return linkedContextIDs(
+            for: context,
+            excludingContextID: context.id
+        )
+    }
+
+    func activePromptHistory(
+        for contextID: String,
+        userText: String,
+        limit: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedContextID = contextID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedContextID.isEmpty else {
+            return []
+        }
+
+        if contextsByID[normalizedContextID] == nil,
+           let store = resolvedSQLiteStore() {
+            _ = loadStoredContextFromSQLite(threadID: normalizedContextID, store: store)
+        }
+        return promptHistory(
+            for: normalizedContextID,
+            limit: normalizedTurnLimit(limit),
+            userText: userText
+        )
     }
 
     func recordTurn(
@@ -1232,7 +1426,8 @@ final class PromptRewriteConversationStore: ObservableObject {
         ruleType: ConversationDisambiguationRuleType,
         appPairKey: String,
         subjectKey: String,
-        contextScopeKey: String?
+        contextScopeKey: String?,
+        source: ConversationContextMappingSource
     ) -> String {
         let seed = [
             ruleType.rawValue,
@@ -1242,7 +1437,74 @@ final class PromptRewriteConversationStore: ObservableObject {
         ].joined(separator: "|")
         let digest = SHA256.hash(data: Data(seed.utf8))
         let digestPrefix = digest.map { String(format: "%02x", $0) }.joined().prefix(24)
-        return "disambiguation-\(digestPrefix)"
+        return "\(mappingSourceRuleIDPrefix(source))\(digestPrefix)"
+    }
+
+    private func mappingSourceRuleIDPrefix(_ source: ConversationContextMappingSource) -> String {
+        switch source {
+        case .manual:
+            return mappingRuleIDPrefixManual
+        case .ai:
+            return mappingRuleIDPrefixAI
+        case .deterministic:
+            return mappingRuleIDPrefixDeterministic
+        case .legacy:
+            return mappingRuleIDPrefixLegacy
+        }
+    }
+
+    private func mappingSource(forRuleID ruleID: String) -> ConversationContextMappingSource {
+        let normalizedID = ruleID.lowercased()
+        if normalizedID.hasPrefix(mappingRuleIDPrefixManual) {
+            return .manual
+        }
+        if normalizedID.hasPrefix(mappingRuleIDPrefixAI) {
+            return .ai
+        }
+        if normalizedID.hasPrefix(mappingRuleIDPrefixDeterministic) {
+            return .deterministic
+        }
+        return .legacy
+    }
+
+    private func normalizedDisambiguationAppPairKey(_ value: String) -> String {
+        let normalized = value
+            .split(separator: "|")
+            .map { normalizedClarificationBundle(String($0)) }
+            .filter { !$0.isEmpty }
+            .sorted()
+        if normalized.count >= 2 {
+            return normalized.joined(separator: "|")
+        }
+        return normalizedClarificationBundle(value)
+    }
+
+    private func normalizedClarificationOptionalKey(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = normalizedClarificationKey(value)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func tagAliasMappingID(aliasType: String, aliasKey: String) -> String {
+        let encodedAliasType = Data(aliasType.utf8).base64EncodedString()
+        let encodedAliasKey = Data(aliasKey.utf8).base64EncodedString()
+        return "\(aliasMappingIDPrefix)\(encodedAliasType)|\(encodedAliasKey)"
+    }
+
+    private func decodeTagAliasMappingID(_ value: String) -> (aliasType: String, aliasKey: String)? {
+        guard value.hasPrefix(aliasMappingIDPrefix) else {
+            return nil
+        }
+        let encodedPayload = String(value.dropFirst(aliasMappingIDPrefix.count))
+        let parts = encodedPayload.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let aliasTypeData = Data(base64Encoded: String(parts[0])),
+              let aliasKeyData = Data(base64Encoded: String(parts[1])),
+              let aliasType = String(data: aliasTypeData, encoding: .utf8),
+              let aliasKey = String(data: aliasKeyData, encoding: .utf8) else {
+            return nil
+        }
+        return (aliasType, aliasKey)
     }
 
     private func resolvedClarificationAliasKey(
@@ -1396,6 +1658,215 @@ final class PromptRewriteConversationStore: ObservableObject {
             return 0
         }
         return Double(lhsTokens.intersection(rhsTokens).count) / Double(unionCount)
+    }
+
+    private func mergedRequestHistory(
+        for context: PromptRewriteConversationContext,
+        limit: Int,
+        userText: String
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedLimit = normalizedTurnLimit(limit)
+        guard normalizedLimit > 0 else { return [] }
+
+        let activeOnlyHistory = promptHistory(
+            for: context.id,
+            limit: normalizedLimit,
+            userText: userText
+        )
+        let linkedBudget = min(
+            linkedPromptHistoryTurnBudget,
+            max(0, normalizedLimit - 1)
+        )
+        guard linkedBudget > 0 else {
+            return activeOnlyHistory
+        }
+
+        let linkedTurns = linkedContextTurnCandidates(
+            for: context,
+            excludingContextID: context.id,
+            userText: userText,
+            limit: linkedBudget
+        )
+        guard !linkedTurns.isEmpty else {
+            return activeOnlyHistory
+        }
+
+        let activeBudget = min(
+            primaryPromptHistoryTurnBudget,
+            max(1, normalizedLimit - linkedTurns.count)
+        )
+        let prioritizedActive = promptHistory(
+            for: context.id,
+            limit: activeBudget,
+            userText: userText
+        )
+
+        var merged = prioritizedActive + linkedTurns
+        if merged.count < normalizedLimit {
+            for turn in activeOnlyHistory where !merged.contains(turn) {
+                merged.append(turn)
+                if merged.count >= normalizedLimit {
+                    break
+                }
+            }
+        }
+
+        let deduped = dedupedMergedPromptHistory(
+            merged,
+            limit: normalizedLimit
+        )
+        return deduped.isEmpty ? activeOnlyHistory : deduped
+    }
+
+    private func linkedContextTurnCandidates(
+        for context: PromptRewriteConversationContext,
+        excludingContextID: String,
+        userText: String,
+        limit: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedLimit = max(0, min(linkedPromptHistoryTurnBudget, limit))
+        guard normalizedLimit > 0 else { return [] }
+
+        let linkedIDs = linkedContextIDs(
+            for: context,
+            excludingContextID: excludingContextID
+        )
+        guard !linkedIDs.isEmpty else { return [] }
+
+        var primaries: [PromptRewriteConversationTurn] = []
+        var secondaries: [PromptRewriteConversationTurn] = []
+
+        for contextID in linkedIDs {
+            let selected = promptHistory(
+                for: contextID,
+                limit: linkedPromptHistoryTurnBudget,
+                userText: userText
+            )
+            let exchangeTurns = selected.filter { !$0.isSummary }
+            guard let latest = exchangeTurns.last else {
+                continue
+            }
+            primaries.append(latest)
+            if exchangeTurns.count > 1 {
+                secondaries.append(exchangeTurns[exchangeTurns.count - 2])
+            }
+        }
+
+        var output = primaries
+            .sorted { lhs, rhs in lhs.timestamp > rhs.timestamp }
+        if output.count < normalizedLimit {
+            let remainder = secondaries
+                .sorted { lhs, rhs in lhs.timestamp > rhs.timestamp }
+            for candidate in remainder {
+                output.append(candidate)
+                if output.count >= normalizedLimit {
+                    break
+                }
+            }
+        }
+
+        if output.count > normalizedLimit {
+            output = Array(output.prefix(normalizedLimit))
+        }
+        return output.sorted { lhs, rhs in
+            lhs.timestamp < rhs.timestamp
+        }
+    }
+
+    private func linkedContextIDs(
+        for context: PromptRewriteConversationContext,
+        excludingContextID: String
+    ) -> [String] {
+        let projectKey = contextLinkingKey(context.projectKey)
+        let identityKey = contextLinkingKey(context.identityKey)
+        guard projectKey != nil || identityKey != nil else {
+            return []
+        }
+
+        let candidates = contextsByID.values
+            .filter { stored in
+                stored.context.id != excludingContextID
+                    && contextMatchesLinkingKeys(
+                        stored.context,
+                        projectKey: projectKey,
+                        identityKey: identityKey
+                    )
+            }
+            .sorted { lhs, rhs in
+                let lhsCrossApp = lhs.context.bundleIdentifier.caseInsensitiveCompare(context.bundleIdentifier) != .orderedSame
+                let rhsCrossApp = rhs.context.bundleIdentifier.caseInsensitiveCompare(context.bundleIdentifier) != .orderedSame
+                if lhsCrossApp != rhsCrossApp {
+                    return lhsCrossApp && !rhsCrossApp
+                }
+                if lhs.lastUpdatedAt != rhs.lastUpdatedAt {
+                    return lhs.lastUpdatedAt > rhs.lastUpdatedAt
+                }
+                return lhs.context.id < rhs.context.id
+            }
+            .map { $0.context.id }
+
+        return Array(candidates.prefix(linkedPromptHistoryTurnBudget))
+    }
+
+    private func contextMatchesLinkingKeys(
+        _ candidate: PromptRewriteConversationContext,
+        projectKey: String?,
+        identityKey: String?
+    ) -> Bool {
+        let candidateProject = contextLinkingKey(candidate.projectKey)
+        let candidateIdentity = contextLinkingKey(candidate.identityKey)
+        let projectMatches = (projectKey != nil && candidateProject == projectKey)
+        let identityMatches = (identityKey != nil && candidateIdentity == identityKey)
+        return projectMatches || identityMatches
+    }
+
+    private func contextLinkingKey(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return nil }
+        if normalized == "project:unknown"
+            || normalized == "identity:unknown"
+            || normalized == "person:unknown"
+            || normalized == "unknown" {
+            return nil
+        }
+        return normalized
+    }
+
+    private func dedupedMergedPromptHistory(
+        _ turns: [PromptRewriteConversationTurn],
+        limit: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedLimit = normalizedTurnLimit(limit)
+        guard normalizedLimit > 0 else { return [] }
+
+        var seenKeys = Set<String>()
+        var deduped: [PromptRewriteConversationTurn] = []
+        deduped.reserveCapacity(turns.count)
+        for turn in turns {
+            let key = mergedPromptHistoryDedupeKey(for: turn)
+            if seenKeys.contains(key) {
+                continue
+            }
+            seenKeys.insert(key)
+            deduped.append(turn)
+        }
+
+        if deduped.count > normalizedLimit {
+            deduped = Array(deduped.suffix(normalizedLimit))
+        }
+        return deduped.sorted { lhs, rhs in
+            lhs.timestamp < rhs.timestamp
+        }
+    }
+
+    private func mergedPromptHistoryDedupeKey(for turn: PromptRewriteConversationTurn) -> String {
+        let timestampKey = Int((turn.timestamp.timeIntervalSince1970 * 1_000).rounded())
+        let normalizedUser = collapsedWhitespace(turn.userText).lowercased()
+        let normalizedAssistant = collapsedWhitespace(turn.assistantText).lowercased()
+        return "\(timestampKey)|\(normalizedUser)|\(normalizedAssistant)"
     }
 
     private func promptHistory(
@@ -2032,6 +2503,126 @@ final class PromptRewriteConversationStore: ObservableObject {
         return created
     }
 
+    private var isConversationRedirectWriteEnabled: Bool {
+        if UserDefaults.standard.object(forKey: redirectWriteFlagUserDefaultsKey) != nil {
+            return UserDefaults.standard.bool(forKey: redirectWriteFlagUserDefaultsKey)
+        }
+        if let rawValue = ProcessInfo.processInfo.environment[redirectWriteFlagEnvironmentKey],
+           let parsed = parsedFeatureFlagBoolean(rawValue) {
+            return parsed
+        }
+        return true
+    }
+
+    private func parsedFeatureFlagBoolean(_ value: String) -> Bool? {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes", "on", "enabled":
+            return true
+        case "0", "false", "no", "off", "disabled":
+            return false
+        default:
+            return nil
+        }
+    }
+
+    private func resolvedConversationThreadIDWithRedirect(
+        _ threadID: String,
+        store: MemorySQLiteStore?
+    ) -> String {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return "" }
+        guard let store else { return normalizedThreadID }
+
+        var resolvedThreadID = normalizedThreadID
+        var visited = Set<String>()
+        for _ in 0..<6 {
+            guard !visited.contains(resolvedThreadID) else {
+                break
+            }
+            visited.insert(resolvedThreadID)
+            guard let redirectedID = (try? store.resolveConversationThreadRedirect(resolvedThreadID))?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !redirectedID.isEmpty,
+                  redirectedID.caseInsensitiveCompare(resolvedThreadID) != .orderedSame else {
+                break
+            }
+            resolvedThreadID = redirectedID
+        }
+        return resolvedThreadID
+    }
+
+    private func loadStoredContextFromSQLite(
+        threadID: String,
+        store: MemorySQLiteStore
+    ) -> StoredContext? {
+        let resolvedThreadID = resolvedConversationThreadIDWithRedirect(
+            threadID,
+            store: store
+        )
+        guard !resolvedThreadID.isEmpty,
+              let thread = try? store.fetchConversationThread(id: resolvedThreadID) else {
+            return nil
+        }
+
+        let context = PromptRewriteConversationContext(
+            id: thread.id,
+            appName: thread.appName,
+            bundleIdentifier: thread.bundleID,
+            screenLabel: thread.screenLabel,
+            fieldLabel: thread.fieldLabel,
+            logicalSurfaceKey: thread.logicalSurfaceKey,
+            projectKey: thread.projectKey,
+            projectLabel: thread.projectLabel,
+            identityKey: thread.identityKey,
+            identityType: thread.identityType,
+            identityLabel: thread.identityLabel,
+            nativeThreadKey: thread.nativeThreadKey,
+            people: thread.people
+        )
+        let tags = ConversationTupleTags(
+            projectKey: thread.projectKey,
+            projectLabel: thread.projectLabel,
+            identityKey: thread.identityKey,
+            identityType: thread.identityType,
+            identityLabel: thread.identityLabel,
+            people: thread.people,
+            nativeThreadKey: thread.nativeThreadKey
+        )
+        let tupleKey = tagInferenceService.tupleKey(
+            capturedContext: context,
+            tags: tags
+        )
+        let loadedTurns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
+            .compactMap(conversationTurn(from:))
+        let loaded = StoredContext(
+            context: PromptRewriteConversationContext(
+                id: thread.id,
+                appName: thread.appName,
+                bundleIdentifier: tupleKey.bundleID,
+                screenLabel: thread.screenLabel,
+                fieldLabel: thread.fieldLabel,
+                logicalSurfaceKey: tupleKey.logicalSurfaceKey,
+                projectKey: thread.projectKey,
+                projectLabel: thread.projectLabel,
+                identityKey: thread.identityKey,
+                identityType: thread.identityType,
+                identityLabel: thread.identityLabel,
+                nativeThreadKey: thread.nativeThreadKey,
+                people: thread.people
+            ),
+            turns: Array(loadedTurns.suffix(maxStoredTurnsPerContext)),
+            lastUpdatedAt: thread.lastActivityAt,
+            tupleKey: tupleKey,
+            totalExchangeTurns: max(
+                thread.totalExchangeTurns,
+                loadedTurns.filter { !$0.isSummary }.count
+            )
+        )
+        contextsByID[thread.id] = loaded
+        contextIDByTuple[tupleKey] = thread.id
+        return loaded
+    }
+
     private func mergeDuplicateThreadsIfNeeded(
         for canonicalThreadID: String,
         tupleKey: ConversationThreadTupleKey
@@ -2051,6 +2642,7 @@ final class PromptRewriteConversationStore: ObservableObject {
                 && $0.nativeThreadKey.caseInsensitiveCompare(tupleKey.nativeThreadKey) == .orderedSame
         }
         guard !duplicates.isEmpty else { return }
+        guard isConversationRedirectWriteEnabled else { return }
         for duplicate in duplicates {
             try store.upsertConversationThreadRedirect(
                 oldThreadID: duplicate.id,
@@ -3002,6 +3594,13 @@ enum PromptRewriteConversationContextResolver {
         if blocked.contains(lowered) {
             return false
         }
+        if lowered == "hide sidebar"
+            || lowered == "show sidebar"
+            || lowered == "toggle sidebar"
+            || lowered == "toggle terminal"
+            || lowered == "toggle diff panel" {
+            return false
+        }
         if lowered.hasPrefix("ask for follow-up changes") {
             return false
         }
@@ -3056,6 +3655,17 @@ enum PromptRewriteConversationContextResolver {
             || lowered.range(of: #"^\d+\s*[smhdw]$"#, options: .regularExpression) != nil {
             return false
         }
+        let codexControlCommandPattern = #"^(?:hide|show|toggle|open|close|collapse|expand)\s+(?:sidebar|terminal|panel|diff(?:\s+panel)?|files?|explorer|settings|menu|chat|thread|threads)\b"#
+        if lowered.range(of: codexControlCommandPattern, options: .regularExpression) != nil {
+            return false
+        }
+        if lowered.contains("axtextarea")
+            || lowered.contains("axtextfield")
+            || lowered.contains("axbutton")
+            || lowered.contains("axgroup")
+            || lowered.contains("axscrollarea") {
+            return false
+        }
         let blocked: Set<String> = [
             "new thread",
             "threads",
@@ -3064,7 +3674,13 @@ enum PromptRewriteConversationContextResolver {
             "skills",
             "show more",
             "open",
-            "commit"
+            "commit",
+            "hide sidebar",
+            "show sidebar",
+            "toggle sidebar",
+            "toggle terminal",
+            "toggle diff panel",
+            "thread actions"
         ]
         if blocked.contains(lowered) {
             return false
