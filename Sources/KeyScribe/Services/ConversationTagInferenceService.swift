@@ -18,6 +18,10 @@ enum ConversationIdentityKind: String {
 final class ConversationTagInferenceService {
     static let shared = ConversationTagInferenceService()
     private let codingWorkspaceBundleID = "com.keyscribe.coding-workspace"
+    private let browserWorkspaceBundleID = "com.keyscribe.browser-workspace"
+    private let browserWorkspaceProjectKey = "project:browser-workspace"
+    private let browserWorkspaceIdentityKey = "identity:browser-workspace"
+    private let browserWorkspaceNativeThreadKey = "thread:browser-workspace"
 
     private init() {}
 
@@ -85,22 +89,34 @@ final class ConversationTagInferenceService {
         capturedContext: PromptRewriteConversationContext,
         tags: ConversationTupleTags
     ) -> ConversationThreadTupleKey {
+        let isBrowserContext = isBrowser(bundleID: capturedContext.bundleIdentifier, appName: capturedContext.appName)
         let canonicalBundle = canonicalBundleID(
             bundleID: capturedContext.bundleIdentifier,
             appName: capturedContext.appName,
-            projectKey: tags.projectKey
+            projectKey: tags.projectKey,
+            isBrowserContext: isBrowserContext
         )
         let canonicalSurface = canonicalLogicalSurfaceKey(
             capturedContext: capturedContext,
             canonicalBundleID: canonicalBundle,
-            projectKey: tags.projectKey
+            projectKey: tags.projectKey,
+            isBrowserContext: isBrowserContext
         )
+        let canonicalProjectKey: String = isBrowserContext
+            ? browserWorkspaceProjectKey
+            : collapseWhitespace(tags.projectKey).lowercased()
+        let canonicalIdentityKey: String = isBrowserContext
+            ? browserWorkspaceIdentityKey
+            : collapseWhitespace(tags.identityKey).lowercased()
+        let canonicalNativeThreadKey: String = isBrowserContext
+            ? browserWorkspaceNativeThreadKey
+            : collapseWhitespace(tags.nativeThreadKey).lowercased()
         return ConversationThreadTupleKey(
             bundleID: canonicalBundle,
             logicalSurfaceKey: canonicalSurface,
-            projectKey: tags.projectKey,
-            identityKey: tags.identityKey,
-            nativeThreadKey: collapseWhitespace(tags.nativeThreadKey).lowercased()
+            projectKey: canonicalProjectKey,
+            identityKey: canonicalIdentityKey,
+            nativeThreadKey: canonicalNativeThreadKey
         )
     }
 
@@ -165,7 +181,15 @@ final class ConversationTagInferenceService {
         return "Unknown Project"
     }
 
-    private func canonicalBundleID(bundleID: String, appName: String, projectKey: String) -> String {
+    private func canonicalBundleID(
+        bundleID: String,
+        appName: String,
+        projectKey: String,
+        isBrowserContext: Bool
+    ) -> String {
+        if isBrowserContext {
+            return browserWorkspaceBundleID
+        }
         if isCrossIDECodingProjectContext(bundleID: bundleID, appName: appName, projectKey: projectKey) {
             return codingWorkspaceBundleID
         }
@@ -175,8 +199,13 @@ final class ConversationTagInferenceService {
     private func canonicalLogicalSurfaceKey(
         capturedContext: PromptRewriteConversationContext,
         canonicalBundleID: String,
-        projectKey: String
+        projectKey: String,
+        isBrowserContext: Bool
     ) -> String {
+        if isBrowserContext {
+            // Use one browser-wide surface so tabs/windows from any browser app share history.
+            return stableKey(prefix: "surface", value: "\(canonicalBundleID)|browser-workspace")
+        }
         if isCrossIDECodingProjectContext(
             bundleID: capturedContext.bundleIdentifier,
             appName: capturedContext.appName,
@@ -188,8 +217,31 @@ final class ConversationTagInferenceService {
         return logicalSurfaceKey(for: capturedContext)
     }
 
-    private func isCrossIDECodingProjectContext(bundleID: String, appName: String, projectKey: String) -> Bool {
-        guard FeatureFlags.crossIDEConversationSharingEnabled else {
+    func isBrowserContext(bundleID: String, appName: String) -> Bool {
+        isBrowser(bundleID: bundleID, appName: appName)
+    }
+
+    func shouldShareCrossIDECodingContext(
+        bundleID: String,
+        appName: String,
+        projectKey: String,
+        featureEnabled: Bool
+    ) -> Bool {
+        isCrossIDECodingProjectContext(
+            bundleID: bundleID,
+            appName: appName,
+            projectKey: projectKey,
+            featureEnabled: featureEnabled
+        )
+    }
+
+    private func isCrossIDECodingProjectContext(
+        bundleID: String,
+        appName: String,
+        projectKey: String,
+        featureEnabled: Bool = FeatureFlags.crossIDEConversationSharingEnabled
+    ) -> Bool {
+        guard featureEnabled else {
             return false
         }
         guard hasMeaningfulProjectKey(projectKey) else {
@@ -297,7 +349,7 @@ final class ConversationTagInferenceService {
             return hashChannel
         }
         if let explicit = firstMatch(
-            pattern: #"(?i)\b(?:channel|room|team)\s*[:\-]?\s*([a-z0-9._\-/ ]{2,80})"#,
+            pattern: #"(?i)\b(?:channel|room|team|chat|conversation|thread)\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9 ._()'’&\-/]{1,80})\b"#,
             in: text
         ) {
             return collapseWhitespace(explicit)

@@ -886,8 +886,19 @@ struct AIMemoryStudioView: View {
                 )
                 .disabled(!settings.promptRewriteConversationHistoryEnabled || !settings.promptRewriteEnabled)
 
+                if let crossIDEConversationSharingOverrideHint {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Color.orange)
+                            .font(.caption2)
+                        Text(crossIDEConversationSharingOverrideHint)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Text(
-                    "When enabled, coding apps (Codex, Antigravity, VS Code, Cursor, Xcode, JetBrains) can reuse one conversation bucket for the same project."
+                    "Enabled by default: coding apps (Codex, Antigravity, VS Code, Cursor, Xcode, JetBrains) reuse one conversation bucket per project. Disable to keep coding history app-isolated."
                 )
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -2149,6 +2160,20 @@ struct AIMemoryStudioView: View {
 
     private var promptAssistantStateTint: Color {
         settings.promptRewriteEnabled ? AppVisualTheme.accentTint : Color.white.opacity(0.58)
+    }
+
+    private var crossIDEConversationSharingResolution: FeatureFlags.CrossIDEConversationSharingResolution {
+        FeatureFlags.crossIDEConversationSharingResolution()
+    }
+
+    private var crossIDEConversationSharingOverrideHint: String? {
+        guard crossIDEConversationSharingResolution.source == .env else {
+            return nil
+        }
+
+        let runtimeState = crossIDEConversationSharingResolution.enabled ? "Enabled" : "Disabled"
+        let savedSettingState = settings.promptRewriteCrossIDEConversationSharingEnabled ? "On" : "Off"
+        return "Environment override (`KEYSCRIBE_FEATURE_CROSS_IDE_CONVERSATION_SHARING`) is active. Effective runtime: \(runtimeState). Saved toggle preference: \(savedSettingState), so this toggle may differ from runtime."
     }
 
     private var memoryBrowserVisibleCount: Int {

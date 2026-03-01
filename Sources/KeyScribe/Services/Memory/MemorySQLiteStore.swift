@@ -656,6 +656,40 @@ final class MemorySQLiteStore {
         })
     }
 
+    func fetchAllConversationThreads() throws -> [ConversationThreadRecord] {
+        let sql = """
+        SELECT
+            id, app_name, bundle_id, logical_surface_key, screen_label, field_label,
+            project_key, project_label, identity_key, identity_type, identity_label,
+            native_thread_key, people_json, running_summary, total_exchange_turns,
+            created_at, last_activity_at, updated_at
+        FROM conversation_threads
+        ORDER BY last_activity_at DESC;
+        """
+        return try query(sql: sql, mapRow: { statement in
+            ConversationThreadRecord(
+                id: self.readString(at: 0, in: statement) ?? "",
+                appName: self.readString(at: 1, in: statement) ?? "Unknown App",
+                bundleID: self.readString(at: 2, in: statement) ?? "unknown.bundle",
+                logicalSurfaceKey: self.readString(at: 3, in: statement) ?? "",
+                screenLabel: self.readString(at: 4, in: statement) ?? "Current Surface",
+                fieldLabel: self.readString(at: 5, in: statement) ?? "Focused Input",
+                projectKey: self.readString(at: 6, in: statement) ?? "project:unknown",
+                projectLabel: self.readString(at: 7, in: statement) ?? "Unknown Project",
+                identityKey: self.readString(at: 8, in: statement) ?? "identity:unknown",
+                identityType: self.readString(at: 9, in: statement) ?? "unknown",
+                identityLabel: self.readString(at: 10, in: statement) ?? "Unknown Identity",
+                nativeThreadKey: self.readString(at: 11, in: statement) ?? "",
+                people: self.decodeStringArray(from: self.readString(at: 12, in: statement) ?? "[]"),
+                runningSummary: self.readString(at: 13, in: statement) ?? "",
+                totalExchangeTurns: Int(sqlite3_column_int64(statement, 14)),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 15)),
+                lastActivityAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 16)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 17))
+            )
+        })
+    }
+
     func insertConversationTurn(_ turn: ConversationTurnRecord) throws -> Bool {
         let sql = """
         INSERT OR IGNORE INTO conversation_turns (
