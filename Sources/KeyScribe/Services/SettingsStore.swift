@@ -1453,12 +1453,17 @@ final class SettingsStore: ObservableObject {
     }
 
     private func scheduleOnChangeNotificationIfNeeded() {
-        guard !isApplyingChanges else { return }
+        guard !isApplyingChanges else {
+            pendingOnChangeWorkItem?.cancel()
+            pendingOnChangeWorkItem = nil
+            return
+        }
         pendingOnChangeWorkItem?.cancel()
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingOnChangeWorkItem = nil
+            guard !self.isApplyingChanges else { return }
             self.onChange?()
         }
         pendingOnChangeWorkItem = workItem

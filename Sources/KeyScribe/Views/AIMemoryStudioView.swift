@@ -74,6 +74,7 @@ struct AIMemoryStudioView: View {
     @State private var showConversationContextMappingsSheet = false
     @State private var contextMappingRows: [ContextMappingRow] = []
     @State private var isContextMappingsLoading = false
+    @State private var contextMappingsLoadRequestToken = UUID()
     @State private var contextMappingMutatingRowID: String?
     @State private var lastContextMappingMutation: ContextMappingMutation?
     @State private var memoryBrowserRefreshWorkItem: DispatchWorkItem?
@@ -3672,29 +3673,40 @@ struct AIMemoryStudioView: View {
                 contextMappingRows.first(where: { $0.id == rowID })?.normalizedDecisionValue ?? "separate"
             },
             set: { updatedDecision in
-                updateContextMappingDecision(for: rowID, decisionRawValue: updatedDecision)
+                Task { @MainActor in
+                    await Task.yield()
+                    updateContextMappingDecision(for: rowID, decisionRawValue: updatedDecision)
+                }
             }
         )
     }
 
+    @MainActor
     private func loadContextMappings(showStatusMessage: Bool) {
         isContextMappingsLoading = true
-        let fetched = promptRewriteConversationStore.fetchContextMappings()
-        let rows = fetched
-            .map(contextMappingRow(from:))
-            .sorted { lhs, rhs in
-                lhs.updatedAt > rhs.updatedAt
+        let requestToken = UUID()
+        contextMappingsLoadRequestToken = requestToken
+
+        Task {
+            let rows = await Task.detached(priority: .userInitiated) {
+                Self.fetchContextMappingRowsForDisplay(limit: 400)
+            }.value
+
+            guard contextMappingsLoadRequestToken == requestToken else { return }
+
+            contextMappingRows = rows
+            isContextMappingsLoading = false
+            if showStatusMessage {
+                conversationActionMessage = rows.isEmpty
+                    ? "No context mappings found."
+                    : "Loaded \(rows.count) context mapping(s)."
             }
-        contextMappingRows = rows
-        isContextMappingsLoading = false
-        if showStatusMessage {
-            conversationActionMessage = rows.isEmpty
-                ? "No context mappings found."
-                : "Loaded \(rows.count) context mapping(s)."
         }
     }
 
+    @MainActor
     private func updateContextMappingDecision(for rowID: String, decisionRawValue: String) {
+        guard contextMappingMutatingRowID == nil else { return }
         guard let index = contextMappingRows.firstIndex(where: { $0.id == rowID }) else {
             return
         }
@@ -3715,22 +3727,53 @@ struct AIMemoryStudioView: View {
             return
         }
 
-        promptRewriteConversationStore.upsertContextMappingDecision(
-            mappingType: mappingType,
-            appPairKey: previous.appPairKey,
-            subjectKey: previous.subjectKey,
-            contextScopeKey: previous.contextScopeKey,
-            decision: normalizedDecision == "linked" ? .link : .separate,
-            canonicalKey: previous.canonicalKey,
-            source: previous.source
-        )
-        lastContextMappingMutation = ContextMappingMutation(
-            kind: .decisionChange,
-            snapshot: previous
-        )
-        contextMappingMutatingRowID = nil
-        conversationActionMessage = "Updated mapping decision to \(normalizedDecision == "linked" ? "linked" : "separate")."
-        loadContextMappings(showStatusMessage: false)
+        let normalizedCanonicalKey = previous.canonicalKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if previous.normalizedDecisionValue == "separate",
+           normalizedDecision == "linked",
+           normalizedCanonicalKey.isEmpty {
+            if let rollbackIndex = contextMappingRows.firstIndex(where: { $0.id == rowID }) {
+                contextMappingRows[rollbackIndex].decisionRawValue = previous.decisionRawValue
+            }
+            contextMappingMutatingRowID = nil
+            conversationActionMessage = "Cannot switch to linked without a canonical target."
+            return
+        }
+
+        let decision: ConversationDisambiguationDecision = normalizedDecision == "linked" ? .link : .separate
+        Task {
+            let didPersist = await Task.detached(priority: .userInitiated) {
+                Self.persistContextMappingDecision(
+                    rowID: previous.id,
+                    mappingType: mappingType,
+                    appPairKey: previous.appPairKey,
+                    subjectKey: previous.subjectKey,
+                    contextScopeKey: previous.contextScopeKey,
+                    decision: decision,
+                    canonicalKey: previous.canonicalKey
+                )
+            }.value
+
+            guard let rollbackIndex = contextMappingRows.firstIndex(where: { $0.id == rowID }) else {
+                contextMappingMutatingRowID = nil
+                return
+            }
+
+            guard didPersist else {
+                contextMappingRows[rollbackIndex].decisionRawValue = previous.decisionRawValue
+                contextMappingMutatingRowID = nil
+                conversationActionMessage = "Failed to update mapping decision."
+                return
+            }
+
+            lastContextMappingMutation = ContextMappingMutation(
+                kind: .decisionChange,
+                snapshot: previous
+            )
+            contextMappingMutatingRowID = nil
+            conversationActionMessage = "Updated mapping decision to \(normalizedDecision == "linked" ? "linked" : "separate")."
+            loadContextMappings(showStatusMessage: false)
+        }
     }
 
     private func removeContextMapping(_ rowID: String) {
@@ -3772,7 +3815,129 @@ struct AIMemoryStudioView: View {
         loadContextMappings(showStatusMessage: false)
     }
 
-    private func contextMappingRow(from rawMapping: ConversationContextMappingRow) -> ContextMappingRow {
+    nonisolated private static func fetchContextMappingRowsForDisplay(limit: Int = 400) -> [ContextMappingRow] {
+        guard let store = try? MemorySQLiteStore() else {
+            return []
+        }
+
+        let normalizedLimit = max(1, min(limit, 2_000))
+        let rules = (try? store.fetchConversationDisambiguationRules(limit: normalizedLimit)) ?? []
+        let aliases = (try? store.fetchConversationTagAliases(limit: normalizedLimit)) ?? []
+
+        var rows = rules.map { rule in
+            contextMappingRow(from: ConversationContextMappingRow(
+                id: rule.id,
+                mappingType: rule.ruleType.rawValue,
+                appPairKey: rule.appPairKey,
+                subjectKey: rule.subjectKey,
+                contextScopeKey: rule.contextScopeKey,
+                decision: rule.decision,
+                canonicalKey: rule.canonicalKey,
+                source: contextMappingSource(forRuleID: rule.id),
+                updatedAt: rule.updatedAt
+            ))
+        }
+
+        rows.append(contentsOf: aliases.map { alias in
+            contextMappingRow(from: ConversationContextMappingRow(
+                id: tagAliasMappingID(aliasType: alias.aliasType, aliasKey: alias.aliasKey),
+                mappingType: "alias:\(alias.aliasType)",
+                appPairKey: "global",
+                subjectKey: alias.aliasKey,
+                contextScopeKey: nil,
+                decision: .link,
+                canonicalKey: alias.canonicalKey,
+                source: .legacy,
+                updatedAt: alias.updatedAt
+            ))
+        })
+
+        rows.sort { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.id < rhs.id
+        }
+        if rows.count > normalizedLimit {
+            rows = Array(rows.prefix(normalizedLimit))
+        }
+        return rows
+    }
+
+    nonisolated private static func persistContextMappingDecision(
+        rowID: String,
+        mappingType: ConversationDisambiguationRuleType,
+        appPairKey: String,
+        subjectKey: String,
+        contextScopeKey: String?,
+        decision: ConversationDisambiguationDecision,
+        canonicalKey: String?
+    ) -> Bool {
+        guard let store = try? MemorySQLiteStore() else {
+            return false
+        }
+
+        let existing = try? store.fetchConversationDisambiguationRule(
+            ruleType: mappingType,
+            appPairKey: appPairKey,
+            subjectKey: subjectKey,
+            contextScopeKey: contextScopeKey
+        )
+        if let existing,
+           existing.id.caseInsensitiveCompare(rowID) != .orderedSame {
+            try? store.deleteConversationDisambiguationRule(id: existing.id)
+        }
+
+        let canonicalForWrite: String?
+        if decision == .link {
+            let normalized = canonicalKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            canonicalForWrite = normalized.isEmpty ? nil : normalized
+        } else {
+            canonicalForWrite = nil
+        }
+
+        let now = Date()
+        let record = ConversationDisambiguationRuleRecord(
+            id: rowID,
+            ruleType: mappingType,
+            appPairKey: appPairKey,
+            subjectKey: subjectKey,
+            contextScopeKey: contextScopeKey,
+            decision: decision,
+            canonicalKey: canonicalForWrite,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now
+        )
+
+        do {
+            try store.upsertConversationDisambiguationRule(record)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    nonisolated private static func contextMappingSource(forRuleID ruleID: String) -> ConversationContextMappingSource {
+        let normalizedID = ruleID.lowercased()
+        if normalizedID.hasPrefix("map-manual-") {
+            return .manual
+        }
+        if normalizedID.hasPrefix("map-ai-") {
+            return .ai
+        }
+        if normalizedID.hasPrefix("map-deterministic-") {
+            return .deterministic
+        }
+        return .legacy
+    }
+
+    nonisolated private static func tagAliasMappingID(aliasType: String, aliasKey: String) -> String {
+        let encodedAliasType = Data(aliasType.utf8).base64EncodedString()
+        let encodedAliasKey = Data(aliasKey.utf8).base64EncodedString()
+        return "tag-alias|\(encodedAliasType)|\(encodedAliasKey)"
+    }
+
+    nonisolated private static func contextMappingRow(from rawMapping: ConversationContextMappingRow) -> ContextMappingRow {
         ContextMappingRow(
             id: rawMapping.id,
             mappingTypeRawValue: rawMapping.mappingType,

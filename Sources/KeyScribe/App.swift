@@ -10,6 +10,600 @@ extension Notification.Name {
     static let keyScribeOpenSettings = Notification.Name("KeyScribe.openSettings")
 }
 
+private struct PromptRewriteAIMappingCandidate {
+    let prompt: ConversationClarificationPrompt
+    let candidateKey: String
+    let candidateLabel: String
+    let candidateBundleIdentifier: String
+    let confidence: Double
+}
+
+private enum PromptRewriteAIMappingEvaluator {
+    private enum ClarificationAxis {
+        case project
+        case person
+
+        var aliasType: String {
+            switch self {
+            case .project:
+                return "project"
+            case .person:
+                return "identity"
+            }
+        }
+
+        var ruleType: ConversationDisambiguationRuleType {
+            switch self {
+            case .project:
+                return .project
+            case .person:
+                return .person
+            }
+        }
+    }
+
+    private enum ClarificationRuleResolution {
+        case link(canonicalKey: String?)
+        case keepSeparate
+    }
+
+    private struct ClarificationRankedCandidate {
+        let candidate: ConversationClarificationCandidate
+        let isExact: Bool
+    }
+
+    private static let maxStoredContexts = 24
+    private static let sqliteStartupThreadScanMultiplier = 4
+    private static let sqliteStartupThreadScanHardLimit = 120
+    private static let clarificationSimilarityThreshold = 0.92
+    private static let clarificationCandidateLimit = 3
+
+    static func evaluate(
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) -> PromptRewriteAIMappingCandidate? {
+        guard FeatureFlags.conversationTupleSQLiteEnabled else {
+            return nil
+        }
+        guard let store = try? MemorySQLiteStore() else {
+            return nil
+        }
+
+        let tagInferenceService = ConversationTagInferenceService.shared
+        let inferredTags = canonicalizedTags(
+            tagInferenceService.inferTags(
+                capturedContext: capturedContext,
+                userText: userText
+            ),
+            store: store
+        )
+        let currentTupleKey = tagInferenceService.tupleKey(
+            capturedContext: capturedContext,
+            tags: inferredTags
+        )
+        let normalizedCurrentBundle = normalizedClarificationBundle(currentTupleKey.bundleID)
+        guard !normalizedCurrentBundle.isEmpty else {
+            return nil
+        }
+
+        let scanLimit = min(
+            sqliteStartupThreadScanHardLimit,
+            max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
+        )
+        let allThreads = (try? store.fetchConversationThreads(limit: scanLimit)) ?? []
+        guard !allThreads.isEmpty else {
+            return nil
+        }
+
+        let crossAppThreads = allThreads.filter { thread in
+            normalizedClarificationBundle(thread.bundleID) != normalizedCurrentBundle
+        }
+        guard !crossAppThreads.isEmpty else {
+            return nil
+        }
+
+        let currentIdentityType = normalizedClarificationIdentityType(inferredTags.identityType)
+        if currentIdentityType == "person",
+           let prompt = clarificationPrompt(
+               axis: .person,
+               currentKey: inferredTags.identityKey,
+               currentLabel: inferredTags.identityLabel,
+               currentBundleIdentifier: normalizedCurrentBundle,
+               threads: crossAppThreads,
+               store: store
+           ) {
+            return candidate(from: prompt)
+        }
+
+        if isMeaningfulProjectClarificationKey(inferredTags.projectKey),
+           let prompt = clarificationPrompt(
+               axis: .project,
+               currentKey: inferredTags.projectKey,
+               currentLabel: inferredTags.projectLabel,
+               currentBundleIdentifier: normalizedCurrentBundle,
+               threads: crossAppThreads,
+               store: store
+           ) {
+            return candidate(from: prompt)
+        }
+
+        return nil
+    }
+
+    private static func candidate(from prompt: ConversationClarificationPrompt) -> PromptRewriteAIMappingCandidate? {
+        guard let primary = prompt.primaryCandidate else {
+            return nil
+        }
+        return PromptRewriteAIMappingCandidate(
+            prompt: prompt,
+            candidateKey: primary.canonicalKey,
+            candidateLabel: primary.label,
+            candidateBundleIdentifier: primary.bundleIdentifier,
+            confidence: max(0, min(1, primary.similarity))
+        )
+    }
+
+    private static func canonicalizedTags(
+        _ tags: ConversationTupleTags,
+        store: MemorySQLiteStore
+    ) -> ConversationTupleTags {
+        let normalizedProjectKey = tags.projectKey.lowercased()
+        let normalizedIdentityKey = tags.identityKey.lowercased()
+
+        var canonicalProject = normalizedProjectKey
+        if let resolved = try? store.resolveConversationTagAlias(
+            aliasType: "project",
+            aliasKey: normalizedProjectKey
+        ),
+           !resolved.isEmpty {
+            canonicalProject = resolved
+        }
+
+        var canonicalIdentity = normalizedIdentityKey
+        if let resolved = try? store.resolveConversationTagAlias(
+            aliasType: "identity",
+            aliasKey: normalizedIdentityKey
+        ),
+           !resolved.isEmpty {
+            canonicalIdentity = resolved
+        }
+
+        if canonicalProject != normalizedProjectKey {
+            try? store.upsertConversationTagAlias(
+                aliasType: "project",
+                aliasKey: normalizedProjectKey,
+                canonicalKey: canonicalProject
+            )
+        }
+        if canonicalIdentity != normalizedIdentityKey {
+            try? store.upsertConversationTagAlias(
+                aliasType: "identity",
+                aliasKey: normalizedIdentityKey,
+                canonicalKey: canonicalIdentity
+            )
+        }
+
+        return ConversationTupleTags(
+            projectKey: canonicalProject,
+            projectLabel: tags.projectLabel,
+            identityKey: canonicalIdentity,
+            identityType: tags.identityType,
+            identityLabel: tags.identityLabel,
+            people: tags.people,
+            nativeThreadKey: tags.nativeThreadKey
+        )
+    }
+
+    private static func clarificationPrompt(
+        axis: ClarificationAxis,
+        currentKey: String,
+        currentLabel: String,
+        currentBundleIdentifier: String,
+        threads: [ConversationThreadRecord],
+        store: MemorySQLiteStore
+    ) -> ConversationClarificationPrompt? {
+        let normalizedCurrentKey = normalizedClarificationKey(currentKey)
+        guard !normalizedCurrentKey.isEmpty else {
+            return nil
+        }
+        let normalizedCurrentLabel = comparableClarificationLabel(
+            label: currentLabel,
+            fallbackKey: normalizedCurrentKey
+        )
+        guard !normalizedCurrentLabel.isEmpty else {
+            return nil
+        }
+        let subjectKey = normalizedClarificationKey(normalizedCurrentLabel)
+        guard !subjectKey.isEmpty else {
+            return nil
+        }
+
+        var rankedByCanonicalKey: [String: ClarificationRankedCandidate] = [:]
+        var shouldSuppressPrompt = false
+
+        for thread in threads {
+            guard let (candidateKey, candidateLabel) = clarificationCandidateParts(
+                for: axis,
+                thread: thread
+            ) else {
+                continue
+            }
+
+            let normalizedCandidateKey = normalizedClarificationKey(candidateKey)
+            guard !normalizedCandidateKey.isEmpty else {
+                continue
+            }
+            let canonicalCandidateKey = resolvedClarificationAliasKey(
+                aliasType: axis.aliasType,
+                key: normalizedCandidateKey,
+                store: store
+            )
+            guard !canonicalCandidateKey.isEmpty,
+                  canonicalCandidateKey != normalizedCurrentKey else {
+                continue
+            }
+
+            if let existingRule = clarificationRuleResolution(
+                axis: axis,
+                currentBundleIdentifier: currentBundleIdentifier,
+                subjectKey: subjectKey,
+                currentKey: normalizedCurrentKey,
+                candidateKey: canonicalCandidateKey,
+                candidateBundleIdentifier: thread.bundleID,
+                store: store
+            ) {
+                switch existingRule {
+                case .keepSeparate:
+                    continue
+                case let .link(canonicalKey):
+                    let resolvedCanonicalKey = normalizedClarificationKey(canonicalKey ?? canonicalCandidateKey)
+                    guard !resolvedCanonicalKey.isEmpty else {
+                        continue
+                    }
+                    try? store.upsertConversationTagAlias(
+                        aliasType: axis.aliasType,
+                        aliasKey: normalizedCurrentKey,
+                        canonicalKey: resolvedCanonicalKey
+                    )
+                    shouldSuppressPrompt = true
+                    continue
+                }
+            }
+
+            let normalizedCandidateLabel = comparableClarificationLabel(
+                label: candidateLabel,
+                fallbackKey: canonicalCandidateKey
+            )
+            guard !normalizedCandidateLabel.isEmpty else {
+                continue
+            }
+
+            let isExact = normalizedCandidateLabel == normalizedCurrentLabel
+            let similarity = isExact
+                ? 1
+                : normalizedClarificationSimilarity(
+                    normalizedCurrentLabel,
+                    normalizedCandidateLabel
+                )
+            guard isExact || similarity >= clarificationSimilarityThreshold else {
+                continue
+            }
+
+            let rankedCandidate = ClarificationRankedCandidate(
+                candidate: ConversationClarificationCandidate(
+                    canonicalKey: canonicalCandidateKey,
+                    label: collapsedWhitespace(candidateLabel),
+                    appName: collapsedWhitespace(thread.appName),
+                    bundleIdentifier: normalizedClarificationBundle(thread.bundleID),
+                    similarity: similarity,
+                    lastActivityAt: thread.lastActivityAt
+                ),
+                isExact: isExact
+            )
+
+            if let existing = rankedByCanonicalKey[canonicalCandidateKey] {
+                if shouldReplaceClarificationCandidate(existing, with: rankedCandidate) {
+                    rankedByCanonicalKey[canonicalCandidateKey] = rankedCandidate
+                }
+            } else {
+                rankedByCanonicalKey[canonicalCandidateKey] = rankedCandidate
+            }
+        }
+
+        if shouldSuppressPrompt {
+            return nil
+        }
+
+        let ranked = rankedByCanonicalKey.values.sorted { lhs, rhs in
+            if lhs.isExact != rhs.isExact {
+                return lhs.isExact && !rhs.isExact
+            }
+            if lhs.candidate.similarity != rhs.candidate.similarity {
+                return lhs.candidate.similarity > rhs.candidate.similarity
+            }
+            if lhs.candidate.lastActivityAt != rhs.candidate.lastActivityAt {
+                return lhs.candidate.lastActivityAt > rhs.candidate.lastActivityAt
+            }
+            return lhs.candidate.label.localizedCaseInsensitiveCompare(rhs.candidate.label) == .orderedAscending
+        }
+        guard !ranked.isEmpty else {
+            return nil
+        }
+
+        let exactMatches = ranked.filter(\.isExact)
+        let selected: [ClarificationRankedCandidate]
+        let kind: ConversationClarificationKind
+        if !exactMatches.isEmpty {
+            selected = Array(exactMatches.prefix(clarificationCandidateLimit))
+            kind = axis == .project ? .projectExact : .personExact
+        } else {
+            selected = Array(ranked.prefix(clarificationCandidateLimit))
+            kind = axis == .project ? .projectAmbiguous : .personAmbiguous
+        }
+
+        let displayLabel = collapsedWhitespace(currentLabel)
+
+        return ConversationClarificationPrompt(
+            kind: kind,
+            currentKey: normalizedCurrentKey,
+            currentLabel: displayLabel.isEmpty
+                ? readableClarificationLabel(from: normalizedCurrentKey)
+                : displayLabel,
+            currentBundleIdentifier: currentBundleIdentifier,
+            subjectKey: subjectKey,
+            candidates: selected.map(\.candidate)
+        )
+    }
+
+    private static func clarificationCandidateParts(
+        for axis: ClarificationAxis,
+        thread: ConversationThreadRecord
+    ) -> (key: String, label: String)? {
+        switch axis {
+        case .project:
+            guard isMeaningfulProjectClarificationKey(thread.projectKey) else {
+                return nil
+            }
+            return (thread.projectKey, thread.projectLabel)
+        case .person:
+            guard normalizedClarificationIdentityType(thread.identityType) == "person" else {
+                return nil
+            }
+            guard isMeaningfulPersonClarificationKey(thread.identityKey) else {
+                return nil
+            }
+            return (thread.identityKey, thread.identityLabel)
+        }
+    }
+
+    private static func shouldReplaceClarificationCandidate(
+        _ existing: ClarificationRankedCandidate,
+        with candidate: ClarificationRankedCandidate
+    ) -> Bool {
+        if existing.isExact != candidate.isExact {
+            return candidate.isExact
+        }
+        if existing.candidate.similarity != candidate.candidate.similarity {
+            return candidate.candidate.similarity > existing.candidate.similarity
+        }
+        return candidate.candidate.lastActivityAt > existing.candidate.lastActivityAt
+    }
+
+    private static func clarificationRuleResolution(
+        axis: ClarificationAxis,
+        currentBundleIdentifier: String,
+        subjectKey: String,
+        currentKey: String,
+        candidateKey: String,
+        candidateBundleIdentifier: String,
+        store: MemorySQLiteStore
+    ) -> ClarificationRuleResolution? {
+        let appPairKey = store.conversationDisambiguationAppPairKey(
+            normalizedClarificationBundle(currentBundleIdentifier),
+            normalizedClarificationBundle(candidateBundleIdentifier)
+        )
+        let normalizedSubjectKey = normalizedClarificationKey(subjectKey)
+        let normalizedCandidateKey = normalizedClarificationKey(candidateKey)
+        guard !appPairKey.isEmpty, !normalizedSubjectKey.isEmpty else {
+            return nil
+        }
+
+        let scopedRule = try? store.fetchConversationDisambiguationRule(
+            ruleType: axis.ruleType,
+            appPairKey: appPairKey,
+            subjectKey: normalizedSubjectKey,
+            contextScopeKey: normalizedCandidateKey
+        )
+        if let scopedRule {
+            switch scopedRule.decision {
+            case .separate:
+                return .keepSeparate
+            case .link:
+                return .link(canonicalKey: scopedRule.canonicalKey)
+            }
+        }
+
+        let broadRule = try? store.fetchConversationDisambiguationRule(
+            ruleType: axis.ruleType,
+            appPairKey: appPairKey,
+            subjectKey: normalizedSubjectKey,
+            contextScopeKey: nil
+        )
+        if let broadRule {
+            switch broadRule.decision {
+            case .separate:
+                return .keepSeparate
+            case .link:
+                return .link(canonicalKey: broadRule.canonicalKey)
+            }
+        }
+
+        if let resolvedAlias = try? store.resolveConversationTagAlias(
+            aliasType: axis.aliasType,
+            aliasKey: currentKey
+        ),
+           normalizedClarificationKey(resolvedAlias) == candidateKey {
+            return .link(canonicalKey: candidateKey)
+        }
+
+        return nil
+    }
+
+    private static func resolvedClarificationAliasKey(
+        aliasType: String,
+        key: String,
+        store: MemorySQLiteStore
+    ) -> String {
+        let normalized = normalizedClarificationKey(key)
+        guard !normalized.isEmpty else {
+            return ""
+        }
+        if let resolved = try? store.resolveConversationTagAlias(aliasType: aliasType, aliasKey: normalized),
+           !resolved.isEmpty {
+            return normalizedClarificationKey(resolved)
+        }
+        return normalized
+    }
+
+    private static func normalizedClarificationKey(_ value: String) -> String {
+        collapsedWhitespace(value).lowercased()
+    }
+
+    private static func normalizedClarificationBundle(_ value: String) -> String {
+        collapsedWhitespace(value).lowercased()
+    }
+
+    private static func normalizedClarificationIdentityType(_ value: String) -> String {
+        collapsedWhitespace(value).lowercased()
+    }
+
+    private static func comparableClarificationLabel(label: String, fallbackKey: String) -> String {
+        let fromLabel = normalizedClarificationLabel(label)
+        if !fromLabel.isEmpty {
+            return fromLabel
+        }
+        return normalizedClarificationLabel(readableClarificationLabel(from: fallbackKey))
+    }
+
+    private static func normalizedClarificationLabel(_ value: String) -> String {
+        let collapsed = collapsedWhitespace(value).lowercased()
+        guard !collapsed.isEmpty else {
+            return ""
+        }
+        let alphanumericOnly = collapsed.replacingOccurrences(
+            of: #"[^a-z0-9]+"#,
+            with: " ",
+            options: .regularExpression
+        )
+        return collapsedWhitespace(alphanumericOnly)
+    }
+
+    private static func readableClarificationLabel(from key: String) -> String {
+        let split = key.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: true)
+        let fallback = split.count == 2 ? String(split[1]) : key
+        let separated = fallback
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        let normalized = collapsedWhitespace(separated)
+        return normalized.isEmpty ? key : normalized
+    }
+
+    private static func isMeaningfulProjectClarificationKey(_ projectKey: String) -> Bool {
+        let normalized = normalizedClarificationKey(projectKey)
+        guard normalized.hasPrefix("project:") else {
+            return false
+        }
+        let value = String(normalized.dropFirst("project:".count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            return false
+        }
+        let blockedValues: Set<String> = [
+            "unknown",
+            "unknown-project",
+            "current-screen",
+            "focused-input"
+        ]
+        if blockedValues.contains(value) || value.hasPrefix("unknown-") {
+            return false
+        }
+        return true
+    }
+
+    private static func isMeaningfulPersonClarificationKey(_ identityKey: String) -> Bool {
+        let normalized = normalizedClarificationKey(identityKey)
+        guard normalized.hasPrefix("person:") else {
+            return false
+        }
+        let value = String(normalized.dropFirst("person:".count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value == "unknown" {
+            return false
+        }
+        return true
+    }
+
+    private static func normalizedClarificationSimilarity(_ lhs: String, _ rhs: String) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else {
+            return 0
+        }
+        if lhs == rhs {
+            return 1
+        }
+        let editDistanceSimilarity = normalizedLevenshteinSimilarity(lhs, rhs)
+        let tokenSimilarity = tokenOverlapSimilarity(lhs, rhs)
+        return max(editDistanceSimilarity, tokenSimilarity)
+    }
+
+    private static func normalizedLevenshteinSimilarity(_ lhs: String, _ rhs: String) -> Double {
+        let lhsCharacters = Array(lhs)
+        let rhsCharacters = Array(rhs)
+        guard !lhsCharacters.isEmpty, !rhsCharacters.isEmpty else {
+            return 0
+        }
+
+        var previous = Array(0...rhsCharacters.count)
+        var current = Array(repeating: 0, count: rhsCharacters.count + 1)
+
+        for lhsIndex in 1...lhsCharacters.count {
+            current[0] = lhsIndex
+            for rhsIndex in 1...rhsCharacters.count {
+                let substitutionCost = lhsCharacters[lhsIndex - 1] == rhsCharacters[rhsIndex - 1] ? 0 : 1
+                current[rhsIndex] = Swift.min(
+                    previous[rhsIndex] + 1,
+                    current[rhsIndex - 1] + 1,
+                    previous[rhsIndex - 1] + substitutionCost
+                )
+            }
+            swap(&previous, &current)
+        }
+
+        let maxLength = max(lhsCharacters.count, rhsCharacters.count)
+        guard maxLength > 0 else {
+            return 0
+        }
+        let distance = previous[rhsCharacters.count]
+        return max(0, 1 - (Double(distance) / Double(maxLength)))
+    }
+
+    private static func tokenOverlapSimilarity(_ lhs: String, _ rhs: String) -> Double {
+        let lhsTokens = Set(lhs.split(separator: " ").map(String.init))
+        let rhsTokens = Set(rhs.split(separator: " ").map(String.init))
+        guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else {
+            return 0
+        }
+        let unionCount = lhsTokens.union(rhsTokens).count
+        guard unionCount > 0 else {
+            return 0
+        }
+        return Double(lhsTokens.intersection(rhsTokens).count) / Double(unionCount)
+    }
+
+    private static func collapsedWhitespace(_ value: String) -> String {
+        MemoryTextNormalizer.collapsedWhitespace(value)
+    }
+}
+
 @main
 struct KeyScribeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
@@ -126,6 +720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let aiMappingHighConfidenceThreshold: Double = 0.90
     private static let aiMappingTimeoutSeconds: TimeInterval = 0.25
     private static let aiMappingPromptSuppressionWindowSeconds: TimeInterval = 180
+    private static let localAIRuntimeShutdownTimeoutSeconds: TimeInterval = 1.5
 
     private enum DictationFeedbackCue: CaseIterable {
         case startListening
@@ -413,8 +1008,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowCoordinator?.closeAllWindows()
         windowCoordinator = nil
 
+        let runtimeStopSemaphore = DispatchSemaphore(value: 0)
         Task.detached(priority: .utility) {
             await LocalAIRuntimeManager.shared.stop()
+            runtimeStopSemaphore.signal()
+        }
+        if runtimeStopSemaphore.wait(timeout: .now() + Self.localAIRuntimeShutdownTimeoutSeconds) == .timedOut {
+            CrashReporter.logInfo(
+                "Local AI runtime stop timed out after \(Self.localAIRuntimeShutdownTimeoutSeconds)s during app termination"
+            )
         }
 
         isDictating = false
@@ -1292,7 +1894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
 
             let evaluationStartedAt = Date()
-            let candidate = self.conversationContextResolverV2.evaluateAIMappingCandidate(
+            let candidate = await self.evaluateAIMappingCandidateOffMain(
                 capturedContext: capturedContext,
                 userText: userText
             )
@@ -1398,8 +2000,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func evaluateAIMappingCandidateOffMain(
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) async -> PromptRewriteAIMappingCandidate? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let candidate = PromptRewriteAIMappingEvaluator.evaluate(
+                    capturedContext: capturedContext,
+                    userText: userText
+                )
+                continuation.resume(returning: candidate)
+            }
+        }
+    }
+
     private func presentPromptRewriteAIMappingDecision(
-        candidate: ConversationContextResolverV2.AIMappingCandidate
+        candidate: PromptRewriteAIMappingCandidate
     ) -> PromptRewriteAIMappingChoice {
         let alert = NSAlert()
         alert.alertStyle = .informational
@@ -1424,7 +2041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func aiMappingSuppressionKey(
         activeContextID: String,
-        candidate: ConversationContextResolverV2.AIMappingCandidate
+        candidate: PromptRewriteAIMappingCandidate
     ) -> String {
         "\(activeContextID)|\(candidate.candidateBundleIdentifier)|\(candidate.candidateKey)"
     }
