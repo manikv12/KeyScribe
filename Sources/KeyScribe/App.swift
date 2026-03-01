@@ -1,12 +1,607 @@
 import AppKit
 import AVFoundation
 import Combine
+import Sparkle
 import Speech
 import SwiftUI
 
 extension Notification.Name {
     static let keyScribeOpenAIMemoryStudio = Notification.Name("KeyScribe.openAIMemoryStudio")
     static let keyScribeOpenSettings = Notification.Name("KeyScribe.openSettings")
+}
+
+private struct PromptRewriteAIMappingCandidate {
+    let prompt: ConversationClarificationPrompt
+    let candidateKey: String
+    let candidateLabel: String
+    let candidateBundleIdentifier: String
+    let confidence: Double
+}
+
+private enum PromptRewriteAIMappingEvaluator {
+    private enum ClarificationAxis {
+        case project
+        case person
+
+        var aliasType: String {
+            switch self {
+            case .project:
+                return "project"
+            case .person:
+                return "identity"
+            }
+        }
+
+        var ruleType: ConversationDisambiguationRuleType {
+            switch self {
+            case .project:
+                return .project
+            case .person:
+                return .person
+            }
+        }
+    }
+
+    private enum ClarificationRuleResolution {
+        case link(canonicalKey: String?)
+        case keepSeparate
+    }
+
+    private struct ClarificationRankedCandidate {
+        let candidate: ConversationClarificationCandidate
+        let isExact: Bool
+    }
+
+    private static let maxStoredContexts = 24
+    private static let sqliteStartupThreadScanMultiplier = 4
+    private static let sqliteStartupThreadScanHardLimit = 120
+    private static let clarificationSimilarityThreshold = 0.92
+    private static let clarificationCandidateLimit = 3
+
+    static func evaluate(
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) -> PromptRewriteAIMappingCandidate? {
+        guard FeatureFlags.conversationTupleSQLiteEnabled else {
+            return nil
+        }
+        guard let store = try? MemorySQLiteStore() else {
+            return nil
+        }
+
+        let tagInferenceService = ConversationTagInferenceService.shared
+        let inferredTags = canonicalizedTags(
+            tagInferenceService.inferTags(
+                capturedContext: capturedContext,
+                userText: userText
+            ),
+            store: store
+        )
+        let currentTupleKey = tagInferenceService.tupleKey(
+            capturedContext: capturedContext,
+            tags: inferredTags
+        )
+        let normalizedCurrentBundle = normalizedClarificationBundle(currentTupleKey.bundleID)
+        guard !normalizedCurrentBundle.isEmpty else {
+            return nil
+        }
+
+        let scanLimit = min(
+            sqliteStartupThreadScanHardLimit,
+            max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
+        )
+        let allThreads = (try? store.fetchConversationThreads(limit: scanLimit)) ?? []
+        guard !allThreads.isEmpty else {
+            return nil
+        }
+
+        let crossAppThreads = allThreads.filter { thread in
+            normalizedClarificationBundle(thread.bundleID) != normalizedCurrentBundle
+        }
+        guard !crossAppThreads.isEmpty else {
+            return nil
+        }
+
+        let currentIdentityType = normalizedClarificationIdentityType(inferredTags.identityType)
+        if currentIdentityType == "person",
+           let prompt = clarificationPrompt(
+               axis: .person,
+               currentKey: inferredTags.identityKey,
+               currentLabel: inferredTags.identityLabel,
+               currentBundleIdentifier: normalizedCurrentBundle,
+               threads: crossAppThreads,
+               store: store
+           ) {
+            return candidate(from: prompt)
+        }
+
+        if isMeaningfulProjectClarificationKey(inferredTags.projectKey),
+           let prompt = clarificationPrompt(
+               axis: .project,
+               currentKey: inferredTags.projectKey,
+               currentLabel: inferredTags.projectLabel,
+               currentBundleIdentifier: normalizedCurrentBundle,
+               threads: crossAppThreads,
+               store: store
+           ) {
+            return candidate(from: prompt)
+        }
+
+        return nil
+    }
+
+    private static func candidate(from prompt: ConversationClarificationPrompt) -> PromptRewriteAIMappingCandidate? {
+        guard let primary = prompt.primaryCandidate else {
+            return nil
+        }
+        return PromptRewriteAIMappingCandidate(
+            prompt: prompt,
+            candidateKey: primary.canonicalKey,
+            candidateLabel: primary.label,
+            candidateBundleIdentifier: primary.bundleIdentifier,
+            confidence: max(0, min(1, primary.similarity))
+        )
+    }
+
+    private static func canonicalizedTags(
+        _ tags: ConversationTupleTags,
+        store: MemorySQLiteStore
+    ) -> ConversationTupleTags {
+        let normalizedProjectKey = tags.projectKey.lowercased()
+        let normalizedIdentityKey = tags.identityKey.lowercased()
+
+        var canonicalProject = normalizedProjectKey
+        if let resolved = try? store.resolveConversationTagAlias(
+            aliasType: "project",
+            aliasKey: normalizedProjectKey
+        ),
+           !resolved.isEmpty {
+            canonicalProject = resolved
+        }
+
+        var canonicalIdentity = normalizedIdentityKey
+        if let resolved = try? store.resolveConversationTagAlias(
+            aliasType: "identity",
+            aliasKey: normalizedIdentityKey
+        ),
+           !resolved.isEmpty {
+            canonicalIdentity = resolved
+        }
+
+        if canonicalProject != normalizedProjectKey {
+            try? store.upsertConversationTagAlias(
+                aliasType: "project",
+                aliasKey: normalizedProjectKey,
+                canonicalKey: canonicalProject
+            )
+        }
+        if canonicalIdentity != normalizedIdentityKey {
+            try? store.upsertConversationTagAlias(
+                aliasType: "identity",
+                aliasKey: normalizedIdentityKey,
+                canonicalKey: canonicalIdentity
+            )
+        }
+
+        return ConversationTupleTags(
+            projectKey: canonicalProject,
+            projectLabel: tags.projectLabel,
+            identityKey: canonicalIdentity,
+            identityType: tags.identityType,
+            identityLabel: tags.identityLabel,
+            people: tags.people,
+            nativeThreadKey: tags.nativeThreadKey
+        )
+    }
+
+    private static func clarificationPrompt(
+        axis: ClarificationAxis,
+        currentKey: String,
+        currentLabel: String,
+        currentBundleIdentifier: String,
+        threads: [ConversationThreadRecord],
+        store: MemorySQLiteStore
+    ) -> ConversationClarificationPrompt? {
+        let normalizedCurrentKey = normalizedClarificationKey(currentKey)
+        guard !normalizedCurrentKey.isEmpty else {
+            return nil
+        }
+        let normalizedCurrentLabel = comparableClarificationLabel(
+            label: currentLabel,
+            fallbackKey: normalizedCurrentKey
+        )
+        guard !normalizedCurrentLabel.isEmpty else {
+            return nil
+        }
+        let subjectKey = normalizedClarificationKey(normalizedCurrentLabel)
+        guard !subjectKey.isEmpty else {
+            return nil
+        }
+
+        var rankedByCanonicalKey: [String: ClarificationRankedCandidate] = [:]
+        var shouldSuppressPrompt = false
+
+        for thread in threads {
+            guard let (candidateKey, candidateLabel) = clarificationCandidateParts(
+                for: axis,
+                thread: thread
+            ) else {
+                continue
+            }
+
+            let normalizedCandidateKey = normalizedClarificationKey(candidateKey)
+            guard !normalizedCandidateKey.isEmpty else {
+                continue
+            }
+            let canonicalCandidateKey = resolvedClarificationAliasKey(
+                aliasType: axis.aliasType,
+                key: normalizedCandidateKey,
+                store: store
+            )
+            guard !canonicalCandidateKey.isEmpty,
+                  canonicalCandidateKey != normalizedCurrentKey else {
+                continue
+            }
+
+            if let existingRule = clarificationRuleResolution(
+                axis: axis,
+                currentBundleIdentifier: currentBundleIdentifier,
+                subjectKey: subjectKey,
+                currentKey: normalizedCurrentKey,
+                candidateKey: canonicalCandidateKey,
+                candidateBundleIdentifier: thread.bundleID,
+                store: store
+            ) {
+                switch existingRule {
+                case .keepSeparate:
+                    continue
+                case let .link(canonicalKey):
+                    let resolvedCanonicalKey = normalizedClarificationKey(canonicalKey ?? canonicalCandidateKey)
+                    guard !resolvedCanonicalKey.isEmpty else {
+                        continue
+                    }
+                    try? store.upsertConversationTagAlias(
+                        aliasType: axis.aliasType,
+                        aliasKey: normalizedCurrentKey,
+                        canonicalKey: resolvedCanonicalKey
+                    )
+                    shouldSuppressPrompt = true
+                    continue
+                }
+            }
+
+            let normalizedCandidateLabel = comparableClarificationLabel(
+                label: candidateLabel,
+                fallbackKey: canonicalCandidateKey
+            )
+            guard !normalizedCandidateLabel.isEmpty else {
+                continue
+            }
+
+            let isExact = normalizedCandidateLabel == normalizedCurrentLabel
+            let similarity = isExact
+                ? 1
+                : normalizedClarificationSimilarity(
+                    normalizedCurrentLabel,
+                    normalizedCandidateLabel
+                )
+            guard isExact || similarity >= clarificationSimilarityThreshold else {
+                continue
+            }
+
+            let rankedCandidate = ClarificationRankedCandidate(
+                candidate: ConversationClarificationCandidate(
+                    canonicalKey: canonicalCandidateKey,
+                    label: collapsedWhitespace(candidateLabel),
+                    appName: collapsedWhitespace(thread.appName),
+                    bundleIdentifier: normalizedClarificationBundle(thread.bundleID),
+                    similarity: similarity,
+                    lastActivityAt: thread.lastActivityAt
+                ),
+                isExact: isExact
+            )
+
+            if let existing = rankedByCanonicalKey[canonicalCandidateKey] {
+                if shouldReplaceClarificationCandidate(existing, with: rankedCandidate) {
+                    rankedByCanonicalKey[canonicalCandidateKey] = rankedCandidate
+                }
+            } else {
+                rankedByCanonicalKey[canonicalCandidateKey] = rankedCandidate
+            }
+        }
+
+        if shouldSuppressPrompt {
+            return nil
+        }
+
+        let ranked = rankedByCanonicalKey.values.sorted { lhs, rhs in
+            if lhs.isExact != rhs.isExact {
+                return lhs.isExact && !rhs.isExact
+            }
+            if lhs.candidate.similarity != rhs.candidate.similarity {
+                return lhs.candidate.similarity > rhs.candidate.similarity
+            }
+            if lhs.candidate.lastActivityAt != rhs.candidate.lastActivityAt {
+                return lhs.candidate.lastActivityAt > rhs.candidate.lastActivityAt
+            }
+            return lhs.candidate.label.localizedCaseInsensitiveCompare(rhs.candidate.label) == .orderedAscending
+        }
+        guard !ranked.isEmpty else {
+            return nil
+        }
+
+        let exactMatches = ranked.filter(\.isExact)
+        let selected: [ClarificationRankedCandidate]
+        let kind: ConversationClarificationKind
+        if !exactMatches.isEmpty {
+            selected = Array(exactMatches.prefix(clarificationCandidateLimit))
+            kind = axis == .project ? .projectExact : .personExact
+        } else {
+            selected = Array(ranked.prefix(clarificationCandidateLimit))
+            kind = axis == .project ? .projectAmbiguous : .personAmbiguous
+        }
+
+        let displayLabel = collapsedWhitespace(currentLabel)
+
+        return ConversationClarificationPrompt(
+            kind: kind,
+            currentKey: normalizedCurrentKey,
+            currentLabel: displayLabel.isEmpty
+                ? readableClarificationLabel(from: normalizedCurrentKey)
+                : displayLabel,
+            currentBundleIdentifier: currentBundleIdentifier,
+            subjectKey: subjectKey,
+            candidates: selected.map(\.candidate)
+        )
+    }
+
+    private static func clarificationCandidateParts(
+        for axis: ClarificationAxis,
+        thread: ConversationThreadRecord
+    ) -> (key: String, label: String)? {
+        switch axis {
+        case .project:
+            guard isMeaningfulProjectClarificationKey(thread.projectKey) else {
+                return nil
+            }
+            return (thread.projectKey, thread.projectLabel)
+        case .person:
+            guard normalizedClarificationIdentityType(thread.identityType) == "person" else {
+                return nil
+            }
+            guard isMeaningfulPersonClarificationKey(thread.identityKey) else {
+                return nil
+            }
+            return (thread.identityKey, thread.identityLabel)
+        }
+    }
+
+    private static func shouldReplaceClarificationCandidate(
+        _ existing: ClarificationRankedCandidate,
+        with candidate: ClarificationRankedCandidate
+    ) -> Bool {
+        if existing.isExact != candidate.isExact {
+            return candidate.isExact
+        }
+        if existing.candidate.similarity != candidate.candidate.similarity {
+            return candidate.candidate.similarity > existing.candidate.similarity
+        }
+        return candidate.candidate.lastActivityAt > existing.candidate.lastActivityAt
+    }
+
+    private static func clarificationRuleResolution(
+        axis: ClarificationAxis,
+        currentBundleIdentifier: String,
+        subjectKey: String,
+        currentKey: String,
+        candidateKey: String,
+        candidateBundleIdentifier: String,
+        store: MemorySQLiteStore
+    ) -> ClarificationRuleResolution? {
+        let appPairKey = store.conversationDisambiguationAppPairKey(
+            normalizedClarificationBundle(currentBundleIdentifier),
+            normalizedClarificationBundle(candidateBundleIdentifier)
+        )
+        let normalizedSubjectKey = normalizedClarificationKey(subjectKey)
+        let normalizedCandidateKey = normalizedClarificationKey(candidateKey)
+        guard !appPairKey.isEmpty, !normalizedSubjectKey.isEmpty else {
+            return nil
+        }
+
+        let scopedRule = try? store.fetchConversationDisambiguationRule(
+            ruleType: axis.ruleType,
+            appPairKey: appPairKey,
+            subjectKey: normalizedSubjectKey,
+            contextScopeKey: normalizedCandidateKey
+        )
+        if let scopedRule {
+            switch scopedRule.decision {
+            case .separate:
+                return .keepSeparate
+            case .link:
+                return .link(canonicalKey: scopedRule.canonicalKey)
+            }
+        }
+
+        let broadRule = try? store.fetchConversationDisambiguationRule(
+            ruleType: axis.ruleType,
+            appPairKey: appPairKey,
+            subjectKey: normalizedSubjectKey,
+            contextScopeKey: nil
+        )
+        if let broadRule {
+            switch broadRule.decision {
+            case .separate:
+                return .keepSeparate
+            case .link:
+                return .link(canonicalKey: broadRule.canonicalKey)
+            }
+        }
+
+        if let resolvedAlias = try? store.resolveConversationTagAlias(
+            aliasType: axis.aliasType,
+            aliasKey: currentKey
+        ),
+           normalizedClarificationKey(resolvedAlias) == candidateKey {
+            return .link(canonicalKey: candidateKey)
+        }
+
+        return nil
+    }
+
+    private static func resolvedClarificationAliasKey(
+        aliasType: String,
+        key: String,
+        store: MemorySQLiteStore
+    ) -> String {
+        let normalized = normalizedClarificationKey(key)
+        guard !normalized.isEmpty else {
+            return ""
+        }
+        if let resolved = try? store.resolveConversationTagAlias(aliasType: aliasType, aliasKey: normalized),
+           !resolved.isEmpty {
+            return normalizedClarificationKey(resolved)
+        }
+        return normalized
+    }
+
+    private static func normalizedClarificationKey(_ value: String) -> String {
+        collapsedWhitespace(value).lowercased()
+    }
+
+    private static func normalizedClarificationBundle(_ value: String) -> String {
+        collapsedWhitespace(value).lowercased()
+    }
+
+    private static func normalizedClarificationIdentityType(_ value: String) -> String {
+        collapsedWhitespace(value).lowercased()
+    }
+
+    private static func comparableClarificationLabel(label: String, fallbackKey: String) -> String {
+        let fromLabel = normalizedClarificationLabel(label)
+        if !fromLabel.isEmpty {
+            return fromLabel
+        }
+        return normalizedClarificationLabel(readableClarificationLabel(from: fallbackKey))
+    }
+
+    private static func normalizedClarificationLabel(_ value: String) -> String {
+        let collapsed = collapsedWhitespace(value).lowercased()
+        guard !collapsed.isEmpty else {
+            return ""
+        }
+        let alphanumericOnly = collapsed.replacingOccurrences(
+            of: #"[^a-z0-9]+"#,
+            with: " ",
+            options: .regularExpression
+        )
+        return collapsedWhitespace(alphanumericOnly)
+    }
+
+    private static func readableClarificationLabel(from key: String) -> String {
+        let split = key.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: true)
+        let fallback = split.count == 2 ? String(split[1]) : key
+        let separated = fallback
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        let normalized = collapsedWhitespace(separated)
+        return normalized.isEmpty ? key : normalized
+    }
+
+    private static func isMeaningfulProjectClarificationKey(_ projectKey: String) -> Bool {
+        let normalized = normalizedClarificationKey(projectKey)
+        guard normalized.hasPrefix("project:") else {
+            return false
+        }
+        let value = String(normalized.dropFirst("project:".count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            return false
+        }
+        let blockedValues: Set<String> = [
+            "unknown",
+            "unknown-project",
+            "current-screen",
+            "focused-input"
+        ]
+        if blockedValues.contains(value) || value.hasPrefix("unknown-") {
+            return false
+        }
+        return true
+    }
+
+    private static func isMeaningfulPersonClarificationKey(_ identityKey: String) -> Bool {
+        let normalized = normalizedClarificationKey(identityKey)
+        guard normalized.hasPrefix("person:") else {
+            return false
+        }
+        let value = String(normalized.dropFirst("person:".count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value == "unknown" {
+            return false
+        }
+        return true
+    }
+
+    private static func normalizedClarificationSimilarity(_ lhs: String, _ rhs: String) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else {
+            return 0
+        }
+        if lhs == rhs {
+            return 1
+        }
+        let editDistanceSimilarity = normalizedLevenshteinSimilarity(lhs, rhs)
+        let tokenSimilarity = tokenOverlapSimilarity(lhs, rhs)
+        return max(editDistanceSimilarity, tokenSimilarity)
+    }
+
+    private static func normalizedLevenshteinSimilarity(_ lhs: String, _ rhs: String) -> Double {
+        let lhsCharacters = Array(lhs)
+        let rhsCharacters = Array(rhs)
+        guard !lhsCharacters.isEmpty, !rhsCharacters.isEmpty else {
+            return 0
+        }
+
+        var previous = Array(0...rhsCharacters.count)
+        var current = Array(repeating: 0, count: rhsCharacters.count + 1)
+
+        for lhsIndex in 1...lhsCharacters.count {
+            current[0] = lhsIndex
+            for rhsIndex in 1...rhsCharacters.count {
+                let substitutionCost = lhsCharacters[lhsIndex - 1] == rhsCharacters[rhsIndex - 1] ? 0 : 1
+                current[rhsIndex] = Swift.min(
+                    previous[rhsIndex] + 1,
+                    current[rhsIndex - 1] + 1,
+                    previous[rhsIndex - 1] + substitutionCost
+                )
+            }
+            swap(&previous, &current)
+        }
+
+        let maxLength = max(lhsCharacters.count, rhsCharacters.count)
+        guard maxLength > 0 else {
+            return 0
+        }
+        let distance = previous[rhsCharacters.count]
+        return max(0, 1 - (Double(distance) / Double(maxLength)))
+    }
+
+    private static func tokenOverlapSimilarity(_ lhs: String, _ rhs: String) -> Double {
+        let lhsTokens = Set(lhs.split(separator: " ").map(String.init))
+        let rhsTokens = Set(rhs.split(separator: " ").map(String.init))
+        guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else {
+            return 0
+        }
+        let unionCount = lhsTokens.union(rhsTokens).count
+        guard unionCount > 0 else {
+            return 0
+        }
+        return Double(lhsTokens.intersection(rhsTokens).count) / Double(unionCount)
+    }
+
+    private static func collapsedWhitespace(_ value: String) -> String {
+        MemoryTextNormalizer.collapsedWhitespace(value)
+    }
 }
 
 @main
@@ -29,12 +624,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         static let modifiers: NSEvent.ModifierFlags = [.command, .option]
     }
 
+    private(set) lazy var updaterController = SPUStandardUpdaterController(
+        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
+    )
+
     private let transcriber = SpeechTranscriber()
     private let whisperModelManager = WhisperModelManager.shared
     private let settings = SettingsStore.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     private let promptRewriteService = PromptRewriteService.shared
     private let promptRewriteConversationStore = PromptRewriteConversationStore.shared
+    private let conversationContextResolverV2 = ConversationContextResolverV2()
     private let postInsertCorrectionMonitor = PostInsertCorrectionMonitor()
     private let waveform = WaveformHUDManager()
     private var hotkeyManager: HoldToTalkManager?
@@ -61,6 +661,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
     private var hasScheduledPermissionRestart = false
+    private var settingsApplyWorkItem: DispatchWorkItem?
+    private var lastAppliedSettingsSnapshot: SettingsApplySnapshot?
+    private var aiMappingPromptSuppressionByPair: [String: Date] = [:]
 
     private enum PromptRewriteFailureChoice {
         case retry
@@ -73,6 +676,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case bypassed
     }
 
+    private enum PromptRewriteAIMappingChoice {
+        case link
+        case keepSeparate
+        case dismiss
+    }
+
     private struct PromptRewriteSessionContext {
         let conversationContext: PromptRewriteConversationContext
         let insertionHUDContext: PromptRewriteInsertionHUDContext
@@ -83,6 +692,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let conversationContext: PromptRewriteConversationContext?
         let insertionHUDContext: PromptRewriteInsertionHUDContext
     }
+
+    private struct SettingsApplySnapshot: Equatable {
+        let autoDetectMicrophone: Bool
+        let selectedMicrophoneUID: String
+        let shortcutKeyCode: UInt16
+        let shortcutModifiers: UInt
+        let continuousToggleShortcutKeyCode: UInt16
+        let continuousToggleShortcutModifiers: UInt
+        let muteSystemSoundsWhileHoldingShortcut: Bool
+        let transcriptionEngineRawValue: String
+        let selectedWhisperModelID: String
+        let whisperUseCoreML: Bool
+        let whisperAutoUnloadIdleContextEnabled: Bool
+        let whisperIdleContextUnloadSeconds: Double
+        let adaptiveCorrectionsEnabled: Bool
+        let enableContextualBias: Bool
+        let keepTextAcrossPauses: Bool
+        let recognitionModeRawValue: String
+        let autoPunctuation: Bool
+        let finalizeDelaySeconds: Double
+        let customContextPhrases: String
+    }
+
+    private static let promptRewriteAutoInsertMinimumConfidence: Double = 0.85
+    private static let settingsApplyDebounceSeconds: TimeInterval = 0.14
+    private static let aiMappingHighConfidenceThreshold: Double = 0.90
+    private static let aiMappingTimeoutSeconds: TimeInterval = 0.25
+    private static let aiMappingPromptSuppressionWindowSeconds: TimeInterval = 180
+    private static let localAIRuntimeShutdownTimeoutSeconds: TimeInterval = 1.5
+
     private enum DictationFeedbackCue: CaseIterable {
         case startListening
         case stopListening
@@ -214,6 +853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             idleContextUnloadDelaySeconds: settings.whisperIdleContextUnloadSeconds
         )
         transcriber.setTranscriptionEngine(settings.transcriptionEngine)
+        lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
 
         postInsertCorrectionMonitor.onCorrectionDetected = { [weak self] result in
             Task { @MainActor in
@@ -270,7 +910,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         settings.onChange = { [weak self] in
             Task { @MainActor in
-                self?.applySettingsChanges()
+                self?.scheduleApplySettingsChanges()
             }
         }
 
@@ -350,6 +990,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NotificationCenter.default.removeObserver(settingsRequestObserver)
             self.settingsRequestObserver = nil
         }
+        settingsApplyWorkItem?.cancel()
+        settingsApplyWorkItem = nil
+        settings.onChange = nil
         adaptiveCorrectionObserver?.cancel()
         adaptiveCorrectionObserver = nil
         pasteLastTranscriptHotkeyManager?.stop()
@@ -359,19 +1002,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         continuousToggleHotkeyManager?.stop()
         continuousToggleHotkeyManager = nil
         stopStatusIconAnimation()
-        transcriber.stopRecording()
+        transcriber.stopRecording(emitFinalText: false)
         postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
         waveform.hide()
         windowCoordinator?.closeAllWindows()
         windowCoordinator = nil
 
-        let runtimeShutdownGroup = DispatchGroup()
-        runtimeShutdownGroup.enter()
-        Task.detached(priority: .userInitiated) {
+        let runtimeStopSemaphore = DispatchSemaphore(value: 0)
+        Task.detached(priority: .utility) {
             await LocalAIRuntimeManager.shared.stop()
-            runtimeShutdownGroup.leave()
+            runtimeStopSemaphore.signal()
         }
-        _ = runtimeShutdownGroup.wait(timeout: .now() + 1.5)
+        if runtimeStopSemaphore.wait(timeout: .now() + Self.localAIRuntimeShutdownTimeoutSeconds) == .timedOut {
+            CrashReporter.logInfo(
+                "Local AI runtime stop timed out after \(Self.localAIRuntimeShutdownTimeoutSeconds)s during app termination"
+            )
+        }
 
         isDictating = false
         dictationInputMode = .idle
@@ -547,24 +1193,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func scheduleApplySettingsChanges() {
+        settingsApplyWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.applySettingsChanges()
+        }
+        settingsApplyWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.settingsApplyDebounceSeconds,
+            execute: workItem
+        )
+    }
+
+    private func currentSettingsApplySnapshot() -> SettingsApplySnapshot {
+        SettingsApplySnapshot(
+            autoDetectMicrophone: settings.autoDetectMicrophone,
+            selectedMicrophoneUID: settings.selectedMicrophoneUID,
+            shortcutKeyCode: settings.shortcutKeyCode,
+            shortcutModifiers: settings.shortcutModifiers,
+            continuousToggleShortcutKeyCode: settings.continuousToggleShortcutKeyCode,
+            continuousToggleShortcutModifiers: settings.continuousToggleShortcutModifiers,
+            muteSystemSoundsWhileHoldingShortcut: settings.muteSystemSoundsWhileHoldingShortcut,
+            transcriptionEngineRawValue: settings.transcriptionEngineRawValue,
+            selectedWhisperModelID: settings.selectedWhisperModelID,
+            whisperUseCoreML: settings.whisperUseCoreML,
+            whisperAutoUnloadIdleContextEnabled: settings.whisperAutoUnloadIdleContextEnabled,
+            whisperIdleContextUnloadSeconds: settings.whisperIdleContextUnloadSeconds,
+            adaptiveCorrectionsEnabled: settings.adaptiveCorrectionsEnabled,
+            enableContextualBias: settings.enableContextualBias,
+            keepTextAcrossPauses: settings.keepTextAcrossPauses,
+            recognitionModeRawValue: settings.recognitionModeRawValue,
+            autoPunctuation: settings.autoPunctuation,
+            finalizeDelaySeconds: settings.finalizeDelaySeconds,
+            customContextPhrases: settings.customContextPhrases
+        )
+    }
+
     private func applySettingsChanges() {
-        settings.refreshMicrophones(notifyChange: false)
-        syncWhisperModelSelectionIfNeeded()
-        transcriber.applyMicrophoneSettings(autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID)
-        applyRecognitionSettingsToTranscriber()
-        transcriber.applyWhisperSettings(
-            selectedModelID: settings.selectedWhisperModelID,
-            useCoreML: settings.whisperUseCoreML
-        )
-        transcriber.applyWhisperContextRetentionSettings(
-            autoUnloadIdleContext: settings.whisperAutoUnloadIdleContextEnabled,
-            idleContextUnloadDelaySeconds: settings.whisperIdleContextUnloadSeconds
-        )
-        transcriber.setTranscriptionEngine(settings.transcriptionEngine)
-        if !settings.adaptiveCorrectionsEnabled {
+        let snapshot = currentSettingsApplySnapshot()
+        let previousSnapshot = lastAppliedSettingsSnapshot
+
+        let microphoneChanged = previousSnapshot == nil
+            || previousSnapshot?.autoDetectMicrophone != snapshot.autoDetectMicrophone
+            || previousSnapshot?.selectedMicrophoneUID != snapshot.selectedMicrophoneUID
+        if microphoneChanged {
+            settings.refreshMicrophones(notifyChange: false)
+            transcriber.applyMicrophoneSettings(
+                autoDetect: settings.autoDetectMicrophone,
+                microphoneUID: settings.selectedMicrophoneUID
+            )
+        }
+
+        let recognitionChanged = previousSnapshot == nil
+            || previousSnapshot?.adaptiveCorrectionsEnabled != snapshot.adaptiveCorrectionsEnabled
+            || previousSnapshot?.enableContextualBias != snapshot.enableContextualBias
+            || previousSnapshot?.keepTextAcrossPauses != snapshot.keepTextAcrossPauses
+            || previousSnapshot?.recognitionModeRawValue != snapshot.recognitionModeRawValue
+            || previousSnapshot?.autoPunctuation != snapshot.autoPunctuation
+            || previousSnapshot?.finalizeDelaySeconds != snapshot.finalizeDelaySeconds
+            || previousSnapshot?.customContextPhrases != snapshot.customContextPhrases
+        if recognitionChanged {
+            applyRecognitionSettingsToTranscriber()
+        }
+
+        let engineChanged = previousSnapshot == nil
+            || previousSnapshot?.transcriptionEngineRawValue != snapshot.transcriptionEngineRawValue
+        let whisperRuntimeChanged = previousSnapshot == nil
+            || previousSnapshot?.selectedWhisperModelID != snapshot.selectedWhisperModelID
+            || previousSnapshot?.whisperUseCoreML != snapshot.whisperUseCoreML
+            || previousSnapshot?.whisperAutoUnloadIdleContextEnabled != snapshot.whisperAutoUnloadIdleContextEnabled
+            || previousSnapshot?.whisperIdleContextUnloadSeconds != snapshot.whisperIdleContextUnloadSeconds
+        if engineChanged || whisperRuntimeChanged {
+            syncWhisperModelSelectionIfNeeded()
+            transcriber.applyWhisperSettings(
+                selectedModelID: settings.selectedWhisperModelID,
+                useCoreML: settings.whisperUseCoreML
+            )
+            transcriber.applyWhisperContextRetentionSettings(
+                autoUnloadIdleContext: settings.whisperAutoUnloadIdleContextEnabled,
+                idleContextUnloadDelaySeconds: settings.whisperIdleContextUnloadSeconds
+            )
+        }
+
+        if engineChanged {
+            transcriber.setTranscriptionEngine(settings.transcriptionEngine)
+            updatePermissionGate(openOnboardingIfNeeded: false)
+        }
+
+        let hotkeysChanged = previousSnapshot == nil
+            || previousSnapshot?.shortcutKeyCode != snapshot.shortcutKeyCode
+            || previousSnapshot?.shortcutModifiers != snapshot.shortcutModifiers
+            || previousSnapshot?.continuousToggleShortcutKeyCode != snapshot.continuousToggleShortcutKeyCode
+            || previousSnapshot?.continuousToggleShortcutModifiers != snapshot.continuousToggleShortcutModifiers
+            || previousSnapshot?.muteSystemSoundsWhileHoldingShortcut != snapshot.muteSystemSoundsWhileHoldingShortcut
+        if hotkeysChanged {
+            applyHotkeyMode()
+            configurePasteLastTranscriptHotkey()
+        }
+
+        if (previousSnapshot?.adaptiveCorrectionsEnabled ?? true) && !settings.adaptiveCorrectionsEnabled {
             postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
         }
-        updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+
+        lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
+        updateMenuState()
     }
 
     private func observeAdaptiveCorrectionChanges() {
@@ -842,8 +1575,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for: insertionSessionContext.conversationContext,
             userText: cleanedTranscript
         )
-        let conversationContext = conversationRequestContext?.context
-        let conversationHistory = conversationRequestContext?.history ?? []
+        let conversationContext = conversationRequestContext?.activeContext
+        let conversationHistory = conversationRequestContext?.mergedHistory ?? []
+
+        if let conversationRequestContext {
+            scheduleAIMappingEvaluationIfNeeded(
+                resolvedBundle: conversationRequestContext,
+                capturedContext: insertionSessionContext.conversationContext,
+                userText: cleanedTranscript
+            )
+        }
 
         while true {
             do {
@@ -901,6 +1642,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     rawSuggestion,
                     originalText: cleanedTranscript,
                     refinementDurationSeconds: refinementElapsed
+                )
+                let autoInsertEnabled = settings.promptRewriteAutoInsertEnabled
+                let autoInsertThreshold = Self.promptRewriteAutoInsertMinimumConfidence
+                let suggestionConfidence = suggestion.confidence
+                let suggestionConfidenceString = suggestionConfidence.map { value in
+                    String(format: "%.3f", value)
+                } ?? "nil"
+                let thresholdString = String(format: "%.3f", autoInsertThreshold)
+
+                if autoInsertEnabled,
+                   let suggestionConfidence,
+                   suggestionConfidence >= autoInsertThreshold {
+                    CrashReporter.logInfo(
+                        "Prompt rewrite insertion decision=auto-insert " +
+                        "provider=\(settings.promptRewriteProviderModeRawValue) " +
+                        "confidence=\(suggestionConfidenceString) " +
+                        "threshold=\(thresholdString) " +
+                        "continuity=\(suggestion.continuityTrace ?? "none")"
+                    )
+                    await recordPromptRewriteFeedback(
+                        action: .autoInsertedSuggested,
+                        originalText: cleanedTranscript,
+                        suggestedText: suggestion.suggestedText,
+                        finalInsertedText: suggestion.suggestedText
+                    )
+                    return PromptRewriteInsertionResolution(
+                        insertionText: suggestion.suggestedText,
+                        conversationContext: conversationContext,
+                        insertionHUDContext: insertionSessionContext.insertionHUDContext
+                    )
+                }
+
+                let previewReason: String
+                if !autoInsertEnabled {
+                    previewReason = "auto-insert-disabled"
+                } else if suggestionConfidence == nil {
+                    previewReason = "confidence-missing"
+                } else {
+                    previewReason = "below-threshold"
+                }
+                CrashReporter.logInfo(
+                    "Prompt rewrite insertion decision=preview " +
+                    "provider=\(settings.promptRewriteProviderModeRawValue) " +
+                    "reason=\(previewReason) " +
+                    "confidence=\(suggestionConfidenceString) " +
+                    "threshold=\(thresholdString) " +
+                    "continuity=\(suggestion.continuityTrace ?? "none")"
                 )
 
                 while true {
@@ -1041,31 +1829,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func promptRewriteConversationRequestContext(
         for capturedContext: PromptRewriteConversationContext,
         userText: String
-    ) -> PromptRewriteConversationStore.RequestContext? {
+    ) -> ConversationContextResolverV2.ResolvedContextBundle? {
         guard settings.promptRewriteEnabled, settings.promptRewriteConversationHistoryEnabled else {
             return nil
         }
 
-        while let clarificationPrompt = promptRewriteConversationStore.nextClarificationPrompt(
-            capturedContext: capturedContext,
-            userText: userText
-        ) {
-            let decision = presentConversationClarificationPrompt(clarificationPrompt)
-            if decision == .dismiss {
-                break
-            }
-            promptRewriteConversationStore.applyClarificationDecision(
-                decision,
-                for: clarificationPrompt
-            )
-        }
-
-        let requestContext = promptRewriteConversationStore.prepareRequestContext(
+        guard let requestContext = conversationContextResolverV2.resolve(
             capturedContext: capturedContext,
             userText: userText,
             timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes,
             turnLimit: settings.promptRewriteConversationTurnLimit,
             pinnedContextID: settings.promptRewriteConversationPinnedContextID
+        ) else {
+            return nil
+        }
+
+        logPromptRewriteMappingTelemetry(
+            mappingSource: "resolver",
+            linkedContextCount: requestContext.linkedContextIDs.count,
+            mergeTurns: requestContext.mergedHistory.count,
+            aiMatchTimeout: false,
+            detail: requestContext.resolutionTrace
         )
 
         let pinnedID = settings.promptRewriteConversationPinnedContextID
@@ -1074,45 +1858,173 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings.promptRewriteConversationPinnedContextID = ""
         }
 
-        if !settings.isPromptRewriteConversationHistoryEnabled(forContextID: requestContext.context.id) {
-            return PromptRewriteConversationStore.RequestContext(
-                context: requestContext.context,
-                history: [],
-                usesPinnedContext: requestContext.usesPinnedContext
+        if !settings.isPromptRewriteConversationHistoryEnabled(forContextID: requestContext.activeContext.id) {
+            return ConversationContextResolverV2.ResolvedContextBundle(
+                activeContext: requestContext.activeContext,
+                activeHistory: [],
+                linkedContextIDs: requestContext.linkedContextIDs,
+                mergedHistory: [],
+                usesPinnedContext: requestContext.usesPinnedContext,
+                resolutionTrace: requestContext.resolutionTrace
             )
         }
 
         return requestContext
     }
 
-    private func presentConversationClarificationPrompt(
-        _ prompt: ConversationClarificationPrompt
-    ) -> ConversationClarificationDecision {
-        guard let candidate = prompt.primaryCandidate else {
-            return .dismiss
+    private func scheduleAIMappingEvaluationIfNeeded(
+        resolvedBundle: ConversationContextResolverV2.ResolvedContextBundle,
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) {
+        let linkedContextCount = resolvedBundle.linkedContextIDs.count
+        let mergeTurns = resolvedBundle.mergedHistory.count
+        guard linkedContextCount == 0 else {
+            logPromptRewriteMappingTelemetry(
+                mappingSource: "linked-existing",
+                linkedContextCount: linkedContextCount,
+                mergeTurns: mergeTurns,
+                aiMatchTimeout: false,
+                detail: "skipped_ai_mapping=true"
+            )
+            return
         }
 
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            let evaluationStartedAt = Date()
+            let candidate = await self.evaluateAIMappingCandidateOffMain(
+                capturedContext: capturedContext,
+                userText: userText
+            )
+            let elapsed = Date().timeIntervalSince(evaluationStartedAt)
+            let timedOut = elapsed > Self.aiMappingTimeoutSeconds
+
+            if timedOut {
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "ai",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: true,
+                    detail: "elapsed_ms=\(Int((elapsed * 1_000).rounded()))"
+                )
+                return
+            }
+
+            guard let candidate else {
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "ai",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "candidate_found=false"
+                )
+                return
+            }
+
+            guard candidate.confidence >= Self.aiMappingHighConfidenceThreshold else {
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "ai",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "candidate_found=true confidence=\(String(format: "%.3f", candidate.confidence)) below_threshold=true"
+                )
+                return
+            }
+
+            let suppressionKey = self.aiMappingSuppressionKey(
+                activeContextID: resolvedBundle.activeContext.id,
+                candidate: candidate
+            )
+            if self.shouldSuppressAIMappingPrompt(for: suppressionKey) {
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "ai",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "candidate_found=true prompt_suppressed=true confidence=\(String(format: "%.3f", candidate.confidence))"
+                )
+                return
+            }
+
+            self.markAIMappingPromptShown(for: suppressionKey)
+            self.logPromptRewriteMappingTelemetry(
+                mappingSource: "ai",
+                linkedContextCount: linkedContextCount,
+                mergeTurns: mergeTurns,
+                aiMatchTimeout: false,
+                detail: "candidate_found=true prompt_shown=true confidence=\(String(format: "%.3f", candidate.confidence))"
+            )
+
+            let choice = self.presentPromptRewriteAIMappingDecision(candidate: candidate)
+            switch choice {
+            case .link:
+                self.conversationContextResolverV2.persistMappingDecision(
+                    .link,
+                    prompt: candidate.prompt,
+                    source: .ai
+                )
+                self.setUIStatus(.message("Linked related conversation"))
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "ai",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "decision=link"
+                )
+            case .keepSeparate:
+                self.conversationContextResolverV2.persistMappingDecision(
+                    .keepSeparate,
+                    prompt: candidate.prompt,
+                    source: .ai
+                )
+                self.setUIStatus(.message("Keeping conversations separate"))
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "ai",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "decision=keep-separate"
+                )
+            case .dismiss:
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "ai",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "decision=dismiss"
+                )
+            }
+        }
+    }
+
+    private func evaluateAIMappingCandidateOffMain(
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) async -> PromptRewriteAIMappingCandidate? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let candidate = PromptRewriteAIMappingEvaluator.evaluate(
+                    capturedContext: capturedContext,
+                    userText: userText
+                )
+                continuation.resume(returning: candidate)
+            }
+        }
+    }
+
+    private func presentPromptRewriteAIMappingDecision(
+        candidate: PromptRewriteAIMappingCandidate
+    ) -> PromptRewriteAIMappingChoice {
         let alert = NSAlert()
         alert.alertStyle = .informational
-        switch prompt.kind {
-        case .projectExact:
-            alert.messageText = "Link matching project?"
-        case .projectAmbiguous:
-            alert.messageText = "Link similar project?"
-        case .personExact:
-            alert.messageText = "Link matching person?"
-        case .personAmbiguous:
-            alert.messageText = "Link similar person?"
-        }
-
-        let currentLabel = prompt.currentLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        let candidateLabel = candidate.label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let left = currentLabel.isEmpty ? prompt.currentKey : currentLabel
-        let right = candidateLabel.isEmpty ? candidate.canonicalKey : candidateLabel
-        let appLabel = candidate.appName.isEmpty ? candidate.bundleIdentifier : candidate.appName
-        let relationshipText = prompt.kind.isExact ? "matches" : "looks close to"
-        alert.informativeText = "\"\(left)\" \(relationshipText) \"\(right)\" in \(appLabel)."
-
+        alert.messageText = "Link related conversations?"
+        alert.informativeText = """
+        Found a likely match (\(Int((candidate.confidence * 100).rounded()))%):
+        \(candidate.candidateLabel)
+        """
         alert.addButton(withTitle: "Link")
         alert.addButton(withTitle: "Keep Separate")
         alert.addButton(withTitle: "Dismiss")
@@ -1125,6 +2037,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             return .dismiss
         }
+    }
+
+    private func aiMappingSuppressionKey(
+        activeContextID: String,
+        candidate: PromptRewriteAIMappingCandidate
+    ) -> String {
+        "\(activeContextID)|\(candidate.candidateBundleIdentifier)|\(candidate.candidateKey)"
+    }
+
+    private func shouldSuppressAIMappingPrompt(for key: String, now: Date = Date()) -> Bool {
+        purgeExpiredAIMappingPromptSuppressions(now: now)
+        guard let expiresAt = aiMappingPromptSuppressionByPair[key] else {
+            return false
+        }
+        return expiresAt > now
+    }
+
+    private func markAIMappingPromptShown(for key: String, now: Date = Date()) {
+        purgeExpiredAIMappingPromptSuppressions(now: now)
+        aiMappingPromptSuppressionByPair[key] = now.addingTimeInterval(Self.aiMappingPromptSuppressionWindowSeconds)
+    }
+
+    private func purgeExpiredAIMappingPromptSuppressions(now: Date = Date()) {
+        aiMappingPromptSuppressionByPair = aiMappingPromptSuppressionByPair.filter { _, expiresAt in
+            expiresAt > now
+        }
+    }
+
+    private func logPromptRewriteMappingTelemetry(
+        mappingSource: String,
+        linkedContextCount: Int,
+        mergeTurns: Int,
+        aiMatchTimeout: Bool,
+        detail: String? = nil
+    ) {
+        var message = "Prompt rewrite mapping telemetry"
+        message += " mapping_source=\(mappingSource)"
+        message += " linked_context_count=\(linkedContextCount)"
+        message += " merge_turns=\(mergeTurns)"
+        message += " ai_match_timeout=\(aiMatchTimeout)"
+        if let detail,
+           !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            message += " \(detail)"
+        }
+        CrashReporter.logInfo(message)
     }
 
     private func capturePromptRewriteSessionContext() -> PromptRewriteSessionContext {
@@ -1328,6 +2285,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return PromptRewriteSuggestion(
             suggestedText: resolvedText,
             memoryContext: suggestion.memoryContext,
+            confidence: suggestion.confidence,
+            rewriteStrength: suggestion.rewriteStrength,
+            continuityTrace: suggestion.continuityTrace,
             refinementDurationSeconds: refinementDurationSeconds ?? suggestion.refinementDurationSeconds
         )
     }
@@ -1862,8 +2822,6 @@ struct SettingsView: View {
     @State private var showQuickReferenceTips = false
     @State private var showAppleSpeechAdvancedSettings = false
     @State private var showRecognitionAdvancedSettings = false
-    @State private var showAIPromptStyleSettings = false
-    @State private var showAIConversationHistorySettings = false
     @State private var whisperModelSearchQuery = ""
     @State private var whisperFamilyFilter = "all"
     @State private var whisperShowInstalledOnly = false
@@ -2868,8 +3826,6 @@ struct SettingsView: View {
             aiProviderStatusCard
         }
         .onAppear {
-            showAIPromptStyleSettings = false
-            showAIConversationHistorySettings = false
             localAISetupService.refreshStatus()
         }
     }
@@ -2886,132 +3842,25 @@ struct SettingsView: View {
             if FeatureFlags.aiMemoryEnabled {
                 Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
             }
+            Toggle("Auto-insert high-confidence AI suggestions", isOn: $settings.promptRewriteAutoInsertEnabled)
+                .disabled(!settings.promptRewriteEnabled)
+            Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
+                .disabled(!settings.promptRewriteEnabled)
 
-            DisclosureGroup("Style & formatting", isExpanded: $showAIPromptStyleSettings) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
+            Divider()
 
-                    HStack {
-                        Text("Rewrite style")
-                            .font(.callout.weight(.medium))
-                        Spacer()
-                        Picker("Rewrite style", selection: $settings.promptRewriteStylePresetRawValue) {
-                            ForEach(PromptRewriteStylePreset.allCases) { preset in
-                                Text(preset.rawValue).tag(preset.rawValue)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .frame(width: 220)
-                        .labelsHidden()
-                    }
+            Text("Advanced rewrite style, conversation-aware history, and context mappings are managed in AI Studio.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Custom style instructions (tone only, optional)")
-                            .font(.callout.weight(.medium))
-                        TextEditor(text: $settings.promptRewriteCustomStyleInstructions)
-                            .frame(height: 88)
-                            .font(.callout)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(Color.primary.opacity(0.15), lineWidth: 1)
-                            )
-                        Text("Examples: \"Sound like a principal architect\", \"Write as a senior iOS engineer\", \"Keep tone concise and formal\". These adjust tone only, not behavior.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+            HStack {
+                Spacer()
+                Button("Open AI Studio…") {
+                    cancelShortcutCapture()
+                    NotificationCenter.default.post(name: .keyScribeOpenAIMemoryStudio, object: nil)
                 }
-                .padding(.top, 8)
+                .buttonStyle(.bordered)
             }
-            .disabled(!settings.promptRewriteEnabled)
-
-            DisclosureGroup("Conversation-aware history", isExpanded: $showAIConversationHistorySettings) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Toggle(
-                        "Enable conversation-aware rewrite history (app + screen)",
-                        isOn: $settings.promptRewriteConversationHistoryEnabled
-                    )
-                    Toggle(
-                        "Share coding conversation history across apps when project matches",
-                        isOn: $settings.promptRewriteCrossIDEConversationSharingEnabled
-                    )
-                    .disabled(!settings.promptRewriteConversationHistoryEnabled)
-
-                    Text(
-                        "When enabled, coding apps (Codex, Antigravity, VS Code, Cursor, Xcode, JetBrains) can reuse the same history bucket for the same project."
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-
-                    if settings.promptRewriteConversationHistoryEnabled {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("Conversation timeout")
-                                    .font(.callout.weight(.medium))
-                                Spacer()
-                                Text("\(Int(settings.promptRewriteConversationTimeoutMinutes.rounded())) min")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Slider(
-                                value: $settings.promptRewriteConversationTimeoutMinutes,
-                                in: 2...240,
-                                step: 1
-                            )
-
-                            HStack {
-                                Text("Turns kept per context")
-                                    .font(.callout.weight(.medium))
-                                Spacer()
-                                Stepper(
-                                    "\(settings.promptRewriteConversationTurnLimit)",
-                                    value: $settings.promptRewriteConversationTurnLimit,
-                                    in: 1...50
-                                )
-                                .labelsHidden()
-                                Text("\(settings.promptRewriteConversationTurnLimit)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            HStack {
-                                Text("History source")
-                                    .font(.callout.weight(.medium))
-                                Spacer()
-                                Picker(
-                                    "History source",
-                                    selection: promptRewriteConversationContextSelection
-                                ) {
-                                    Text("Automatic (current app/screen)").tag("auto")
-                                    ForEach(promptRewriteConversationStore.contextSummaries.prefix(12)) { summary in
-                                        Text("\(summary.displayName) • \(summary.turnCount) turns")
-                                            .tag(summary.id)
-                                    }
-                                }
-                                .pickerStyle(.menu)
-                                .labelsHidden()
-                                .frame(width: 360)
-                            }
-
-                            if let pinnedHistoryToggle = promptRewritePinnedConversationHistoryToggle {
-                                Toggle(
-                                    "Use pinned context history for AI tips",
-                                    isOn: pinnedHistoryToggle
-                                )
-                                .toggleStyle(.switch)
-                                Text("Turn this off to keep AI tips enabled but ignore conversation history for the selected pinned context.")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Text("Use AI Memory Studio to manage rewrite conversation buckets (start new / clear history).")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(.top, 8)
-            }
-            .disabled(!settings.promptRewriteEnabled)
 
             Text("Current rewrite provider: \(settings.promptRewriteProviderMode.displayName)")
                 .font(.caption)
@@ -4192,43 +5041,6 @@ struct SettingsView: View {
         )
     }
 
-    private var promptRewriteConversationContextSelection: Binding<String> {
-        Binding(
-            get: {
-                let pinned = settings.promptRewriteConversationPinnedContextID
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) else {
-                    return "auto"
-                }
-                return pinned
-            },
-            set: { selected in
-                if selected == "auto" {
-                    settings.promptRewriteConversationPinnedContextID = ""
-                } else {
-                    settings.promptRewriteConversationPinnedContextID = selected
-                }
-            }
-        )
-    }
-
-    private var promptRewritePinnedConversationHistoryToggle: Binding<Bool>? {
-        let pinned = settings.promptRewriteConversationPinnedContextID
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !pinned.isEmpty, promptRewriteConversationStore.hasContext(id: pinned) else {
-            return nil
-        }
-
-        return Binding(
-            get: {
-                settings.isPromptRewriteConversationHistoryEnabled(forContextID: pinned)
-            },
-            set: { isEnabled in
-                settings.setPromptRewriteConversationHistoryEnabled(isEnabled, forContextID: pinned)
-            }
-        )
-    }
-
     private func sanitizePinnedConversationContextSelection() {
         let pinned = settings.promptRewriteConversationPinnedContextID
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4270,6 +5082,7 @@ struct SettingsView: View {
             .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
             .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
             .init(section: .aiModels, title: "AI prompt correction toggle", detail: "Enable or disable AI prompt rewrite assistance", keywords: ["prompt", "rewrite", "toggle", "enable", "ai"]),
+            .init(section: .aiModels, title: "Auto-insert high-confidence suggestions", detail: "Skip preview and insert AI suggestion immediately when confidence is at least 85%", keywords: ["auto", "insert", "confidence", "rewrite", "preview"]),
             .init(section: .aiModels, title: "Markdown suggestion conversion", detail: "Always convert AI suggestions to Markdown before insertion", keywords: ["markdown", "format", "rewrite", "insert", "assistant"]),
             .init(section: .aiModels, title: "Rewrite style preset", detail: "Choose formal, casual, architect, developer, or writer voice", keywords: ["style", "tone", "formal", "casual", "architect", "senior", "junior", "writer"]),
             .init(section: .aiModels, title: "Custom style instructions", detail: "Provide tone-only rewrite guidance without changing refine-only behavior", keywords: ["custom", "style", "persona", "voice", "architect", "developer", "writer", "instruction", "tone-only"]),
@@ -4616,6 +5429,10 @@ struct SettingsView: View {
                         Text("Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "–"))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Check for Updates…") {
+                        (NSApp.delegate as? AppDelegate)?.updaterController.checkForUpdates(nil)
                     }
                 }
             }

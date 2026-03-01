@@ -30,7 +30,7 @@ enum MemorySQLiteStoreError: LocalizedError {
 }
 
 final class MemorySQLiteStore {
-    private static let schemaVersion = 5
+    private static let schemaVersion = 6
     private static let cleanupUnknownIssueKey = "issue-unassigned"
     private static let cleanupNoiseIssueKey = "issue-noise"
 
@@ -405,6 +405,66 @@ final class MemorySQLiteStore {
         CREATE INDEX IF NOT EXISTS idx_conversation_disambiguation_subject
             ON conversation_disambiguation_rules(rule_type, app_pair_key, subject_key, updated_at DESC);
         """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_agent_profiles (
+            thread_id TEXT PRIMARY KEY NOT NULL REFERENCES conversation_threads(id) ON DELETE CASCADE,
+            profile_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL DEFAULT (strftime('%s', 'now')),
+            updated_at REAL NOT NULL DEFAULT (strftime('%s', 'now')),
+            expires_at REAL NOT NULL DEFAULT 253402300799
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_agent_profiles_thread_expires
+            ON conversation_agent_profiles(thread_id, expires_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_agent_profiles_expires
+            ON conversation_agent_profiles(expires_at);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_agent_entities (
+            thread_id TEXT PRIMARY KEY NOT NULL REFERENCES conversation_threads(id) ON DELETE CASCADE,
+            entities_json TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL DEFAULT (strftime('%s', 'now')),
+            updated_at REAL NOT NULL DEFAULT (strftime('%s', 'now')),
+            expires_at REAL NOT NULL DEFAULT 253402300799
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_agent_entities_thread_expires
+            ON conversation_agent_entities(thread_id, expires_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_agent_entities_expires
+            ON conversation_agent_entities(expires_at);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_agent_preferences (
+            thread_id TEXT PRIMARY KEY NOT NULL REFERENCES conversation_threads(id) ON DELETE CASCADE,
+            preferences_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL DEFAULT (strftime('%s', 'now')),
+            updated_at REAL NOT NULL DEFAULT (strftime('%s', 'now')),
+            expires_at REAL NOT NULL DEFAULT 253402300799
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_agent_preferences_thread_expires
+            ON conversation_agent_preferences(thread_id, expires_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_conversation_agent_preferences_expires
+            ON conversation_agent_preferences(expires_at);
+        """)
     }
 
     func hasTable(named tableName: String) throws -> Bool {
@@ -746,6 +806,234 @@ final class MemorySQLiteStore {
         try execute(sql: "DELETE FROM conversation_thread_redirects;")
     }
 
+    func upsertConversationAgentProfile(_ profile: ConversationAgentProfileRecord) throws {
+        let threadID = profile.threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !threadID.isEmpty else { return }
+
+        let sql = """
+        INSERT INTO conversation_agent_profiles (
+            thread_id, profile_json, created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            profile_json = excluded.profile_json,
+            updated_at = excluded.updated_at,
+            expires_at = excluded.expires_at;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(threadID, at: 1, in: statement)
+            self.bind(profile.profileJSON, at: 2, in: statement)
+            self.bind(profile.createdAt.timeIntervalSince1970, at: 3, in: statement)
+            self.bind(profile.updatedAt.timeIntervalSince1970, at: 4, in: statement)
+            self.bind(profile.expiresAt.timeIntervalSince1970, at: 5, in: statement)
+        })
+    }
+
+    func fetchConversationAgentProfile(threadID: String) throws -> ConversationAgentProfileRecord? {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return nil }
+
+        let sql = """
+        SELECT thread_id, profile_json, created_at, updated_at, expires_at
+        FROM conversation_agent_profiles
+        WHERE thread_id = ?
+        LIMIT 1;
+        """
+
+        let rows: [ConversationAgentProfileRecord] = try query(sql: sql, bind: { statement in
+            self.bind(normalizedThreadID, at: 1, in: statement)
+        }, mapRow: { statement in
+            ConversationAgentProfileRecord(
+                threadID: self.readString(at: 0, in: statement) ?? normalizedThreadID,
+                profileJSON: self.readString(at: 1, in: statement) ?? "{}",
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
+                expiresAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))
+            )
+        })
+        return rows.first
+    }
+
+    func clearConversationAgentProfile(threadID: String) throws {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return }
+        try execute(sql: "DELETE FROM conversation_agent_profiles WHERE thread_id = ?;", bind: { statement in
+            self.bind(normalizedThreadID, at: 1, in: statement)
+        })
+    }
+
+    func upsertConversationAgentEntities(_ entities: ConversationAgentEntitiesRecord) throws {
+        let threadID = entities.threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !threadID.isEmpty else { return }
+
+        let sql = """
+        INSERT INTO conversation_agent_entities (
+            thread_id, entities_json, created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            entities_json = excluded.entities_json,
+            updated_at = excluded.updated_at,
+            expires_at = excluded.expires_at;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(threadID, at: 1, in: statement)
+            self.bind(entities.entitiesJSON, at: 2, in: statement)
+            self.bind(entities.createdAt.timeIntervalSince1970, at: 3, in: statement)
+            self.bind(entities.updatedAt.timeIntervalSince1970, at: 4, in: statement)
+            self.bind(entities.expiresAt.timeIntervalSince1970, at: 5, in: statement)
+        })
+    }
+
+    func fetchConversationAgentEntities(threadID: String) throws -> ConversationAgentEntitiesRecord? {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return nil }
+
+        let sql = """
+        SELECT thread_id, entities_json, created_at, updated_at, expires_at
+        FROM conversation_agent_entities
+        WHERE thread_id = ?
+        LIMIT 1;
+        """
+
+        let rows: [ConversationAgentEntitiesRecord] = try query(sql: sql, bind: { statement in
+            self.bind(normalizedThreadID, at: 1, in: statement)
+        }, mapRow: { statement in
+            ConversationAgentEntitiesRecord(
+                threadID: self.readString(at: 0, in: statement) ?? normalizedThreadID,
+                entitiesJSON: self.readString(at: 1, in: statement) ?? "[]",
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
+                expiresAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))
+            )
+        })
+        return rows.first
+    }
+
+    func clearConversationAgentEntities(threadID: String) throws {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return }
+        try execute(sql: "DELETE FROM conversation_agent_entities WHERE thread_id = ?;", bind: { statement in
+            self.bind(normalizedThreadID, at: 1, in: statement)
+        })
+    }
+
+    func upsertConversationAgentPreferences(_ preferences: ConversationAgentPreferencesRecord) throws {
+        let threadID = preferences.threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !threadID.isEmpty else { return }
+
+        let sql = """
+        INSERT INTO conversation_agent_preferences (
+            thread_id, preferences_json, created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            preferences_json = excluded.preferences_json,
+            updated_at = excluded.updated_at,
+            expires_at = excluded.expires_at;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(threadID, at: 1, in: statement)
+            self.bind(preferences.preferencesJSON, at: 2, in: statement)
+            self.bind(preferences.createdAt.timeIntervalSince1970, at: 3, in: statement)
+            self.bind(preferences.updatedAt.timeIntervalSince1970, at: 4, in: statement)
+            self.bind(preferences.expiresAt.timeIntervalSince1970, at: 5, in: statement)
+        })
+    }
+
+    func fetchConversationAgentPreferences(threadID: String) throws -> ConversationAgentPreferencesRecord? {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return nil }
+
+        let sql = """
+        SELECT thread_id, preferences_json, created_at, updated_at, expires_at
+        FROM conversation_agent_preferences
+        WHERE thread_id = ?
+        LIMIT 1;
+        """
+
+        let rows: [ConversationAgentPreferencesRecord] = try query(sql: sql, bind: { statement in
+            self.bind(normalizedThreadID, at: 1, in: statement)
+        }, mapRow: { statement in
+            ConversationAgentPreferencesRecord(
+                threadID: self.readString(at: 0, in: statement) ?? normalizedThreadID,
+                preferencesJSON: self.readString(at: 1, in: statement) ?? "{}",
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
+                expiresAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))
+            )
+        })
+        return rows.first
+    }
+
+    func clearConversationAgentPreferences(threadID: String) throws {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return }
+        try execute(sql: "DELETE FROM conversation_agent_preferences WHERE thread_id = ?;", bind: { statement in
+            self.bind(normalizedThreadID, at: 1, in: statement)
+        })
+    }
+
+    func clearAllConversationAgentState() throws {
+        try execute(sql: "DELETE FROM conversation_agent_profiles;")
+        try execute(sql: "DELETE FROM conversation_agent_entities;")
+        try execute(sql: "DELETE FROM conversation_agent_preferences;")
+    }
+
+    func purgeExpiredAgentState(
+        now: Date = Date()
+    ) throws -> (profilesDeleted: Int, entitiesDeleted: Int, preferencesDeleted: Int) {
+        let cutoff = now.timeIntervalSince1970
+
+        let profilesDeleted = try scalarInt(sql: """
+        SELECT COUNT(*)
+        FROM conversation_agent_profiles
+        WHERE expires_at <= ?;
+        """, bind: { statement in
+            self.bind(cutoff, at: 1, in: statement)
+        })
+        try execute(sql: """
+        DELETE FROM conversation_agent_profiles
+        WHERE expires_at <= ?;
+        """, bind: { statement in
+            self.bind(cutoff, at: 1, in: statement)
+        })
+
+        let entitiesDeleted = try scalarInt(sql: """
+        SELECT COUNT(*)
+        FROM conversation_agent_entities
+        WHERE expires_at <= ?;
+        """, bind: { statement in
+            self.bind(cutoff, at: 1, in: statement)
+        })
+        try execute(sql: """
+        DELETE FROM conversation_agent_entities
+        WHERE expires_at <= ?;
+        """, bind: { statement in
+            self.bind(cutoff, at: 1, in: statement)
+        })
+
+        let preferencesDeleted = try scalarInt(sql: """
+        SELECT COUNT(*)
+        FROM conversation_agent_preferences
+        WHERE expires_at <= ?;
+        """, bind: { statement in
+            self.bind(cutoff, at: 1, in: statement)
+        })
+        try execute(sql: """
+        DELETE FROM conversation_agent_preferences
+        WHERE expires_at <= ?;
+        """, bind: { statement in
+            self.bind(cutoff, at: 1, in: statement)
+        })
+
+        return (
+            profilesDeleted: profilesDeleted,
+            entitiesDeleted: entitiesDeleted,
+            preferencesDeleted: preferencesDeleted
+        )
+    }
+
     func upsertConversationThreadRedirect(
         oldThreadID: String,
         newThreadID: String,
@@ -821,6 +1109,69 @@ final class MemorySQLiteStore {
             self.readString(at: 0, in: statement) ?? ""
         })
         return rows.first
+    }
+
+    func fetchConversationTagAliases(
+        aliasType: String? = nil,
+        limit: Int = 500
+    ) throws -> [ConversationTagAliasRecord] {
+        let normalizedLimit = max(1, min(limit, 5_000))
+        let normalizedAliasType = normalizeLookupOptional(aliasType)
+
+        let sql: String
+        if normalizedAliasType == nil {
+            sql = """
+            SELECT alias_type, alias_key, canonical_key, updated_at
+            FROM conversation_tag_aliases
+            ORDER BY updated_at DESC
+            LIMIT ?;
+            """
+            return try query(sql: sql, bind: { statement in
+                self.bind(Int64(normalizedLimit), at: 1, in: statement)
+            }, mapRow: { statement in
+                ConversationTagAliasRecord(
+                    aliasType: self.readString(at: 0, in: statement) ?? "",
+                    aliasKey: self.readString(at: 1, in: statement) ?? "",
+                    canonicalKey: self.readString(at: 2, in: statement) ?? "",
+                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
+                )
+            })
+        }
+
+        sql = """
+        SELECT alias_type, alias_key, canonical_key, updated_at
+        FROM conversation_tag_aliases
+        WHERE alias_type = ?
+        ORDER BY updated_at DESC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(normalizedAliasType, at: 1, in: statement)
+            self.bind(Int64(normalizedLimit), at: 2, in: statement)
+        }, mapRow: { statement in
+            ConversationTagAliasRecord(
+                aliasType: self.readString(at: 0, in: statement) ?? "",
+                aliasKey: self.readString(at: 1, in: statement) ?? "",
+                canonicalKey: self.readString(at: 2, in: statement) ?? "",
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
+            )
+        })
+    }
+
+    func deleteConversationTagAlias(aliasType: String, aliasKey: String) throws {
+        let normalizedAliasType = normalizeLookupKey(aliasType)
+        let normalizedAliasKey = normalizeLookupKey(aliasKey)
+        guard !normalizedAliasType.isEmpty, !normalizedAliasKey.isEmpty else { return }
+
+        try execute(sql: """
+        DELETE FROM conversation_tag_aliases
+        WHERE alias_type = ?
+            AND alias_key = ?;
+        """, bind: { statement in
+            self.bind(normalizedAliasType, at: 1, in: statement)
+            self.bind(normalizedAliasKey, at: 2, in: statement)
+        })
     }
 
     func conversationDisambiguationAppPairKey(
@@ -934,6 +1285,23 @@ final class MemorySQLiteStore {
             self.bind(ruleType.rawValue, at: 1, in: statement)
             self.bind(normalizedAppPairKey, at: 2, in: statement)
             self.bind(normalizedSubjectKey, at: 3, in: statement)
+        }, mapRow: { statement in
+            self.conversationDisambiguationRule(from: statement)
+        })
+    }
+
+    func fetchConversationDisambiguationRules(limit: Int = 500) throws -> [ConversationDisambiguationRuleRecord] {
+        let normalizedLimit = max(1, min(limit, 5_000))
+        let sql = """
+        SELECT
+            id, rule_type, app_pair_key, subject_key, context_scope_key, decision, canonical_key, created_at, updated_at
+        FROM conversation_disambiguation_rules
+        ORDER BY updated_at DESC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(Int64(normalizedLimit), at: 1, in: statement)
         }, mapRow: { statement in
             self.conversationDisambiguationRule(from: statement)
         })

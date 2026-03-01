@@ -417,6 +417,75 @@ struct ConversationTurnRecord: Codable, Hashable, Identifiable {
     let turnDedupeKey: String
 }
 
+struct ConversationAgentProfileRecord: Codable, Hashable {
+    let threadID: String
+    let profileJSON: String
+    let createdAt: Date
+    let updatedAt: Date
+    let expiresAt: Date
+
+    init(
+        threadID: String,
+        profileJSON: String = "{}",
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        expiresAt: Date = .distantFuture
+    ) {
+        let normalized = profileJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.threadID = threadID
+        self.profileJSON = normalized.isEmpty ? "{}" : normalized
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.expiresAt = expiresAt
+    }
+}
+
+struct ConversationAgentEntitiesRecord: Codable, Hashable {
+    let threadID: String
+    let entitiesJSON: String
+    let createdAt: Date
+    let updatedAt: Date
+    let expiresAt: Date
+
+    init(
+        threadID: String,
+        entitiesJSON: String = "[]",
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        expiresAt: Date = .distantFuture
+    ) {
+        let normalized = entitiesJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.threadID = threadID
+        self.entitiesJSON = normalized.isEmpty ? "[]" : normalized
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.expiresAt = expiresAt
+    }
+}
+
+struct ConversationAgentPreferencesRecord: Codable, Hashable {
+    let threadID: String
+    let preferencesJSON: String
+    let createdAt: Date
+    let updatedAt: Date
+    let expiresAt: Date
+
+    init(
+        threadID: String,
+        preferencesJSON: String = "{}",
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        expiresAt: Date = .distantFuture
+    ) {
+        let normalized = preferencesJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.threadID = threadID
+        self.preferencesJSON = normalized.isEmpty ? "{}" : normalized
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.expiresAt = expiresAt
+    }
+}
+
 enum ConversationDisambiguationRuleType: String, Codable, Hashable {
     case person
     case project
@@ -425,6 +494,13 @@ enum ConversationDisambiguationRuleType: String, Codable, Hashable {
 enum ConversationDisambiguationDecision: String, Codable, Hashable {
     case link
     case separate
+}
+
+enum ConversationContextMappingSource: String, Codable, Hashable {
+    case manual
+    case ai
+    case deterministic
+    case legacy
 }
 
 struct ConversationDisambiguationRuleRecord: Codable, Hashable, Identifiable {
@@ -436,6 +512,29 @@ struct ConversationDisambiguationRuleRecord: Codable, Hashable, Identifiable {
     let decision: ConversationDisambiguationDecision
     let canonicalKey: String?
     let createdAt: Date
+    let updatedAt: Date
+}
+
+struct ConversationTagAliasRecord: Codable, Hashable, Identifiable {
+    let aliasType: String
+    let aliasKey: String
+    let canonicalKey: String
+    let updatedAt: Date
+
+    var id: String {
+        "\(aliasType)|\(aliasKey)"
+    }
+}
+
+struct ConversationContextMappingRow: Codable, Hashable, Identifiable {
+    let id: String
+    let mappingType: String
+    let appPairKey: String
+    let subjectKey: String
+    let contextScopeKey: String?
+    let decision: ConversationDisambiguationDecision
+    let canonicalKey: String?
+    let source: ConversationContextMappingSource
     let updatedAt: Date
 }
 

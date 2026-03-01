@@ -71,6 +71,13 @@ struct AIMemoryStudioView: View {
     @State private var conversationPatternOccurrences: [MemoryPatternOccurrence] = []
     @State private var showConversationContextInspectSheet = false
     @State private var inspectedConversationContextID = ""
+    @State private var showConversationContextMappingsSheet = false
+    @State private var contextMappingRows: [ContextMappingRow] = []
+    @State private var isContextMappingsLoading = false
+    @State private var contextMappingsLoadRequestToken = UUID()
+    @State private var contextMappingMutatingRowID: String?
+    @State private var lastContextMappingMutation: ContextMappingMutation?
+    @State private var memoryBrowserRefreshWorkItem: DispatchWorkItem?
 
     private enum StudioPage: String, CaseIterable, Identifiable {
         case dashboard
@@ -185,6 +192,88 @@ struct AIMemoryStudioView: View {
         }
     }
 
+    private struct ContextMappingRow: Identifiable, Equatable {
+        let id: String
+        let mappingTypeRawValue: String
+        let appPairKey: String
+        let subjectLabel: String
+        let subjectKey: String
+        let contextScopeKey: String?
+        let canonicalKey: String?
+        var decisionRawValue: String
+        let source: ConversationContextMappingSource
+        let updatedAt: Date
+
+        var normalizedDecisionValue: String {
+            let lowered = decisionRawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if lowered == "link" || lowered == "linked" {
+                return "linked"
+            }
+            return "separate"
+        }
+
+        var normalizedMappingTypeValue: String {
+            let lowered = mappingTypeRawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if lowered.hasPrefix("alias:") {
+                return "alias"
+            }
+            if lowered == "person" {
+                return "person"
+            }
+            return "project"
+        }
+
+        var mappingRuleType: ConversationDisambiguationRuleType? {
+            let lowered = mappingTypeRawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            switch lowered {
+            case "person":
+                return .person
+            case "project":
+                return .project
+            default:
+                return nil
+            }
+        }
+
+        var normalizedDecision: ConversationDisambiguationDecision {
+            normalizedDecisionValue == "linked" ? .link : .separate
+        }
+
+        var supportsDecisionMutation: Bool {
+            mappingRuleType != nil
+        }
+
+        var mappingTypeDisplay: String {
+            if mappingTypeRawValue.hasPrefix("alias:") {
+                return "Alias"
+            }
+            return normalizedMappingTypeValue.capitalized
+        }
+
+        var decisionDisplay: String {
+            normalizedDecisionValue == "linked" ? "Linked" : "Separate"
+        }
+
+        var sourceDisplay: String {
+            source.rawValue.uppercased()
+        }
+
+        var subjectDisplay: String {
+            let normalizedLabel = subjectLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalizedLabel.isEmpty ? subjectKey : normalizedLabel
+        }
+    }
+
+    private struct ContextMappingMutation {
+        enum Kind {
+            case decisionChange
+            case remove
+        }
+
+        let kind: Kind
+        let snapshot: ContextMappingRow
+    }
+
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let studioSidebarWidth: CGFloat = 244
     private let aiCorePages: [StudioPage] = [.dashboard, .models, .conversationMemory]
@@ -221,6 +310,9 @@ struct AIMemoryStudioView: View {
         .sheet(isPresented: $showConversationContextInspectSheet) {
             conversationContextInspectSheet
         }
+        .sheet(isPresented: $showConversationContextMappingsSheet) {
+            conversationContextMappingsSheet
+        }
         .sheet(isPresented: $showMemoryDetailSheet) {
             memoryDetailSheet
         }
@@ -253,6 +345,11 @@ struct AIMemoryStudioView: View {
                 inspectedConversationContextID = ""
             }
         }
+        .onChange(of: showConversationContextMappingsSheet) { isPresented in
+            if isPresented {
+                loadContextMappings(showStatusMessage: false)
+            }
+        }
         .onChange(of: localAISetupService.setupState) { newValue in
             if newValue == .ready {
                 refreshPromptRewriteModels(showMessage: true)
@@ -278,6 +375,10 @@ struct AIMemoryStudioView: View {
         .onChange(of: memoryDetailShowLowSignal) { _ in
             guard let selectedMemoryBrowserEntry else { return }
             refreshMemoryDetailContext(for: selectedMemoryBrowserEntry)
+        }
+        .onDisappear {
+            memoryBrowserRefreshWorkItem?.cancel()
+            memoryBrowserRefreshWorkItem = nil
         }
     }
 
@@ -476,7 +577,7 @@ struct AIMemoryStudioView: View {
             settingsCard(
                 title: isMemoryFeatureEnabled ? "AI Memory Assistant" : "AI Prompt Assistant",
                 subtitle: isMemoryFeatureEnabled
-                    ? "Toggle the assistant and auto-refresh behavior."
+                    ? "Toggle assistant-level prompt behavior."
                     : "Toggle prompt correction and formatting behavior.",
                 symbol: "brain.head.profile",
                 tint: promptAssistantStateTint
@@ -485,27 +586,24 @@ struct AIMemoryStudioView: View {
                     Toggle("Enable AI prompt correction", isOn: $settings.promptRewriteEnabled)
                     if isMemoryFeatureEnabled {
                         Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
-                        Toggle("Auto-refresh detected providers and folders", isOn: $settings.memoryProviderCatalogAutoUpdate)
                     }
+                    Toggle("Auto-insert high-confidence AI suggestions", isOn: $settings.promptRewriteAutoInsertEnabled)
+                        .disabled(!settings.promptRewriteEnabled)
                     Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
                         .disabled(!settings.promptRewriteEnabled)
-                    Toggle(
-                        "Enable conversation-aware rewrite history (app + screen)",
-                        isOn: $settings.promptRewriteConversationHistoryEnabled
-                    )
-                    .disabled(!settings.promptRewriteEnabled)
-                    if settings.promptRewriteConversationHistoryEnabled {
-                        HStack {
-                            Text("Conversation timeout")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text("\(Int(settings.promptRewriteConversationTimeoutMinutes.rounded())) min")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.top, 2)
+
+                    Divider()
+                        .padding(.vertical, 2)
+
+                    Text("For conversation mapping, shared history, and per-context controls, use Conversation Memory.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("Open Conversation Memory") {
+                        selectedStudioPage = .conversationMemory
                     }
+                    .buttonStyle(.bordered)
+
                     Text(isMemoryFeatureEnabled
                          ? "Turn this off if you only want manual control via maintenance actions."
                          : "Prompt correction works without memory indexing in this mode.")
@@ -763,6 +861,7 @@ struct AIMemoryStudioView: View {
         VStack(alignment: .leading, spacing: 14) {
             conversationMemoryOverviewCard
             conversationContextListCard
+            conversationContextMappingsCard
             conversationLongTermPatternsCard
         }
     }
@@ -1025,6 +1124,58 @@ struct AIMemoryStudioView: View {
         }
     }
 
+    private var conversationContextMappingsCard: some View {
+        settingsCard(
+            title: "Context Mappings",
+            subtitle: "Manage cross-app project/person link decisions used for shared conversation context.",
+            symbol: "point.bottomleft.forward.to.point.topright.scurvepath",
+            tint: AppVisualTheme.accentTint
+        ) {
+            Text("Review project/person mappings, switch decisions between linked vs separate, and remove stale mappings.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                metricPill(
+                    label: "Mappings",
+                    value: "\(contextMappingRows.count)",
+                    tint: AppVisualTheme.accentTint
+                )
+                metricPill(
+                    label: "Project",
+                    value: "\(contextMappingRows.filter { $0.normalizedMappingTypeValue == "project" }.count)",
+                    tint: AppVisualTheme.accentTint
+                )
+                metricPill(
+                    label: "Person",
+                    value: "\(contextMappingRows.filter { $0.normalizedMappingTypeValue == "person" }.count)",
+                    tint: AppVisualTheme.accentTint
+                )
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 8) {
+                Button("Open Context Mappings") {
+                    showConversationContextMappingsSheet = true
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("Refresh Cached Count") {
+                    loadContextMappings(showStatusMessage: true)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isContextMappingsLoading)
+
+                if isContextMappingsLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
     private var conversationLongTermPatternsCard: some View {
         settingsCard(
             title: "Long-term Memory Promotions",
@@ -1256,6 +1407,195 @@ struct AIMemoryStudioView: View {
             .padding(10)
         }
         .frame(width: 860, height: 700)
+    }
+
+    @ViewBuilder
+    private var conversationContextMappingsSheet: some View {
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Context Mappings")
+                            .font(.headline)
+                        Text("Project/person link rules for app pairs.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    if isContextMappingsLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Button("Refresh") {
+                        loadContextMappings(showStatusMessage: true)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isContextMappingsLoading)
+
+                    Button("Undo Recent Change") {
+                        undoLastContextMappingMutation()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(lastContextMappingMutation == nil || contextMappingMutatingRowID != nil)
+
+                    Button("Done") {
+                        showConversationContextMappingsSheet = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
+
+                Divider()
+                    .overlay(Color.primary.opacity(0.08))
+
+                if isContextMappingsLoading, contextMappingRows.isEmpty {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading context mappings...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if contextMappingRows.isEmpty {
+                    emptyStateRow(
+                        title: "No context mappings",
+                        message: "Mappings will appear after project/person clarification decisions are recorded.",
+                        systemImage: "tray"
+                    )
+                    .padding(18)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        contextMappingsTableHeader
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 8) {
+                                ForEach(contextMappingRows) { row in
+                                    contextMappingsRow(row)
+                                }
+                            }
+                            .padding(.trailing, 2)
+                        }
+                    }
+                    .padding(18)
+                }
+            }
+            .padding(10)
+            .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.16)
+            .padding(10)
+        }
+        .frame(width: 980, height: 650)
+    }
+
+    private var contextMappingsTableHeader: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("Type")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+
+            Text("App Pair")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 200, alignment: .leading)
+
+            Text("Subject")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 240, alignment: .leading)
+
+            Text("Decision")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 120, alignment: .leading)
+
+            Text("Source")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 88, alignment: .leading)
+
+            Text("Updated")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 125, alignment: .leading)
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func contextMappingsRow(_ row: ContextMappingRow) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text(row.mappingTypeDisplay)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 70, alignment: .leading)
+
+            Text(row.appPairKey)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(width: 200, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.subjectDisplay)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(row.subjectKey)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(width: 240, alignment: .leading)
+
+            Picker("Decision", selection: contextMappingDecisionBinding(for: row.id)) {
+                Text("Linked").tag("linked")
+                Text("Separate").tag("separate")
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 120, alignment: .leading)
+            .disabled(contextMappingMutatingRowID == row.id || !row.supportsDecisionMutation)
+
+            Text(row.sourceDisplay)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 88, alignment: .leading)
+
+            Text(row.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .frame(width: 125, alignment: .leading)
+
+            Spacer(minLength: 0)
+
+            Button(role: .destructive) {
+                removeContextMapping(row.id)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .disabled(contextMappingMutatingRowID == row.id)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.7)
+        )
     }
 
     private func conversationContextInspectorContent(
@@ -1560,16 +1900,16 @@ struct AIMemoryStudioView: View {
             }
             .onChange(of: memoryBrowserSelectedProviderID) { _ in
                 normalizeMemoryBrowserSelections()
-                refreshMemoryBrowser()
+                scheduleMemoryBrowserRefresh()
             }
             .onChange(of: memoryBrowserSelectedFolderID) { _ in
-                refreshMemoryBrowser()
+                scheduleMemoryBrowserRefresh()
             }
             .onChange(of: memoryBrowserIncludePlanContent) { _ in
-                refreshMemoryBrowser()
+                scheduleMemoryBrowserRefresh()
             }
             .onChange(of: memoryBrowserHighSignalOnly) { _ in
-                refreshMemoryBrowser()
+                scheduleMemoryBrowserRefresh()
             }
 
             if memoryBrowserEntries.isEmpty {
@@ -3327,6 +3667,299 @@ struct AIMemoryStudioView: View {
         refreshConversationContextDetails()
     }
 
+    private func contextMappingDecisionBinding(for rowID: String) -> Binding<String> {
+        Binding(
+            get: {
+                contextMappingRows.first(where: { $0.id == rowID })?.normalizedDecisionValue ?? "separate"
+            },
+            set: { updatedDecision in
+                Task { @MainActor in
+                    await Task.yield()
+                    updateContextMappingDecision(for: rowID, decisionRawValue: updatedDecision)
+                }
+            }
+        )
+    }
+
+    @MainActor
+    private func loadContextMappings(showStatusMessage: Bool) {
+        isContextMappingsLoading = true
+        let requestToken = UUID()
+        contextMappingsLoadRequestToken = requestToken
+
+        Task {
+            let rows = await Task.detached(priority: .userInitiated) {
+                Self.fetchContextMappingRowsForDisplay(limit: 400)
+            }.value
+
+            guard contextMappingsLoadRequestToken == requestToken else { return }
+
+            contextMappingRows = rows
+            isContextMappingsLoading = false
+            if showStatusMessage {
+                conversationActionMessage = rows.isEmpty
+                    ? "No context mappings found."
+                    : "Loaded \(rows.count) context mapping(s)."
+            }
+        }
+    }
+
+    @MainActor
+    private func updateContextMappingDecision(for rowID: String, decisionRawValue: String) {
+        guard contextMappingMutatingRowID == nil else { return }
+        guard let index = contextMappingRows.firstIndex(where: { $0.id == rowID }) else {
+            return
+        }
+
+        let previous = contextMappingRows[index]
+        let normalizedDecision = normalizeContextMappingDecision(decisionRawValue)
+        guard previous.normalizedDecisionValue != normalizedDecision else { return }
+
+        contextMappingRows[index].decisionRawValue = normalizedDecision
+        contextMappingMutatingRowID = rowID
+
+        guard let mappingType = previous.mappingRuleType else {
+            if let rollbackIndex = contextMappingRows.firstIndex(where: { $0.id == rowID }) {
+                contextMappingRows[rollbackIndex].decisionRawValue = previous.decisionRawValue
+            }
+            contextMappingMutatingRowID = nil
+            conversationActionMessage = "Alias mappings are fixed to linked."
+            return
+        }
+
+        let normalizedCanonicalKey = previous.canonicalKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if previous.normalizedDecisionValue == "separate",
+           normalizedDecision == "linked",
+           normalizedCanonicalKey.isEmpty {
+            if let rollbackIndex = contextMappingRows.firstIndex(where: { $0.id == rowID }) {
+                contextMappingRows[rollbackIndex].decisionRawValue = previous.decisionRawValue
+            }
+            contextMappingMutatingRowID = nil
+            conversationActionMessage = "Cannot switch to linked without a canonical target."
+            return
+        }
+
+        let decision: ConversationDisambiguationDecision = normalizedDecision == "linked" ? .link : .separate
+        Task {
+            let didPersist = await Task.detached(priority: .userInitiated) {
+                Self.persistContextMappingDecision(
+                    rowID: previous.id,
+                    mappingType: mappingType,
+                    appPairKey: previous.appPairKey,
+                    subjectKey: previous.subjectKey,
+                    contextScopeKey: previous.contextScopeKey,
+                    decision: decision,
+                    canonicalKey: previous.canonicalKey
+                )
+            }.value
+
+            guard let rollbackIndex = contextMappingRows.firstIndex(where: { $0.id == rowID }) else {
+                contextMappingMutatingRowID = nil
+                return
+            }
+
+            guard didPersist else {
+                contextMappingRows[rollbackIndex].decisionRawValue = previous.decisionRawValue
+                contextMappingMutatingRowID = nil
+                conversationActionMessage = "Failed to update mapping decision."
+                return
+            }
+
+            lastContextMappingMutation = ContextMappingMutation(
+                kind: .decisionChange,
+                snapshot: previous
+            )
+            contextMappingMutatingRowID = nil
+            conversationActionMessage = "Updated mapping decision to \(normalizedDecision == "linked" ? "linked" : "separate")."
+            loadContextMappings(showStatusMessage: false)
+        }
+    }
+
+    private func removeContextMapping(_ rowID: String) {
+        guard let row = contextMappingRows.first(where: { $0.id == rowID }) else { return }
+        contextMappingMutatingRowID = rowID
+
+        promptRewriteConversationStore.removeContextMapping(id: row.id)
+        lastContextMappingMutation = ContextMappingMutation(
+            kind: .remove,
+            snapshot: row
+        )
+        contextMappingMutatingRowID = nil
+        conversationActionMessage = "Removed context mapping."
+        loadContextMappings(showStatusMessage: false)
+    }
+
+    private func undoLastContextMappingMutation() {
+        guard let mutation = lastContextMappingMutation else { return }
+        contextMappingMutatingRowID = mutation.snapshot.id
+
+        guard let mappingType = mutation.snapshot.mappingRuleType else {
+            contextMappingMutatingRowID = nil
+            conversationActionMessage = "Undo is only available for project/person mappings."
+            return
+        }
+
+        promptRewriteConversationStore.upsertContextMappingDecision(
+            mappingType: mappingType,
+            appPairKey: mutation.snapshot.appPairKey,
+            subjectKey: mutation.snapshot.subjectKey,
+            contextScopeKey: mutation.snapshot.contextScopeKey,
+            decision: mutation.snapshot.normalizedDecision,
+            canonicalKey: mutation.snapshot.canonicalKey,
+            source: mutation.snapshot.source
+        )
+        contextMappingMutatingRowID = nil
+        lastContextMappingMutation = nil
+        conversationActionMessage = "Undid recent context mapping change."
+        loadContextMappings(showStatusMessage: false)
+    }
+
+    nonisolated private static func fetchContextMappingRowsForDisplay(limit: Int = 400) -> [ContextMappingRow] {
+        guard let store = try? MemorySQLiteStore() else {
+            return []
+        }
+
+        let normalizedLimit = max(1, min(limit, 2_000))
+        let rules = (try? store.fetchConversationDisambiguationRules(limit: normalizedLimit)) ?? []
+        let aliases = (try? store.fetchConversationTagAliases(limit: normalizedLimit)) ?? []
+
+        var rows = rules.map { rule in
+            contextMappingRow(from: ConversationContextMappingRow(
+                id: rule.id,
+                mappingType: rule.ruleType.rawValue,
+                appPairKey: rule.appPairKey,
+                subjectKey: rule.subjectKey,
+                contextScopeKey: rule.contextScopeKey,
+                decision: rule.decision,
+                canonicalKey: rule.canonicalKey,
+                source: contextMappingSource(forRuleID: rule.id),
+                updatedAt: rule.updatedAt
+            ))
+        }
+
+        rows.append(contentsOf: aliases.map { alias in
+            contextMappingRow(from: ConversationContextMappingRow(
+                id: tagAliasMappingID(aliasType: alias.aliasType, aliasKey: alias.aliasKey),
+                mappingType: "alias:\(alias.aliasType)",
+                appPairKey: "global",
+                subjectKey: alias.aliasKey,
+                contextScopeKey: nil,
+                decision: .link,
+                canonicalKey: alias.canonicalKey,
+                source: .legacy,
+                updatedAt: alias.updatedAt
+            ))
+        })
+
+        rows.sort { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.id < rhs.id
+        }
+        if rows.count > normalizedLimit {
+            rows = Array(rows.prefix(normalizedLimit))
+        }
+        return rows
+    }
+
+    nonisolated private static func persistContextMappingDecision(
+        rowID: String,
+        mappingType: ConversationDisambiguationRuleType,
+        appPairKey: String,
+        subjectKey: String,
+        contextScopeKey: String?,
+        decision: ConversationDisambiguationDecision,
+        canonicalKey: String?
+    ) -> Bool {
+        guard let store = try? MemorySQLiteStore() else {
+            return false
+        }
+
+        let existing = try? store.fetchConversationDisambiguationRule(
+            ruleType: mappingType,
+            appPairKey: appPairKey,
+            subjectKey: subjectKey,
+            contextScopeKey: contextScopeKey
+        )
+        if let existing,
+           existing.id.caseInsensitiveCompare(rowID) != .orderedSame {
+            try? store.deleteConversationDisambiguationRule(id: existing.id)
+        }
+
+        let canonicalForWrite: String?
+        if decision == .link {
+            let normalized = canonicalKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            canonicalForWrite = normalized.isEmpty ? nil : normalized
+        } else {
+            canonicalForWrite = nil
+        }
+
+        let now = Date()
+        let record = ConversationDisambiguationRuleRecord(
+            id: rowID,
+            ruleType: mappingType,
+            appPairKey: appPairKey,
+            subjectKey: subjectKey,
+            contextScopeKey: contextScopeKey,
+            decision: decision,
+            canonicalKey: canonicalForWrite,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now
+        )
+
+        do {
+            try store.upsertConversationDisambiguationRule(record)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    nonisolated private static func contextMappingSource(forRuleID ruleID: String) -> ConversationContextMappingSource {
+        let normalizedID = ruleID.lowercased()
+        if normalizedID.hasPrefix("map-manual-") {
+            return .manual
+        }
+        if normalizedID.hasPrefix("map-ai-") {
+            return .ai
+        }
+        if normalizedID.hasPrefix("map-deterministic-") {
+            return .deterministic
+        }
+        return .legacy
+    }
+
+    nonisolated private static func tagAliasMappingID(aliasType: String, aliasKey: String) -> String {
+        let encodedAliasType = Data(aliasType.utf8).base64EncodedString()
+        let encodedAliasKey = Data(aliasKey.utf8).base64EncodedString()
+        return "tag-alias|\(encodedAliasType)|\(encodedAliasKey)"
+    }
+
+    nonisolated private static func contextMappingRow(from rawMapping: ConversationContextMappingRow) -> ContextMappingRow {
+        ContextMappingRow(
+            id: rawMapping.id,
+            mappingTypeRawValue: rawMapping.mappingType,
+            appPairKey: rawMapping.appPairKey,
+            subjectLabel: "",
+            subjectKey: rawMapping.subjectKey,
+            contextScopeKey: rawMapping.contextScopeKey,
+            canonicalKey: rawMapping.canonicalKey,
+            decisionRawValue: rawMapping.decision.rawValue,
+            source: rawMapping.source,
+            updatedAt: rawMapping.updatedAt
+        )
+    }
+
+    private func normalizeContextMappingDecision(_ rawValue: String) -> String {
+        let lowered = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lowered == "link" || lowered == "linked" {
+            return "linked"
+        }
+        return "separate"
+    }
+
     private func sanitizeSelectedStudioPage() {
         if !availableStudioPages.contains(selectedStudioPage) {
             selectedStudioPage = .dashboard
@@ -3427,6 +4060,23 @@ struct AIMemoryStudioView: View {
 
     private func refreshPromptRewriteModels(showMessage: Bool) {
         let mode = settings.promptRewriteProviderMode
+        if mode == .openAI,
+           settings.hasPromptRewriteOAuthSession(for: .openAI),
+           !settings.hasPromptRewriteAPIKey(for: .openAI) {
+            let normalizedBaseURL = settings.promptRewriteOpenAIBaseURL
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let oauthDefaultBaseURL = PromptRewriteProviderMode.openAI.defaultBaseURL
+            if normalizedBaseURL.caseInsensitiveCompare(oauthDefaultBaseURL) != .orderedSame {
+                settings.promptRewriteOpenAIBaseURL = oauthDefaultBaseURL
+            }
+
+            let normalizedModel = settings.promptRewriteOpenAIModel
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !PromptRewriteModelCatalogService.isOpenAIOAuthCompatibleModelID(normalizedModel) {
+                settings.promptRewriteOpenAIModel = PromptRewriteModelCatalogService.defaultOpenAIOAuthModelID
+            }
+        }
+
         let requestToken = UUID()
         let baseURL = settings.promptRewriteOpenAIBaseURL
         let apiKey = settings.promptRewriteOpenAIAPIKey
@@ -3711,7 +4361,24 @@ struct AIMemoryStudioView: View {
         }
     }
 
+    private func scheduleMemoryBrowserRefresh(delay: TimeInterval = 0.12) {
+        memoryBrowserRefreshWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem {
+            refreshMemoryBrowser()
+            memoryBrowserRefreshWorkItem = nil
+        }
+        memoryBrowserRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + delay,
+            execute: workItem
+        )
+    }
+
     private func refreshMemoryBrowser() {
+        memoryBrowserRefreshWorkItem?.cancel()
+        memoryBrowserRefreshWorkItem = nil
+
         let entries = memoryIndexingSettingsService.browseIndexedMemories(
             query: memoryBrowserQuery,
             providerID: normalizedMemoryBrowserProviderID,
@@ -3741,7 +4408,6 @@ struct AIMemoryStudioView: View {
                 issueTimelineEntriesHiddenCount = 0
             }
         }
-        refreshMemoryAnalytics()
     }
 
     private func selectMemoryBrowserEntry(_ entry: MemoryIndexedEntry) {
@@ -3882,6 +4548,7 @@ struct AIMemoryStudioView: View {
         memoryActionMessage = result.message
         if result.didRun {
             refreshMemoryBrowser()
+            refreshMemoryAnalytics()
         }
     }
 
@@ -3965,6 +4632,7 @@ struct AIMemoryStudioView: View {
         settings.updateDetectedMemorySourceFolders(result.sourceFolders.map(\.id))
         normalizeMemoryBrowserSelections()
         refreshMemoryBrowser()
+        refreshMemoryAnalytics()
 
         if result.indexQueued {
             isMemoryIndexingInProgress = true
@@ -4090,6 +4758,7 @@ struct AIMemoryStudioView: View {
 
         memoryActionMessage = "\(actionLabel) finished. Indexed \(indexedFiles) files, skipped \(skippedFiles), produced \(indexedCards) cards, and generated \(indexedRewrites) rewrite suggestion(s)."
         refreshMemoryBrowser()
+        refreshMemoryAnalytics()
     }
 
     @ViewBuilder

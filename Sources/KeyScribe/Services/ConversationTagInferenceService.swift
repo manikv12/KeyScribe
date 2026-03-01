@@ -26,9 +26,11 @@ final class ConversationTagInferenceService {
         userText: String,
         assistantText: String? = nil
     ) -> ConversationTupleTags {
-        let contextOnlyText = [capturedContext.screenLabel, capturedContext.fieldLabel]
+        let normalizedScreenContextText = collapseWhitespace(capturedContext.screenLabel)
+        let normalizedFieldContextText = collapseWhitespace(capturedContext.fieldLabel)
+        let normalizedContextText = [normalizedScreenContextText, normalizedFieldContextText]
+            .filter { !$0.isEmpty }
             .joined(separator: "\n")
-        let normalizedContextText = collapseWhitespace(contextOnlyText)
         let supplementalText = [userText, assistantText ?? ""]
             .joined(separator: "\n")
         let normalizedSupplementalText = collapseWhitespace(supplementalText)
@@ -40,11 +42,19 @@ final class ConversationTagInferenceService {
             supplementalText: normalizedSupplementalText
         )
         let projectKey = canonicalProjectKey(projectLabel)
+        let identityContextText: String
+        if !normalizedScreenContextText.isEmpty {
+            // Keep identity extraction focused on screen-level text so UI field labels
+            // (for example AXTextArea) do not pollute inferred thread IDs.
+            identityContextText = normalizedScreenContextText
+        } else {
+            identityContextText = normalizedContextText
+        }
 
         let identity = inferIdentity(
             bundleID: capturedContext.bundleIdentifier,
             appName: capturedContext.appName,
-            contextText: normalizedContextText,
+            contextText: identityContextText,
             supplementalText: normalizedSupplementalText
         )
 
@@ -232,8 +242,8 @@ final class ConversationTagInferenceService {
         if let explicitThreadLabel = firstMatch(
             pattern: #"(?i)\bthread\s*[:\-]\s*([a-z0-9][a-z0-9 .,_'’()\-]{2,120})\b"#,
             in: primaryText
-        ) {
-            let normalizedThread = collapseWhitespace(explicitThreadLabel)
+        ),
+           let normalizedThread = sanitizedThreadIdentityLabel(explicitThreadLabel) {
             let key = "thread:\(slug(normalizedThread))"
             let resolvedNativeThreadKey = nativeThreadKey.isEmpty ? key : nativeThreadKey
             return (key, .channel, normalizedThread, people, resolvedNativeThreadKey)
@@ -249,8 +259,8 @@ final class ConversationTagInferenceService {
            let codexThreadLabel = firstMatch(
                pattern: #"(?i)\bthread\s*[:\-]\s*([a-z0-9][a-z0-9 .,_'’()\-]{2,120})\b"#,
                in: contextText
-           ) {
-            let normalizedThread = collapseWhitespace(codexThreadLabel)
+           ),
+           let normalizedThread = sanitizedThreadIdentityLabel(codexThreadLabel) {
             let key = "thread:\(slug(normalizedThread))"
             let resolvedNativeThreadKey = nativeThreadKey.isEmpty ? key : nativeThreadKey
             return (key, .channel, normalizedThread, people, resolvedNativeThreadKey)
@@ -273,7 +283,8 @@ final class ConversationTagInferenceService {
             return (key, .person, person, people, nativeThreadKey)
         }
 
-        if let channel = inferChannelLabel(from: primaryText) {
+        if isLikelyChannelIdentityApp(bundleID: bundleID, appName: appName),
+           let channel = inferChannelLabel(from: primaryText) {
             let key = "channel:\(slug(channel))"
             return (key, .channel, channel, people, nativeThreadKey)
         }
@@ -291,10 +302,48 @@ final class ConversationTagInferenceService {
         ) {
             return collapseWhitespace(explicit)
         }
-        if let bars = splitByStrongSeparators(text).first, !bars.isEmpty {
-            return bars
-        }
         return nil
+    }
+
+    private func sanitizedThreadIdentityLabel(_ value: String) -> String? {
+        let normalized = collapseWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !normalized.isEmpty else { return nil }
+        let lowered = normalized.lowercased()
+
+        let blockedExact: Set<String> = [
+            "thread actions",
+            "new thread",
+            "threads",
+            "settings",
+            "explorer",
+            "explorer section",
+            "source control"
+        ]
+        if blockedExact.contains(lowered) {
+            return nil
+        }
+
+        if lowered.range(of: #"^\d+\s*[smhdw]$"#, options: .regularExpression) != nil {
+            return nil
+        }
+
+        if lowered.range(
+            of: #"^(?:hide|show|toggle|open|close|expand|collapse)\b"#,
+            options: .regularExpression
+        ) != nil {
+            return nil
+        }
+
+        if lowered.contains("axtextarea")
+            || lowered.contains("axtextfield")
+            || lowered.contains("axbutton")
+            || lowered.contains("axgroup")
+            || lowered.contains("axscrollarea") {
+            return nil
+        }
+
+        return normalized
     }
 
     private func inferNativeThreadKey(from text: String) -> String {
@@ -580,6 +629,23 @@ final class ConversationTagInferenceService {
     private func isGroupChatApp(bundleID: String, appName: String) -> Bool {
         let value = "\(bundleID) \(appName)".lowercased()
         return ["teams", "slack", "discord", "chat"].contains(where: value.contains)
+    }
+
+    private func isLikelyChannelIdentityApp(bundleID: String, appName: String) -> Bool {
+        let value = "\(bundleID) \(appName)".lowercased()
+        let needles = [
+            "teams",
+            "slack",
+            "discord",
+            "telegram",
+            "whatsapp",
+            "mobilesms",
+            "messages",
+            "signal",
+            "imessage",
+            "chat"
+        ]
+        return needles.contains(where: value.contains)
     }
 
     private func isTeamsApp(bundleID: String, appName: String) -> Bool {

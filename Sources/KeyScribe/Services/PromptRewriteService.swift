@@ -1,24 +1,40 @@
 import Foundation
 import Security
 
+enum PromptRewriteStrength: String, Equatable {
+    case light
+    case balanced
+    case strong
+}
+
 struct PromptRewriteSuggestion: Equatable {
     let suggestedText: String
     let memoryContext: String?
+    let confidence: Double?
+    let rewriteStrength: PromptRewriteStrength?
+    let continuityTrace: String?
     let refinementDurationSeconds: TimeInterval?
 
     init(
         suggestedText: String,
         memoryContext: String?,
+        confidence: Double? = nil,
+        rewriteStrength: PromptRewriteStrength? = nil,
+        continuityTrace: String? = nil,
         refinementDurationSeconds: TimeInterval? = nil
     ) {
         self.suggestedText = suggestedText
         self.memoryContext = memoryContext
+        self.confidence = confidence
+        self.rewriteStrength = rewriteStrength
+        self.continuityTrace = continuityTrace
         self.refinementDurationSeconds = refinementDurationSeconds
     }
 }
 
 enum PromptRewriteFeedbackAction: String, Equatable {
     case usedSuggested = "used-suggested"
+    case autoInsertedSuggested = "auto-inserted-suggested"
     case editedThenInserted = "edited-then-inserted"
     case insertedOriginal = "inserted-original"
     case dismissedSuggestion = "dismissed-suggestion"
@@ -369,7 +385,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                         return nil
                     }
 
-                    return try await openAIProvider.retrieveSuggestion(
+                    let suggestion = try await openAIProvider.retrieveSuggestion(
                         for: cleanedTranscript,
                         rewriteContext: rewriteContext,
                         includeMemoryContext: true,
@@ -377,15 +393,27 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                         conversationContext: conversationContext,
                         conversationHistory: conversationHistory
                     )
+                    return enrichedSuggestion(
+                        suggestion,
+                        memoryEnabled: true,
+                        lessonCount: rewriteContext.lessons.count,
+                        historyCount: conversationHistory.count
+                    )
                 }
 
-                return try await openAIProvider.retrieveSuggestion(
+                let suggestion = try await openAIProvider.retrieveSuggestion(
                     for: cleanedTranscript,
                     rewriteContext: MemoryRewritePromptContext(lessons: [], supportingCards: []),
                     includeMemoryContext: false,
                     configuration: config,
                     conversationContext: conversationContext,
                     conversationHistory: conversationHistory
+                )
+                return enrichedSuggestion(
+                    suggestion,
+                    memoryEnabled: false,
+                    lessonCount: 0,
+                    historyCount: conversationHistory.count
                 )
             } catch let backendError as PromptRewriteBackendError {
                 throw backendError
@@ -401,9 +429,15 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         case .suggest:
             let suggestedText = Self.suggestedStubText(fallback: cleanedTranscript)
             guard !suggestedText.isEmpty else { return nil }
-            return PromptRewriteSuggestion(
+            let suggestion = PromptRewriteSuggestion(
                 suggestedText: suggestedText,
                 memoryContext: "stubbed-memory-context"
+            )
+            return enrichedSuggestion(
+                suggestion,
+                memoryEnabled: false,
+                lessonCount: 0,
+                historyCount: conversationHistory.count
             )
         case .fail:
             throw PromptRewriteBackendError.providerFailure(reason: "stub-provider-failure")
@@ -467,6 +501,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                 }
             case .dismissedSuggestion,
                  .usedSuggested,
+                 .autoInsertedSuggested,
                  .retriedAfterFailure,
                  .insertedOriginalAfterFailure,
                  .canceledAfterFailure:
@@ -484,6 +519,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         switch event.action {
         case .usedSuggested:
             return "User accepted suggested rewrite"
+        case .autoInsertedSuggested:
+            return "Suggested rewrite auto-inserted"
         case .editedThenInserted:
             return "User edited suggested rewrite and inserted"
         case .insertedOriginal:
@@ -503,6 +540,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         switch action {
         case .usedSuggested:
             return 0.95
+        case .autoInsertedSuggested:
+            return 0.93
         case .editedThenInserted:
             return 0.90
         case .insertedOriginal:
@@ -516,6 +555,63 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         case .canceledAfterFailure:
             return 0.10
         }
+    }
+
+    private func enrichedSuggestion(
+        _ suggestion: PromptRewriteSuggestion?,
+        memoryEnabled: Bool,
+        lessonCount: Int,
+        historyCount: Int
+    ) -> PromptRewriteSuggestion? {
+        guard let suggestion else { return nil }
+        let metadata = rewriteMetadataHeuristic(
+            memoryEnabled: memoryEnabled,
+            lessonCount: lessonCount,
+            historyCount: historyCount
+        )
+        return PromptRewriteSuggestion(
+            suggestedText: suggestion.suggestedText,
+            memoryContext: suggestion.memoryContext,
+            confidence: suggestion.confidence ?? metadata.confidence,
+            rewriteStrength: suggestion.rewriteStrength ?? metadata.rewriteStrength,
+            continuityTrace: suggestion.continuityTrace ?? metadata.continuityTrace,
+            refinementDurationSeconds: suggestion.refinementDurationSeconds
+        )
+    }
+
+    private func rewriteMetadataHeuristic(
+        memoryEnabled: Bool,
+        lessonCount: Int,
+        historyCount: Int
+    ) -> (confidence: Double, rewriteStrength: PromptRewriteStrength, continuityTrace: String) {
+        let normalizedLessonCount = max(0, lessonCount)
+        let normalizedHistoryCount = max(0, historyCount)
+        let lessonBacked = memoryEnabled && normalizedLessonCount > 0
+
+        let confidence: Double
+        let rewriteStrength: PromptRewriteStrength
+        if lessonBacked {
+            confidence = min(0.90, 0.80 + (Double(min(normalizedLessonCount, 3)) * 0.03))
+            if normalizedLessonCount >= 4 {
+                rewriteStrength = .strong
+            } else if normalizedLessonCount >= 2 {
+                rewriteStrength = .balanced
+            } else {
+                rewriteStrength = .light
+            }
+        } else {
+            confidence = min(0.85, 0.60 + (Double(min(normalizedHistoryCount, 5)) * 0.05))
+            if normalizedHistoryCount >= 5 {
+                rewriteStrength = .strong
+            } else if normalizedHistoryCount >= 3 {
+                rewriteStrength = .balanced
+            } else {
+                rewriteStrength = .light
+            }
+        }
+
+        let continuityTrace = "historyTurns=\(normalizedHistoryCount); lessons=\(normalizedLessonCount); lessonBacked=\(lessonBacked)"
+        return (confidence, rewriteStrength, continuityTrace)
     }
 
     private static var stubMode: StubMode {
@@ -584,6 +680,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         let oauthSession = PromptRewriteOAuthCredentialStore.loadSession(for: providerMode.settingsProviderMode)
         let loadedAPIKey = loadProviderAPIKey(for: providerMode)
         var resolvedModel = (model?.isEmpty == false) ? model! : providerMode.defaultModel
+        var resolvedBaseURL = (baseURL?.isEmpty == false) ? baseURL! : providerMode.defaultBaseURL
         if providerMode == .openAI {
             let usingOpenAIOAuthOnly = oauthSession != nil
                 && loadedAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -591,8 +688,10 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                !PromptRewriteModelCatalogService.isOpenAIOAuthCompatibleModelID(resolvedModel) {
                 resolvedModel = PromptRewriteModelCatalogService.defaultOpenAIOAuthModelID
             }
+            if usingOpenAIOAuthOnly {
+                resolvedBaseURL = providerMode.defaultBaseURL
+            }
         }
-        let resolvedBaseURL = (baseURL?.isEmpty == false) ? baseURL! : providerMode.defaultBaseURL
         return PromptRewriteLiveConfiguration(
             providerMode: providerMode,
             openAIModel: resolvedModel,

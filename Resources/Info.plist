@@ -26,5 +26,11 @@
         <string>1.0.0</string>
         <key>CFBundleVersion</key>
         <string>1</string>
+        <key>SUFeedURL</key>
+        <string>https://manikv12.github.io/KeyScribe/appcast.xml</string>
+        <key>SUEnableAutomaticChecks</key>
+        <true />
+        <key>SUPublicEDKey</key>
+        <string>GpMECN74Dihchnqk1zVDShhEzh1xk/ASPTMjm67FlLU=</string>
     </dict>
 </plist>
