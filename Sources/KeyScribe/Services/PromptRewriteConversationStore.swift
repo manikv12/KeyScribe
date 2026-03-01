@@ -3922,8 +3922,8 @@ enum PromptRewriteConversationContextResolver {
         let candidates = [topBarProject, sidebarProject]
             .compactMap(normalizedLabel)
             .compactMap(normalizedProjectName)
-        if let bestNonPR = candidates.first(where: { !isLikelyPullRequestSelectionLabel($0) }) {
-            return bestNonPR
+        if let bestNonVCS = candidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+            return bestNonVCS
         }
         return candidates.first
     }
@@ -4061,7 +4061,7 @@ enum PromptRewriteConversationContextResolver {
         let normalized = collapsedWhitespace(value)
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
         guard !normalized.isEmpty else { return false }
-        guard !isLikelyPullRequestSelectionLabel(normalized) else { return false }
+        guard !isLikelyVersionControlReferenceLabel(normalized) else { return false }
 
         let lowered = normalized.lowercased()
         if lowered.contains("http://") || lowered.contains("https://") {
@@ -4389,18 +4389,19 @@ enum PromptRewriteConversationContextResolver {
         if blocked.contains(lowered) {
             return nil
         }
-        if isLikelyPullRequestSelectionLabel(normalized) {
+        if isLikelyVersionControlReferenceLabel(normalized) {
             return nil
         }
         return normalized
     }
 
-    private static func isLikelyPullRequestSelectionLabel(_ value: String) -> Bool {
+    private static func isLikelyVersionControlReferenceLabel(_ value: String) -> Bool {
         let normalized = collapsedWhitespace(value)
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
             .lowercased()
         guard !normalized.isEmpty else { return false }
 
+        // Pull request / issue style badges.
         if normalized.range(
             of: #"^(?:pr|pull request)\s*#?\d+\b"#,
             options: .regularExpression
@@ -4408,6 +4409,29 @@ enum PromptRewriteConversationContextResolver {
             return true
         }
         if normalized.range(of: #"^#\d+$"#, options: .regularExpression) != nil {
+            return true
+        }
+
+        // Branch/ref selectors and commit hashes that are not stable project names.
+        if normalized.range(
+            of: #"^(?:refs/(?:heads|tags|pull)/|origin/|upstream/|branch\s*:|tag\s*:)"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+        if normalized.range(
+            of: #"^(?:main|master|develop|development|dev)$"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+        if normalized.range(
+            of: #"^(?:feature|bugfix|hotfix|release|chore|fix|refactor|test|docs|ci|perf)/[a-z0-9._\-\/]{2,}$"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+        if normalized.range(of: #"^[a-f0-9]{7,40}$"#, options: .regularExpression) != nil {
             return true
         }
         return false
@@ -4468,7 +4492,7 @@ enum PromptRewriteConversationContextResolver {
 
     private static func isCodexToolbarControlLabel(_ value: String) -> Bool {
         let lowered = value.lowercased()
-        if isLikelyPullRequestSelectionLabel(lowered) {
+        if isLikelyVersionControlReferenceLabel(lowered) {
             return true
         }
         let blocked: Set<String> = [
