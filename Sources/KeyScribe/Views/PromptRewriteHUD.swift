@@ -69,6 +69,106 @@ private enum PromptRewriteHUDLayout {
     static let loadingOffsetY: CGFloat = 16
 }
 
+private final class PromptRewriteHUDKeyEventSuppressor {
+    typealias KeyDownHandler = (UInt16) -> Void
+
+    private static let blockedModifiers: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+
+    private let suppressedKeyCodes: Set<UInt16>
+    private let onSuppressedKeyDown: KeyDownHandler
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+
+    init(suppressedKeyCodes: Set<UInt16>, onSuppressedKeyDown: @escaping KeyDownHandler) {
+        self.suppressedKeyCodes = suppressedKeyCodes
+        self.onSuppressedKeyDown = onSuppressedKeyDown
+    }
+
+    deinit {
+        stop()
+    }
+
+    func start() {
+        stop()
+
+        let eventsOfInterest = CGEventMask(1) << CGEventType.keyDown.rawValue
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            guard let userInfo else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let suppressor = Unmanaged<PromptRewriteHUDKeyEventSuppressor>.fromOpaque(userInfo).takeUnretainedValue()
+
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = suppressor.eventTap {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            guard type == .keyDown else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            guard let keyCode = suppressor.suppressedKeyCode(for: event) else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            suppressor.notifySuppressedKeyDown(keyCode)
+            return nil
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventsOfInterest,
+            callback: callback,
+            userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        ) else {
+            CrashReporter.logInfo("HUD key suppressor: failed to create event tap")
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        eventTap = tap
+        runLoopSource = source
+
+        if let source {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    func stop() {
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            runLoopSource = nil
+        }
+
+        if let tap = eventTap {
+            CFMachPortInvalidate(tap)
+            eventTap = nil
+        }
+    }
+
+    private func suppressedKeyCode(for event: CGEvent) -> UInt16? {
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        guard suppressedKeyCodes.contains(keyCode) else { return nil }
+        if !event.flags.intersection(Self.blockedModifiers).isEmpty {
+            return nil
+        }
+        return keyCode
+    }
+
+    private func notifySuppressedKeyDown(_ keyCode: UInt16) {
+        DispatchQueue.main.async {
+            self.onSuppressedKeyDown(keyCode)
+        }
+    }
+}
+
 @MainActor
 final class PromptRewriteHUDManager {
     static let shared = PromptRewriteHUDManager()
@@ -172,6 +272,7 @@ final class PromptRewriteHUDManager {
     private var activeLoadingSessionOrder: [PromptRewriteHUDSessionKey] = []
     private var globalKeyMonitor: Any?
     private var localKeyMonitor: Any?
+    private var keyEventSuppressor: PromptRewriteHUDKeyEventSuppressor?
     private var loadingBypassRequests: Set<PromptRewriteHUDSessionKey> = []
 
     func showLoadingIndicator(
@@ -719,6 +820,16 @@ final class PromptRewriteHUDManager {
     }
 
     private func installKeyMonitor() {
+        if keyEventSuppressor == nil {
+            keyEventSuppressor = PromptRewriteHUDKeyEventSuppressor(
+                suppressedKeyCodes: [HUDKeyCodes.escape, HUDKeyCodes.returnKey, HUDKeyCodes.keypadEnter],
+                onSuppressedKeyDown: { [weak self] keyCode in
+                    _ = self?.handleHUDKeyCode(keyCode)
+                }
+            )
+            keyEventSuppressor?.start()
+        }
+
         guard globalKeyMonitor == nil, localKeyMonitor == nil else { return }
 
         // Use both monitors: global handles when another app is focused,
@@ -743,6 +854,8 @@ final class PromptRewriteHUDManager {
             NSEvent.removeMonitor(monitor)
             localKeyMonitor = nil
         }
+        keyEventSuppressor?.stop()
+        keyEventSuppressor = nil
     }
 
     @discardableResult
@@ -752,7 +865,12 @@ final class PromptRewriteHUDManager {
         let blockingModifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
         guard blockingModifiers.isEmpty else { return false }
 
-        switch event.keyCode {
+        return handleHUDKeyCode(event.keyCode)
+    }
+
+    @discardableResult
+    private func handleHUDKeyCode(_ keyCode: UInt16) -> Bool {
+        switch keyCode {
         case HUDKeyCodes.escape:
             return cancelMostRecentSession()
         case HUDKeyCodes.returnKey, HUDKeyCodes.keypadEnter:
