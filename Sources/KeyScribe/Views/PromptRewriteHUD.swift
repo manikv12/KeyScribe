@@ -21,6 +21,32 @@ struct PromptRewriteInsertionHUDContext: Equatable {
     let targetProcessIdentifier: pid_t?
 }
 
+struct PromptRewriteLoadingDisplayState: Equatable {
+    let transcription: String
+    let currentStep: String
+    let aiSuggestionsEnabled: Bool
+    let aiGenerationSummary: String
+    let aiRuntimeSummary: String?
+
+    static let placeholder = PromptRewriteLoadingDisplayState(
+        transcription: "",
+        currentStep: "Preparing request",
+        aiSuggestionsEnabled: false,
+        aiGenerationSummary: "AI suggestions are currently disabled.",
+        aiRuntimeSummary: nil
+    )
+}
+
+@MainActor
+final class PromptRewriteLoadingStateModel: ObservableObject {
+    @Published var displayState: PromptRewriteLoadingDisplayState = .placeholder
+
+    func update(with state: PromptRewriteLoadingDisplayState) {
+        guard displayState != state else { return }
+        displayState = state
+    }
+}
+
 private struct PromptRewriteHUDPlacement {
     let frame: NSRect
     let bubbleEdge: PromptRewriteBubbleEdge
@@ -39,7 +65,7 @@ private enum PromptRewriteHUDLayout {
     static let screenMargin: CGFloat = 8
     static let anchorGap: CGFloat = 14
     static let cornerRadius: CGFloat = 26
-    static let loadingSize = NSSize(width: 72, height: 30)
+    static let loadingSize = NSSize(width: 460, height: 286)
     static let loadingOffsetY: CGFloat = 16
 }
 
@@ -106,12 +132,14 @@ final class PromptRewriteHUDManager {
         let key: PromptRewriteHUDSessionKey
         var insertionContext: PromptRewriteInsertionHUDContext
         let window: NSPanel
+        let stateModel: PromptRewriteLoadingStateModel
         var manualOffset: CGSize = .zero
         var dragBaseManualOffset: CGSize?
 
         init(key: PromptRewriteHUDSessionKey, insertionContext: PromptRewriteInsertionHUDContext) {
             self.key = key
             self.insertionContext = insertionContext
+            self.stateModel = PromptRewriteLoadingStateModel()
             self.window = NSPanel(
                 contentRect: NSRect(origin: .zero, size: PromptRewriteHUDLayout.loadingSize),
                 styleMask: [.borderless, .nonactivatingPanel],
@@ -141,11 +169,16 @@ final class PromptRewriteHUDManager {
     private var sessions: [PromptRewriteHUDSessionKey: PromptRewriteHUDSession] = [:]
     private var loadingSessions: [PromptRewriteHUDSessionKey: PromptRewriteLoadingSession] = [:]
     private var activeSessionOrder: [PromptRewriteHUDSessionKey] = []
+    private var activeLoadingSessionOrder: [PromptRewriteHUDSessionKey] = []
     private var globalKeyMonitor: Any?
     private var localKeyMonitor: Any?
     private var loadingBypassRequests: Set<PromptRewriteHUDSessionKey> = []
 
-    func showLoadingIndicator(insertionContext: PromptRewriteInsertionHUDContext) {
+    func showLoadingIndicator(
+        insertionContext: PromptRewriteInsertionHUDContext,
+        displayState: PromptRewriteLoadingDisplayState
+    ) {
+        installKeyMonitor()
         let key = sessionKey(for: insertionContext)
         loadingBypassRequests.remove(key)
         let session: PromptRewriteLoadingSession
@@ -156,8 +189,10 @@ final class PromptRewriteHUDManager {
             session = PromptRewriteLoadingSession(key: key, insertionContext: insertionContext)
             loadingSessions[key] = session
         }
+        touchLoadingSession(key)
+        session.stateModel.update(with: displayState)
 
-        let loadingView = makeLoadingView(for: key)
+        let loadingView = makeLoadingView(for: key, stateModel: session.stateModel)
         if let hosting = session.window.contentViewController as? NSHostingController<PromptRewriteLoadingView> {
             hosting.rootView = loadingView
         } else {
@@ -172,6 +207,16 @@ final class PromptRewriteHUDManager {
         session.window.alphaValue = 1
         session.window.setFrame(frame, display: true)
         session.window.orderFrontRegardless()
+    }
+
+    func updateLoadingIndicator(
+        insertionContext: PromptRewriteInsertionHUDContext,
+        displayState: PromptRewriteLoadingDisplayState
+    ) {
+        let key = sessionKey(for: insertionContext)
+        guard let session = loadingSessions[key] else { return }
+        session.insertionContext = insertionContext
+        session.stateModel.update(with: displayState)
     }
 
     func hideLoadingIndicator(insertionContext: PromptRewriteInsertionHUDContext) {
@@ -263,8 +308,17 @@ final class PromptRewriteHUDManager {
         activeSessionOrder.append(key)
     }
 
+    private func touchLoadingSession(_ key: PromptRewriteHUDSessionKey) {
+        activeLoadingSessionOrder.removeAll(where: { $0 == key })
+        activeLoadingSessionOrder.append(key)
+    }
+
     private func removeSessionFromOrder(_ key: PromptRewriteHUDSessionKey) {
         activeSessionOrder.removeAll(where: { $0 == key })
+    }
+
+    private func removeLoadingSessionFromOrder(_ key: PromptRewriteHUDSessionKey) {
+        activeLoadingSessionOrder.removeAll(where: { $0 == key })
     }
 
     private func captureTargetProcessID(fallbackApp: NSRunningApplication?) -> pid_t? {
@@ -530,8 +584,12 @@ final class PromptRewriteHUDManager {
         }
     }
 
-    private func makeLoadingView(for key: PromptRewriteHUDSessionKey) -> PromptRewriteLoadingView {
+    private func makeLoadingView(
+        for key: PromptRewriteHUDSessionKey,
+        stateModel: PromptRewriteLoadingStateModel
+    ) -> PromptRewriteLoadingView {
         PromptRewriteLoadingView(
+            model: stateModel,
             onPause: { [weak self] in
                 self?.requestLoadingBypass(for: key)
             },
@@ -579,6 +637,8 @@ final class PromptRewriteHUDManager {
         loading.window.contentViewController = nil
         loading.window.orderOut(nil)
         loading.window.alphaValue = 1
+        removeLoadingSessionFromOrder(key)
+        maybeRemoveKeyMonitor()
     }
 
     private func loadingFrame(for context: PromptRewriteInsertionHUDContext, manualOffset: CGSize = .zero) -> NSRect {
@@ -641,9 +701,7 @@ final class PromptRewriteHUDManager {
         removeSessionFromOrder(key)
         hide(session: session)
         hideLoadingSession(for: key)
-        if sessions.isEmpty {
-            removeKeyMonitor()
-        }
+        maybeRemoveKeyMonitor()
     }
 
     private func hide(session: PromptRewriteHUDSession) {
@@ -651,7 +709,11 @@ final class PromptRewriteHUDManager {
         session.window.orderOut(nil)
         session.window.alphaValue = 1
         removeSessionFromOrder(session.key)
-        if sessions.values.allSatisfy({ !$0.window.isVisible }) {
+        maybeRemoveKeyMonitor()
+    }
+
+    private func maybeRemoveKeyMonitor() {
+        if sessions.isEmpty && loadingSessions.isEmpty {
             removeKeyMonitor()
         }
     }
@@ -692,24 +754,28 @@ final class PromptRewriteHUDManager {
 
         switch event.keyCode {
         case HUDKeyCodes.escape:
-            cancelMostRecentSession()
-            return true
+            return cancelMostRecentSession()
         case HUDKeyCodes.returnKey, HUDKeyCodes.keypadEnter:
-            acceptMostRecentSession()
-            return true
+            return acceptMostRecentSession()
         default:
             return false
         }
     }
 
-    private func cancelMostRecentSession() {
-        guard let key = latestVisibleSessionKey() else { return }
-        finishSelected(key, with: .insertOriginal)
+    private func cancelMostRecentSession() -> Bool {
+        if let key = latestVisibleSessionKey() {
+            finishSelected(key, with: .insertOriginal)
+            return true
+        }
+        guard let loadingKey = latestVisibleLoadingSessionKey() else { return false }
+        requestLoadingBypass(for: loadingKey)
+        return true
     }
 
-    private func acceptMostRecentSession() {
-        guard let key = latestVisibleSessionKey() else { return }
+    private func acceptMostRecentSession() -> Bool {
+        guard let key = latestVisibleSessionKey() else { return false }
         finishSelected(key, with: .useSuggested)
+        return true
     }
 
     private func latestVisibleSessionKey() -> PromptRewriteHUDSessionKey? {
@@ -719,6 +785,17 @@ final class PromptRewriteHUDManager {
         }
         // Fallback for edge cases where visibility state lags while a session is still active.
         for key in activeSessionOrder.reversed() where sessions[key] != nil {
+            return key
+        }
+        return nil
+    }
+
+    private func latestVisibleLoadingSessionKey() -> PromptRewriteHUDSessionKey? {
+        for key in activeLoadingSessionOrder.reversed() {
+            guard let session = loadingSessions[key], session.window.isVisible else { continue }
+            return key
+        }
+        for key in activeLoadingSessionOrder.reversed() where loadingSessions[key] != nil {
             return key
         }
         return nil
@@ -1046,9 +1123,370 @@ private struct PromptRewriteDiscussionPage: Identifiable, Equatable {
 }
 
 private struct PromptRewriteLoadingView: View {
+    private enum Stage: Int, CaseIterable {
+        case prepare
+        case generate
+        case finalize
+
+        var title: String {
+            switch self {
+            case .prepare:
+                return "Prepare"
+            case .generate:
+                return "Generate"
+            case .finalize:
+                return "Finalize"
+            }
+        }
+
+        static func from(step: String) -> Stage {
+            let normalized = step.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if normalized.contains("final") || normalized.contains("restoring") || normalized.contains("paused") {
+                return .finalize
+            }
+            if normalized.contains("send")
+                || normalized.contains("receiv")
+                || normalized.contains("normaliz")
+                || normalized.contains("response") {
+                return .generate
+            }
+            return .prepare
+        }
+    }
+
+    @ObservedObject var model: PromptRewriteLoadingStateModel
     let onPause: () -> Void
     var onDragChanged: ((CGSize) -> Void)? = nil
     var onDragEnded: ((CGSize) -> Void)? = nil
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    private var state: PromptRewriteLoadingDisplayState {
+        model.displayState
+    }
+
+    private var transcriptPreview: String {
+        let normalized = state.transcription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return "Transcription will appear here." }
+        let words = normalized.split(whereSeparator: \.isWhitespace)
+        if words.count <= 42 {
+            return normalized
+        }
+        return words.prefix(42).joined(separator: " ") + "…"
+    }
+
+    private var stepText: String {
+        let normalized = state.currentStep.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? "Preparing rewrite request" : normalized
+    }
+
+    private var aiSummaryText: String {
+        let normalized = state.aiGenerationSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return state.aiSuggestionsEnabled
+                ? "AI suggestions are active for this request."
+                : "AI suggestions are not active for this request."
+        }
+        return normalized
+    }
+
+    private var runtimeSummaryText: String? {
+        guard let runtime = state.aiRuntimeSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !runtime.isEmpty else {
+            return nil
+        }
+        return runtime
+    }
+
+    private var stage: Stage {
+        Stage.from(step: stepText)
+    }
+
+    private var nextStepText: String {
+        switch stage {
+        case .prepare:
+            return "Generate a rewrite suggestion"
+        case .generate:
+            return "Finalize confidence and insertion path"
+        case .finalize:
+            return "Insert text into the active app"
+        }
+    }
+
+    var body: some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 10) {
+                AppIconBadge(
+                    symbol: "waveform.and.sparkles",
+                    tint: AppVisualTheme.accentTint,
+                    size: 24,
+                    symbolSize: 10,
+                    isEmphasized: true
+                )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("AI Rewrite In Progress")
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.white.opacity(0.95))
+                    Text("Live status while your transcript is refined")
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(Color.white.opacity(0.70))
+                }
+
+                Spacer(minLength: 8)
+
+                PromptRewriteLoadingStatePill(
+                    title: state.aiSuggestionsEnabled ? "AI Active" : "AI Off",
+                    isActive: state.aiSuggestionsEnabled
+                )
+
+                if let runtimeSummaryText {
+                    Text(runtimeSummaryText)
+                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(Color.white.opacity(0.46))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.06))
+                        )
+                        .help("Rewrite runtime")
+                }
+
+                Button(action: onPause) {
+                    Image(systemName: "pause.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color.white.opacity(0.96))
+                        .frame(width: 19, height: 19)
+                        .background(
+                            Circle()
+                                .fill(Color.red.opacity(0.90))
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("Pause AI rewrite and insert transcribed text")
+            }
+
+            PromptRewriteActivityBar()
+                .frame(height: 4)
+                .padding(.top, -1)
+
+            HStack(spacing: 8) {
+                ForEach(Stage.allCases, id: \.self) { candidate in
+                    let isCompleted = candidate.rawValue < stage.rawValue
+                    let isActive = candidate == stage
+                    PromptRewriteStageChip(
+                        title: candidate.title,
+                        isActive: isActive,
+                        isCompleted: isCompleted
+                    )
+                }
+            }
+
+            HStack(spacing: 8) {
+                PromptRewriteNowNextCard(
+                    title: "Now",
+                    icon: "bolt.fill",
+                    text: stepText,
+                    wordsPerSecond: 10
+                )
+                PromptRewriteNowNextCard(
+                    title: "Next",
+                    icon: "arrow.turn.down.right",
+                    text: nextStepText,
+                    wordsPerSecond: 9
+                )
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            PromptRewriteLoadingBlock(
+                title: "Captured Transcript",
+                iconName: "waveform.badge.mic",
+                text: transcriptPreview,
+                wordsPerSecond: 11,
+                lineLimit: 2
+            )
+
+            PromptRewriteLoadingBlock(
+                title: state.aiSuggestionsEnabled ? "What AI Is Doing" : "Suggestion Status",
+                iconName: state.aiSuggestionsEnabled ? "wand.and.stars" : "power",
+                text: aiSummaryText,
+                wordsPerSecond: 8,
+                lineLimit: 3
+            )
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 12)
+        .background {
+            ZStack {
+                PromptRewriteGlassSurface(cornerRadius: 20)
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.black.opacity(reduceTransparency ? 0.30 : 0.18))
+                LinearGradient(
+                    colors: [
+                        AppVisualTheme.accentTint.opacity(0.14),
+                        Color.clear,
+                        AppVisualTheme.baseTint.opacity(0.20)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { value in
+                        onDragChanged?(value.translation)
+                    }
+                    .onEnded { value in
+                        onDragEnded?(value.translation)
+                    }
+            )
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(tokens.strokeTop.opacity(0.42), lineWidth: 1)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(Color.black.opacity(0.30), lineWidth: 0.6)
+                        .blur(radius: 0.3)
+                )
+        }
+        .shadow(
+            color: tokens.cardShadowColor.opacity(0.86),
+            radius: max(14, tokens.cardShadowRadius),
+            x: 0,
+            y: max(7, tokens.cardShadowYOffset)
+        )
+        .frame(
+            width: PromptRewriteHUDLayout.loadingSize.width,
+            height: PromptRewriteHUDLayout.loadingSize.height,
+            alignment: .center
+        )
+    }
+}
+
+private struct PromptRewriteActivityBar: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isAnimating = false
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(20, proxy.size.width)
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.14))
+                .overlay(alignment: .leading) {
+                    Capsule(style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    AppVisualTheme.accentTint.opacity(0.45),
+                                    AppVisualTheme.accentTint.opacity(0.92),
+                                    Color.white.opacity(0.85)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .frame(width: width * 0.30)
+                        .offset(x: reduceMotion ? 0 : (isAnimating ? width * 0.70 : -width * 0.05))
+                }
+        }
+        .clipped()
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.linear(duration: 1.25).repeatForever(autoreverses: false)) {
+                isAnimating = true
+            }
+        }
+    }
+}
+
+private struct PromptRewriteStageChip: View {
+    let title: String
+    let isActive: Bool
+    let isCompleted: Bool
+
+    var body: some View {
+        let baseColor: Color = {
+            if isCompleted {
+                return Color.green
+            }
+            if isActive {
+                return AppVisualTheme.accentTint
+            }
+            return Color.white
+        }()
+        HStack(spacing: 6) {
+            Image(systemName: isCompleted ? "checkmark.circle.fill" : (isActive ? "record.circle.fill" : "circle"))
+                .font(.system(size: 9, weight: .semibold))
+            Text(title)
+                .font(.system(size: 10.5, weight: .bold, design: .rounded))
+        }
+        .foregroundStyle(baseColor.opacity(isActive || isCompleted ? 0.96 : 0.74))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Capsule(style: .continuous)
+                .fill(baseColor.opacity(isActive ? 0.22 : (isCompleted ? 0.16 : 0.08)))
+        )
+    }
+}
+
+private struct PromptRewriteNowNextCard: View {
+    let title: String
+    let icon: String
+    let text: String
+    let wordsPerSecond: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label {
+                Text(title)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Color.white.opacity(0.76))
+            } icon: {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.78))
+            }
+
+            PromptRewriteWordFlowText(
+                text: text,
+                font: .system(size: 12.5, weight: .semibold, design: .rounded),
+                foregroundColor: Color.white.opacity(0.96),
+                wordsPerSecond: wordsPerSecond,
+                lineLimit: 2
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .stroke(Color.white.opacity(0.18), lineWidth: 0.7)
+                )
+        )
+    }
+}
+
+private struct PromptRewriteLoadingBlock: View {
+    let title: String
+    let iconName: String
+    let text: String
+    let wordsPerSecond: Double
+    let lineLimit: Int
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
@@ -1057,54 +1495,109 @@ private struct PromptRewriteLoadingView: View {
             reduceTransparency: reduceTransparency
         )
 
-        HStack(spacing: 7) {
-            ProgressView()
-                .controlSize(.small)
-                .tint(AppVisualTheme.accentTint)
-            Button(action: onPause) {
-                Image(systemName: "pause.fill")
-                    .font(.system(size: 8.5, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.96))
-                    .frame(width: 17, height: 17)
-                    .background(
-                        Circle()
-                            .fill(Color.red.opacity(0.92))
-                    )
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text(title)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Color.white.opacity(0.78))
+            } icon: {
+                Image(systemName: iconName)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.accentTint.opacity(0.96))
             }
-            .buttonStyle(.plain)
-            .help("Pause AI rewrite and insert transcribed text")
+
+            PromptRewriteWordFlowText(
+                text: text,
+                font: .system(size: 12.5, weight: .semibold, design: .rounded),
+                foregroundColor: Color.white.opacity(0.96),
+                wordsPerSecond: wordsPerSecond,
+                lineLimit: lineLimit
+            )
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background {
-            PromptRewriteGlassSurface(cornerRadius: 14)
-                .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .gesture(
-                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
-                        .onChanged { value in
-                            onDragChanged?(value.translation)
-                        }
-                        .onEnded { value in
-                            onDragEnded?(value.translation)
-                        }
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(tokens.surfaceBottom.opacity(0.40))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .stroke(tokens.strokeTop.opacity(0.42), lineWidth: 0.8)
                 )
+        )
+    }
+}
+
+private struct PromptRewriteLoadingStatePill: View {
+    let title: String
+    let isActive: Bool
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(isActive ? AppVisualTheme.accentTint : Color.white.opacity(0.52))
+                .frame(width: 6, height: 6)
+            Text(title)
+                .font(.system(size: 10.5, weight: .bold, design: .rounded))
         }
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(.clear, lineWidth: 0)
+        .foregroundStyle(Color.white.opacity(isActive ? 0.94 : 0.72))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            Capsule(style: .continuous)
+                .fill((isActive ? AppVisualTheme.accentTint : Color.white).opacity(isActive ? 0.30 : 0.14))
         )
-        .shadow(
-            color: tokens.cardShadowColor.opacity(0.78),
-            radius: max(7, tokens.cardShadowRadius * 0.62),
-            x: 0,
-            y: max(3, tokens.cardShadowYOffset * 0.72)
-        )
-        .frame(
-            width: PromptRewriteHUDLayout.loadingSize.width,
-            height: PromptRewriteHUDLayout.loadingSize.height,
-            alignment: .center
-        )
+    }
+}
+
+private struct PromptRewriteWordFlowText: View {
+    let text: String
+    let font: Font
+    let foregroundColor: Color
+    let wordsPerSecond: Double
+    let lineLimit: Int?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var words: [String] = []
+    @State private var animationStart = Date()
+
+    private var normalizedText: String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "…" : trimmed
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: animationStart, by: 1.0 / 30.0)) { timeline in
+            Text(displayText(at: timeline.date))
+                .font(font)
+                .foregroundStyle(foregroundColor)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(lineLimit)
+                .animation(.easeOut(duration: 0.16), value: words)
+        }
+        .onAppear {
+            rebuildWordTimeline(for: normalizedText)
+        }
+        .onChange(of: text) { _ in
+            rebuildWordTimeline(for: normalizedText)
+        }
+    }
+
+    private func displayText(at now: Date) -> String {
+        if reduceMotion {
+            return normalizedText
+        }
+        guard !words.isEmpty else { return normalizedText }
+        let elapsed = max(0, now.timeIntervalSince(animationStart))
+        let wordRate = max(2, min(wordsPerSecond, 20))
+        let revealCount = min(words.count, max(1, Int((elapsed * wordRate).rounded(.down)) + 1))
+        return words.prefix(revealCount).joined(separator: " ")
+    }
+
+    private func rebuildWordTimeline(for sourceText: String) {
+        let tokens = sourceText.split(whereSeparator: \.isWhitespace).map(String.init)
+        words = tokens.isEmpty ? ["…"] : tokens
+        animationStart = Date()
     }
 }
 

@@ -315,6 +315,8 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let autoCompactionRetainedExchangeTurns = 8
     private let maxPromptContextCharacters = 1_800
     private let compactionVersion = 1
+    private let expiredSummaryAITimeoutSeconds = 60
+    private let expiredSummaryRetentionDays = 30
     private let sqliteStartupThreadScanMultiplier = 4
     private let sqliteStartupThreadScanHardLimit = 120
     private let duplicateMergeThreadScanMultiplier = 4
@@ -412,6 +414,7 @@ final class PromptRewriteConversationStore: ObservableObject {
         let usesPinnedContext: Bool
         var history: [PromptRewriteConversationTurn]
         var resolutionSource: String
+        var expiredHandoffRecordToConsume: ExpiredConversationContextRecord?
         let resolvedTupleKey: ConversationThreadTupleKey
         if let pinnedContext {
             resolvedContext = pinnedContext.context
@@ -518,6 +521,33 @@ final class PromptRewriteConversationStore: ObservableObject {
             usesPinnedContext = false
         }
 
+        if history.isEmpty,
+           promptRewriteConversationHistoryEnabled,
+           let store {
+            let crossIDESharingEnabled = promptRewriteCrossIDEConversationSharingEnabled
+            let scopeKey = scopeKeyForExpiredHandoff(
+                context: resolvedContext,
+                crossIDESharingEnabled: crossIDESharingEnabled
+            )
+            let bundleIDConstraint = crossIDESharingEnabled
+                ? nil
+                : resolvedContext.bundleIdentifier
+            if let expiredRecord = try? store.fetchLatestExpiredConversationContext(
+                scopeKey: scopeKey,
+                bundleIDConstraint: bundleIDConstraint
+            ) {
+                let handoffHistory = expiredHandoffHistory(
+                    from: expiredRecord,
+                    limit: normalizedRequestTurnLimit
+                )
+                if !handoffHistory.isEmpty {
+                    history = handoffHistory
+                    resolutionSource += "+expired-handoff"
+                    expiredHandoffRecordToConsume = expiredRecord
+                }
+            }
+        }
+
         if !usesPinnedContext,
            tagInferenceService.shouldSuppressUnknownCodingHistory(
                bundleID: capturedContext.bundleIdentifier,
@@ -535,6 +565,16 @@ final class PromptRewriteConversationStore: ObservableObject {
                 project=\(resolvedTupleKey.projectKey) \
                 identity=\(resolvedTupleKey.identityKey)
                 """
+            )
+        }
+
+        if let expiredHandoffRecordToConsume,
+           !history.isEmpty,
+           let store {
+            _ = try? store.markExpiredConversationContextConsumed(
+                id: expiredHandoffRecordToConsume.id,
+                consumedByThreadID: resolvedContext.id,
+                at: Date()
             )
         }
 
@@ -2399,11 +2439,229 @@ final class PromptRewriteConversationStore: ObservableObject {
         return min(240, max(2, value))
     }
 
+    private var promptRewriteConversationHistoryEnabled: Bool {
+        SettingsStore.shared.promptRewriteConversationHistoryEnabled
+    }
+
+    private var promptRewriteCrossIDEConversationSharingEnabled: Bool {
+        SettingsStore.shared.promptRewriteCrossIDEConversationSharingEnabled
+    }
+
+    private func scopeKeyForExpiredHandoff(
+        context: PromptRewriteConversationContext,
+        crossIDESharingEnabled: Bool
+    ) -> String {
+        let normalizedBundleID = collapsedWhitespace(context.bundleIdentifier).lowercased()
+        let normalizedSurfaceKey: String
+        let logicalSurface = collapsedWhitespace(context.logicalSurfaceKey).lowercased()
+        if !logicalSurface.isEmpty {
+            normalizedSurfaceKey = logicalSurface
+        } else {
+            let fallbackSeed = "\(context.screenLabel)|\(context.fieldLabel)|\(normalizedBundleID)"
+            normalizedSurfaceKey = "surface-\(MemoryIdentifier.stableHexDigest(for: fallbackSeed).prefix(24))"
+        }
+
+        let projectKey = contextLinkingKey(context.projectKey)
+        let identityKey = contextLinkingKey(context.identityKey)
+        if let projectKey, let identityKey {
+            if crossIDESharingEnabled {
+                return "expired-scope|project=\(projectKey)|identity=\(identityKey)"
+            }
+            return "expired-scope|bundle=\(normalizedBundleID)|project=\(projectKey)|identity=\(identityKey)"
+        }
+        return "expired-scope|bundle=\(normalizedBundleID)|surface=\(normalizedSurfaceKey)"
+    }
+
+    private func expiredHandoffHistory(
+        from record: ExpiredConversationContextRecord,
+        limit: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedLimit = normalizedTurnLimit(limit)
+        guard normalizedLimit > 0 else { return [] }
+
+        let normalizedSummary = collapsedWhitespace(record.summaryText)
+        guard !normalizedSummary.isEmpty else { return [] }
+
+        let summaryTurn = PromptRewriteConversationTurn(
+            userText: "Compacted conversation summary",
+            assistantText: normalizedSummary,
+            timestamp: record.expiredAt,
+            isSummary: true,
+            sourceTurnCount: max(1, record.sourceTurnCount),
+            compactionVersion: compactionVersion
+        )
+
+        let recentArchiveTurns = decodedArchivedTurns(from: record.recentTurnsJSON)
+        let archiveTurns = recentArchiveTurns.isEmpty
+            ? decodedArchivedTurns(from: record.rawTurnsJSON)
+            : recentArchiveTurns
+        let exchangeBudget = max(0, normalizedLimit - 1)
+        let selectedArchiveTurns = exchangeBudget == 0
+            ? []
+            : Array(
+                archiveTurns
+                    .filter { !$0.isSummary }
+                    .suffix(min(2, exchangeBudget))
+            )
+
+        var output = [summaryTurn]
+        output.append(contentsOf: selectedArchiveTurns)
+        if output.count > normalizedLimit {
+            output = Array(output.suffix(normalizedLimit))
+        }
+
+        while estimatedContextCharacters(output) > maxPromptContextCharacters,
+              output.count > 1 {
+            if let dropIndex = output.firstIndex(where: { !$0.isSummary }) {
+                output.remove(at: dropIndex)
+            } else {
+                break
+            }
+        }
+
+        return output
+    }
+
+    private func decodedArchivedTurns(from rawJSON: String) -> [PromptRewriteConversationTurn] {
+        let normalizedJSON = rawJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedJSON.isEmpty,
+              let data = normalizedJSON.data(using: .utf8) else {
+            return []
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let turns = try? decoder.decode([PromptRewriteConversationTurn].self, from: data) else {
+            return []
+        }
+
+        return turns
+            .compactMap(sanitizedStoredTurn)
+            .sorted { lhs, rhs in lhs.timestamp < rhs.timestamp }
+    }
+
+    private func encodedArchivedTurnsJSON(_ turns: [PromptRewriteConversationTurn]) -> String {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(turns),
+              let json = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return json
+    }
+
+    private func expiredContextRecordID(
+        scopeKey: String,
+        threadID: String,
+        expiredAt: Date
+    ) -> String {
+        let epoch = Int(expiredAt.timeIntervalSince1970)
+        let seed = "\(scopeKey)|\(threadID)|\(epoch)"
+        let digest = MemoryIdentifier.stableHexDigest(for: seed).prefix(24)
+        return "expired-\(digest)-\(epoch)"
+    }
+
+    private func expiredContextDeleteAfterDate(from date: Date) -> Date {
+        if let value = Calendar.current.date(
+            byAdding: .day,
+            value: expiredSummaryRetentionDays,
+            to: date
+        ) {
+            return value
+        }
+        return date.addingTimeInterval(Double(expiredSummaryRetentionDays * 24 * 60 * 60))
+    }
+
+    private func enqueueExpiredSummaryAIEnrichment(record: ExpiredConversationContextRecord) {
+        let timeoutSeconds = max(1, expiredSummaryAITimeoutSeconds)
+        let recordID = record.id
+        let fallbackSummary = record.summaryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !fallbackSummary.isEmpty else { return }
+        let candidateTurns = decodedArchivedTurns(from: record.recentTurnsJSON)
+        let enrichmentTurns = candidateTurns.isEmpty
+            ? decodedArchivedTurns(from: record.rawTurnsJSON)
+            : candidateTurns
+        let enrichmentContext = expiredHandoffEnrichmentContext(for: record)
+        let metadata = record.metadata
+
+        Task.detached(priority: .utility) {
+            let enriched = await StubMemoryRewriteExtractionProvider.shared.summarizeConversationHandoff(
+                summarySeed: fallbackSummary,
+                recentTurns: enrichmentTurns,
+                context: enrichmentContext,
+                timeoutSeconds: timeoutSeconds
+            )
+            let normalizedMethod = enriched.method
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let isAIMethod = normalizedMethod == "ai" || normalizedMethod.hasPrefix("ai-")
+            guard isAIMethod else { return }
+
+            let normalizedAISummary = enriched.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedAISummary.isEmpty,
+                  normalizedAISummary.caseInsensitiveCompare(fallbackSummary) != .orderedSame else {
+                return
+            }
+
+            var updatedMetadata = metadata
+            updatedMetadata["ai_summary_enriched"] = "true"
+            updatedMetadata["ai_summary_timeout_seconds"] = "\(timeoutSeconds)"
+            updatedMetadata["ai_summary_updated_at"] = ISO8601DateFormatter().string(from: Date())
+            updatedMetadata["summary_method"] = "ai"
+            updatedMetadata["summary_method_detail"] = normalizedMethod
+            if let confidence = enriched.confidence {
+                updatedMetadata["summary_confidence"] = String(format: "%.3f", max(0, min(1, confidence)))
+            }
+
+            guard let store = try? MemorySQLiteStore() else { return }
+            _ = try? store.updateExpiredConversationContextSummary(
+                id: recordID,
+                summaryText: normalizedAISummary,
+                method: .ai,
+                confidence: enriched.confidence,
+                metadata: updatedMetadata
+            )
+        }
+    }
+
+    private func expiredHandoffEnrichmentContext(
+        for record: ExpiredConversationContextRecord
+    ) -> PromptRewriteConversationContext {
+        let appName = collapsedWhitespace(record.metadata["app_name"] ?? "Unknown App")
+        let screenLabel = collapsedWhitespace(record.metadata["screen_label"] ?? "Current Screen")
+        let fieldLabel = collapsedWhitespace(record.metadata["field_label"] ?? "Focused Input")
+        let logicalSurfaceKey = collapsedWhitespace(
+            record.metadata["logical_surface_key"] ?? "expired-\(record.scopeKey)"
+        )
+        let projectLabel = collapsedWhitespace(record.metadata["project_label"] ?? "")
+        let identityLabel = collapsedWhitespace(record.metadata["identity_label"] ?? "")
+        let identityType = collapsedWhitespace(record.metadata["identity_type"] ?? "")
+        let nativeThreadKey = collapsedWhitespace(record.metadata["native_thread_key"] ?? "")
+
+        return PromptRewriteConversationContext(
+            id: record.threadID,
+            appName: appName.isEmpty ? "Unknown App" : appName,
+            bundleIdentifier: record.bundleID,
+            screenLabel: screenLabel.isEmpty ? "Current Screen" : screenLabel,
+            fieldLabel: fieldLabel.isEmpty ? "Focused Input" : fieldLabel,
+            logicalSurfaceKey: logicalSurfaceKey,
+            projectKey: record.projectKey,
+            projectLabel: projectLabel.isEmpty ? nil : projectLabel,
+            identityKey: record.identityKey,
+            identityType: identityType.isEmpty ? nil : identityType,
+            identityLabel: identityLabel.isEmpty ? nil : identityLabel,
+            nativeThreadKey: nativeThreadKey.isEmpty ? nil : nativeThreadKey,
+            people: []
+        )
+    }
+
     private func pruneStaleContexts(timeoutMinutes: Double) {
         guard !contextsByID.isEmpty else { return }
 
         let timeout = normalizedTimeoutMinutes(timeoutMinutes) * 60
         let now = Date()
+        let shouldPersistExpiredHandoff = promptRewriteConversationHistoryEnabled
+        let crossIDESharingEnabled = promptRewriteCrossIDEConversationSharingEnabled
         let staleIDs = contextsByID.compactMap { (id, stored) in
             now.timeIntervalSince(stored.lastUpdatedAt) > timeout ? id : nil
         }
@@ -2420,13 +2678,67 @@ final class PromptRewriteConversationStore: ObservableObject {
                             partial += 1
                         }
                     }
+                    let recentTurns = Array(
+                        stored.turns
+                            .filter { !$0.isSummary }
+                            .suffix(autoCompactionRetainedExchangeTurns)
+                    )
+                    var expiredScopeKey: String?
+                    if shouldPersistExpiredHandoff,
+                       let store = resolvedSQLiteStore() {
+                        let scopeKey = scopeKeyForExpiredHandoff(
+                            context: stored.context,
+                            crossIDESharingEnabled: crossIDESharingEnabled
+                        )
+                        expiredScopeKey = scopeKey
+                        let expiredRecord = ExpiredConversationContextRecord(
+                            id: expiredContextRecordID(
+                                scopeKey: scopeKey,
+                                threadID: stored.context.id,
+                                expiredAt: now
+                            ),
+                            scopeKey: scopeKey,
+                            threadID: stored.context.id,
+                            bundleID: stored.context.bundleIdentifier,
+                            projectKey: contextLinkingKey(stored.context.projectKey),
+                            identityKey: contextLinkingKey(stored.context.identityKey),
+                            summaryText: summaryText,
+                            summaryMethod: .fallback,
+                            summaryConfidence: nil,
+                            sourceTurnCount: max(1, sourceTurnCount),
+                            recentTurnsJSON: encodedArchivedTurnsJSON(recentTurns),
+                            rawTurnsJSON: encodedArchivedTurnsJSON(stored.turns),
+                            trigger: MemoryPromotionTrigger.timeout.rawValue,
+                            expiredAt: now,
+                            deleteAfterAt: expiredContextDeleteAfterDate(from: now),
+                            consumedAt: nil,
+                            consumedByThreadID: nil,
+                            metadata: [
+                                "app_name": stored.context.appName,
+                                "screen_label": stored.context.screenLabel,
+                                "field_label": stored.context.fieldLabel,
+                                "logical_surface_key": stored.context.logicalSurfaceKey,
+                                "ai_summary_timeout_seconds": "\(expiredSummaryAITimeoutSeconds)",
+                                "retention_days": "\(expiredSummaryRetentionDays)"
+                            ]
+                        )
+                        try? store.upsertExpiredConversationContext(expiredRecord)
+                        enqueueExpiredSummaryAIEnrichment(record: expiredRecord)
+                    }
                     enqueueConversationPromotion(
                         context: stored.context,
                         summaryText: summaryText,
                         sourceTurnCount: max(1, sourceTurnCount),
                         compactionVersion: compactionVersion,
                         trigger: .timeout,
-                        recentTurns: Array(stored.turns.filter { !$0.isSummary }.suffix(autoCompactionRetainedExchangeTurns)),
+                        recentTurns: recentTurns,
+                        rawTurns: stored.turns,
+                        fallbackSummaryText: summaryText,
+                        promotionScopeKey: expiredScopeKey,
+                        summaryGenerationMetadata: [
+                            "summary_method": "fallback",
+                            "ai_timeout_seconds": "\(expiredSummaryAITimeoutSeconds)"
+                        ],
                         timestamp: now
                     )
                 }
@@ -3105,6 +3417,10 @@ final class PromptRewriteConversationStore: ObservableObject {
         compactionVersion: Int?,
         trigger: MemoryPromotionTrigger,
         recentTurns: [PromptRewriteConversationTurn],
+        rawTurns: [PromptRewriteConversationTurn]? = nil,
+        fallbackSummaryText: String? = nil,
+        promotionScopeKey: String? = nil,
+        summaryGenerationMetadata: [String: String] = [:],
         timestamp: Date
     ) {
         let tupleTags: ConversationTupleTags?
@@ -3131,6 +3447,10 @@ final class PromptRewriteConversationStore: ObservableObject {
             tupleTags: tupleTags,
             context: context,
             summaryText: summaryText,
+            fallbackSummaryText: fallbackSummaryText,
+            rawTurns: rawTurns,
+            promotionScopeKey: promotionScopeKey,
+            summaryGenerationMetadata: summaryGenerationMetadata,
             sourceTurnCount: max(1, sourceTurnCount),
             compactionVersion: compactionVersion,
             trigger: trigger,
@@ -3210,11 +3530,33 @@ enum PromptRewriteConversationContextResolver {
             return FocusMetadata(windowTitle: nil, documentLabel: nil, fieldLabel: nil)
         }
 
+        let fallbackWindowElement = frontmostFocusedWindowElement()
+
         let systemWide = AXUIElementCreateSystemWide()
         guard let focusedElement = axElementAttribute(kAXFocusedUIElementAttribute as CFString, from: systemWide) else {
+            let windowTitle = fallbackWindowElement
+                .flatMap { axStringAttribute(kAXTitleAttribute as CFString, from: $0) }
+                ?? frontmostFocusedWindowTitle()
+            let documentPath = fallbackWindowElement
+                .flatMap { axStringAttribute(kAXDocumentAttribute as CFString, from: $0) }
+            let documentLabel = documentPath.flatMap(deriveDocumentLabel)
+            let appSpecificContextLabel = codexContextLabel(
+                app: app,
+                windowElement: fallbackWindowElement,
+                fallbackWindowTitle: windowTitle
+            ) ?? antigravityContextLabel(
+                app: app,
+                windowElement: fallbackWindowElement,
+                fallbackWindowTitle: windowTitle
+            ) ?? telegramContextLabel(
+                app: app,
+                windowElement: fallbackWindowElement,
+                fallbackWindowTitle: windowTitle
+            )
+            let resolvedWindowTitle = appSpecificContextLabel ?? windowTitle
             return FocusMetadata(
-                windowTitle: normalizedLabel(frontmostFocusedWindowTitle()),
-                documentLabel: nil,
+                windowTitle: normalizedLabel(resolvedWindowTitle),
+                documentLabel: documentLabel,
                 fieldLabel: nil
             )
         }
@@ -3248,6 +3590,7 @@ enum PromptRewriteConversationContextResolver {
         }
 
         let windowElement = axElementAttribute(kAXWindowAttribute as CFString, from: focusedElement)
+            ?? fallbackWindowElement
         let windowTitle = windowElement.flatMap { axStringAttribute(kAXTitleAttribute as CFString, from: $0) }
             ?? frontmostFocusedWindowTitle()
         let documentPath = windowElement.flatMap { axStringAttribute(kAXDocumentAttribute as CFString, from: $0) }
@@ -3545,7 +3888,19 @@ enum PromptRewriteConversationContextResolver {
                     $0.role.caseInsensitiveCompare("AXButton") == .orderedSame &&
                         $0.label.caseInsensitiveCompare("Commit") == .orderedSame
                 }
-                if hasThreadActions && hasOpen && hasCommit {
+                let hasSecondaryAction = entries.contains {
+                    $0.label.caseInsensitiveCompare("Secondary action") == .orderedSame
+                }
+                let controlSignalCount = entries.reduce(0) { partialResult, entry in
+                    partialResult + (isCodexToolbarControlLabel(entry.label) ? 1 : 0)
+                }
+                let hasProjectCandidate = entries.contains {
+                    codexNormalizedTopBarProjectCandidate($0.label) != nil
+                }
+                if hasThreadActions && (hasOpen || hasCommit || hasSecondaryAction) {
+                    return element
+                }
+                if hasProjectCandidate && controlSignalCount >= 2 {
                     return element
                 }
             }
@@ -3590,14 +3945,13 @@ enum PromptRewriteConversationContextResolver {
         }), threadActionsIndex > 0 {
             for index in stride(from: threadActionsIndex - 1, through: 0, by: -1) {
                 let entry = entries[index]
-                guard entry.role.caseInsensitiveCompare("AXButton") == .orderedSame else { continue }
                 if let candidate = codexNormalizedTopBarProjectCandidate(entry.label) {
                     return candidate
                 }
             }
         }
 
-        for entry in entries where entry.role.caseInsensitiveCompare("AXButton") == .orderedSame {
+        for entry in entries {
             if let candidate = codexNormalizedTopBarProjectCandidate(entry.label) {
                 return candidate
             }
@@ -3842,7 +4196,14 @@ enum PromptRewriteConversationContextResolver {
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
         guard !normalized.isEmpty else { return nil }
         let lowered = normalized.lowercased()
-        let blocked: Set<String> = ["thread", "new thread", "current thread", "codex"]
+        let blocked: Set<String> = [
+            "thread",
+            "new thread",
+            "current thread",
+            "codex",
+            "unknown",
+            "unknown project"
+        ]
         if blocked.contains(lowered) {
             return nil
         }
@@ -4166,7 +4527,7 @@ enum PromptRewriteConversationContextResolver {
         return appName == "telegram" || appName.contains("telegram") || bundleID.contains("telegram")
     }
 
-    private static func frontmostFocusedWindowTitle() -> String? {
+    private static func frontmostFocusedWindowElement() -> AXUIElement? {
         let selfPID = ProcessInfo.processInfo.processIdentifier
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
               frontmostApp.processIdentifier != selfPID else {
@@ -4174,19 +4535,24 @@ enum PromptRewriteConversationContextResolver {
         }
 
         let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
-        if let focusedWindow = axElementAttribute(kAXFocusedWindowAttribute as CFString, from: appElement),
-           let title = axStringAttribute(kAXTitleAttribute as CFString, from: focusedWindow),
-           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return title
+        if let focusedWindow = axElementAttribute(kAXFocusedWindowAttribute as CFString, from: appElement) {
+            return focusedWindow
         }
 
-        if let firstWindow = axElementFromArrayAttribute(kAXWindowsAttribute as CFString, from: appElement),
-           let title = axStringAttribute(kAXTitleAttribute as CFString, from: firstWindow),
-           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return title
+        if let firstWindow = axElementFromArrayAttribute(kAXWindowsAttribute as CFString, from: appElement) {
+            return firstWindow
         }
 
         return nil
+    }
+
+    private static func frontmostFocusedWindowTitle() -> String? {
+        guard let window = frontmostFocusedWindowElement(),
+              let title = axStringAttribute(kAXTitleAttribute as CFString, from: window),
+              !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return title
     }
 
     private static func axElementAttribute(_ attribute: CFString, from element: AXUIElement) -> AXUIElement? {

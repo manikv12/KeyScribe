@@ -7,11 +7,16 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build-and-release:
     name: Build, Sign, Notarize & Release
     runs-on: macos-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy-pages.outputs.page_url }}
 
     steps:
       - name: Checkout
@@ -83,7 +88,6 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           DMG_FILE="dist/KeyScribe.dmg"
-          DMG_SIZE=$(stat -f%z "$DMG_FILE")
           DOWNLOAD_URL="https://github.com/manikv12/KeyScribe/releases/download/${{ github.ref_name }}/KeyScribe.dmg"
           SPARKLE_KEY_FILE="$(mktemp -t sparkle_ed25519)"
           trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
@@ -94,12 +98,17 @@ jobs:
           SIGNATURE=$(/tmp/sparkle/bin/sign_update "$DMG_FILE" --ed-key-file "$SPARKLE_KEY_FILE")
 
           # Generate appcast.xml
-          cat > dist/appcast.xml <<EOF
+          # NOTE: sign_update outputs 'sparkle:edSignature="..." length="..."'
+          # so we do not add a separate length attribute.
+          cat > dist/appcast.xml <<'APPCAST_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
             <channel>
               <title>KeyScribe Updates</title>
               <link>https://manikv12.github.io/KeyScribe/appcast.xml</link>
+          APPCAST_EOF
+
+          cat >> dist/appcast.xml <<EOF
               <item>
                 <title>Version ${VERSION}</title>
                 <sparkle:version>${VERSION}</sparkle:version>
@@ -107,7 +116,6 @@ jobs:
                 <pubDate>$(date -R)</pubDate>
                 <enclosure
                   url="${DOWNLOAD_URL}"
-                  length="${DMG_SIZE}"
                   type="application/octet-stream"
                   ${SIGNATURE}
                 />
@@ -125,15 +133,16 @@ jobs:
           generate_release_notes: true
           files: dist/KeyScribe.dmg
 
-      - name: Publish appcast to GitHub Pages
+      - name: Prepare Pages content
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p pages
+          cp dist/appcast.xml pages/appcast.xml
 
-          # Create or update gh-pages branch with appcast.xml
-          git checkout --orphan gh-pages-tmp 2>/dev/null || git checkout gh-pages-tmp
-          git rm -rf . 2>/dev/null || true
-          cp dist/appcast.xml appcast.xml
-          git add appcast.xml
-          git commit -m "Update appcast for ${{ github.ref_name }}"
-          git push origin HEAD:gh-pages --force
+      - name: Upload appcast as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+      - name: Deploy to GitHub Pages
+        id: deploy-pages
+        uses: actions/deploy-pages@v4

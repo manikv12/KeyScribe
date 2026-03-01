@@ -743,17 +743,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         // Preserve user-requested original text (for example Esc in rewrite HUD)
         // without applying adaptive correction post-processing.
         let preserveInsertionText: Bool
+        // When users explicitly request original text (for example Esc in preview),
+        // briefly re-activate the target app before paste so focus is restored.
+        let forceTargetRefocusBeforeInsert: Bool
 
         init(
             insertionText: String,
             conversationContext: PromptRewriteConversationContext?,
             insertionHUDContext: PromptRewriteInsertionHUDContext,
-            preserveInsertionText: Bool = false
+            preserveInsertionText: Bool = false,
+            forceTargetRefocusBeforeInsert: Bool = false
         ) {
             self.insertionText = insertionText
             self.conversationContext = conversationContext
             self.insertionHUDContext = insertionHUDContext
             self.preserveInsertionText = preserveInsertionText
+            self.forceTargetRefocusBeforeInsert = forceTargetRefocusBeforeInsert
+        }
+    }
+
+    private struct PromptRewriteLoadingNarrative {
+        let transcript: String
+        let aiSuggestionsEnabled: Bool
+        let aiGenerationSummary: String
+        let aiRuntimeSummary: String?
+
+        func displayState(step: String) -> PromptRewriteLoadingDisplayState {
+            PromptRewriteLoadingDisplayState(
+                transcription: transcript,
+                currentStep: step,
+                aiSuggestionsEnabled: aiSuggestionsEnabled,
+                aiGenerationSummary: aiGenerationSummary,
+                aiRuntimeSummary: aiRuntimeSummary
+            )
         }
     }
 
@@ -1674,7 +1696,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         insertText(
             readyForInsert,
             trackCorrections: settings.adaptiveCorrectionsEnabled,
-            insertionContext: rewriteResolution.insertionHUDContext
+            insertionContext: rewriteResolution.insertionHUDContext,
+            forceActivateTargetBeforeInsert: rewriteResolution.forceTargetRefocusBeforeInsert
         )
         setUIStatus(.ready)
     }
@@ -1697,6 +1720,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         )
         let conversationContext = conversationRequestContext?.activeContext
         let conversationHistory = conversationRequestContext?.mergedHistory ?? []
+        let loadingNarrative = makePromptRewriteLoadingNarrative(
+            cleanedTranscript: cleanedTranscript,
+            conversationHistoryTurnCount: conversationHistory.count
+        )
 
         if let conversationRequestContext {
             scheduleAIMappingEvaluationIfNeeded(
@@ -1710,7 +1737,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             do {
                 let refinementStart = Date()
                 PromptRewriteHUDManager.shared.showLoadingIndicator(
-                    insertionContext: insertionSessionContext.insertionHUDContext
+                    insertionContext: insertionSessionContext.insertionHUDContext,
+                    displayState: loadingNarrative.displayState(step: "Preparing rewrite request")
                 )
                 let retrievalOutcome: PromptRewriteRetrievalOutcome
                 do {
@@ -1723,7 +1751,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                         for: cleanedTranscript,
                         conversationContext: conversationContext,
                         conversationHistory: conversationHistory,
-                        insertionContext: insertionSessionContext.insertionHUDContext
+                        insertionContext: insertionSessionContext.insertionHUDContext,
+                        loadingNarrative: loadingNarrative
                     )
                 }
 
@@ -1738,7 +1767,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     return PromptRewriteInsertionResolution(
                         insertionText: cleanedTranscript,
                         conversationContext: conversationContext,
-                        insertionHUDContext: insertionSessionContext.insertionHUDContext
+                        insertionHUDContext: insertionSessionContext.insertionHUDContext,
+                        forceTargetRefocusBeforeInsert: true
                     )
                 }
 
@@ -1860,7 +1890,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                             insertionText: cleanedTranscript,
                             conversationContext: conversationContext,
                             insertionHUDContext: insertionSessionContext.insertionHUDContext,
-                            preserveInsertionText: true
+                            preserveInsertionText: true,
+                            forceTargetRefocusBeforeInsert: true
                         )
                     case .rejectSuggestion:
                         await recordPromptRewriteFeedback(
@@ -1892,7 +1923,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                         insertionText: cleanedTranscript,
                         conversationContext: conversationContext,
                         insertionHUDContext: insertionSessionContext.insertionHUDContext,
-                        preserveInsertionText: true
+                        preserveInsertionText: true,
+                        forceTargetRefocusBeforeInsert: true
                     )
                 case .close:
                     await recordPromptRewriteFeedback(
@@ -1906,20 +1938,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
     }
 
+    private func makePromptRewriteLoadingNarrative(
+        cleanedTranscript: String,
+        conversationHistoryTurnCount: Int
+    ) -> PromptRewriteLoadingNarrative {
+        let transcript = cleanedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let aiSuggestionsEnabled = settings.promptRewriteEnabled
+        guard aiSuggestionsEnabled else {
+            return PromptRewriteLoadingNarrative(
+                transcript: transcript,
+                aiSuggestionsEnabled: false,
+                aiGenerationSummary: "AI suggestions are disabled. KeyScribe will insert the cleaned transcription as-is.",
+                aiRuntimeSummary: nil
+            )
+        }
+
+        let providerLabel = settings.promptRewriteProviderMode.displayName
+        let configuredModel = settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelLabel = configuredModel.isEmpty
+            ? settings.promptRewriteProviderMode.defaultModel
+            : configuredModel
+        let styleLabel = settings.promptRewriteStylePreset.rawValue
+            .replacingOccurrences(of: " (Default)", with: "")
+        let historyPhrase: String
+        if settings.promptRewriteConversationHistoryEnabled {
+            if conversationHistoryTurnCount > 0 {
+                historyPhrase = "\(conversationHistoryTurnCount) prior turn(s)"
+            } else {
+                historyPhrase = "current utterance only"
+            }
+        } else {
+            historyPhrase = "history disabled"
+        }
+        let insertionPath = settings.promptRewriteAutoInsertEnabled
+            ? "auto-insert for high confidence"
+            : "manual preview before insert"
+        let processNarrative = "Improving clarity, grammar, and tone from your transcript while preserving intent."
+        let contextNarrative = "Context source: \(historyPhrase)."
+        let decisionNarrative = "Decision path: \(insertionPath)."
+
+        return PromptRewriteLoadingNarrative(
+            transcript: transcript,
+            aiSuggestionsEnabled: true,
+            aiGenerationSummary: "\(processNarrative) Style profile: \(styleLabel). \(contextNarrative) \(decisionNarrative)",
+            aiRuntimeSummary: "\(providerLabel) · \(modelLabel)"
+        )
+    }
+
     private func retrievePromptRewriteSuggestionOrBypass(
         for cleanedTranscript: String,
         conversationContext: PromptRewriteConversationContext?,
         conversationHistory: [PromptRewriteConversationTurn],
-        insertionContext: PromptRewriteInsertionHUDContext
+        insertionContext: PromptRewriteInsertionHUDContext,
+        loadingNarrative: PromptRewriteLoadingNarrative
     ) async throws -> PromptRewriteRetrievalOutcome {
         PromptRewriteHUDManager.shared.clearLoadingBypassRequest(insertionContext: insertionContext)
+        PromptRewriteHUDManager.shared.updateLoadingIndicator(
+            insertionContext: insertionContext,
+            displayState: loadingNarrative.displayState(step: "Connecting to AI suggestion service")
+        )
 
         return try await withThrowingTaskGroup(of: PromptRewriteRetrievalOutcome.self) { group in
             group.addTask {
+                await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                    insertionContext: insertionContext,
+                    displayState: loadingNarrative.displayState(step: "Sending transcript for rewrite suggestion")
+                )
                 let suggestion = try await PromptRewriteService.shared.retrieveSuggestion(
                     for: cleanedTranscript,
                     conversationContext: conversationContext,
                     conversationHistory: conversationHistory
+                )
+                await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                    insertionContext: insertionContext,
+                    displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
                 )
                 return .suggestion(suggestion)
             }
@@ -1929,6 +2021,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     if await PromptRewriteHUDManager.shared.consumeLoadingBypassRequest(
                         insertionContext: insertionContext
                     ) {
+                        await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                            insertionContext: insertionContext,
+                            displayState: loadingNarrative.displayState(step: "Paused AI refinement. Restoring transcript")
+                        )
                         return .bypassed
                     }
                     if Task.isCancelled {
@@ -1943,6 +2039,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 return .suggestion(nil)
             }
 
+            PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                insertionContext: insertionContext,
+                displayState: loadingNarrative.displayState(step: "Finalizing rewrite decision")
+            )
             group.cancelAll()
             return firstResult
         }
@@ -2436,11 +2536,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         forceCopyToClipboard: Bool = false,
         overrideCopyToClipboard: Bool? = nil,
         trackCorrections: Bool = false,
-        insertionContext: PromptRewriteInsertionHUDContext? = nil
+        insertionContext: PromptRewriteInsertionHUDContext? = nil,
+        forceActivateTargetBeforeInsert: Bool = false
     ) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard ensureAccessibilityReadyForInsertion() else { return }
         let copyToClipboard = overrideCopyToClipboard ?? (settings.copyToClipboard || forceCopyToClipboard)
+        if forceActivateTargetBeforeInsert,
+           let target = targetApplication(for: insertionContext),
+           !target.isTerminated {
+            lastTargetApplication = target
+            _ = target.activate(options: [.activateIgnoringOtherApps])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+                self?.attemptInsertText(
+                    text,
+                    copyToClipboard: copyToClipboard,
+                    attemptsRemaining: 5,
+                    insertionContext: insertionContext
+                ) { [weak self] didInsert in
+                    guard let self else { return }
+                    if didInsert {
+                        self.playDictationFeedbackSound(.pasted)
+                    }
+                    guard trackCorrections else { return }
+                    if didInsert {
+                        self.postInsertCorrectionMonitor.startMonitoring(insertedText: text)
+                    }
+                }
+            }
+            return
+        }
         attemptInsertText(
             text,
             copyToClipboard: copyToClipboard,

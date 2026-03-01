@@ -19,10 +19,30 @@ protocol MemoryRewriteExtractionProviding {
         provider: MemoryProviderKind
     ) async -> MemoryLessonDraft?
 
+    func summarizeConversationHandoff(
+        summarySeed: String,
+        recentTurns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext,
+        timeoutSeconds: Int
+    ) async -> (text: String, confidence: Double?, method: String)
+
     func hasAIBackedIndexingAccess(for provider: MemoryProviderKind) async -> Bool
 }
 
 extension MemoryRewriteExtractionProviding {
+    func summarizeConversationHandoff(
+        summarySeed: String,
+        recentTurns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext,
+        timeoutSeconds: Int
+    ) async -> (text: String, confidence: Double?, method: String) {
+        _ = recentTurns
+        _ = context
+        _ = timeoutSeconds
+        let normalized = MemoryTextNormalizer.normalizedBody(summarySeed)
+        return (normalized, nil, "deterministic-fallback")
+    }
+
     func hasAIBackedIndexingAccess(for provider: MemoryProviderKind) async -> Bool {
         _ = provider
         return false
@@ -96,6 +116,67 @@ final class StubMemoryRewriteExtractionProvider: MemoryRewriteExtractionProvidin
     func hasAIBackedIndexingAccess(for provider: MemoryProviderKind) async -> Bool {
         _ = provider
         return await aiLessonProvider.hasLiveSynthesisConfiguration()
+    }
+
+    func summarizeConversationHandoff(
+        summarySeed: String,
+        recentTurns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext,
+        timeoutSeconds: Int
+    ) async -> (text: String, confidence: Double?, method: String) {
+        enum HandoffResult {
+            case ai(text: String, confidence: Double, method: String)
+            case unavailable
+            case timeout
+        }
+
+        let normalizedSeed = MemoryTextNormalizer.normalizedBody(summarySeed)
+        let deterministicFallback = deterministicHandoffSummary(
+            summarySeed: normalizedSeed,
+            recentTurns: recentTurns,
+            context: context
+        )
+        let fallbackText = deterministicFallback.isEmpty ? normalizedSeed : deterministicFallback
+        let hardTimeoutSeconds = min(60, max(1, timeoutSeconds))
+
+        let racedResult = await withTaskGroup(of: HandoffResult.self) { group in
+            group.addTask { [aiLessonProvider] in
+                guard let aiSummary = await aiLessonProvider.synthesizeHandoffSummary(
+                    summarySeed: normalizedSeed,
+                    recentTurns: recentTurns,
+                    context: context
+                ) else {
+                    return .unavailable
+                }
+                return .ai(
+                    text: aiSummary.text,
+                    confidence: aiSummary.confidence,
+                    method: aiSummary.method
+                )
+            }
+            group.addTask {
+                let nanoseconds = UInt64(hardTimeoutSeconds) * 1_000_000_000
+                try? await Task.sleep(nanoseconds: nanoseconds)
+                return .timeout
+            }
+
+            let first = await group.next() ?? .unavailable
+            group.cancelAll()
+            return first
+        }
+
+        switch racedResult {
+        case let .ai(text, confidence, method):
+            let normalizedAI = MemoryTextNormalizer.normalizedBody(text)
+            if normalizedAI.isEmpty {
+                return (fallbackText, nil, "deterministic-fallback")
+            }
+            return (normalizedAI, min(1.0, max(0.0, confidence)), method)
+        case .timeout:
+            return (fallbackText, nil, "deterministic-timeout-fallback")
+        case .unavailable:
+            return (fallbackText, nil, "deterministic-fallback")
+        }
     }
 
     private func sourceMetadata(
@@ -172,6 +253,85 @@ final class StubMemoryRewriteExtractionProvider: MemoryRewriteExtractionProvidin
             return nil
         }
         return trimmed
+    }
+
+    private func deterministicHandoffSummary(
+        summarySeed: String,
+        recentTurns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext
+    ) -> String {
+        let seed = MemoryTextNormalizer.normalizedBody(summarySeed)
+        let recentWindow = Array(recentTurns.suffix(8))
+        let userSignals = distinctHandoffSnippets(
+            from: recentWindow.filter { !$0.isSummary }.map(\.userText),
+            limit: 3,
+            snippetLimit: 180
+        )
+        let assistantSignals = distinctHandoffSnippets(
+            from: recentWindow.filter { !$0.isSummary }.map(\.assistantText),
+            limit: 3,
+            snippetLimit: 200
+        )
+
+        var sections: [String] = []
+        sections.append("## Context")
+        sections.append("- \(context.providerContextLabel)")
+
+        if !seed.isEmpty {
+            sections.append("")
+            sections.append("## Prior Summary")
+            sections.append("- \(MemoryTextNormalizer.normalizedSummary(seed, limit: 420))")
+        }
+
+        if !userSignals.isEmpty {
+            sections.append("")
+            sections.append("## User Intent Signals")
+            sections.append(contentsOf: userSignals.map { "- \($0)" })
+        }
+
+        if !assistantSignals.isEmpty {
+            sections.append("")
+            sections.append("## Assistant Progress Signals")
+            sections.append(contentsOf: assistantSignals.map { "- \($0)" })
+        }
+
+        sections.append("")
+        sections.append("## Handoff")
+        sections.append("- Continue from the latest user intent and explicit constraints.")
+        sections.append("- Keep continuity with this app context and conversation style.")
+
+        let built = handoffSnippet(sections.joined(separator: "\n"), limit: 1_600)
+        return MemoryTextNormalizer.normalizedBody(built)
+    }
+
+    private func distinctHandoffSnippets(
+        from values: [String],
+        limit: Int,
+        snippetLimit: Int
+    ) -> [String] {
+        var output: [String] = []
+        var seen: Set<String> = []
+
+        for value in values {
+            let normalized = MemoryTextNormalizer.normalizedBody(value)
+            guard !normalized.isEmpty else { continue }
+            let concise = handoffSnippet(normalized, limit: snippetLimit)
+            let key = concise.lowercased()
+            guard !key.isEmpty, !seen.contains(key) else { continue }
+            seen.insert(key)
+            output.append(concise)
+            if output.count >= limit {
+                break
+            }
+        }
+
+        return output
+    }
+
+    private func handoffSnippet(_ value: String, limit: Int) -> String {
+        let normalized = MemoryTextNormalizer.normalizedBody(value)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(max(0, limit - 3))) + "..."
     }
 }
 
@@ -352,6 +512,95 @@ private actor MemoryAILessonSynthesisProvider {
                 "ai_model": configuration.model,
                 "fallback_rule": "none"
             ]
+        )
+    }
+
+    func synthesizeHandoffSummary(
+        summarySeed: String,
+        recentTurns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext
+    ) async -> (text: String, confidence: Double, method: String)? {
+        guard let configuration = liveConfiguration() else { return nil }
+        guard configuration.hasCredentials else { return nil }
+
+        let credential: ProviderCredential
+        do {
+            credential = try await resolveCredential(for: configuration)
+        } catch {
+            return nil
+        }
+
+        if configuration.providerMode.requiresAPIKey {
+            if case .none = credential {
+                return nil
+            }
+        }
+
+        let systemPrompt = """
+        You enrich conversation handoff summaries for long-term memory promotion.
+        Return strict JSON only:
+        {
+          "summary_text": string,
+          "confidence": number
+        }
+        Rules:
+        - summary_text must be concise, specific, and carry forward intent, constraints, and recent progress.
+        - confidence must be 0.0 to 1.0 and reflect summary usefulness for future continuation.
+        - Avoid greetings, pleasantries, or generic filler.
+        - Preserve factual context only; do not invent details.
+        """
+
+        let userPrompt = """
+        Context:
+        - app_name: \(snippet(context.appName, limit: 80))
+        - bundle_id: \(snippet(context.bundleIdentifier, limit: 120))
+        - screen_label: \(snippet(context.screenLabel, limit: 120))
+        - field_label: \(snippet(context.fieldLabel, limit: 120))
+        - project_label: \(snippet(context.projectLabel ?? "", limit: 120))
+        - identity_label: \(snippet(context.identityLabel ?? "", limit: 120))
+
+        Summary seed:
+        \(snippet(summarySeed, limit: 1600))
+
+        Recent turns:
+        \(formattedTurnsForHandoffSummaryPrompt(recentTurns))
+        """
+
+        let request: URLRequest
+        do {
+            request = try buildRequest(
+                configuration: configuration,
+                credential: credential,
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt
+            )
+        } catch {
+            return nil
+        }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            return nil
+        }
+
+        guard let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let parsed = parseHandoffSummaryResponse(
+                data: data,
+                providerMode: configuration.providerMode
+              ) else {
+            return nil
+        }
+
+        let normalizedText = MemoryTextNormalizer.normalizedBody(parsed.text)
+        guard !normalizedText.isEmpty else { return nil }
+        return (
+            text: normalizedText,
+            confidence: min(1.0, max(0.0, parsed.confidence)),
+            method: "ai-\(configuration.providerMode.rawValue.lowercased())"
         )
     }
 
@@ -804,6 +1053,37 @@ private actor MemoryAILessonSynthesisProvider {
         )
     }
 
+    private func parseHandoffSummaryResponse(
+        data: Data,
+        providerMode: PromptRewriteProviderMode
+    ) -> (text: String, confidence: Double)? {
+        let content: String
+        if providerMode == .anthropic {
+            content = decodeAnthropicContent(data: data)
+        } else {
+            content = decodeOpenAICompatibleContent(data: data)
+        }
+
+        let cleaned = sanitizeModelJSONText(content)
+        guard let payloadData = cleaned.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: payloadData, options: [])) as? [String: Any] else {
+            return nil
+        }
+
+        guard let summary = extractString(
+            from: object,
+            keys: ["summary_text", "summary", "handoff_summary", "handoff", "text"]
+        ) else {
+            return nil
+        }
+        let confidence = extractDouble(
+            from: object,
+            keys: ["confidence", "summary_confidence", "score"]
+        ) ?? 0.72
+
+        return (summary, confidence)
+    }
+
     private func extractString(from object: [String: Any], keys: [String]) -> String? {
         for key in keys {
             guard let raw = object[key] else { continue }
@@ -857,5 +1137,21 @@ private actor MemoryAILessonSynthesisProvider {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized.count > limit else { return normalized }
         return String(normalized.prefix(max(0, limit - 3))) + "..."
+    }
+
+    private func formattedTurnsForHandoffSummaryPrompt(_ turns: [PromptRewriteConversationTurn]) -> String {
+        let recent = turns.suffix(8)
+        guard !recent.isEmpty else { return "- none" }
+
+        var lines: [String] = []
+        for turn in recent {
+            if turn.isSummary {
+                lines.append("- summary: \(snippet(turn.assistantText, limit: 320))")
+            } else {
+                lines.append("- user: \(snippet(turn.userText, limit: 260))")
+                lines.append("  assistant: \(snippet(turn.assistantText, limit: 260))")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 }

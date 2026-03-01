@@ -69,6 +69,9 @@ struct AIMemoryStudioView: View {
     @State private var conversationPatternStats: [MemoryPatternStats] = []
     @State private var selectedConversationPatternKey = ""
     @State private var conversationPatternOccurrences: [MemoryPatternOccurrence] = []
+    @State private var expiredConversationHandoffCount = 0
+    @State private var lastConversationHandoffSummaryMethod = "fallback"
+    @State private var lastConversationPromotionDecisionSummary = "No promotion decision yet."
     @State private var showConversationContextInspectSheet = false
     @State private var inspectedConversationContextID = ""
     @State private var showConversationContextMappingsSheet = false
@@ -924,6 +927,32 @@ struct AIMemoryStudioView: View {
                         value: "\(totalConversationEstimatedTokenCount)",
                         tint: AppVisualTheme.accentTint
                     )
+                }
+
+                HStack(spacing: 8) {
+                    metricPill(
+                        label: "Expired Handoffs",
+                        value: "\(expiredConversationHandoffCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Last Method",
+                        value: lastConversationHandoffSummaryMethod.uppercased(),
+                        tint: AppVisualTheme.accentTint
+                    )
+                    Spacer(minLength: 0)
+                }
+
+                HStack(alignment: .top, spacing: 8) {
+                    Text("Last promotion decision")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(lastConversationPromotionDecisionSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
                 }
 
                 HStack {
@@ -3506,6 +3535,7 @@ struct AIMemoryStudioView: View {
             timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes
         )
         conversationContextDetails = details
+        refreshConversationArchiveDiagnostics()
         sanitizePinnedConversationContextSelection()
 
         let normalizedInspectedID = inspectedConversationContextID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4568,10 +4598,69 @@ struct AIMemoryStudioView: View {
             && normalized != "issue-hey"
     }
 
+    private struct ConversationArchiveDiagnosticsSnapshot {
+        let expiredCount: Int
+        let lastSummaryMethod: String
+        let lastPromotionDecisionSummary: String
+
+        static let empty = ConversationArchiveDiagnosticsSnapshot(
+            expiredCount: 0,
+            lastSummaryMethod: "fallback",
+            lastPromotionDecisionSummary: "No promotion decision yet."
+        )
+    }
+
+    private func refreshConversationArchiveDiagnostics() {
+        let snapshot = loadConversationArchiveDiagnosticsSnapshot()
+        expiredConversationHandoffCount = snapshot.expiredCount
+        lastConversationHandoffSummaryMethod = snapshot.lastSummaryMethod
+        lastConversationPromotionDecisionSummary = snapshot.lastPromotionDecisionSummary
+    }
+
+    private func loadConversationArchiveDiagnosticsSnapshot() -> ConversationArchiveDiagnosticsSnapshot {
+        do {
+            let store = try MemorySQLiteStore()
+            let diagnostics = try store.fetchExpiredConversationContextDiagnostics()
+            return ConversationArchiveDiagnosticsSnapshot(
+                expiredCount: max(0, diagnostics.totalCount),
+                lastSummaryMethod: diagnostics.lastSummaryMethod.rawValue,
+                lastPromotionDecisionSummary: diagnostics.lastPromotionDecisionSummary
+            )
+        } catch {
+            return .empty
+        }
+    }
+
+    private func purgeExpiredConversationContextArchiveMaintenance() -> (
+        expiredDeleted: Int,
+        retentionDeleted: Int,
+        rowLimitDeleted: Int,
+        rawSizeDeleted: Int
+    )? {
+        do {
+            let store = try MemorySQLiteStore()
+            return try store.purgeExpiredConversationContextArchive()
+        } catch {
+            return nil
+        }
+    }
+
     private func runQualityMaintenance() {
         let result = memoryIndexingSettingsService.runQualityMaintenance()
-        memoryActionMessage = result.message
-        if result.didRun {
+        let archivePurgeResult = purgeExpiredConversationContextArchiveMaintenance()
+        let archiveDeletedCount = (archivePurgeResult?.expiredDeleted ?? 0)
+            + (archivePurgeResult?.retentionDeleted ?? 0)
+            + (archivePurgeResult?.rowLimitDeleted ?? 0)
+            + (archivePurgeResult?.rawSizeDeleted ?? 0)
+
+        var message = result.message
+        if let archivePurgeResult {
+            message += " Expired handoff archive purge: deleted \(archivePurgeResult.expiredDeleted) expired, \(archivePurgeResult.retentionDeleted) by retention, \(archivePurgeResult.rowLimitDeleted) by row cap, \(archivePurgeResult.rawSizeDeleted) by raw-byte cap."
+        }
+        memoryActionMessage = message
+
+        refreshConversationArchiveDiagnostics()
+        if result.didRun || archiveDeletedCount > 0 {
             refreshMemoryBrowser()
             refreshMemoryAnalytics()
         }
