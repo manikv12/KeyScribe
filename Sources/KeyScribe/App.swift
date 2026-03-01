@@ -10,6 +10,50 @@ extension Notification.Name {
     static let keyScribeOpenSettings = Notification.Name("KeyScribe.openSettings")
 }
 
+@MainActor
+final class UpdateCheckStatusStore: ObservableObject {
+    enum State: Equatable {
+        case idle
+        case checking
+        case upToDate
+        case updateAvailable(version: String)
+        case failed(message: String)
+    }
+
+    static let shared = UpdateCheckStatusStore()
+
+    @Published private(set) var state: State = .idle
+    @Published private(set) var lastCheckedAt: Date?
+
+    var isChecking: Bool {
+        if case .checking = state {
+            return true
+        }
+        return false
+    }
+
+    private init() {}
+
+    func beginCheck() {
+        state = .checking
+    }
+
+    func markUpToDate() {
+        state = .upToDate
+        lastCheckedAt = Date()
+    }
+
+    func markUpdateAvailable(version: String) {
+        state = .updateAvailable(version: version)
+        lastCheckedAt = Date()
+    }
+
+    func markFailed(message: String) {
+        state = .failed(message: message)
+        lastCheckedAt = Date()
+    }
+}
+
 private struct PromptRewriteAIMappingCandidate {
     let prompt: ConversationClarificationPrompt
     let candidateKey: String
@@ -618,15 +662,20 @@ struct KeyScribeApp: App {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private enum PasteLastTranscriptShortcut {
         static let keyCode: UInt16 = 9 // V
         static let modifiers: NSEvent.ModifierFlags = [.command, .option]
     }
 
-    private(set) lazy var updaterController = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
-    )
+    private(set) lazy var updaterController: SPUStandardUpdaterController = {
+        SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: self,
+            userDriverDelegate: nil
+        )
+    }()
+    private let updateCheckStatusStore = UpdateCheckStatusStore.shared
 
     private let transcriber = SpeechTranscriber()
     private let whisperModelManager = WhisperModelManager.shared
@@ -819,6 +868,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         CrashReporter.install()
         NSApp.setActivationPolicy(.accessory)
+        _ = updaterController
 
         // Set app icon programmatically to bypass macOS automatic icon margin
         if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
@@ -1025,6 +1075,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         updatePermissionGate(openOnboardingIfNeeded: true)
+    }
+
+    func checkForUpdatesFromSettings() {
+        guard let feedURLRaw = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
+              !feedURLRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              URL(string: feedURLRaw) != nil else {
+            updateCheckStatusStore.markFailed(message: "Update feed URL is missing or invalid.")
+            return
+        }
+
+        let updater = updaterController.updater
+        guard updater.canCheckForUpdates else {
+            updateCheckStatusStore.markFailed(message: "An update check is already in progress.")
+            return
+        }
+
+        updateCheckStatusStore.beginCheck()
+        updaterController.checkForUpdates(nil)
+    }
+
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        updateCheckStatusStore.markUpdateAvailable(version: item.displayVersionString)
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: any Error) {
+        updateCheckStatusStore.markUpToDate()
+    }
+
+    func updater(_ updater: SPUUpdater, didAbortWithError error: any Error) {
+        updateCheckStatusStore.markFailed(message: readableUpdateErrorMessage(error))
+    }
+
+    func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: (any Error)?) {
+        guard updateCheckStatusStore.isChecking else { return }
+
+        if let error {
+            updateCheckStatusStore.markFailed(message: readableUpdateErrorMessage(error))
+        } else {
+            updateCheckStatusStore.markUpToDate()
+        }
+    }
+
+    private func readableUpdateErrorMessage(_ error: any Error) -> String {
+        let nsError = error as NSError
+        if let failureReason = nsError.localizedFailureReason?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !failureReason.isEmpty {
+            return failureReason
+        }
+        let description = nsError.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        return description.isEmpty ? "Unknown update error." : description
     }
 
     private func currentPermissionSnapshot() -> PermissionCenter.Snapshot {
@@ -2808,6 +2908,7 @@ struct SettingsView: View {
     @StateObject private var adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
     @StateObject private var localAISetupService = LocalAISetupService.shared
+    @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
     @State private var selectedSection: SettingsSection = .essentials
     @State private var searchQuery = ""
     @State private var hoveredSection: SettingsSection?
@@ -2861,6 +2962,53 @@ struct SettingsView: View {
     private let settingsSidebarWidth: CGFloat = 304
     private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
         ShortcutKeyOption(keyCode: $0, label: ShortcutValidation.keyName(for: $0))
+    }
+
+    private var appVersionDisplayText: String {
+        let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let buildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+
+        let short = shortVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let build = buildVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        switch (short.isEmpty, build.isEmpty) {
+        case (false, false):
+            return "Version \(short) (\(build))"
+        case (false, true):
+            return "Version \(short)"
+        case (true, false):
+            return "Build \(build)"
+        case (true, true):
+            return "Version unavailable"
+        }
+    }
+
+    @ViewBuilder
+    private var updateCheckStatusRow: some View {
+        switch updateCheckStatusStore.state {
+        case .idle:
+            EmptyView()
+        case .checking:
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Checking for updates…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .upToDate:
+            Label("You’re up to date.", systemImage: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(Color.green.opacity(0.92))
+        case .updateAvailable(let version):
+            Label("Update \(version) is available.", systemImage: "arrow.down.circle.fill")
+                .font(.caption)
+                .foregroundStyle(AppVisualTheme.accentTint)
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(Color.red.opacity(0.92))
+        }
     }
 
     var body: some View {
@@ -5426,14 +5574,16 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("KeyScribe")
                             .font(.headline)
-                        Text("Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "–"))")
+                        Text(appVersionDisplayText)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        updateCheckStatusRow
                     }
                     Spacer()
-                    Button("Check for Updates…") {
-                        (NSApp.delegate as? AppDelegate)?.updaterController.checkForUpdates(nil)
+                    Button(updateCheckStatusStore.isChecking ? "Checking…" : "Check for Updates…") {
+                        (NSApp.delegate as? AppDelegate)?.checkForUpdatesFromSettings()
                     }
+                    .disabled(updateCheckStatusStore.isChecking)
                 }
             }
 

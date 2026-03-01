@@ -13,9 +13,55 @@ DMG_VOLUME_NAME="${APP_NAME} Installer"
 PROJECT_ROOT="$(pwd)"
 APP_DIR_ABS="${PROJECT_ROOT}/${APP_DIR}"
 DIST_DIR_ABS="${PROJECT_ROOT}/dist"
+SOURCE_INFO_PLIST="Resources/Info.plist"
+PLIST_BUDDY="/usr/libexec/PlistBuddy"
 
 INSTALL_APP=false
 MAKE_DMG=false
+
+read_source_plist_value() {
+    local key="$1"
+    "$PLIST_BUDDY" -c "Print :${key}" "$SOURCE_INFO_PLIST" 2>/dev/null || true
+}
+
+resolve_marketing_version() {
+    local tagged_version
+    tagged_version="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+    if [ -n "$tagged_version" ]; then
+        echo "${tagged_version#v}"
+        return
+    fi
+
+    local plist_version
+    plist_version="$(read_source_plist_value "CFBundleShortVersionString")"
+    if [ -n "$plist_version" ]; then
+        echo "$plist_version"
+        return
+    fi
+
+    echo "1.0.0"
+}
+
+resolve_build_version() {
+    local commit_count
+    commit_count="$(git rev-list --count HEAD 2>/dev/null || true)"
+    if [[ "$commit_count" =~ ^[0-9]+$ ]] && [ "$commit_count" -gt 0 ]; then
+        echo "$commit_count"
+        return
+    fi
+
+    local plist_build
+    plist_build="$(read_source_plist_value "CFBundleVersion")"
+    if [[ "$plist_build" =~ ^[0-9]+$ ]] && [ "$plist_build" -gt 0 ]; then
+        echo "$plist_build"
+        return
+    fi
+
+    echo "1"
+}
+
+APP_MARKETING_VERSION="${KEYSCRIBE_VERSION:-$(resolve_marketing_version)}"
+APP_BUILD_VERSION="${KEYSCRIBE_BUILD_VERSION:-$(resolve_build_version)}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -34,6 +80,7 @@ for arg in "$@"; do
 done
 
 echo "Building ${APP_NAME} (Release)..."
+echo "Using app version ${APP_MARKETING_VERSION} (${APP_BUILD_VERSION})"
 if [ ! -d "Vendor/Whisper/whisper.xcframework" ]; then
     echo "whisper.xcframework not found, downloading framework..."
     Scripts/update-whisper-framework.sh
@@ -73,9 +120,11 @@ if ! otool -l "$APP_BINARY" | grep -q "@executable_path/../Frameworks"; then
 fi
 
 echo "Copying Info.plist and resources..."
-cp Resources/Info.plist "$APP_DIR/Contents/"
+cp "$SOURCE_INFO_PLIST" "$APP_DIR/Contents/"
 cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
 cp Resources/AppIcon.png "$APP_DIR/Contents/Resources/"
+"$PLIST_BUDDY" -c "Set :CFBundleShortVersionString ${APP_MARKETING_VERSION}" "$APP_DIR/Contents/Info.plist"
+"$PLIST_BUDDY" -c "Set :CFBundleVersion ${APP_BUILD_VERSION}" "$APP_DIR/Contents/Info.plist"
 
 echo "Applying code signature..."
 if [ -n "${DEVELOPER_ID:-}" ]; then

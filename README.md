@@ -28,6 +28,14 @@ It runs entirely as a menu-bar utility (no Dock icon). Everything is stored loca
 
 ---
 
+## User Guide
+
+For a full step-by-step walkthrough (setup, permissions, daily workflows, AI features, updates, and troubleshooting), see:
+
+- [KeyScribe User Guide](Docs/User-Guide.md)
+
+---
+
 ## Features
 
 ### 🎙️ Transcription
