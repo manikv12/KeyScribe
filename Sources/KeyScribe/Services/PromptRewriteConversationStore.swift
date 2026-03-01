@@ -3875,7 +3875,10 @@ enum PromptRewriteConversationContextResolver {
 
         let topBarSelection = inferCodexTopBarSelection(from: windowElement)
         let sidebarSelection = inferCodexSidebarSelection(from: windowElement)
-        var project = sidebarSelection?.project ?? topBarSelection?.project
+        var project = preferredCodexProjectCandidate(
+            topBarProject: topBarSelection?.project,
+            sidebarProject: sidebarSelection?.project
+        )
         var thread = topBarSelection?.thread ?? sidebarSelection?.thread
 
         if project == nil {
@@ -3910,6 +3913,19 @@ enum PromptRewriteConversationContextResolver {
         }
 
         return (project, thread)
+    }
+
+    private static func preferredCodexProjectCandidate(
+        topBarProject: String?,
+        sidebarProject: String?
+    ) -> String? {
+        let candidates = [topBarProject, sidebarProject]
+            .compactMap(normalizedLabel)
+            .compactMap(normalizedProjectName)
+        if let bestNonPR = candidates.first(where: { !isLikelyPullRequestSelectionLabel($0) }) {
+            return bestNonPR
+        }
+        return candidates.first
     }
 
     private static func inferCodexTopBarSelection(
@@ -4012,6 +4028,18 @@ enum PromptRewriteConversationContextResolver {
                     return candidate
                 }
             }
+
+            // Some Codex builds expose the workspace label as static text
+            // near "Thread actions"; fall back to non-control labels.
+            for index in stride(from: threadActionsIndex - 1, through: 0, by: -1) {
+                let entry = entries[index]
+                if isCodexToolbarControlLabel(entry.label) {
+                    continue
+                }
+                guard let candidate = codexNormalizedTopBarProjectCandidate(entry.label) else { continue }
+                guard looksLikeLooseCodexProjectLabel(candidate) else { continue }
+                return candidate
+            }
         }
 
         for entry in entries where codexRoleSupportsProjectSelection(entry.role) {
@@ -4027,6 +4055,31 @@ enum PromptRewriteConversationContextResolver {
         }
 
         return nil
+    }
+
+    private static func looksLikeLooseCodexProjectLabel(_ value: String) -> Bool {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !normalized.isEmpty else { return false }
+        guard !isLikelyPullRequestSelectionLabel(normalized) else { return false }
+
+        let lowered = normalized.lowercased()
+        if lowered.contains("http://") || lowered.contains("https://") {
+            return false
+        }
+        if lowered.contains("axtextarea")
+            || lowered.contains("axtextfield")
+            || lowered.contains("axbutton")
+            || lowered.contains("axgroup")
+            || lowered.contains("axscrollarea") {
+            return false
+        }
+
+        let words = normalized.split(whereSeparator: \.isWhitespace).count
+        if words > 4 || normalized.count > 40 {
+            return false
+        }
+        return true
     }
 
     private static func codexRoleSupportsProjectSelection(_ role: String) -> Bool {
@@ -4336,7 +4389,28 @@ enum PromptRewriteConversationContextResolver {
         if blocked.contains(lowered) {
             return nil
         }
+        if isLikelyPullRequestSelectionLabel(normalized) {
+            return nil
+        }
         return normalized
+    }
+
+    private static func isLikelyPullRequestSelectionLabel(_ value: String) -> Bool {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        if normalized.range(
+            of: #"^(?:pr|pull request)\s*#?\d+\b"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+        if normalized.range(of: #"^#\d+$"#, options: .regularExpression) != nil {
+            return true
+        }
+        return false
     }
 
     private static func looksLikeCodexThreadTitle(_ value: String, project: String?) -> Bool {
@@ -4394,6 +4468,9 @@ enum PromptRewriteConversationContextResolver {
 
     private static func isCodexToolbarControlLabel(_ value: String) -> Bool {
         let lowered = value.lowercased()
+        if isLikelyPullRequestSelectionLabel(lowered) {
+            return true
+        }
         let blocked: Set<String> = [
             "codex",
             "thread actions",
