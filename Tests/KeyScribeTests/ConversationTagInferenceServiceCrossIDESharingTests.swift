@@ -47,4 +47,48 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
 
         XCTAssertFalse(result)
     }
+
+    func testShouldSuppressUnknownCodingHistoryForUnknownCodingContext() {
+        let result = service.shouldSuppressUnknownCodingHistory(
+            bundleID: "com.openai.codex",
+            appName: "Codex",
+            projectKey: "project:unknown",
+            identityKey: "identity:unknown"
+        )
+
+        XCTAssertTrue(result)
+    }
+
+    func testShouldNotSuppressUnknownCodingHistoryWhenIdentityIsMeaningful() {
+        let result = service.shouldSuppressUnknownCodingHistory(
+            bundleID: "com.openai.codex",
+            appName: "Codex",
+            projectKey: "project:unknown",
+            identityKey: "thread:bug-123"
+        )
+
+        XCTAssertFalse(result)
+    }
+
+    func testShouldNotSuppressUnknownCodingHistoryWhenProjectIsMeaningful() {
+        let result = service.shouldSuppressUnknownCodingHistory(
+            bundleID: "com.openai.codex",
+            appName: "Codex",
+            projectKey: "project:keyscribe",
+            identityKey: "identity:unknown"
+        )
+
+        XCTAssertFalse(result)
+    }
+
+    func testShouldNotSuppressUnknownCodingHistoryForNonCodingApp() {
+        let result = service.shouldSuppressUnknownCodingHistory(
+            bundleID: "com.apple.Safari",
+            appName: "Safari",
+            projectKey: "project:unknown",
+            identityKey: "identity:unknown"
+        )
+
+        XCTAssertFalse(result)
+    }
 }

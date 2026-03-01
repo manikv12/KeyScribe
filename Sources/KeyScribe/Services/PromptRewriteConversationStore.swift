@@ -410,8 +410,8 @@ final class PromptRewriteConversationStore: ObservableObject {
 
         let resolvedContext: PromptRewriteConversationContext
         let usesPinnedContext: Bool
-        let history: [PromptRewriteConversationTurn]
-        let resolutionSource: String
+        var history: [PromptRewriteConversationTurn]
+        var resolutionSource: String
         let resolvedTupleKey: ConversationThreadTupleKey
         if let pinnedContext {
             resolvedContext = pinnedContext.context
@@ -516,6 +516,26 @@ final class PromptRewriteConversationStore: ObservableObject {
                 resolvedTupleKey = tupleKey
             }
             usesPinnedContext = false
+        }
+
+        if !usesPinnedContext,
+           tagInferenceService.shouldSuppressUnknownCodingHistory(
+               bundleID: capturedContext.bundleIdentifier,
+               appName: capturedContext.appName,
+               projectKey: resolvedTupleKey.projectKey,
+               identityKey: resolvedTupleKey.identityKey
+           ),
+           !history.isEmpty {
+            history = []
+            resolutionSource += "+suppressed-unknown-coding-history"
+            CrashReporter.logInfo(
+                """
+                Prompt rewrite history suppressed \
+                bundle=\(resolvedTupleKey.bundleID) \
+                project=\(resolvedTupleKey.projectKey) \
+                identity=\(resolvedTupleKey.identityKey)
+                """
+            )
         }
 
         CrashReporter.logInfo(
