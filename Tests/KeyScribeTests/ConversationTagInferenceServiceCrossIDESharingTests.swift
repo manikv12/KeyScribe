@@ -91,4 +91,49 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
 
         XCTAssertFalse(result)
     }
+
+    func testAppleMessagesInfersPersonIdentityFromScreenLabel() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-messages",
+            appName: "Messages",
+            bundleIdentifier: "com.apple.MobileSMS",
+            screenLabel: "Scott Boy - Text Message • SMS",
+            fieldLabel: "Message"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.identityType, "person")
+        XCTAssertEqual(tags.identityLabel, "Scott Boy")
+        XCTAssertEqual(tags.identityKey, "person:scott-boy")
+    }
+
+    func testAppleMessagesInfersPersonIdentityFromSimpleHeader() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-messages-2",
+            appName: "Messages",
+            bundleIdentifier: "com.apple.MobileSMS",
+            screenLabel: "Scott",
+            fieldLabel: "Message"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.identityType, "person")
+        XCTAssertEqual(tags.identityLabel, "Scott")
+        XCTAssertEqual(tags.identityKey, "person:scott")
+    }
+
+    func testAppleMessagesStripsMaybePrefixFromPersonName() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-messages-3",
+            appName: "Messages",
+            bundleIdentifier: "com.apple.MobileSMS",
+            screenLabel: "Maybe: Contact Person - Text Message • SMS",
+            fieldLabel: "Message"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.identityType, "person")
+        XCTAssertEqual(tags.identityLabel, "Contact Person")
+        XCTAssertEqual(tags.identityKey, "person:contact-person")
+    }
 }

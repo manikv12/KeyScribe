@@ -56,6 +56,7 @@ struct MemoryScopeContext: Codable, Hashable {
     let appName: String
     let bundleID: String
     let surfaceLabel: String
+    let projectKey: String?
     let projectName: String?
     let repositoryName: String?
     let identityKey: String?
@@ -68,6 +69,7 @@ struct MemoryScopeContext: Codable, Hashable {
         appName: String,
         bundleID: String,
         surfaceLabel: String,
+        projectKey: String? = nil,
         projectName: String? = nil,
         repositoryName: String? = nil,
         identityKey: String? = nil,
@@ -79,6 +81,7 @@ struct MemoryScopeContext: Codable, Hashable {
         let normalizedAppName = MemoryTextNormalizer.collapsedWhitespace(appName)
         let normalizedBundleID = MemoryTextNormalizer.collapsedWhitespace(bundleID).lowercased()
         let normalizedSurface = MemoryTextNormalizer.collapsedWhitespace(surfaceLabel)
+        let normalizedProjectKey = MemoryScopeContext.normalizedScopeValue(projectKey)?.lowercased()
         let normalizedProject = MemoryScopeContext.normalizedScopeValue(projectName)
         let normalizedRepository = MemoryScopeContext.normalizedScopeValue(repositoryName)
         let normalizedIdentityKey = MemoryScopeContext.normalizedScopeValue(identityKey)?.lowercased()
@@ -88,6 +91,7 @@ struct MemoryScopeContext: Codable, Hashable {
         self.appName = normalizedAppName.isEmpty ? "Unknown App" : normalizedAppName
         self.bundleID = normalizedBundleID.isEmpty ? "unknown.bundle" : normalizedBundleID
         self.surfaceLabel = normalizedSurface.isEmpty ? "Unknown Surface" : normalizedSurface
+        self.projectKey = normalizedProjectKey
         self.projectName = normalizedProject
         self.repositoryName = normalizedRepository
         self.identityKey = normalizedIdentityKey
@@ -99,6 +103,7 @@ struct MemoryScopeContext: Codable, Hashable {
             : MemoryScopeContext.makeScopeKey(
                 bundleID: self.bundleID,
                 surfaceLabel: self.surfaceLabel,
+                projectKey: self.projectKey,
                 projectName: self.projectName,
                 repositoryName: self.repositoryName,
                 identityKey: self.identityKey,
@@ -109,6 +114,7 @@ struct MemoryScopeContext: Codable, Hashable {
     static func makeScopeKey(
         bundleID: String,
         surfaceLabel: String,
+        projectKey: String? = nil,
         projectName: String?,
         repositoryName: String?,
         identityKey: String? = nil,
@@ -116,7 +122,7 @@ struct MemoryScopeContext: Codable, Hashable {
     ) -> String {
         let normalizedBundleID = MemoryTextNormalizer.collapsedWhitespace(bundleID).lowercased()
         let normalizedSurface = MemoryTextNormalizer.collapsedWhitespace(surfaceLabel).lowercased()
-        let normalizedProject = normalizedScopeValue(projectName)?.lowercased() ?? "-"
+        let normalizedProject = normalizedScopeValue(projectKey ?? projectName)?.lowercased() ?? "-"
         let normalizedRepository = normalizedScopeValue(repositoryName)?.lowercased() ?? "-"
         let normalizedIdentityKey = normalizedScopeValue(identityKey)?.lowercased() ?? "-"
         let normalizedIdentityType = normalizedScopeValue(identityType)?.lowercased() ?? "-"

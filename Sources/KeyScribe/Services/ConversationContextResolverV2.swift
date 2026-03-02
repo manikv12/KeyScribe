@@ -19,8 +19,29 @@ final class ConversationContextResolverV2 {
         let confidence: Double
     }
 
+    struct DeterministicMappingCandidate {
+        enum MatchAxis: String {
+            case project
+            case person
+        }
+
+        enum MatchType: String {
+            case exact
+            case highSimilar = "high-similar"
+        }
+
+        let prompt: ConversationClarificationPrompt
+        let candidateKey: String
+        let candidateLabel: String
+        let candidateBundleIdentifier: String
+        let confidence: Double
+        let matchAxis: MatchAxis
+        let matchType: MatchType
+    }
+
     enum MappingSource: String {
         case ai
+        case deterministic
         case manual
     }
 
@@ -101,6 +122,26 @@ final class ConversationContextResolverV2 {
         )
     }
 
+    func evaluateDeterministicMappingCandidate(
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) -> DeterministicMappingCandidate? {
+        store.nextDeterministicMappingCandidate(
+            capturedContext: capturedContext,
+            userText: userText
+        ).map { candidate in
+            DeterministicMappingCandidate(
+                prompt: candidate.prompt,
+                candidateKey: candidate.candidateKey,
+                candidateLabel: candidate.candidateLabel,
+                candidateBundleIdentifier: candidate.candidateBundleIdentifier,
+                confidence: candidate.confidence,
+                matchAxis: candidate.matchAxis == .project ? .project : .person,
+                matchType: candidate.matchType == .exact ? .exact : .highSimilar
+            )
+        }
+    }
+
     func persistMappingDecision(
         _ decision: MappingDecision,
         prompt: ConversationClarificationPrompt,
@@ -118,6 +159,8 @@ final class ConversationContextResolverV2 {
         switch source {
         case .ai:
             persistedSource = .ai
+        case .deterministic:
+            persistedSource = .deterministic
         case .manual:
             persistedSource = .manual
         }

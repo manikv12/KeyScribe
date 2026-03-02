@@ -135,6 +135,12 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
         XCTAssertTrue(card.summary.localizedCaseInsensitiveContains("AI handoff summary"))
         XCTAssertEqual(card.metadata["summary_method"], "ai-test")
         XCTAssertEqual(card.metadata["ai_timeout_seconds"], "60")
+        XCTAssertEqual(card.metadata["project_key"], "project:keyscribe")
+        XCTAssertEqual(card.metadata["canonical_project_key"], "project:keyscribe")
+        XCTAssertEqual(card.metadata["identity_key"], "thread:promotion")
+        XCTAssertEqual(card.metadata["canonical_identity_key"], "thread:promotion")
+        XCTAssertEqual(card.metadata["canonical_project_key_source"], "tuple-tags")
+        XCTAssertEqual(card.metadata["canonical_identity_key_source"], "tuple-tags")
     }
 
     func testTimeoutOrFailureKeepsFallbackSummary() async throws {
@@ -400,6 +406,104 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
         XCTAssertTrue(triggers.contains(MemoryPromotionTrigger.manualPin.rawValue))
     }
 
+    func testRetrievalPrefersCanonicalProjectKeyOverLabelFallback() async throws {
+        let databaseURL = try makeIsolatedDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let retrievalService = MemoryRewriteRetrievalService(
+            storeFactory: { try MemorySQLiteStore(databaseURL: databaseURL) }
+        )
+
+        let timestamp = Date()
+        try insertLesson(
+            store: store,
+            cardSeed: "canonical-match",
+            mistakePattern: "please fix teh request",
+            improvedPrompt: "please fix the request",
+            confidence: 0.82,
+            metadata: [
+                "origin": "conversation-history",
+                "bundle_id": "com.apple.dt.xcode",
+                "project_key": "project:keyscribe",
+                "project_name": "Mapped Label Two"
+            ],
+            timestamp: timestamp
+        )
+        try insertLesson(
+            store: store,
+            cardSeed: "label-only-match",
+            mistakePattern: "replace teh wording",
+            improvedPrompt: "replace the wording",
+            confidence: 0.99,
+            metadata: [
+                "origin": "conversation-history",
+                "bundle_id": "com.apple.dt.xcode",
+                "project_key": "project:other-app",
+                "project_name": "Mapped Label One"
+            ],
+            timestamp: timestamp.addingTimeInterval(1)
+        )
+
+        let scope = MemoryScopeContext(
+            appName: "Xcode",
+            bundleID: "com.apple.dt.xcode",
+            surfaceLabel: "Editor • Prompt",
+            projectName: "Mapped Label One",
+            repositoryName: nil,
+            identityKey: nil,
+            identityType: nil,
+            identityLabel: nil,
+            scopeKey: "scope|com.apple.dt.xcode|editor|project:keyscribe|-|-|-",
+            isCodingContext: true
+        )
+
+        let suggestion = try await retrievalService.retrieveSuggestion(
+            for: "please fix teh request before release",
+            scope: scope
+        )
+        XCTAssertEqual(suggestion?.suggestedText, "please fix the request")
+    }
+
+    func testRetrievalFallsBackToProjectLabelWhenCanonicalKeysMissing() async throws {
+        let databaseURL = try makeIsolatedDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let retrievalService = MemoryRewriteRetrievalService(
+            storeFactory: { try MemorySQLiteStore(databaseURL: databaseURL) }
+        )
+
+        let timestamp = Date()
+        try insertLesson(
+            store: store,
+            cardSeed: "legacy-label-only",
+            mistakePattern: "improve teh grammar",
+            improvedPrompt: "improve the grammar",
+            confidence: 0.88,
+            metadata: [
+                "origin": "conversation-history",
+                "bundle_id": "com.apple.dt.xcode",
+                "project_name": "Legacy Workspace"
+            ],
+            timestamp: timestamp
+        )
+
+        let scope = MemoryScopeContext(
+            appName: "Xcode",
+            bundleID: "com.apple.dt.xcode",
+            surfaceLabel: "Editor • Prompt",
+            projectName: "Legacy Workspace",
+            repositoryName: nil,
+            identityKey: nil,
+            identityType: nil,
+            identityLabel: nil,
+            isCodingContext: true
+        )
+
+        let suggestion = try await retrievalService.retrieveSuggestion(
+            for: "please improve teh grammar now",
+            scope: scope
+        )
+        XCTAssertEqual(suggestion?.suggestedText, "improve the grammar")
+    }
+
     func testRetentionPurgeByAgeRowByteCaps() throws {
         let store = try makeIsolatedStore()
         let now = Date()
@@ -506,6 +610,105 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
             createdAt: createdAt,
             turnDedupeKey: "dedupe-\(UUID().uuidString)"
         )
+    }
+
+    private func insertLesson(
+        store: MemorySQLiteStore,
+        cardSeed: String,
+        mistakePattern: String,
+        improvedPrompt: String,
+        confidence: Double,
+        metadata: [String: String],
+        timestamp: Date
+    ) throws {
+        var effectiveMetadata = metadata
+        if effectiveMetadata["provider_mode"] == nil {
+            effectiveMetadata["provider_mode"] = "test"
+        }
+        if effectiveMetadata["extraction_method"] == nil {
+            effectiveMetadata["extraction_method"] = "deterministic"
+        }
+
+        let sourceID = MemoryIdentifier.stableUUID(for: "source-\(cardSeed)")
+        let sourceFileID = MemoryIdentifier.stableUUID(for: "file-\(cardSeed)")
+        let eventID = MemoryIdentifier.stableUUID(for: "event-\(cardSeed)")
+        let cardID = MemoryIdentifier.stableUUID(for: "card-\(cardSeed)")
+        let lessonID = MemoryIdentifier.stableUUID(for: "lesson-\(cardSeed)")
+
+        let source = MemorySource(
+            id: sourceID,
+            provider: .unknown,
+            rootPath: "test://\(cardSeed)",
+            displayName: "Test Source \(cardSeed)",
+            discoveredAt: timestamp,
+            metadata: effectiveMetadata
+        )
+        try store.upsertSource(source)
+
+        let sourceFile = MemorySourceFile(
+            id: sourceFileID,
+            sourceID: sourceID,
+            absolutePath: "/tmp/\(cardSeed).json",
+            relativePath: "\(cardSeed).json",
+            fileHash: cardSeed,
+            fileSizeBytes: 64,
+            modifiedAt: timestamp,
+            indexedAt: timestamp,
+            parseError: nil
+        )
+        try store.upsertSourceFile(sourceFile)
+
+        let event = MemoryEvent(
+            id: eventID,
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            provider: .unknown,
+            kind: .summary,
+            title: "Rewrite Lesson \(cardSeed)",
+            body: "Rewrite \(mistakePattern) -> \(improvedPrompt)",
+            timestamp: timestamp,
+            nativeSummary: "Rewrite memory",
+            keywords: ["rewrite", "memory", cardSeed],
+            isPlanContent: false,
+            metadata: effectiveMetadata,
+            rawPayload: nil
+        )
+        try store.upsertEvent(event)
+
+        let card = MemoryCard(
+            id: cardID,
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            eventID: eventID,
+            provider: .unknown,
+            title: "Rewrite card \(cardSeed)",
+            summary: "Rewrite \(mistakePattern) -> \(improvedPrompt)",
+            detail: "Original: \(mistakePattern). Suggested: \(improvedPrompt).",
+            keywords: ["rewrite", "correction", "memory"],
+            score: max(0.75, confidence),
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            isPlanContent: false,
+            metadata: effectiveMetadata
+        )
+        try store.upsertCard(card)
+
+        let lesson = MemoryLesson(
+            id: lessonID,
+            sourceID: sourceID,
+            sourceFileID: sourceFileID,
+            eventID: eventID,
+            cardID: cardID,
+            provider: .unknown,
+            mistakePattern: mistakePattern,
+            improvedPrompt: improvedPrompt,
+            rationale: "Stored lesson for retrieval scope testing.",
+            validationConfidence: confidence,
+            sourceMetadata: effectiveMetadata,
+            createdAt: timestamp,
+            updatedAt: timestamp
+        )
+        try store.upsertLesson(lesson)
     }
 
     private func makeScopeKey(

@@ -3766,6 +3766,7 @@ final class MemorySQLiteStore {
         let appName = metadata["app_name"] ?? metadata["app"] ?? "KeyScribe"
         let bundleID = metadata["bundle_id"] ?? metadata["bundle"] ?? "com.keyscribe.unknown"
         let surfaceLabel = metadata["surface_label"] ?? metadata["context_label"] ?? "Conversation"
+        let projectKey = metadata["canonical_project_key"] ?? metadata["project_key"]
         let projectName = metadata["project_name"] ?? metadata["project"]
         let repositoryName = metadata["repository_name"] ?? metadata["repository"] ?? metadata["repo"]
         let identityKey = metadata["identity_key"] ?? metadata["identity"]
@@ -3785,6 +3786,7 @@ final class MemorySQLiteStore {
             appName: appName,
             bundleID: bundleID,
             surfaceLabel: surfaceLabel,
+            projectKey: projectKey,
             projectName: projectName,
             repositoryName: repositoryName,
             identityKey: identityKey,

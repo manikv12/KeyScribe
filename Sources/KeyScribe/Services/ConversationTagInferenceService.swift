@@ -325,6 +325,15 @@ final class ConversationTagInferenceService {
             return ("\(keyPrefix):\(slug(teamsIdentity.label))", teamsIdentity.type, teamsIdentity.label, people, nativeThreadKey)
         }
 
+        if isAppleMessagesApp(bundleID: bundleID, appName: appName),
+           let messagesPerson = inferAppleMessagesPerson(from: primaryText) {
+            let key = "person:\(slug(messagesPerson))"
+            let mergedPeople = Array(Set((people + [messagesPerson]).map(collapseWhitespace)))
+                .filter { !$0.isEmpty }
+                .sorted()
+            return (key, .person, messagesPerson, mergedPeople, nativeThreadKey)
+        }
+
         if isCodexApp(bundleID: bundleID, appName: appName),
            let codexThreadLabel = firstMatch(
                pattern: #"(?i)\bthread\s*[:\-]\s*([a-z0-9][a-z0-9 .,_'’()\-]{2,120})\b"#,
@@ -495,6 +504,77 @@ final class ConversationTagInferenceService {
             }
         }
         return nil
+    }
+
+    private func inferAppleMessagesPerson(from text: String) -> String? {
+        if let directMatch = firstMatch(
+            pattern: #"(?i)\b([A-Z][A-Za-z'’.\-]{1,40}(?:\s+[A-Z][A-Za-z'’.\-]{1,40}){0,3})\s*(?:[>›]|[-•|:]\s*(?:text\s+message|iMessage|sms))\b"#,
+            in: text
+        ) {
+            let cleaned = normalizedAppleMessagesPersonLabel(directMatch)
+            if looksLikePersonName(cleaned) {
+                return cleaned
+            }
+        }
+
+        var segments = splitByStrongSeparators(text)
+        if segments.isEmpty {
+            segments = [text]
+        }
+
+        for segment in segments {
+            let cleaned = normalizedAppleMessagesPersonLabel(segment)
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            guard !cleaned.isEmpty else { continue }
+
+            let lowered = cleaned.lowercased()
+            let blocked: Set<String> = [
+                "messages",
+                "message",
+                "text message",
+                "imessage",
+                "sms",
+                "chat",
+                "new message",
+                "new messages",
+                "search",
+                "current screen",
+                "focused input",
+                "type a message"
+            ]
+            if blocked.contains(lowered) {
+                continue
+            }
+            if lowered.range(of: #"\b(?:text\s+message|imessage|sms)\b"#, options: .regularExpression) != nil {
+                continue
+            }
+            if lowered.range(of: #"\b(?:today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"#, options: .regularExpression) != nil {
+                continue
+            }
+            if cleaned.range(of: #"\d{1,2}:\d{2}"#, options: .regularExpression) != nil {
+                continue
+            }
+            if looksLikePersonName(cleaned) {
+                return cleaned
+            }
+        }
+
+        return nil
+    }
+
+    private func normalizedAppleMessagesPersonLabel(_ value: String) -> String {
+        var normalized = collapseWhitespace(value)
+        guard !normalized.isEmpty else { return normalized }
+
+        // Messages sometimes prefixes contact candidates as "Maybe: Name".
+        // Strip that prefix so identity keys remain stable (person:<normalized-name>).
+        normalized = normalized.replacingOccurrences(
+            of: #"(?i)^\s*maybe\s*:\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        return collapseWhitespace(normalized)
     }
 
     private func cleanedTeamsSegment(_ value: String) -> String? {
@@ -721,6 +801,15 @@ final class ConversationTagInferenceService {
     private func isTeamsApp(bundleID: String, appName: String) -> Bool {
         let value = "\(bundleID) \(appName)".lowercased()
         return value.contains("teams")
+    }
+
+    private func isAppleMessagesApp(bundleID: String, appName: String) -> Bool {
+        let normalizedBundle = collapseWhitespace(bundleID).lowercased()
+        let normalizedName = collapseWhitespace(appName).lowercased()
+        if normalizedBundle == "com.apple.mobilesms" {
+            return true
+        }
+        return normalizedName == "messages" || normalizedName.contains("messages")
     }
 
     private func isBrowser(bundleID: String, appName: String) -> Bool {
