@@ -699,6 +699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var workspaceActivationObserver: NSObjectProtocol?
     private var aiStudioRequestObserver: NSObjectProtocol?
     private var settingsRequestObserver: NSObjectProtocol?
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var permissionsReady = false
     private var didRequestStartupPermissionPrompt = false
@@ -712,7 +713,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var hasScheduledPermissionRestart = false
     private var settingsApplyWorkItem: DispatchWorkItem?
     private var lastAppliedSettingsSnapshot: SettingsApplySnapshot?
-    private var aiMappingPromptSuppressionByPair: [String: Date] = [:]
 
     private enum PromptRewriteFailureChoice {
         case retry
@@ -723,12 +723,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private enum PromptRewriteRetrievalOutcome {
         case suggestion(PromptRewriteSuggestion?)
         case bypassed
-    }
-
-    private enum PromptRewriteAIMappingChoice {
-        case link
-        case keepSeparate
-        case dismiss
     }
 
     private struct PromptRewriteSessionContext {
@@ -743,17 +737,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         // Preserve user-requested original text (for example Esc in rewrite HUD)
         // without applying adaptive correction post-processing.
         let preserveInsertionText: Bool
+        // When users explicitly request original text (for example Esc in preview),
+        // briefly re-activate the target app before paste so focus is restored.
+        let forceTargetRefocusBeforeInsert: Bool
 
         init(
             insertionText: String,
             conversationContext: PromptRewriteConversationContext?,
             insertionHUDContext: PromptRewriteInsertionHUDContext,
-            preserveInsertionText: Bool = false
+            preserveInsertionText: Bool = false,
+            forceTargetRefocusBeforeInsert: Bool = false
         ) {
             self.insertionText = insertionText
             self.conversationContext = conversationContext
             self.insertionHUDContext = insertionHUDContext
             self.preserveInsertionText = preserveInsertionText
+            self.forceTargetRefocusBeforeInsert = forceTargetRefocusBeforeInsert
+        }
+    }
+
+    private struct PromptRewriteLoadingNarrative {
+        let transcript: String
+        let aiSuggestionsEnabled: Bool
+        let aiGenerationSummary: String
+        let aiRuntimeSummary: String?
+
+        func displayState(step: String) -> PromptRewriteLoadingDisplayState {
+            PromptRewriteLoadingDisplayState(
+                transcription: transcript,
+                currentStep: step,
+                aiSuggestionsEnabled: aiSuggestionsEnabled,
+                aiGenerationSummary: aiGenerationSummary,
+                aiRuntimeSummary: aiRuntimeSummary
+            )
         }
     }
 
@@ -783,7 +799,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private static let settingsApplyDebounceSeconds: TimeInterval = 0.14
     private static let aiMappingHighConfidenceThreshold: Double = 0.90
     private static let aiMappingTimeoutSeconds: TimeInterval = 0.25
-    private static let aiMappingPromptSuppressionWindowSeconds: TimeInterval = 180
     private static let localAIRuntimeShutdownTimeoutSeconds: TimeInterval = 1.5
 
     private enum DictationFeedbackCue: CaseIterable {
@@ -1031,6 +1046,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             }
         }
 
+        startMemoryPressureMonitoring()
         updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
 
         Task { @MainActor in
@@ -1055,6 +1071,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             NotificationCenter.default.removeObserver(settingsRequestObserver)
             self.settingsRequestObserver = nil
         }
+        stopMemoryPressureMonitoring()
         settingsApplyWorkItem?.cancel()
         settingsApplyWorkItem = nil
         settings.onChange = nil
@@ -1086,6 +1103,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         isDictating = false
         dictationInputMode = .idle
+    }
+
+    private func startMemoryPressureMonitoring() {
+        guard memoryPressureSource == nil else { return }
+
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self, weak source] in
+            guard let self, let source else { return }
+            self.handleMemoryPressureEvent(source.data)
+        }
+        source.resume()
+        memoryPressureSource = source
+    }
+
+    private func stopMemoryPressureMonitoring() {
+        memoryPressureSource?.cancel()
+        memoryPressureSource = nil
+    }
+
+    private func handleMemoryPressureEvent(_ event: DispatchSource.MemoryPressureEvent) {
+        let isCritical = event.contains(.critical)
+        let levelDescription = isCritical ? "critical" : "warning"
+        let beforeCount = promptRewriteConversationStore.contextDetails().count
+
+        if isCritical {
+            CrashReporter.logWarning(
+                "Memory pressure event level=\(levelDescription); trimming caches aggressively."
+            )
+        } else {
+            CrashReporter.logInfo(
+                "Memory pressure event level=\(levelDescription); trimming caches."
+            )
+        }
+
+        transcriber.trimMemoryUsage(aggressive: isCritical)
+        promptRewriteConversationStore.trimMemoryUsage(aggressive: isCritical)
+        if isCritical {
+            URLCache.shared.removeAllCachedResponses()
+        }
+
+        let afterCount = promptRewriteConversationStore.contextDetails().count
+        CrashReporter.logInfo(
+            "Memory trim completed level=\(levelDescription) contexts=\(beforeCount)->\(afterCount)"
+        )
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -1674,7 +1738,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         insertText(
             readyForInsert,
             trackCorrections: settings.adaptiveCorrectionsEnabled,
-            insertionContext: rewriteResolution.insertionHUDContext
+            insertionContext: rewriteResolution.insertionHUDContext,
+            forceActivateTargetBeforeInsert: rewriteResolution.forceTargetRefocusBeforeInsert
         )
         setUIStatus(.ready)
     }
@@ -1697,6 +1762,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         )
         let conversationContext = conversationRequestContext?.activeContext
         let conversationHistory = conversationRequestContext?.mergedHistory ?? []
+        let loadingNarrative = makePromptRewriteLoadingNarrative(
+            cleanedTranscript: cleanedTranscript,
+            conversationHistoryTurnCount: conversationHistory.count
+        )
 
         if let conversationRequestContext {
             scheduleAIMappingEvaluationIfNeeded(
@@ -1710,7 +1779,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             do {
                 let refinementStart = Date()
                 PromptRewriteHUDManager.shared.showLoadingIndicator(
-                    insertionContext: insertionSessionContext.insertionHUDContext
+                    insertionContext: insertionSessionContext.insertionHUDContext,
+                    displayState: loadingNarrative.displayState(step: "Preparing rewrite request")
                 )
                 let retrievalOutcome: PromptRewriteRetrievalOutcome
                 do {
@@ -1723,7 +1793,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                         for: cleanedTranscript,
                         conversationContext: conversationContext,
                         conversationHistory: conversationHistory,
-                        insertionContext: insertionSessionContext.insertionHUDContext
+                        insertionContext: insertionSessionContext.insertionHUDContext,
+                        loadingNarrative: loadingNarrative
                     )
                 }
 
@@ -1738,7 +1809,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     return PromptRewriteInsertionResolution(
                         insertionText: cleanedTranscript,
                         conversationContext: conversationContext,
-                        insertionHUDContext: insertionSessionContext.insertionHUDContext
+                        insertionHUDContext: insertionSessionContext.insertionHUDContext,
+                        preserveInsertionText: true,
+                        forceTargetRefocusBeforeInsert: true
                     )
                 }
 
@@ -1860,7 +1933,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                             insertionText: cleanedTranscript,
                             conversationContext: conversationContext,
                             insertionHUDContext: insertionSessionContext.insertionHUDContext,
-                            preserveInsertionText: true
+                            preserveInsertionText: true,
+                            forceTargetRefocusBeforeInsert: true
                         )
                     case .rejectSuggestion:
                         await recordPromptRewriteFeedback(
@@ -1892,7 +1966,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                         insertionText: cleanedTranscript,
                         conversationContext: conversationContext,
                         insertionHUDContext: insertionSessionContext.insertionHUDContext,
-                        preserveInsertionText: true
+                        preserveInsertionText: true,
+                        forceTargetRefocusBeforeInsert: true
                     )
                 case .close:
                     await recordPromptRewriteFeedback(
@@ -1906,20 +1981,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
     }
 
+    private func makePromptRewriteLoadingNarrative(
+        cleanedTranscript: String,
+        conversationHistoryTurnCount: Int
+    ) -> PromptRewriteLoadingNarrative {
+        let transcript = cleanedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let aiSuggestionsEnabled = settings.promptRewriteEnabled
+        guard aiSuggestionsEnabled else {
+            return PromptRewriteLoadingNarrative(
+                transcript: transcript,
+                aiSuggestionsEnabled: false,
+                aiGenerationSummary: "AI suggestions are disabled. KeyScribe will insert the cleaned transcription as-is.",
+                aiRuntimeSummary: nil
+            )
+        }
+
+        let providerLabel = settings.promptRewriteProviderMode.displayName
+        let configuredModel = settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelLabel = configuredModel.isEmpty
+            ? settings.promptRewriteProviderMode.defaultModel
+            : configuredModel
+        let styleLabel = settings.promptRewriteStylePreset.rawValue
+            .replacingOccurrences(of: " (Default)", with: "")
+        let historyPhrase: String
+        if settings.promptRewriteConversationHistoryEnabled {
+            if conversationHistoryTurnCount > 0 {
+                historyPhrase = "\(conversationHistoryTurnCount) prior turn(s)"
+            } else {
+                historyPhrase = "current utterance only"
+            }
+        } else {
+            historyPhrase = "history disabled"
+        }
+        let insertionPath = settings.promptRewriteAutoInsertEnabled
+            ? "auto-insert for high confidence"
+            : "manual preview before insert"
+        let processNarrative = "Improving clarity, grammar, and tone from your transcript while preserving intent."
+        let contextNarrative = "Context source: \(historyPhrase)."
+        let decisionNarrative = "Decision path: \(insertionPath)."
+
+        return PromptRewriteLoadingNarrative(
+            transcript: transcript,
+            aiSuggestionsEnabled: true,
+            aiGenerationSummary: "\(processNarrative) Style profile: \(styleLabel). \(contextNarrative) \(decisionNarrative)",
+            aiRuntimeSummary: "\(providerLabel) · \(modelLabel)"
+        )
+    }
+
     private func retrievePromptRewriteSuggestionOrBypass(
         for cleanedTranscript: String,
         conversationContext: PromptRewriteConversationContext?,
         conversationHistory: [PromptRewriteConversationTurn],
-        insertionContext: PromptRewriteInsertionHUDContext
+        insertionContext: PromptRewriteInsertionHUDContext,
+        loadingNarrative: PromptRewriteLoadingNarrative
     ) async throws -> PromptRewriteRetrievalOutcome {
         PromptRewriteHUDManager.shared.clearLoadingBypassRequest(insertionContext: insertionContext)
+        PromptRewriteHUDManager.shared.updateLoadingIndicator(
+            insertionContext: insertionContext,
+            displayState: loadingNarrative.displayState(step: "Connecting to AI suggestion service")
+        )
 
         return try await withThrowingTaskGroup(of: PromptRewriteRetrievalOutcome.self) { group in
             group.addTask {
+                await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                    insertionContext: insertionContext,
+                    displayState: loadingNarrative.displayState(step: "Sending transcript for rewrite suggestion")
+                )
                 let suggestion = try await PromptRewriteService.shared.retrieveSuggestion(
                     for: cleanedTranscript,
                     conversationContext: conversationContext,
                     conversationHistory: conversationHistory
+                )
+                await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                    insertionContext: insertionContext,
+                    displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
                 )
                 return .suggestion(suggestion)
             }
@@ -1929,6 +2064,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     if await PromptRewriteHUDManager.shared.consumeLoadingBypassRequest(
                         insertionContext: insertionContext
                     ) {
+                        await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                            insertionContext: insertionContext,
+                            displayState: loadingNarrative.displayState(step: "Paused AI refinement. Restoring transcript")
+                        )
                         return .bypassed
                     }
                     if Task.isCancelled {
@@ -1943,6 +2082,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 return .suggestion(nil)
             }
 
+            PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                insertionContext: insertionContext,
+                displayState: loadingNarrative.displayState(step: "Finalizing rewrite decision")
+            )
             group.cancelAll()
             return firstResult
         }
@@ -2056,69 +2199,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 return
             }
 
-            let suppressionKey = self.aiMappingSuppressionKey(
-                activeContextID: resolvedBundle.activeContext.id,
-                candidate: candidate
+            // Always auto-link high-confidence unmapped buckets so future requests
+            // can reuse cross-conversation history without manual confirmation.
+            self.conversationContextResolverV2.persistMappingDecision(
+                .link,
+                prompt: candidate.prompt,
+                source: .ai
             )
-            if self.shouldSuppressAIMappingPrompt(for: suppressionKey) {
-                self.logPromptRewriteMappingTelemetry(
-                    mappingSource: "ai",
-                    linkedContextCount: linkedContextCount,
-                    mergeTurns: mergeTurns,
-                    aiMatchTimeout: false,
-                    detail: "candidate_found=true prompt_suppressed=true confidence=\(String(format: "%.3f", candidate.confidence))"
-                )
-                return
-            }
-
-            self.markAIMappingPromptShown(for: suppressionKey)
+            self.setUIStatus(.message("Linked related conversation"))
             self.logPromptRewriteMappingTelemetry(
                 mappingSource: "ai",
                 linkedContextCount: linkedContextCount,
                 mergeTurns: mergeTurns,
                 aiMatchTimeout: false,
-                detail: "candidate_found=true prompt_shown=true confidence=\(String(format: "%.3f", candidate.confidence))"
+                detail: "candidate_found=true auto_linked=true confidence=\(String(format: "%.3f", candidate.confidence))"
             )
-
-            let choice = self.presentPromptRewriteAIMappingDecision(candidate: candidate)
-            switch choice {
-            case .link:
-                self.conversationContextResolverV2.persistMappingDecision(
-                    .link,
-                    prompt: candidate.prompt,
-                    source: .ai
-                )
-                self.setUIStatus(.message("Linked related conversation"))
-                self.logPromptRewriteMappingTelemetry(
-                    mappingSource: "ai",
-                    linkedContextCount: linkedContextCount,
-                    mergeTurns: mergeTurns,
-                    aiMatchTimeout: false,
-                    detail: "decision=link"
-                )
-            case .keepSeparate:
-                self.conversationContextResolverV2.persistMappingDecision(
-                    .keepSeparate,
-                    prompt: candidate.prompt,
-                    source: .ai
-                )
-                self.setUIStatus(.message("Keeping conversations separate"))
-                self.logPromptRewriteMappingTelemetry(
-                    mappingSource: "ai",
-                    linkedContextCount: linkedContextCount,
-                    mergeTurns: mergeTurns,
-                    aiMatchTimeout: false,
-                    detail: "decision=keep-separate"
-                )
-            case .dismiss:
-                self.logPromptRewriteMappingTelemetry(
-                    mappingSource: "ai",
-                    linkedContextCount: linkedContextCount,
-                    mergeTurns: mergeTurns,
-                    aiMatchTimeout: false,
-                    detail: "decision=dismiss"
-                )
-            }
         }
     }
 
@@ -2134,56 +2229,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 )
                 continuation.resume(returning: candidate)
             }
-        }
-    }
-
-    private func presentPromptRewriteAIMappingDecision(
-        candidate: PromptRewriteAIMappingCandidate
-    ) -> PromptRewriteAIMappingChoice {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Link related conversations?"
-        alert.informativeText = """
-        Found a likely match (\(Int((candidate.confidence * 100).rounded()))%):
-        \(candidate.candidateLabel)
-        """
-        alert.addButton(withTitle: "Link")
-        alert.addButton(withTitle: "Keep Separate")
-        alert.addButton(withTitle: "Dismiss")
-
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return .link
-        case .alertSecondButtonReturn:
-            return .keepSeparate
-        default:
-            return .dismiss
-        }
-    }
-
-    private func aiMappingSuppressionKey(
-        activeContextID: String,
-        candidate: PromptRewriteAIMappingCandidate
-    ) -> String {
-        "\(activeContextID)|\(candidate.candidateBundleIdentifier)|\(candidate.candidateKey)"
-    }
-
-    private func shouldSuppressAIMappingPrompt(for key: String, now: Date = Date()) -> Bool {
-        purgeExpiredAIMappingPromptSuppressions(now: now)
-        guard let expiresAt = aiMappingPromptSuppressionByPair[key] else {
-            return false
-        }
-        return expiresAt > now
-    }
-
-    private func markAIMappingPromptShown(for key: String, now: Date = Date()) {
-        purgeExpiredAIMappingPromptSuppressions(now: now)
-        aiMappingPromptSuppressionByPair[key] = now.addingTimeInterval(Self.aiMappingPromptSuppressionWindowSeconds)
-    }
-
-    private func purgeExpiredAIMappingPromptSuppressions(now: Date = Date()) {
-        aiMappingPromptSuppressionByPair = aiMappingPromptSuppressionByPair.filter { _, expiresAt in
-            expiresAt > now
         }
     }
 
@@ -2436,11 +2481,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         forceCopyToClipboard: Bool = false,
         overrideCopyToClipboard: Bool? = nil,
         trackCorrections: Bool = false,
-        insertionContext: PromptRewriteInsertionHUDContext? = nil
+        insertionContext: PromptRewriteInsertionHUDContext? = nil,
+        forceActivateTargetBeforeInsert: Bool = false
     ) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard ensureAccessibilityReadyForInsertion() else { return }
         let copyToClipboard = overrideCopyToClipboard ?? (settings.copyToClipboard || forceCopyToClipboard)
+        if forceActivateTargetBeforeInsert,
+           let target = targetApplication(for: insertionContext),
+           !target.isTerminated {
+            lastTargetApplication = target
+            _ = target.activate(options: [.activateIgnoringOtherApps])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+                self?.attemptInsertText(
+                    text,
+                    copyToClipboard: copyToClipboard,
+                    attemptsRemaining: 5,
+                    insertionContext: insertionContext
+                ) { [weak self] didInsert in
+                    guard let self else { return }
+                    if didInsert {
+                        self.playDictationFeedbackSound(.pasted)
+                    }
+                    guard trackCorrections else { return }
+                    if didInsert {
+                        self.postInsertCorrectionMonitor.startMonitoring(insertedText: text)
+                    }
+                }
+            }
+            return
+        }
         attemptInsertText(
             text,
             copyToClipboard: copyToClipboard,

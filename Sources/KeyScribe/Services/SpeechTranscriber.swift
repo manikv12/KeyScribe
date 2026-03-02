@@ -145,6 +145,13 @@ final class SpeechTranscriber: NSObject {
         }
     }
 
+    func trimMemoryUsage(aggressive: Bool = false) {
+        performOnMain {
+            self.appleTranscriber.trimMemoryUsage(aggressive: aggressive)
+            self.whisperTranscriber.trimMemoryUsage(aggressive: aggressive)
+        }
+    }
+
     @discardableResult
     private func startRecordingOnMain() -> Bool {
         let started = activeTranscriber.startRecording()

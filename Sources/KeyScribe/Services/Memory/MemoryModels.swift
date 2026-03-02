@@ -417,6 +417,38 @@ struct ConversationTurnRecord: Codable, Hashable, Identifiable {
     let turnDedupeKey: String
 }
 
+enum ExpiredSummaryMethod: String, Codable, Hashable {
+    case fallback
+    case ai
+}
+
+struct ExpiredConversationContextRecord: Codable, Hashable, Identifiable {
+    let id: String
+    let scopeKey: String
+    let threadID: String
+    let bundleID: String
+    let projectKey: String?
+    let identityKey: String?
+    let summaryText: String
+    let summaryMethod: ExpiredSummaryMethod
+    let summaryConfidence: Double?
+    let sourceTurnCount: Int
+    let recentTurnsJSON: String
+    let rawTurnsJSON: String
+    let trigger: String
+    let expiredAt: Date
+    let deleteAfterAt: Date
+    let consumedAt: Date?
+    let consumedByThreadID: String?
+    let metadata: [String: String]
+}
+
+struct ExpiredConversationContextDiagnostics: Codable, Hashable {
+    let totalCount: Int
+    let lastSummaryMethod: ExpiredSummaryMethod
+    let lastPromotionDecisionSummary: String
+}
+
 struct ConversationAgentProfileRecord: Codable, Hashable {
     let threadID: String
     let profileJSON: String

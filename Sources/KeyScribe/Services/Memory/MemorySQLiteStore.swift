@@ -30,9 +30,12 @@ enum MemorySQLiteStoreError: LocalizedError {
 }
 
 final class MemorySQLiteStore {
-    private static let schemaVersion = 6
+    private static let schemaVersion = 7
     private static let cleanupUnknownIssueKey = "issue-unassigned"
     private static let cleanupNoiseIssueKey = "issue-noise"
+    private static let expiredContextDefaultRetentionDays = 30
+    private static let expiredContextDefaultMaxRows = 500
+    private static let expiredContextDefaultMaxRawBytes = 100 * 1024 * 1024
 
     struct MetadataCleanupReport: Hashable {
         let scannedCards: Int
@@ -465,6 +468,44 @@ final class MemorySQLiteStore {
         CREATE INDEX IF NOT EXISTS idx_conversation_agent_preferences_expires
             ON conversation_agent_preferences(expires_at);
         """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS conversation_expired_contexts (
+            id TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            bundle_id TEXT NOT NULL,
+            project_key TEXT,
+            identity_key TEXT,
+            summary_text TEXT NOT NULL,
+            summary_method TEXT NOT NULL,
+            summary_confidence REAL,
+            source_turn_count INTEGER NOT NULL,
+            recent_turns_json TEXT NOT NULL,
+            raw_turns_json TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            expired_at REAL NOT NULL,
+            delete_after_at REAL NOT NULL,
+            consumed_at REAL,
+            consumed_by_thread_id TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_expired_context_scope_recent
+            ON conversation_expired_contexts(scope_key, expired_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_expired_context_delete_after
+            ON conversation_expired_contexts(delete_after_at);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_expired_context_unconsumed
+            ON conversation_expired_contexts(scope_key, consumed_at);
+        """)
     }
 
     func hasTable(named tableName: String) throws -> Bool {
@@ -838,6 +879,320 @@ final class MemorySQLiteStore {
         try execute(sql: "DELETE FROM conversation_turns;")
         try execute(sql: "DELETE FROM conversation_threads;")
         try execute(sql: "DELETE FROM conversation_thread_redirects;")
+    }
+
+    func upsertExpiredConversationContext(_ context: ExpiredConversationContextRecord) throws {
+        let normalizedID = context.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedScopeKey = normalizeLookupKey(context.scopeKey)
+        let normalizedThreadID = context.threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedBundleID = normalizeLookupKey(context.bundleID)
+        guard !normalizedID.isEmpty,
+              !normalizedScopeKey.isEmpty,
+              !normalizedThreadID.isEmpty,
+              !normalizedBundleID.isEmpty else {
+            return
+        }
+
+        let normalizedSummaryText = MemoryTextNormalizer.normalizedBody(context.summaryText)
+        let normalizedRecentTurnsJSON = context.recentTurnsJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "[]"
+            : context.recentTurnsJSON
+        let normalizedRawTurnsJSON = context.rawTurnsJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "[]"
+            : context.rawTurnsJSON
+        let normalizedTrigger = context.trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+        let consumedByThreadID = context.consumedByThreadID?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let sql = """
+        INSERT INTO conversation_expired_contexts (
+            id, scope_key, thread_id, bundle_id, project_key, identity_key,
+            summary_text, summary_method, summary_confidence, source_turn_count,
+            recent_turns_json, raw_turns_json, trigger, expired_at, delete_after_at,
+            consumed_at, consumed_by_thread_id, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            scope_key = excluded.scope_key,
+            thread_id = excluded.thread_id,
+            bundle_id = excluded.bundle_id,
+            project_key = excluded.project_key,
+            identity_key = excluded.identity_key,
+            summary_text = excluded.summary_text,
+            summary_method = excluded.summary_method,
+            summary_confidence = excluded.summary_confidence,
+            source_turn_count = excluded.source_turn_count,
+            recent_turns_json = excluded.recent_turns_json,
+            raw_turns_json = excluded.raw_turns_json,
+            trigger = excluded.trigger,
+            expired_at = excluded.expired_at,
+            delete_after_at = excluded.delete_after_at,
+            consumed_at = excluded.consumed_at,
+            consumed_by_thread_id = excluded.consumed_by_thread_id,
+            metadata_json = excluded.metadata_json;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(normalizedID, at: 1, in: statement)
+            self.bind(normalizedScopeKey, at: 2, in: statement)
+            self.bind(normalizedThreadID, at: 3, in: statement)
+            self.bind(normalizedBundleID, at: 4, in: statement)
+            self.bind(self.normalizeLookupOptional(context.projectKey), at: 5, in: statement)
+            self.bind(self.normalizeLookupOptional(context.identityKey), at: 6, in: statement)
+            self.bind(
+                normalizedSummaryText.isEmpty ? "Context expired without summary." : normalizedSummaryText,
+                at: 7,
+                in: statement
+            )
+            self.bind(context.summaryMethod.rawValue, at: 8, in: statement)
+            if let summaryConfidence = context.summaryConfidence {
+                self.bind(summaryConfidence, at: 9, in: statement)
+            } else {
+                sqlite3_bind_null(statement, 9)
+            }
+            self.bind(Int64(max(0, context.sourceTurnCount)), at: 10, in: statement)
+            self.bind(normalizedRecentTurnsJSON, at: 11, in: statement)
+            self.bind(normalizedRawTurnsJSON, at: 12, in: statement)
+            self.bind(normalizedTrigger.isEmpty ? "unknown" : normalizedTrigger, at: 13, in: statement)
+            self.bind(context.expiredAt.timeIntervalSince1970, at: 14, in: statement)
+            self.bind(context.deleteAfterAt.timeIntervalSince1970, at: 15, in: statement)
+            if let consumedAt = context.consumedAt {
+                self.bind(consumedAt.timeIntervalSince1970, at: 16, in: statement)
+            } else {
+                sqlite3_bind_null(statement, 16)
+            }
+            self.bind(consumedByThreadID, at: 17, in: statement)
+            self.bind(self.encodeJSON(context.metadata, fallback: "{}"), at: 18, in: statement)
+        })
+    }
+
+    func fetchLatestExpiredConversationContext(
+        scopeKey: String,
+        bundleIDConstraint: String?
+    ) throws -> ExpiredConversationContextRecord? {
+        let normalizedScopeKey = normalizeLookupKey(scopeKey)
+        guard !normalizedScopeKey.isEmpty else { return nil }
+        let normalizedBundleConstraint = normalizeLookupOptional(bundleIDConstraint)
+
+        let sql = """
+        SELECT
+            id, scope_key, thread_id, bundle_id, project_key, identity_key,
+            summary_text, summary_method, summary_confidence, source_turn_count,
+            recent_turns_json, raw_turns_json, trigger, expired_at, delete_after_at,
+            consumed_at, consumed_by_thread_id, metadata_json
+        FROM conversation_expired_contexts
+        WHERE scope_key = ?
+            AND consumed_at IS NULL
+            AND delete_after_at > ?
+            AND (? IS NULL OR bundle_id = ?)
+        ORDER BY expired_at DESC
+        LIMIT 1;
+        """
+
+        let rows: [ExpiredConversationContextRecord] = try query(sql: sql, bind: { statement in
+            self.bind(normalizedScopeKey, at: 1, in: statement)
+            self.bind(Date().timeIntervalSince1970, at: 2, in: statement)
+            self.bind(normalizedBundleConstraint, at: 3, in: statement)
+            self.bind(normalizedBundleConstraint, at: 4, in: statement)
+        }, mapRow: { statement in
+            self.expiredConversationContext(from: statement)
+        })
+        return rows.first
+    }
+
+    @discardableResult
+    func markExpiredConversationContextConsumed(
+        id: String,
+        consumedByThreadID: String,
+        at: Date = Date()
+    ) throws -> Bool {
+        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedConsumedByThreadID = consumedByThreadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedID.isEmpty, !normalizedConsumedByThreadID.isEmpty else { return false }
+
+        let changed = try executeReturningChanges(sql: """
+        UPDATE conversation_expired_contexts
+        SET consumed_at = ?,
+            consumed_by_thread_id = ?
+        WHERE id = ?
+            AND consumed_at IS NULL;
+        """, bind: { statement in
+            self.bind(at.timeIntervalSince1970, at: 1, in: statement)
+            self.bind(normalizedConsumedByThreadID, at: 2, in: statement)
+            self.bind(normalizedID, at: 3, in: statement)
+        })
+        return changed > 0
+    }
+
+    @discardableResult
+    func updateExpiredConversationContextSummary(
+        id: String,
+        summaryText: String,
+        method: ExpiredSummaryMethod,
+        confidence: Double?,
+        metadata: [String: String]
+    ) throws -> Bool {
+        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSummaryText = MemoryTextNormalizer.normalizedBody(summaryText)
+        guard !normalizedID.isEmpty, !normalizedSummaryText.isEmpty else { return false }
+
+        let changed = try executeReturningChanges(sql: """
+        UPDATE conversation_expired_contexts
+        SET summary_text = ?,
+            summary_method = ?,
+            summary_confidence = ?,
+            metadata_json = ?
+        WHERE id = ?;
+        """, bind: { statement in
+            self.bind(normalizedSummaryText, at: 1, in: statement)
+            self.bind(method.rawValue, at: 2, in: statement)
+            if let confidence {
+                self.bind(confidence, at: 3, in: statement)
+            } else {
+                sqlite3_bind_null(statement, 3)
+            }
+            self.bind(self.encodeJSON(metadata, fallback: "{}"), at: 4, in: statement)
+            self.bind(normalizedID, at: 5, in: statement)
+        })
+
+        return changed > 0
+    }
+
+    @discardableResult
+    func purgeExpiredConversationContextArchive(
+        now: Date = Date(),
+        retentionDays: Int = MemorySQLiteStore.expiredContextDefaultRetentionDays,
+        maxRows: Int = MemorySQLiteStore.expiredContextDefaultMaxRows,
+        maxRawBytes: Int = MemorySQLiteStore.expiredContextDefaultMaxRawBytes
+    ) throws -> (expiredDeleted: Int, retentionDeleted: Int, rowLimitDeleted: Int, rawSizeDeleted: Int) {
+        let normalizedRetentionDays = max(1, retentionDays)
+        let normalizedMaxRows = max(1, maxRows)
+        let normalizedMaxRawBytes = max(0, maxRawBytes)
+        let nowEpoch = now.timeIntervalSince1970
+        let retentionCutoff = now
+            .addingTimeInterval(-Double(normalizedRetentionDays) * 86_400)
+            .timeIntervalSince1970
+
+        let expiredDeleted = try executeReturningChanges(sql: """
+        DELETE FROM conversation_expired_contexts
+        WHERE delete_after_at <= ?;
+        """, bind: { statement in
+            self.bind(nowEpoch, at: 1, in: statement)
+        })
+
+        let retentionDeleted = try executeReturningChanges(sql: """
+        DELETE FROM conversation_expired_contexts
+        WHERE expired_at <= ?;
+        """, bind: { statement in
+            self.bind(retentionCutoff, at: 1, in: statement)
+        })
+
+        let totalRows = try scalarInt(sql: "SELECT COUNT(*) FROM conversation_expired_contexts;")
+        let overflowRows = max(0, totalRows - normalizedMaxRows)
+        let rowLimitDeleted: Int
+        if overflowRows > 0 {
+            rowLimitDeleted = try executeReturningChanges(sql: """
+            DELETE FROM conversation_expired_contexts
+            WHERE id IN (
+                SELECT id
+                FROM conversation_expired_contexts
+                ORDER BY expired_at ASC, id ASC
+                LIMIT ?
+            );
+            """, bind: { statement in
+                self.bind(Int64(overflowRows), at: 1, in: statement)
+            })
+        } else {
+            rowLimitDeleted = 0
+        }
+
+        let maxRawBytes64 = Int64(normalizedMaxRawBytes)
+        var rawSizeDeleted = 0
+        let totalRawBytes = try scalarInt64(sql: """
+        SELECT coalesce(sum(length(CAST(raw_turns_json AS BLOB))), 0)
+        FROM conversation_expired_contexts;
+        """)
+        if totalRawBytes > maxRawBytes64 {
+            let bytesToTrim = totalRawBytes - maxRawBytes64
+            let candidates: [(id: String, rawBytes: Int64)] = try query(sql: """
+            SELECT id, length(CAST(raw_turns_json AS BLOB))
+            FROM conversation_expired_contexts
+            ORDER BY expired_at ASC, id ASC;
+            """, mapRow: { statement in
+                let id = self.readString(at: 0, in: statement) ?? ""
+                let rawBytes = sqlite3_column_int64(statement, 1)
+                return (id: id, rawBytes: rawBytes)
+            })
+
+            var selectedIDs: [String] = []
+            var reclaimedBytes: Int64 = 0
+            for candidate in candidates {
+                guard !candidate.id.isEmpty else { continue }
+                selectedIDs.append(candidate.id)
+                reclaimedBytes += max(0, candidate.rawBytes)
+                if reclaimedBytes >= bytesToTrim {
+                    break
+                }
+            }
+
+            if !selectedIDs.isEmpty {
+                let placeholders = Array(repeating: "?", count: selectedIDs.count).joined(separator: ", ")
+                rawSizeDeleted = try executeReturningChanges(
+                    sql: "DELETE FROM conversation_expired_contexts WHERE id IN (\(placeholders));",
+                    bind: { statement in
+                        for (index, id) in selectedIDs.enumerated() {
+                            self.bind(id, at: Int32(index + 1), in: statement)
+                        }
+                    }
+                )
+            }
+        }
+
+        return (
+            expiredDeleted: expiredDeleted,
+            retentionDeleted: retentionDeleted,
+            rowLimitDeleted: rowLimitDeleted,
+            rawSizeDeleted: rawSizeDeleted
+        )
+    }
+
+    func fetchExpiredConversationContextDiagnostics() throws -> ExpiredConversationContextDiagnostics {
+        let count = try scalarInt(sql: "SELECT COUNT(*) FROM conversation_expired_contexts;")
+        guard count > 0 else {
+            return ExpiredConversationContextDiagnostics(
+                totalCount: 0,
+                lastSummaryMethod: .fallback,
+                lastPromotionDecisionSummary: "No promotion decision yet."
+            )
+        }
+
+        let latestRows: [(method: ExpiredSummaryMethod, trigger: String, metadata: [String: String])] = try query(sql: """
+        SELECT summary_method, trigger, metadata_json
+        FROM conversation_expired_contexts
+        ORDER BY expired_at DESC, id DESC
+        LIMIT 1;
+        """, mapRow: { statement in
+            let rawMethod = self.readString(at: 0, in: statement) ?? ""
+            let method = ExpiredSummaryMethod(rawValue: rawMethod) ?? .fallback
+            let trigger = self.readString(at: 1, in: statement) ?? ""
+            let metadata = self.decodeStringDictionary(from: self.readString(at: 2, in: statement) ?? "{}")
+            return (method: method, trigger: trigger, metadata: metadata)
+        })
+
+        guard let latest = latestRows.first else {
+            return ExpiredConversationContextDiagnostics(
+                totalCount: count,
+                lastSummaryMethod: .fallback,
+                lastPromotionDecisionSummary: "No promotion decision yet."
+            )
+        }
+
+        return ExpiredConversationContextDiagnostics(
+            totalCount: count,
+            lastSummaryMethod: latest.method,
+            lastPromotionDecisionSummary: promotionDecisionSummary(
+                metadata: latest.metadata,
+                trigger: latest.trigger
+            )
+        )
     }
 
     func upsertConversationAgentProfile(_ profile: ConversationAgentProfileRecord) throws {
@@ -3481,6 +3836,45 @@ final class MemorySQLiteStore {
         )
     }
 
+    private func expiredConversationContext(from statement: OpaquePointer) -> ExpiredConversationContextRecord {
+        let summaryMethod = ExpiredSummaryMethod(
+            rawValue: self.readString(at: 7, in: statement) ?? ""
+        ) ?? .fallback
+        let summaryConfidence: Double?
+        if sqlite3_column_type(statement, 8) == SQLITE_NULL {
+            summaryConfidence = nil
+        } else {
+            summaryConfidence = sqlite3_column_double(statement, 8)
+        }
+        let consumedAt: Date?
+        if sqlite3_column_type(statement, 15) == SQLITE_NULL {
+            consumedAt = nil
+        } else {
+            consumedAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 15))
+        }
+
+        return ExpiredConversationContextRecord(
+            id: self.readString(at: 0, in: statement) ?? "",
+            scopeKey: self.readString(at: 1, in: statement) ?? "",
+            threadID: self.readString(at: 2, in: statement) ?? "",
+            bundleID: self.readString(at: 3, in: statement) ?? "",
+            projectKey: self.readString(at: 4, in: statement),
+            identityKey: self.readString(at: 5, in: statement),
+            summaryText: self.readString(at: 6, in: statement) ?? "",
+            summaryMethod: summaryMethod,
+            summaryConfidence: summaryConfidence,
+            sourceTurnCount: Int(sqlite3_column_int64(statement, 9)),
+            recentTurnsJSON: self.readString(at: 10, in: statement) ?? "[]",
+            rawTurnsJSON: self.readString(at: 11, in: statement) ?? "[]",
+            trigger: self.readString(at: 12, in: statement) ?? "unknown",
+            expiredAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 13)),
+            deleteAfterAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 14)),
+            consumedAt: consumedAt,
+            consumedByThreadID: self.readString(at: 16, in: statement),
+            metadata: self.decodeStringDictionary(from: self.readString(at: 17, in: statement) ?? "{}")
+        )
+    }
+
     private func normalizeLookupKey(_ value: String) -> String {
         value
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3519,6 +3913,51 @@ final class MemorySQLiteStore {
         })
         guard let first = values.first else { return 0 }
         return Int(first)
+    }
+
+    private func scalarInt64(
+        sql: String,
+        bind: ((OpaquePointer) throws -> Void)? = nil
+    ) throws -> Int64 {
+        let values: [Int64] = try query(sql: sql, bind: bind, mapRow: { statement in
+            sqlite3_column_int64(statement, 0)
+        })
+        return values.first ?? 0
+    }
+
+    private func promotionDecisionSummary(
+        metadata: [String: String],
+        trigger: String
+    ) -> String {
+        let explicit = [
+            metadata["promotion_decision_summary"],
+            metadata["promotion_summary"],
+            metadata["decision_summary"]
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        if let explicit {
+            return explicit
+        }
+
+        let decision = metadata["promotion_decision"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !decision.isEmpty {
+            let score = metadata["promotion_score"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let threshold = metadata["promotion_threshold"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !score.isEmpty, !threshold.isEmpty {
+                return "\(decision) (\(score)/\(threshold))"
+            }
+            return decision
+        }
+
+        let normalizedTrigger = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedTrigger.isEmpty {
+            return "trigger=\(normalizedTrigger)"
+        }
+        return "No promotion decision yet."
     }
 
     private func patternOutcome(from raw: String) -> MemoryPatternOutcome {

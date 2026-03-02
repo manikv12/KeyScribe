@@ -69,6 +69,9 @@ struct AIMemoryStudioView: View {
     @State private var conversationPatternStats: [MemoryPatternStats] = []
     @State private var selectedConversationPatternKey = ""
     @State private var conversationPatternOccurrences: [MemoryPatternOccurrence] = []
+    @State private var expiredConversationHandoffCount = 0
+    @State private var lastConversationHandoffSummaryMethod = "fallback"
+    @State private var lastConversationPromotionDecisionSummary = "No promotion decision yet."
     @State private var showConversationContextInspectSheet = false
     @State private var inspectedConversationContextID = ""
     @State private var showConversationContextMappingsSheet = false
@@ -911,12 +914,7 @@ struct AIMemoryStudioView: View {
                     )
                     metricPill(
                         label: "Turns",
-                        value: "\(totalConversationTurnCount)",
-                        tint: AppVisualTheme.accentTint
-                    )
-                    metricPill(
-                        label: "Summaries",
-                        value: "\(totalConversationSummaryTurnCount)",
+                        value: "\(totalConversationExchangeTurnCount)",
                         tint: AppVisualTheme.accentTint
                     )
                     metricPill(
@@ -924,6 +922,32 @@ struct AIMemoryStudioView: View {
                         value: "\(totalConversationEstimatedTokenCount)",
                         tint: AppVisualTheme.accentTint
                     )
+                }
+
+                HStack(spacing: 8) {
+                    metricPill(
+                        label: "Expired Handoffs",
+                        value: "\(expiredConversationHandoffCount)",
+                        tint: AppVisualTheme.accentTint
+                    )
+                    metricPill(
+                        label: "Last Method",
+                        value: lastConversationHandoffSummaryMethod.uppercased(),
+                        tint: AppVisualTheme.accentTint
+                    )
+                    Spacer(minLength: 0)
+                }
+
+                HStack(alignment: .top, spacing: 8) {
+                    Text("Last archive status")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(lastConversationPromotionDecisionSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
                 }
 
                 HStack {
@@ -1070,12 +1094,7 @@ struct AIMemoryStudioView: View {
                                 HStack(spacing: 8) {
                                     metricPill(
                                         label: "Turns",
-                                        value: "\(detail.totalTurnCount)",
-                                        tint: AppVisualTheme.accentTint
-                                    )
-                                    metricPill(
-                                        label: "Summaries",
-                                        value: "\(detail.summaryTurnCount)",
+                                        value: "\(detail.exchangeTurnCount)",
                                         tint: AppVisualTheme.accentTint
                                     )
                                     metricPill(
@@ -1613,7 +1632,7 @@ struct AIMemoryStudioView: View {
         _ detail: PromptRewriteConversationContextDetail
     ) -> some View {
         let payload = formattedConversationContextPayload(for: detail.id)
-        let summaryTurns = detail.turns.filter(\.isSummary)
+        let exchangeTurns = detail.turns.filter { !$0.isSummary }
 
         return VStack(alignment: .leading, spacing: 14) {
             inspectorSection(
@@ -1627,12 +1646,7 @@ struct AIMemoryStudioView: View {
                 ) {
                     metricPill(
                         label: "Turns",
-                        value: "\(detail.totalTurnCount)",
-                        tint: AppVisualTheme.accentTint
-                    )
-                    metricPill(
-                        label: "Summaries",
-                        value: "\(detail.summaryTurnCount)",
+                        value: "\(detail.exchangeTurnCount)",
                         tint: AppVisualTheme.accentTint
                     )
                     metricPill(
@@ -1689,34 +1703,12 @@ struct AIMemoryStudioView: View {
             }
 
             inspectorSection(
-                title: "Compacted Summaries",
-                subtitle: "Summaries generated when older turns are compacted."
-            ) {
-                if summaryTurns.isEmpty {
-                    Text("No compacted summaries yet for this context.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 2)
-                } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 10) {
-                            ForEach(Array(summaryTurns.enumerated()), id: \.offset) { _, turn in
-                                conversationSummaryTurnRow(turn)
-                            }
-                        }
-                        .padding(.trailing, 2)
-                    }
-                    .frame(maxHeight: 230)
-                }
-            }
-
-            inspectorSection(
                 title: "Conversation Turns",
-                subtitle: "Full timeline including exchanges and summary entries."
+                subtitle: "Full exchange timeline."
             ) {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(Array(detail.turns.enumerated()), id: \.offset) { _, turn in
+                        ForEach(Array(exchangeTurns.enumerated()), id: \.offset) { _, turn in
                             conversationTurnRow(turn)
                         }
                     }
@@ -1757,51 +1749,10 @@ struct AIMemoryStudioView: View {
         )
     }
 
-    private func conversationSummaryTurnRow(_ turn: PromptRewriteConversationTurn) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                memoryEntryBadge("Summary", tint: AppVisualTheme.accentTint)
-                if let sourceTurnCount = turn.sourceTurnCount {
-                    Text("from \(sourceTurnCount) earlier turn(s)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Text(turn.timestamp.formatted(date: .abbreviated, time: .shortened))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .monospacedDigit()
-            }
-
-            Text(turn.assistantText)
-                .font(.caption)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(AppVisualTheme.adaptiveMaterialFill())
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
-        )
-    }
-
     private func conversationTurnRow(_ turn: PromptRewriteConversationTurn) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                if turn.isSummary {
-                    memoryEntryBadge("Summary", tint: AppVisualTheme.accentTint)
-                    if let sourceTurnCount = turn.sourceTurnCount {
-                        Text("from \(sourceTurnCount) earlier turn(s)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } else {
-                    memoryEntryBadge("Exchange", tint: AppVisualTheme.accentTint)
-                }
+                memoryEntryBadge("Exchange", tint: AppVisualTheme.accentTint)
                 Spacer()
                 Text(turn.timestamp.formatted(date: .abbreviated, time: .shortened))
                     .font(.caption2)
@@ -1809,17 +1760,15 @@ struct AIMemoryStudioView: View {
                     .monospacedDigit()
             }
 
-            if !turn.isSummary {
-                Text("User")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(turn.userText)
-                    .font(.caption)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            Text("User")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(turn.userText)
+                .font(.caption)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(turn.isSummary ? "Summary" : "Assistant")
+            Text("Assistant")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(turn.assistantText)
@@ -2255,12 +2204,8 @@ struct AIMemoryStudioView: View {
         )
     }
 
-    private var totalConversationTurnCount: Int {
-        conversationContextDetails.reduce(0) { $0 + $1.totalTurnCount }
-    }
-
-    private var totalConversationSummaryTurnCount: Int {
-        conversationContextDetails.reduce(0) { $0 + $1.summaryTurnCount }
+    private var totalConversationExchangeTurnCount: Int {
+        conversationContextDetails.reduce(0) { $0 + $1.exchangeTurnCount }
     }
 
     private var totalConversationEstimatedTokenCount: Int {
@@ -3506,6 +3451,7 @@ struct AIMemoryStudioView: View {
             timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes
         )
         conversationContextDetails = details
+        refreshConversationArchiveDiagnostics()
         sanitizePinnedConversationContextSelection()
 
         let normalizedInspectedID = inspectedConversationContextID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4568,10 +4514,69 @@ struct AIMemoryStudioView: View {
             && normalized != "issue-hey"
     }
 
+    private struct ConversationArchiveDiagnosticsSnapshot {
+        let expiredCount: Int
+        let lastSummaryMethod: String
+        let lastPromotionDecisionSummary: String
+
+        static let empty = ConversationArchiveDiagnosticsSnapshot(
+            expiredCount: 0,
+            lastSummaryMethod: "fallback",
+            lastPromotionDecisionSummary: "No promotion decision yet."
+        )
+    }
+
+    private func refreshConversationArchiveDiagnostics() {
+        let snapshot = loadConversationArchiveDiagnosticsSnapshot()
+        expiredConversationHandoffCount = snapshot.expiredCount
+        lastConversationHandoffSummaryMethod = snapshot.lastSummaryMethod
+        lastConversationPromotionDecisionSummary = snapshot.lastPromotionDecisionSummary
+    }
+
+    private func loadConversationArchiveDiagnosticsSnapshot() -> ConversationArchiveDiagnosticsSnapshot {
+        do {
+            let store = try MemorySQLiteStore()
+            let diagnostics = try store.fetchExpiredConversationContextDiagnostics()
+            return ConversationArchiveDiagnosticsSnapshot(
+                expiredCount: max(0, diagnostics.totalCount),
+                lastSummaryMethod: diagnostics.lastSummaryMethod.rawValue,
+                lastPromotionDecisionSummary: diagnostics.lastPromotionDecisionSummary
+            )
+        } catch {
+            return .empty
+        }
+    }
+
+    private func purgeExpiredConversationContextArchiveMaintenance() -> (
+        expiredDeleted: Int,
+        retentionDeleted: Int,
+        rowLimitDeleted: Int,
+        rawSizeDeleted: Int
+    )? {
+        do {
+            let store = try MemorySQLiteStore()
+            return try store.purgeExpiredConversationContextArchive()
+        } catch {
+            return nil
+        }
+    }
+
     private func runQualityMaintenance() {
         let result = memoryIndexingSettingsService.runQualityMaintenance()
-        memoryActionMessage = result.message
-        if result.didRun {
+        let archivePurgeResult = purgeExpiredConversationContextArchiveMaintenance()
+        let archiveDeletedCount = (archivePurgeResult?.expiredDeleted ?? 0)
+            + (archivePurgeResult?.retentionDeleted ?? 0)
+            + (archivePurgeResult?.rowLimitDeleted ?? 0)
+            + (archivePurgeResult?.rawSizeDeleted ?? 0)
+
+        var message = result.message
+        if let archivePurgeResult {
+            message += " Expired handoff archive purge: deleted \(archivePurgeResult.expiredDeleted) expired, \(archivePurgeResult.retentionDeleted) by retention, \(archivePurgeResult.rowLimitDeleted) by row cap, \(archivePurgeResult.rawSizeDeleted) by raw-byte cap."
+        }
+        memoryActionMessage = message
+
+        refreshConversationArchiveDiagnostics()
+        if result.didRun || archiveDeletedCount > 0 {
             refreshMemoryBrowser()
             refreshMemoryAnalytics()
         }

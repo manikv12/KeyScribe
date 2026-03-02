@@ -208,6 +208,16 @@ final class AppleSpeechTranscriber: NSObject {
         }
     }
 
+    func trimMemoryUsage(aggressive: Bool) {
+        if Thread.isMainThread {
+            trimMemoryUsageOnMain(aggressive: aggressive)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.trimMemoryUsageOnMain(aggressive: aggressive)
+            }
+        }
+    }
+
     @discardableResult
     private func startRecordingOnMain() -> Bool {
         guard granted else {
@@ -293,6 +303,7 @@ final class AppleSpeechTranscriber: NSObject {
 
             audioEngine.inputNode.removeTap(onBus: 0)
             audioEngine.stop()
+            audioEngine.reset()
             onAudioLevel?(0)
         }
 
@@ -321,6 +332,25 @@ final class AppleSpeechTranscriber: NSObject {
 
         if emitFinalText && !text.isEmpty {
             onFinalText?(text)
+        }
+    }
+
+    private func trimMemoryUsageOnMain(aggressive: Bool) {
+        guard !isRecording, !isStopping else { return }
+
+        pendingFinalizeWorkItem?.cancel()
+        pendingFinalizeWorkItem = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest = nil
+        committedTranscript = ""
+        liveTranscript = ""
+        bestTranscriptInCurrentSegment = ""
+
+        if aggressive {
+            audioEngine.stop()
+            audioEngine.reset()
+            onAudioLevel?(0)
         }
     }
 
