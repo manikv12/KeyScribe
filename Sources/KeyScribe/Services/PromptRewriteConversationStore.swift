@@ -3998,11 +3998,33 @@ enum PromptRewriteConversationContextResolver {
             return fetched
         }
 
-        if project == nil {
+        func bestProjectFromVisibleText() -> String? {
             let allTexts = textNodes().map(\.text)
-            project = allTexts.compactMap(codexProjectFromControlLabel).first
-            project = allTexts.compactMap(codexProjectFromPathLikeLabel).first
-            project = allTexts.compactMap(projectName(fromCodexText:)).first
+            let controlCandidates = allTexts.compactMap(codexProjectFromControlLabel)
+            if let candidate = controlCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+                return candidate
+            }
+            let pathCandidates = allTexts.compactMap(codexProjectFromPathLikeLabel)
+            if let candidate = pathCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+                return candidate
+            }
+            let genericCandidates = allTexts.compactMap(projectName(fromCodexText:))
+            if let candidate = genericCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+                return candidate
+            }
+            return controlCandidates.first ?? pathCandidates.first ?? genericCandidates.first
+        }
+
+        // If the initial top bar/sidebar pick looks like a branch/PR/ref label,
+        // try to recover using broader visible text before accepting it.
+        if let currentProject = project,
+           isLikelyVersionControlReferenceLabel(currentProject),
+           let replacement = bestProjectFromVisibleText() {
+            project = replacement
+        }
+
+        if project == nil {
+            project = bestProjectFromVisibleText()
         }
         if thread == nil {
             let selectedTexts = textNodes()
@@ -4508,7 +4530,8 @@ enum PromptRewriteConversationContextResolver {
             "unknown",
             "unknown project",
             "unknown workspace",
-            "unknown identity"
+            "unknown identity",
+            "add new project"
         ]
         if blocked.contains(lowered) {
             return nil
