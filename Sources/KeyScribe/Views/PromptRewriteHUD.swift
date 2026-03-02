@@ -65,7 +65,7 @@ private enum PromptRewriteHUDLayout {
     static let screenMargin: CGFloat = 8
     static let anchorGap: CGFloat = 14
     static let cornerRadius: CGFloat = 26
-    static let loadingSize = NSSize(width: 420, height: 170)
+    static let loadingSize = NSSize(width: 420, height: 154)
     static let loadingOffsetY: CGFloat = 16
 }
 
@@ -541,7 +541,7 @@ final class PromptRewriteHUDManager {
         let pending = session.pendingSuggestions.remove(at: index)
 
         guard !session.pendingSuggestions.isEmpty else {
-            hide(session: session)
+            removeSession(sessionKey)
             pending.continuation.resume(returning: choice)
             return
         }
@@ -1245,7 +1245,9 @@ private struct PromptRewriteLoadingView: View {
     let onPause: () -> Void
     var onDragChanged: ((CGSize) -> Void)? = nil
     var onDragEnded: ((CGSize) -> Void)? = nil
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @State private var animatedProgressValue: Double = 0.08
 
     private var state: PromptRewriteLoadingDisplayState {
         model.displayState
@@ -1266,13 +1268,17 @@ private struct PromptRewriteLoadingView: View {
         return normalized.isEmpty ? "Preparing rewrite request" : normalized
     }
 
+    private var targetProgressValue: Double {
+        PromptRewriteProgressEstimate.progress(for: stepText)
+    }
+
     var body: some View {
         let tokens = AppVisualTheme.glassTokens(
             style: SettingsStore.shared.appChromeStyle,
             reduceTransparency: reduceTransparency
         )
 
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
                 AppIconBadge(
                     symbol: "waveform.and.sparkles",
@@ -1283,7 +1289,7 @@ private struct PromptRewriteLoadingView: View {
                 )
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Refining Your Prompt")
+                    Text("Refining Transcript")
                         .font(.system(size: 13.5, weight: .bold, design: .rounded))
                         .foregroundStyle(Color.white.opacity(0.95))
                     PromptRewriteWordFlowText(
@@ -1304,32 +1310,45 @@ private struct PromptRewriteLoadingView: View {
                         .frame(width: 18, height: 18)
                         .background(
                             Circle()
-                                .fill(Color.red.opacity(0.90))
+                                .fill(Color.white.opacity(0.16))
+                                .overlay(
+                                    Circle()
+                                        .stroke(Color.white.opacity(0.28), lineWidth: 0.8)
+                                )
                         )
                 }
                 .buttonStyle(.plain)
                 .help("Pause AI rewrite and insert transcribed text")
             }
 
-            PromptRewriteActivityBar()
-                .frame(height: 3)
-                .padding(.top, -1)
+            HStack(alignment: .center, spacing: 8) {
+                PromptRewriteActivityBar(progress: animatedProgressValue)
+                    .frame(height: 6)
 
-            VStack(alignment: .leading, spacing: 5) {
-                Text("Transcript")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Color.white.opacity(0.64))
-                PromptRewriteWordFlowText(
-                    text: transcriptPreview,
-                    font: .system(size: 12, weight: .medium, design: .rounded),
-                    foregroundColor: Color.white.opacity(0.92),
-                    wordsPerSecond: 10,
-                    lineLimit: 2
-                )
+                Text("\(Int((animatedProgressValue * 100).rounded()))%")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Color.white.opacity(0.70))
+                    .frame(width: 38, alignment: .trailing)
+            }
+            .padding(.top, -1)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .top, spacing: 8) {
+                    PromptRewriteAccentDot()
+                        .padding(.top, 3)
+
+                    PromptRewriteWordFlowText(
+                        text: transcriptPreview,
+                        font: .system(size: 11.5, weight: .medium, design: .rounded),
+                        foregroundColor: Color.white.opacity(0.90),
+                        wordsPerSecond: 10,
+                        lineLimit: 2
+                    )
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.vertical, 9)
             .background(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                     .fill(tokens.surfaceBottom.opacity(0.36))
@@ -1338,13 +1357,9 @@ private struct PromptRewriteLoadingView: View {
                             .stroke(tokens.strokeTop.opacity(0.40), lineWidth: 0.8)
                     )
             )
-
-            Text("Esc pauses AI and uses original text")
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(Color.white.opacity(0.56))
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 11)
+        .padding(.vertical, 10)
         .background {
             ZStack {
                 PromptRewriteGlassSurface(cornerRadius: 20)
@@ -1392,16 +1407,42 @@ private struct PromptRewriteLoadingView: View {
             height: PromptRewriteHUDLayout.loadingSize.height,
             alignment: .center
         )
+        .onAppear {
+            let clampedTarget = min(1, max(0.08, targetProgressValue))
+            if reduceMotion {
+                animatedProgressValue = clampedTarget
+            } else {
+                animatedProgressValue = 0.08
+                withAnimation(.timingCurve(0.22, 0.88, 0.24, 1.0, duration: 0.34)) {
+                    animatedProgressValue = clampedTarget
+                }
+            }
+        }
+        .onChange(of: targetProgressValue) { newValue in
+            let clampedTarget = min(1, max(0.08, newValue))
+            if reduceMotion {
+                animatedProgressValue = clampedTarget
+            } else {
+                let distance = abs(clampedTarget - animatedProgressValue)
+                let duration = max(0.18, min(0.46, 0.22 + (distance * 0.45)))
+                withAnimation(.timingCurve(0.22, 0.88, 0.24, 1.0, duration: duration)) {
+                    animatedProgressValue = clampedTarget
+                }
+            }
+        }
     }
 }
 
 private struct PromptRewriteActivityBar: View {
+    let progress: Double
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isAnimating = false
+    @State private var shimmerPosition: CGFloat = -0.46
 
     var body: some View {
         GeometryReader { proxy in
             let width = max(20, proxy.size.width)
+            let clampedProgress = min(1, max(0.08, CGFloat(progress)))
+            let fillWidth = max(14, width * clampedProgress)
             Capsule(style: .continuous)
                 .fill(Color.white.opacity(0.14))
                 .overlay(alignment: .leading) {
@@ -1417,17 +1458,78 @@ private struct PromptRewriteActivityBar: View {
                                 endPoint: .trailing
                             )
                         )
-                        .frame(width: width * 0.30)
-                        .offset(x: reduceMotion ? 0 : (isAnimating ? width * 0.70 : -width * 0.05))
+                        .frame(width: fillWidth)
+                        .overlay(alignment: .leading) {
+                            Capsule(style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [
+                                            Color.white.opacity(0.04),
+                                            Color.white.opacity(0.33),
+                                            Color.white.opacity(0.04)
+                                        ],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(width: max(18, fillWidth * 0.38))
+                                .offset(x: reduceMotion ? 0 : shimmerPosition * max(fillWidth, 18))
+                        }
+                        .overlay(alignment: .trailing) {
+                            Circle()
+                                .fill(Color.white.opacity(0.94))
+                                .frame(width: 5, height: 5)
+                                .padding(.trailing, 2)
+                                .shadow(color: AppVisualTheme.accentTint.opacity(0.65), radius: 3, x: 0, y: 0.5)
+                        }
                 }
         }
         .clipped()
         .onAppear {
             guard !reduceMotion else { return }
-            withAnimation(.linear(duration: 1.25).repeatForever(autoreverses: false)) {
-                isAnimating = true
+            shimmerPosition = -0.46
+            withAnimation(.linear(duration: 1.08).repeatForever(autoreverses: false)) {
+                shimmerPosition = 1.08
             }
         }
+    }
+}
+
+private struct PromptRewriteAccentDot: View {
+    var body: some View {
+        Circle()
+            .fill(AppVisualTheme.accentTint)
+            .frame(width: 8, height: 8)
+            .overlay(
+                Circle()
+                    .stroke(Color.white.opacity(0.36), lineWidth: 0.7)
+            )
+            .shadow(color: AppVisualTheme.accentTint.opacity(0.52), radius: 3.5, x: 0, y: 0.8)
+    }
+}
+
+private enum PromptRewriteProgressEstimate {
+    static func progress(for stepText: String) -> Double {
+        let normalized = stepText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.contains("paused") || normalized.contains("restoring") {
+            return 1
+        }
+        if normalized.contains("finalizing") {
+            return 0.92
+        }
+        if normalized.contains("receiving") || normalized.contains("normalizing") {
+            return 0.74
+        }
+        if normalized.contains("sending") {
+            return 0.50
+        }
+        if normalized.contains("connecting") {
+            return 0.28
+        }
+        if normalized.contains("preparing") {
+            return 0.16
+        }
+        return 0.36
     }
 }
 

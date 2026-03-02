@@ -3785,6 +3785,7 @@ enum PromptRewriteConversationContextResolver {
         let text: String
         let role: String
         let selected: Bool
+        let element: AXUIElement?
     }
 
     private struct AXLabelEntry {
@@ -4000,7 +4001,9 @@ enum PromptRewriteConversationContextResolver {
 
         func bestProjectFromVisibleText() -> String? {
             let allTexts = textNodes().map(\.text)
-            let controlCandidates = allTexts.compactMap(codexProjectFromControlLabel)
+            let controlCandidates = allTexts.compactMap {
+                codexProjectFromControlLabel($0, includeProjectSectionLabels: false)
+            }
             if let candidate = controlCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
                 return candidate
             }
@@ -4015,16 +4018,25 @@ enum PromptRewriteConversationContextResolver {
             return controlCandidates.first ?? pathCandidates.first ?? genericCandidates.first
         }
 
+        func bestProjectFromThreadContext(_ threadCandidate: String?) -> String? {
+            codexSidebarProjectFromThreadContext(
+                from: windowElement,
+                thread: threadCandidate
+            )
+        }
+
         // If the initial top bar/sidebar pick looks like a branch/PR/ref label,
         // try to recover using broader visible text before accepting it.
         if let currentProject = project,
            isLikelyVersionControlReferenceLabel(currentProject),
-           let replacement = bestProjectFromVisibleText() {
+           let replacement = bestProjectFromThreadContext(thread)
+           ?? bestProjectFromVisibleText() {
             project = replacement
         }
 
         if project == nil {
-            project = bestProjectFromVisibleText()
+            project = bestProjectFromThreadContext(thread)
+                ?? bestProjectFromVisibleText()
         }
         if thread == nil {
             let selectedTexts = textNodes()
@@ -4033,6 +4045,9 @@ enum PromptRewriteConversationContextResolver {
             thread = selectedTexts.first {
                 looksLikeCodexThreadTitle($0, project: project)
             }
+        }
+        if project == nil {
+            project = bestProjectFromThreadContext(thread)
         }
 
         if let fallbackWindowTitle = normalizedLabel(fallbackWindowTitle),
@@ -4074,8 +4089,15 @@ enum PromptRewriteConversationContextResolver {
             return nil
         }
         let entries = codexDirectChildLabels(of: controlsGroup)
-        let project = codexProjectFromTopBarControls(entries)
-        let thread = codexThreadNearTopBarControls(controlsGroup, project: project)
+        let thread = codexThreadNearTopBarControls(controlsGroup, project: nil)
+        let project = preferredCodexProjectCandidate(
+            topBarProject: codexProjectFromTopBarControls(entries),
+            sidebarProject: codexProjectNearTopBarControls(
+                from: windowElement,
+                controlsGroup,
+                thread: thread
+            )
+        )
         if project == nil, thread == nil {
             return nil
         }
@@ -4192,7 +4214,10 @@ enum PromptRewriteConversationContextResolver {
         }
 
         for entry in entries {
-            if let candidate = codexProjectFromControlLabel(entry.label) {
+            if let candidate = codexProjectFromControlLabel(
+                entry.label,
+                includeProjectSectionLabels: false
+            ) {
                 return candidate
             }
         }
@@ -4234,7 +4259,10 @@ enum PromptRewriteConversationContextResolver {
     }
 
     private static func codexNormalizedTopBarProjectCandidate(_ value: String) -> String? {
-        if let fromControl = codexProjectFromControlLabel(value) {
+        if let fromControl = codexProjectFromControlLabel(
+            value,
+            includeProjectSectionLabels: false
+        ) {
             return fromControl
         }
         if isCodexToolbarControlLabel(value) {
@@ -4246,11 +4274,19 @@ enum PromptRewriteConversationContextResolver {
         return normalizedProjectName(value)
     }
 
-    private static func codexProjectFromControlLabel(_ value: String) -> String? {
-        let controlPatterns = [
-            #"(?i)\b(?:start new thread in|project actions for|automations in)\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+    private static func codexProjectFromControlLabel(
+        _ value: String,
+        includeProjectSectionLabels: Bool = false
+    ) -> String? {
+        var controlPatterns = [
             #"(?i)\b(?:working directory|cwd|folder)\s*[:\-]\s*([^\n]{2,180})$"#
         ]
+        if includeProjectSectionLabels {
+            controlPatterns.insert(
+                #"(?i)\b(?:start new thread in|project actions for|automations in)\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+                at: 0
+            )
+        }
         for pattern in controlPatterns {
             guard let captured = firstRegexCapture(pattern: pattern, in: value) else { continue }
             if let fromPath = codexProjectFromPathLikeLabel(captured) {
@@ -4274,6 +4310,68 @@ enum PromptRewriteConversationContextResolver {
         guard looksLikePath else { return nil }
         guard let label = deriveDocumentLabel(from: normalized) else { return nil }
         return normalizedProjectName(label)
+    }
+
+    private static func codexProjectNearTopBarControls(
+        from windowElement: AXUIElement,
+        _ controlsGroup: AXUIElement,
+        thread: String?
+    ) -> String? {
+        let anchor = axCenterPoint(of: controlsGroup)
+        let nodes = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
+        var bestCandidates: [String: (label: String, score: Double)] = [:]
+
+        for node in nodes {
+            if isCodexToolbarControlLabel(node.text) {
+                continue
+            }
+            guard let candidate = codexNormalizedTopBarProjectCandidate(node.text) else {
+                continue
+            }
+            guard looksLikeLooseCodexProjectLabel(candidate) else {
+                continue
+            }
+            if let thread,
+               candidate.caseInsensitiveCompare(thread) == .orderedSame {
+                continue
+            }
+
+            var score = codexRoleSupportsProjectSelection(node.role) ? 0.0 : 90.0
+            if let anchor,
+               let element = node.element,
+               let center = axCenterPoint(of: element) {
+                let verticalGap = abs(Double(center.y - anchor.y))
+                let horizontalGap = abs(Double(center.x - anchor.x))
+                score += verticalGap * 5.0 + horizontalGap * 0.12
+                if center.y > anchor.y + 120 {
+                    score += 700 // Sidebar rows are typically far below top-bar controls.
+                }
+            } else {
+                score += 450
+            }
+            if isLikelyVersionControlReferenceLabel(candidate) {
+                score += 900
+            }
+
+            let key = candidate.lowercased()
+            let existing = bestCandidates[key]?.score ?? .greatestFiniteMagnitude
+            if score < existing {
+                bestCandidates[key] = (candidate, score)
+            }
+        }
+
+        let ranked = bestCandidates.values
+            .sorted { lhs, rhs in
+                if lhs.score == rhs.score {
+                    return lhs.label.lowercased() < rhs.label.lowercased()
+                }
+                return lhs.score < rhs.score
+            }
+            .map(\.label)
+        if let bestNonVCS = ranked.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+            return bestNonVCS
+        }
+        return ranked.first
     }
 
     private static func codexThreadNearTopBarControls(
@@ -4396,7 +4494,10 @@ enum PromptRewriteConversationContextResolver {
                     if lowered == "automation folders" || lowered == "threads" || lowered == "pinned threads" {
                         continue
                     }
-                    if let normalized = codexProjectFromControlLabel(candidate)
+                    if let normalized = codexProjectFromControlLabel(
+                        candidate,
+                        includeProjectSectionLabels: true
+                    )
                         ?? codexProjectFromPathLikeLabel(candidate)
                         ?? normalizedProjectName(candidate) {
                         return normalized
@@ -4437,7 +4538,7 @@ enum PromptRewriteConversationContextResolver {
             for value in values where isLikelyCodexContextText(value) {
                 let key = "\(value.lowercased())|\(role.lowercased())|\(selected)"
                 if seen.insert(key).inserted {
-                    nodes.append(AXTextNode(text: value, role: role, selected: selected))
+                    nodes.append(AXTextNode(text: value, role: role, selected: selected, element: element))
                 }
             }
 
@@ -4490,7 +4591,10 @@ enum PromptRewriteConversationContextResolver {
     }
 
     private static func projectName(fromCodexText text: String) -> String? {
-        if let fromControl = codexProjectFromControlLabel(text) {
+        if let fromControl = codexProjectFromControlLabel(
+            text,
+            includeProjectSectionLabels: false
+        ) {
             return fromControl
         }
         if let fromPath = codexProjectFromPathLikeLabel(text) {
@@ -4507,6 +4611,42 @@ enum PromptRewriteConversationContextResolver {
             in: text
         ) {
             return normalizedProjectName(captured)
+        }
+        return nil
+    }
+
+    private static func codexSidebarProjectFromThreadContext(
+        from windowElement: AXUIElement,
+        thread: String?
+    ) -> String? {
+        guard let normalizedThread = normalizedLabel(thread),
+              !normalizedThread.isEmpty else {
+            return nil
+        }
+        let textNodes = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
+        let threadIndices = textNodes.enumerated().compactMap { index, node -> Int? in
+            guard node.text.caseInsensitiveCompare(normalizedThread) == .orderedSame else {
+                return nil
+            }
+            guard looksLikeCodexThreadTitle(node.text, project: nil) else {
+                return nil
+            }
+            return index
+        }
+        guard !threadIndices.isEmpty else { return nil }
+
+        for index in threadIndices {
+            let lowerBound = max(0, index - 80)
+            guard index > lowerBound else { continue }
+            for cursor in stride(from: index - 1, through: lowerBound, by: -1) {
+                let text = textNodes[cursor].text
+                if let candidate = codexProjectFromControlLabel(
+                    text,
+                    includeProjectSectionLabels: true
+                ), !isLikelyVersionControlReferenceLabel(candidate) {
+                    return candidate
+                }
+            }
         }
         return nil
     }
@@ -5047,6 +5187,55 @@ enum PromptRewriteConversationContextResolver {
             return number.boolValue
         }
         return nil
+    }
+
+    private static func axCGPointAttribute(_ attribute: CFString, from element: AXUIElement) -> CGPoint? {
+        var valueRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &valueRef)
+        guard result == .success,
+              let valueRef,
+              CFGetTypeID(valueRef) == AXValueGetTypeID() else {
+            return nil
+        }
+        let axValue = unsafeBitCast(valueRef, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cgPoint else {
+            return nil
+        }
+        var point = CGPoint.zero
+        guard AXValueGetValue(axValue, .cgPoint, &point) else {
+            return nil
+        }
+        return point
+    }
+
+    private static func axCGSizeAttribute(_ attribute: CFString, from element: AXUIElement) -> CGSize? {
+        var valueRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &valueRef)
+        guard result == .success,
+              let valueRef,
+              CFGetTypeID(valueRef) == AXValueGetTypeID() else {
+            return nil
+        }
+        let axValue = unsafeBitCast(valueRef, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cgSize else {
+            return nil
+        }
+        var size = CGSize.zero
+        guard AXValueGetValue(axValue, .cgSize, &size) else {
+            return nil
+        }
+        return size
+    }
+
+    private static func axCenterPoint(of element: AXUIElement) -> CGPoint? {
+        guard let position = axCGPointAttribute(kAXPositionAttribute as CFString, from: element),
+              let size = axCGSizeAttribute(kAXSizeAttribute as CFString, from: element) else {
+            return nil
+        }
+        return CGPoint(
+            x: position.x + (size.width / 2.0),
+            y: position.y + (size.height / 2.0)
+        )
     }
 
     private static func normalizedLabel(_ raw: String?) -> String? {
