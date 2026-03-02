@@ -37,6 +37,9 @@ final class WhisperModelManager: NSObject, ObservableObject {
         config.waitsForConnectivity = true
         config.timeoutIntervalForRequest = 10 * 60
         config.timeoutIntervalForResource = 6 * 60 * 60
+        // Model downloads are write-once artifacts; avoid in-memory response caching.
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
 
@@ -156,6 +159,7 @@ final class WhisperModelManager: NSObject, ObservableObject {
 
         var request = URLRequest(url: sourceURL)
         request.timeoutInterval = 10 * 60
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("KeyScribe/1.0", forHTTPHeaderField: "User-Agent")
 
         let task = session.downloadTask(with: request)

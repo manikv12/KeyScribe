@@ -164,6 +164,16 @@ final class WhisperTranscriber: NSObject {
         }
     }
 
+    func trimMemoryUsage(aggressive: Bool) {
+        if Thread.isMainThread {
+            trimMemoryUsageOnMain(aggressive: aggressive)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.trimMemoryUsageOnMain(aggressive: aggressive)
+            }
+        }
+    }
+
     private func requestMicrophonePermissionOnMain(promptIfNeeded: Bool) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -381,6 +391,7 @@ final class WhisperTranscriber: NSObject {
 
             audioEngine.inputNode.removeTap(onBus: 0)
             audioEngine.stop()
+            audioEngine.reset()
             onAudioLevel?(0)
         }
 
@@ -681,6 +692,23 @@ final class WhisperTranscriber: NSObject {
         }
     }
 
+    private func trimMemoryUsageOnMain(aggressive: Bool) {
+        guard !isRecording, !isTranscribing else { return }
+
+        cancelScheduledContextRelease()
+        releaseCachedWhisperContextAsync()
+
+        sampleQueue.async { [weak self] in
+            self?.pcmSamples.removeAll(keepingCapacity: false)
+        }
+
+        if aggressive {
+            audioEngine.stop()
+            audioEngine.reset()
+            onAudioLevel?(0)
+        }
+    }
+
     private func resetTranscriptionQueueAfterTimeout() {
         transcriptionQueueGeneration += 1
         // The timed-out run may still be executing in the old queue. Drop references without
@@ -968,6 +996,8 @@ final class WhisperTranscriber: NSObject {
     func applyBiasPhrases(_ phrases: [String]) {}
 
     func applyFinalizeDelaySeconds(_ delaySeconds: TimeInterval) {}
+
+    func trimMemoryUsage(aggressive: Bool) {}
 
     @discardableResult
     func startRecording() -> Bool {

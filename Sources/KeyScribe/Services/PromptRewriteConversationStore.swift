@@ -1010,6 +1010,38 @@ final class PromptRewriteConversationStore: ObservableObject {
         refreshSummaries()
     }
 
+    func trimMemoryUsage(aggressive: Bool) {
+        guard !contextsByID.isEmpty else { return }
+
+        let keepContextCount = aggressive ? 6 : 12
+        let keepTurnCount = aggressive ? 24 : 60
+
+        let rankedIDs = contextsByID
+            .sorted { lhs, rhs in
+                lhs.value.lastUpdatedAt > rhs.value.lastUpdatedAt
+            }
+            .map(\.key)
+        let keepIDs = Set(rankedIDs.prefix(keepContextCount))
+
+        for id in rankedIDs where !keepIDs.contains(id) {
+            if let removed = contextsByID.removeValue(forKey: id) {
+                contextIDByTuple.removeValue(forKey: removed.tupleKey)
+            }
+            pendingDuplicateMergeContextIDs.remove(id)
+        }
+
+        for id in keepIDs {
+            guard var stored = contextsByID[id],
+                  stored.turns.count > keepTurnCount else {
+                continue
+            }
+            stored.turns = Array(stored.turns.suffix(keepTurnCount))
+            contextsByID[id] = stored
+        }
+
+        refreshSummaries()
+    }
+
     func hasContext(id: String) -> Bool {
         let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedID.isEmpty else { return false }
