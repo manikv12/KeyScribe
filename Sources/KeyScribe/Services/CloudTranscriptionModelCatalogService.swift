@@ -264,17 +264,54 @@ actor CloudTranscriptionModelCatalogService {
                   let modelPayload = providerPayload["models"] else {
                 return []
             }
-            let promptModels = PromptRewriteModelCatalogService.parseModelOptions(
-                from: try JSONSerialization.data(withJSONObject: modelPayload)
-            )
-            return Self.normalizeModelOptions(
-                promptModels.map {
-                    CloudTranscriptionModelOption(
-                        id: Self.normalizedModelID($0.id, for: nil),
-                        displayName: $0.displayName
+
+            // models.dev exposes a dictionary keyed by model ID; prefer parsing it directly.
+            if let modelsDict = modelPayload as? [String: Any] {
+                var options: [CloudTranscriptionModelOption] = []
+                options.reserveCapacity(modelsDict.count)
+
+                for (modelID, rawValue) in modelsDict {
+                    let displayName: String
+
+                    if let dict = rawValue as? [String: Any] {
+                        // Try several likely keys for a human-readable name.
+                        if let explicitName = (dict["displayName"] as? String)
+                            ?? (dict["name"] as? String)
+                            ?? (dict["label"] as? String)
+                            ?? (dict["title"] as? String) {
+                            displayName = explicitName
+                        } else {
+                            displayName = modelID
+                        }
+                    } else if let nameString = rawValue as? String, !nameString.isEmpty {
+                        displayName = nameString
+                    } else {
+                        displayName = modelID
+                    }
+
+                    options.append(
+                        CloudTranscriptionModelOption(
+                            id: Self.normalizedModelID(modelID, for: nil),
+                            displayName: displayName
+                        )
                     )
                 }
-            )
+
+                return Self.normalizeModelOptions(options)
+            } else {
+                // Fallback: if the payload is not a dictionary, reuse the generic parser.
+                let promptModels = PromptRewriteModelCatalogService.parseModelOptions(
+                    from: try JSONSerialization.data(withJSONObject: modelPayload)
+                )
+                return Self.normalizeModelOptions(
+                    promptModels.map {
+                        CloudTranscriptionModelOption(
+                            id: Self.normalizedModelID($0.id, for: nil),
+                            displayName: $0.displayName
+                        )
+                    }
+                )
+            }
         } catch {
             return []
         }
