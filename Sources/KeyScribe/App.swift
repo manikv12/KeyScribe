@@ -566,7 +566,9 @@ private enum PromptRewriteAIMappingEvaluator {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input"
+            "focused-input",
+            "automation-folder",
+            "automation-folders"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
@@ -797,6 +799,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     private static let promptRewriteAutoInsertMinimumConfidence: Double = 0.85
     private static let settingsApplyDebounceSeconds: TimeInterval = 0.14
+    private static let deterministicMappingHighConfidenceThreshold: Double = 0.94
     private static let aiMappingHighConfidenceThreshold: Double = 0.90
     private static let aiMappingTimeoutSeconds: TimeInterval = 0.25
     private static let localAIRuntimeShutdownTimeoutSeconds: TimeInterval = 1.5
@@ -1768,7 +1771,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         )
 
         if let conversationRequestContext {
-            scheduleAIMappingEvaluationIfNeeded(
+            scheduleMappingEvaluationIfNeeded(
                 resolvedBundle: conversationRequestContext,
                 capturedContext: insertionSessionContext.conversationContext,
                 userText: cleanedTranscript
@@ -2038,24 +2041,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         PromptRewriteHUDManager.shared.clearLoadingBypassRequest(insertionContext: insertionContext)
         PromptRewriteHUDManager.shared.updateLoadingIndicator(
             insertionContext: insertionContext,
-            displayState: loadingNarrative.displayState(step: "Connecting to AI suggestion service")
+            displayState: loadingNarrative.displayState(step: "Preparing rewrite request")
         )
 
+        PromptRewriteHUDManager.shared.updateLoadingIndicator(
+            insertionContext: insertionContext,
+            displayState: loadingNarrative.displayState(step: "Connecting to AI suggestion service")
+        )
         return try await withThrowingTaskGroup(of: PromptRewriteRetrievalOutcome.self) { group in
             group.addTask {
                 await PromptRewriteHUDManager.shared.updateLoadingIndicator(
                     insertionContext: insertionContext,
                     displayState: loadingNarrative.displayState(step: "Sending transcript for rewrite suggestion")
                 )
-                let suggestion = try await PromptRewriteService.shared.retrieveSuggestion(
+
+                async let suggestionResult = PromptRewriteService.shared.retrieveSuggestion(
                     for: cleanedTranscript,
                     conversationContext: conversationContext,
                     conversationHistory: conversationHistory
                 )
-                await PromptRewriteHUDManager.shared.updateLoadingIndicator(
-                    insertionContext: insertionContext,
-                    displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
-                )
+
+                // Drip-feed progress while waiting for the API response
+                async let progressDrip: Void = {
+                    try? await Task.sleep(nanoseconds: 1_800_000_000)
+                    guard !Task.isCancelled else { return }
+                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                        insertionContext: insertionContext,
+                        displayState: loadingNarrative.displayState(step: "Waiting for AI response")
+                    )
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    guard !Task.isCancelled else { return }
+                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                        insertionContext: insertionContext,
+                        displayState: loadingNarrative.displayState(step: "Analyzing transcript context")
+                    )
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    guard !Task.isCancelled else { return }
+                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                        insertionContext: insertionContext,
+                        displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
+                    )
+                }()
+
+                let suggestion = try await suggestionResult
+                _ = await progressDrip
                 return .suggestion(suggestion)
             }
 
@@ -2137,7 +2166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         return requestContext
     }
 
-    private func scheduleAIMappingEvaluationIfNeeded(
+    private func scheduleMappingEvaluationIfNeeded(
         resolvedBundle: ConversationContextResolverV2.ResolvedContextBundle,
         capturedContext: PromptRewriteConversationContext,
         userText: String
@@ -2150,7 +2179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 linkedContextCount: linkedContextCount,
                 mergeTurns: mergeTurns,
                 aiMatchTimeout: false,
-                detail: "skipped_ai_mapping=true"
+                detail: "skipped_mapping=true reason=linked-existing"
             )
             return
         }
@@ -2158,8 +2187,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
 
+            let deterministicCandidate = await self.evaluateDeterministicMappingCandidateOffMain(
+                capturedContext: capturedContext,
+                userText: userText
+            )
+
+            if let deterministicCandidate {
+                let matchType = deterministicCandidate.matchType.rawValue
+                if deterministicCandidate.matchType == .exact
+                    || deterministicCandidate.confidence >= Self.deterministicMappingHighConfidenceThreshold {
+                    self.conversationContextResolverV2.persistMappingDecision(
+                        .link,
+                        prompt: deterministicCandidate.prompt,
+                        source: .deterministic
+                    )
+                    self.setUIStatus(.message("Linked related conversation"))
+                    self.logPromptRewriteMappingTelemetry(
+                        mappingSource: "deterministic",
+                        linkedContextCount: linkedContextCount,
+                        mergeTurns: mergeTurns,
+                        aiMatchTimeout: false,
+                        detail: "candidate_found=true auto_linked=true match_axis=\(deterministicCandidate.matchAxis.rawValue) match_type=\(matchType) confidence=\(String(format: "%.3f", deterministicCandidate.confidence))"
+                    )
+                    return
+                }
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "deterministic",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "candidate_found=true auto_linked=false match_axis=\(deterministicCandidate.matchAxis.rawValue) match_type=\(matchType) confidence=\(String(format: "%.3f", deterministicCandidate.confidence)) below_threshold=true"
+                )
+            } else {
+                self.logPromptRewriteMappingTelemetry(
+                    mappingSource: "deterministic",
+                    linkedContextCount: linkedContextCount,
+                    mergeTurns: mergeTurns,
+                    aiMatchTimeout: false,
+                    detail: "candidate_found=false"
+                )
+            }
+
             let evaluationStartedAt = Date()
-            let candidate = await self.evaluateAIMappingCandidateOffMain(
+            let aiCandidate = await self.evaluateAIMappingCandidateOffMain(
                 capturedContext: capturedContext,
                 userText: userText
             )
@@ -2172,12 +2242,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     linkedContextCount: linkedContextCount,
                     mergeTurns: mergeTurns,
                     aiMatchTimeout: true,
-                    detail: "elapsed_ms=\(Int((elapsed * 1_000).rounded()))"
+                    detail: "candidate_found=unknown elapsed_ms=\(Int((elapsed * 1_000).rounded()))"
                 )
                 return
             }
 
-            guard let candidate else {
+            guard let aiCandidate else {
                 self.logPromptRewriteMappingTelemetry(
                     mappingSource: "ai",
                     linkedContextCount: linkedContextCount,
@@ -2188,22 +2258,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 return
             }
 
-            guard candidate.confidence >= Self.aiMappingHighConfidenceThreshold else {
+            guard aiCandidate.confidence >= Self.aiMappingHighConfidenceThreshold else {
                 self.logPromptRewriteMappingTelemetry(
                     mappingSource: "ai",
                     linkedContextCount: linkedContextCount,
                     mergeTurns: mergeTurns,
                     aiMatchTimeout: false,
-                    detail: "candidate_found=true confidence=\(String(format: "%.3f", candidate.confidence)) below_threshold=true"
+                    detail: "candidate_found=true auto_linked=false confidence=\(String(format: "%.3f", aiCandidate.confidence)) below_threshold=true"
                 )
                 return
             }
 
-            // Always auto-link high-confidence unmapped buckets so future requests
-            // can reuse cross-conversation history without manual confirmation.
             self.conversationContextResolverV2.persistMappingDecision(
                 .link,
-                prompt: candidate.prompt,
+                prompt: aiCandidate.prompt,
                 source: .ai
             )
             self.setUIStatus(.message("Linked related conversation"))
@@ -2212,7 +2280,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 linkedContextCount: linkedContextCount,
                 mergeTurns: mergeTurns,
                 aiMatchTimeout: false,
-                detail: "candidate_found=true auto_linked=true confidence=\(String(format: "%.3f", candidate.confidence))"
+                detail: "candidate_found=true auto_linked=true confidence=\(String(format: "%.3f", aiCandidate.confidence)) fallback_from=deterministic"
+            )
+        }
+    }
+
+    private func evaluateDeterministicMappingCandidateOffMain(
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) async -> ConversationContextResolverV2.DeterministicMappingCandidate? {
+        await MainActor.run {
+            self.conversationContextResolverV2.evaluateDeterministicMappingCandidate(
+                capturedContext: capturedContext,
+                userText: userText
             )
         }
     }

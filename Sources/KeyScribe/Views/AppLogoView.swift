@@ -6,10 +6,13 @@ struct AppLogoView: View {
 
     var body: some View {
         logoImage
+            .renderingMode(.original)
+            .antialiased(true)
             .interpolation(.high)
             .resizable()
             .aspectRatio(contentMode: .fit)
             .frame(width: size, height: size)
+            .drawingGroup(opaque: false)
     }
 
     /// Resolve the bundled app icon image.

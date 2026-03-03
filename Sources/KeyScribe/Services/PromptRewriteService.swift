@@ -806,6 +806,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
             appName: conversationContext.appName,
             bundleID: conversationContext.bundleIdentifier,
             surfaceLabel: surface.isEmpty ? "Current Surface" : surface,
+            projectKey: conversationContext.projectKey,
             projectName: conversationContext.projectLabel,
             repositoryName: nil,
             identityKey: conversationContext.identityKey,

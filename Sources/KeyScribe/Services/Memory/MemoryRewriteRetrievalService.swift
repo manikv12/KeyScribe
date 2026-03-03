@@ -428,14 +428,19 @@ actor MemoryRewriteRetrievalService {
         metadata: [String: String],
         scope: MemoryScopeContext
     ) -> Bool {
-        let scopeProject = scope.projectName?.lowercased()
-        let scopeRepository = scope.repositoryName?.lowercased()
+        // Key-first matching keeps mapped contexts unified even when labels drift.
+        let scopeProjectKey = scopeCanonicalProjectKey(scope)
+        let candidateProjectKey = metadataCanonicalProjectKey(metadata)
+        if let scopeProjectKey, let candidateProjectKey {
+            return scopeProjectKey == candidateProjectKey
+        }
+
+        let scopeProject = normalizedLookupValue(scope.projectName)
+        let scopeRepository = normalizedLookupValue(scope.repositoryName)
         guard scopeProject != nil || scopeRepository != nil else { return false }
 
-        let candidateProject = metadata["project_name"]?.lowercased() ?? metadata["project"]?.lowercased()
-        let candidateRepository = metadata["repository_name"]?.lowercased()
-            ?? metadata["repository"]?.lowercased()
-            ?? metadata["repo"]?.lowercased()
+        let candidateProject = metadataProjectLabel(metadata)
+        let candidateRepository = metadataRepositoryLabel(metadata)
 
         if let scopeProject, let candidateProject, scopeProject == candidateProject {
             return true
@@ -456,34 +461,39 @@ actor MemoryRewriteRetrievalService {
         metadata: [String: String],
         scope: MemoryScopeContext
     ) -> Bool {
-        guard let scopeIdentity = scope.identityKey?.lowercased(),
-              !scopeIdentity.isEmpty else {
+        // Identity keys are authoritative; labels only apply when keys are unavailable.
+        let scopeIdentityKey = scopeCanonicalIdentityKey(scope)
+        let candidateIdentityKey = metadataCanonicalIdentityKey(metadata)
+        if let scopeIdentityKey, let candidateIdentityKey {
+            return scopeIdentityKey == candidateIdentityKey
+        }
+
+        guard let scopeIdentityLabel = normalizedLookupValue(scope.identityLabel),
+              let candidateIdentityLabel = metadataIdentityLabel(metadata) else {
             return false
         }
-        let candidate = metadata["identity_key"]?.lowercased() ?? metadata["identity"]?.lowercased()
-        guard let candidate, !candidate.isEmpty else {
-            return false
-        }
-        return scopeIdentity == candidate
+        return scopeIdentityLabel == candidateIdentityLabel
     }
 
     private func hasConflictingConversationIdentity(
         metadata: [String: String],
         scope: MemoryScopeContext
     ) -> Bool {
-        guard let scopeIdentity = scope.identityKey?.lowercased(),
-              !scopeIdentity.isEmpty else {
+        guard let scopeIdentityKey = scopeCanonicalIdentityKey(scope) else {
             return false
         }
         let origin = metadata["origin"]?.lowercased() ?? ""
         guard origin == "conversation-history" else {
             return false
         }
-        guard let candidate = metadata["identity_key"]?.lowercased() ?? metadata["identity"]?.lowercased(),
-              !candidate.isEmpty else {
-            return false
+        if let candidateIdentityKey = metadataCanonicalIdentityKey(metadata) {
+            return candidateIdentityKey != scopeIdentityKey
         }
-        return candidate != scopeIdentity
+        if let scopeIdentityLabel = normalizedLookupValue(scope.identityLabel),
+           let candidateIdentityLabel = metadataIdentityLabel(metadata) {
+            return candidateIdentityLabel != scopeIdentityLabel
+        }
+        return false
     }
 
     private func lessonMatchesApp(
@@ -508,22 +518,124 @@ actor MemoryRewriteRetrievalService {
     }
 
     private func hasProjectMetadata(metadata: [String: String]) -> Bool {
-        let project = metadata["project_name"] ?? metadata["project"]
-        let repository = metadata["repository_name"] ?? metadata["repository"] ?? metadata["repo"]
+        if metadataCanonicalProjectKey(metadata) != nil {
+            return true
+        }
+        return metadataProjectLabel(metadata) != nil || metadataRepositoryLabel(metadata) != nil
+    }
 
-        if let project {
-            let normalized = project.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !normalized.isEmpty {
-                return true
+    private func metadataCanonicalProjectKey(_ metadata: [String: String]) -> String? {
+        firstCanonicalContextKey(
+            keys: ["canonical_project_key", "project_key", "context_project_key"],
+            metadata: metadata
+        )
+    }
+
+    private func metadataCanonicalIdentityKey(_ metadata: [String: String]) -> String? {
+        firstCanonicalContextKey(
+            keys: ["canonical_identity_key", "identity_key", "identity", "context_identity_key"],
+            metadata: metadata
+        )
+    }
+
+    private func metadataProjectLabel(_ metadata: [String: String]) -> String? {
+        firstNormalizedMetadataValue(
+            keys: ["project_name", "project", "project_label"],
+            metadata: metadata
+        )
+    }
+
+    private func metadataRepositoryLabel(_ metadata: [String: String]) -> String? {
+        firstNormalizedMetadataValue(
+            keys: ["repository_name", "repository", "repo"],
+            metadata: metadata
+        )
+    }
+
+    private func metadataIdentityLabel(_ metadata: [String: String]) -> String? {
+        firstNormalizedMetadataValue(
+            keys: ["identity_label"],
+            metadata: metadata
+        )
+    }
+
+    private func scopeCanonicalProjectKey(_ scope: MemoryScopeContext) -> String? {
+        if let projectKey = normalizedLookupValue(scope.projectKey),
+           isCanonicalContextKey(projectKey) {
+            return projectKey
+        }
+        if let projectName = normalizedLookupValue(scope.projectName),
+           isCanonicalContextKey(projectName) {
+            return projectName
+        }
+        guard let projectFromScopeKey = scopeKeyComponent(scope.scopeKey, index: 3),
+              isCanonicalContextKey(projectFromScopeKey) else {
+            return nil
+        }
+        return projectFromScopeKey
+    }
+
+    private func scopeCanonicalIdentityKey(_ scope: MemoryScopeContext) -> String? {
+        if let identityKey = normalizedLookupValue(scope.identityKey),
+           isCanonicalContextKey(identityKey) {
+            return identityKey
+        }
+        guard let identityFromScopeKey = scopeKeyComponent(scope.scopeKey, index: 6),
+              isCanonicalContextKey(identityFromScopeKey) else {
+            return nil
+        }
+        return identityFromScopeKey
+    }
+
+    private func firstCanonicalContextKey(
+        keys: [String],
+        metadata: [String: String]
+    ) -> String? {
+        for key in keys {
+            guard let value = normalizedLookupValue(metadata[key]),
+                  isCanonicalContextKey(value) else {
+                continue
+            }
+            return value
+        }
+        return nil
+    }
+
+    private func firstNormalizedMetadataValue(
+        keys: [String],
+        metadata: [String: String]
+    ) -> String? {
+        for key in keys {
+            if let value = normalizedLookupValue(metadata[key]) {
+                return value
             }
         }
-        if let repository {
-            let normalized = repository.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !normalized.isEmpty {
-                return true
-            }
+        return nil
+    }
+
+    private func normalizedLookupValue(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = MemoryTextNormalizer.collapsedWhitespace(value).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        return normalized
+    }
+
+    private func isCanonicalContextKey(_ value: String) -> Bool {
+        value.contains(":") && !value.contains(" ") && !value.contains("|")
+    }
+
+    private func scopeKeyComponent(_ scopeKey: String, index: Int) -> String? {
+        let components = scopeKey.split(separator: "|", omittingEmptySubsequences: false)
+        guard components.first?.lowercased() == "scope",
+              components.indices.contains(index) else {
+            return nil
         }
-        return false
+        let value = String(components[index])
+        guard let normalized = normalizedLookupValue(value),
+              normalized != "-" else {
+            return nil
+        }
+        return normalized
     }
 
     private func dedupedLessons(_ lessons: [MemoryLesson]) -> [MemoryLesson] {

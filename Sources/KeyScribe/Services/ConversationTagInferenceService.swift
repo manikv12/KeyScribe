@@ -150,13 +150,13 @@ final class ConversationTagInferenceService {
             if let codexProject = firstMatch(
                 pattern: #"(?i)\b(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ) {
+            ), !isBlockedProjectLabel(codexProject) {
                 return codexProject
             }
             if let codexBuildProject = firstMatch(
                 pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ) {
+            ), !isBlockedProjectLabel(codexBuildProject) {
                 return codexBuildProject
             }
         }
@@ -164,7 +164,7 @@ final class ConversationTagInferenceService {
         if let regexMatch = firstMatch(
             pattern: #"(?i)\b(?:project|workspace|repo|repository)\s*[:\-]?\s*([a-z0-9._()\-][a-z0-9._()\- /]{1,80})\b"#,
             in: primaryText
-        ) {
+        ), !isBlockedProjectLabel(regexMatch) {
             return regexMatch
         }
 
@@ -179,6 +179,46 @@ final class ConversationTagInferenceService {
         }
 
         return "Unknown Project"
+    }
+
+    private func isBlockedProjectLabel(_ value: String) -> Bool {
+        let normalized = collapseWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .lowercased()
+        guard !normalized.isEmpty else {
+            return true
+        }
+        let blocked: Set<String> = [
+            "unknown",
+            "unknown project",
+            "unknown workspace",
+            "current screen",
+            "focused input",
+            "automation folder",
+            "automation folders",
+            "automations"
+        ]
+        if blocked.contains(normalized) {
+            return true
+        }
+        let slugged = slug(normalized)
+        return isBlockedProjectSlug(slugged)
+    }
+
+    private func isBlockedProjectSlug(_ value: String) -> Bool {
+        guard !value.isEmpty else {
+            return true
+        }
+        let blocked: Set<String> = [
+            "unknown",
+            "unknown-project",
+            "current-screen",
+            "focused-input",
+            "automation-folder",
+            "automation-folders",
+            "automations"
+        ]
+        return blocked.contains(value) || value.hasPrefix("unknown-")
     }
 
     private func canonicalBundleID(
@@ -284,7 +324,10 @@ final class ConversationTagInferenceService {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input"
+            "focused-input",
+            "automation-folder",
+            "automation-folders",
+            "automations"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
@@ -323,6 +366,15 @@ final class ConversationTagInferenceService {
            let teamsIdentity = inferTeamsIdentity(from: primaryText) {
             let keyPrefix = teamsIdentity.type == .person ? "person" : "channel"
             return ("\(keyPrefix):\(slug(teamsIdentity.label))", teamsIdentity.type, teamsIdentity.label, people, nativeThreadKey)
+        }
+
+        if isAppleMessagesApp(bundleID: bundleID, appName: appName),
+           let messagesPerson = inferAppleMessagesPerson(from: primaryText) {
+            let key = "person:\(slug(messagesPerson))"
+            let mergedPeople = Array(Set((people + [messagesPerson]).map(collapseWhitespace)))
+                .filter { !$0.isEmpty }
+                .sorted()
+            return (key, .person, messagesPerson, mergedPeople, nativeThreadKey)
         }
 
         if isCodexApp(bundleID: bundleID, appName: appName),
@@ -497,6 +549,77 @@ final class ConversationTagInferenceService {
         return nil
     }
 
+    private func inferAppleMessagesPerson(from text: String) -> String? {
+        if let directMatch = firstMatch(
+            pattern: #"(?i)\b([A-Z][A-Za-z'’.\-]{1,40}(?:\s+[A-Z][A-Za-z'’.\-]{1,40}){0,3})\s*(?:[>›]|[-•|:]\s*(?:text\s+message|iMessage|sms))\b"#,
+            in: text
+        ) {
+            let cleaned = normalizedAppleMessagesPersonLabel(directMatch)
+            if looksLikePersonName(cleaned) {
+                return cleaned
+            }
+        }
+
+        var segments = splitByStrongSeparators(text)
+        if segments.isEmpty {
+            segments = [text]
+        }
+
+        for segment in segments {
+            let cleaned = normalizedAppleMessagesPersonLabel(segment)
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            guard !cleaned.isEmpty else { continue }
+
+            let lowered = cleaned.lowercased()
+            let blocked: Set<String> = [
+                "messages",
+                "message",
+                "text message",
+                "imessage",
+                "sms",
+                "chat",
+                "new message",
+                "new messages",
+                "search",
+                "current screen",
+                "focused input",
+                "type a message"
+            ]
+            if blocked.contains(lowered) {
+                continue
+            }
+            if lowered.range(of: #"\b(?:text\s+message|imessage|sms)\b"#, options: .regularExpression) != nil {
+                continue
+            }
+            if lowered.range(of: #"\b(?:today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"#, options: .regularExpression) != nil {
+                continue
+            }
+            if cleaned.range(of: #"\d{1,2}:\d{2}"#, options: .regularExpression) != nil {
+                continue
+            }
+            if looksLikePersonName(cleaned) {
+                return cleaned
+            }
+        }
+
+        return nil
+    }
+
+    private func normalizedAppleMessagesPersonLabel(_ value: String) -> String {
+        var normalized = collapseWhitespace(value)
+        guard !normalized.isEmpty else { return normalized }
+
+        // Messages sometimes prefixes contact candidates as "Maybe: Name".
+        // Strip that prefix so identity keys remain stable (person:<normalized-name>).
+        normalized = normalized.replacingOccurrences(
+            of: #"(?i)^\s*maybe\s*:\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        return collapseWhitespace(normalized)
+    }
+
     private func cleanedTeamsSegment(_ value: String) -> String? {
         var candidate = collapseWhitespace(value)
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
@@ -656,11 +779,7 @@ final class ConversationTagInferenceService {
 
     private func canonicalProjectKey(_ label: String) -> String {
         let normalized = slug(label)
-        if normalized.isEmpty
-            || normalized == "unknown"
-            || normalized == "unknown-project"
-            || normalized == "current-screen"
-            || normalized == "focused-input" {
+        if isBlockedProjectSlug(normalized) {
             return "project:unknown"
         }
         let aliasMap: [String: String] = [
@@ -721,6 +840,15 @@ final class ConversationTagInferenceService {
     private func isTeamsApp(bundleID: String, appName: String) -> Bool {
         let value = "\(bundleID) \(appName)".lowercased()
         return value.contains("teams")
+    }
+
+    private func isAppleMessagesApp(bundleID: String, appName: String) -> Bool {
+        let normalizedBundle = collapseWhitespace(bundleID).lowercased()
+        let normalizedName = collapseWhitespace(appName).lowercased()
+        if normalizedBundle == "com.apple.mobilesms" {
+            return true
+        }
+        return normalizedName == "messages" || normalizedName.contains("messages")
     }
 
     private func isBrowser(bundleID: String, appName: String) -> Bool {

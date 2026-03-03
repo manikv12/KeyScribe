@@ -281,6 +281,26 @@ enum ConversationClarificationDecision: String, Codable, Equatable {
     case dismiss
 }
 
+struct DeterministicConversationMappingCandidate: Equatable {
+    enum MatchAxis: String {
+        case project
+        case person
+    }
+
+    enum MatchType: String {
+        case exact
+        case highSimilar = "high-similar"
+    }
+
+    let prompt: ConversationClarificationPrompt
+    let candidateKey: String
+    let candidateLabel: String
+    let candidateBundleIdentifier: String
+    let confidence: Double
+    let matchAxis: MatchAxis
+    let matchType: MatchType
+}
+
 @MainActor
 final class PromptRewriteConversationStore: ObservableObject {
     static let shared = PromptRewriteConversationStore()
@@ -322,6 +342,7 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let duplicateMergeThreadScanMultiplier = 4
     private let duplicateMergeThreadScanHardLimit = 120
     private let clarificationSimilarityThreshold = 0.92
+    private let deterministicMappingSimilarityThreshold = 0.94
     private let clarificationCandidateLimit = 3
     private let mappingRuleIDPrefixManual = "map-manual-"
     private let mappingRuleIDPrefixAI = "map-ai-"
@@ -521,8 +542,7 @@ final class PromptRewriteConversationStore: ObservableObject {
             usesPinnedContext = false
         }
 
-        if history.isEmpty,
-           promptRewriteConversationHistoryEnabled,
+        if promptRewriteConversationHistoryEnabled,
            let store {
             let crossIDESharingEnabled = promptRewriteCrossIDEConversationSharingEnabled
             let scopeKeys = scopeKeysForExpiredHandoffLookup(
@@ -536,7 +556,8 @@ final class PromptRewriteConversationStore: ObservableObject {
             for scopeKey in scopeKeys {
                 guard let candidate = try? store.fetchLatestExpiredConversationContext(
                     scopeKey: scopeKey,
-                    bundleIDConstraint: bundleIDConstraint
+                    bundleIDConstraint: bundleIDConstraint,
+                    includeConsumed: true
                 ) else {
                     continue
                 }
@@ -550,14 +571,26 @@ final class PromptRewriteConversationStore: ObservableObject {
             }
 
             if let expiredRecord {
-                let handoffHistory = expiredHandoffHistory(
-                    from: expiredRecord,
-                    limit: normalizedRequestTurnLimit
-                )
-                if !handoffHistory.isEmpty {
-                    history = handoffHistory
-                    resolutionSource += "+expired-handoff"
-                    expiredHandoffRecordToConsume = expiredRecord
+                if history.isEmpty {
+                    let handoffHistory = expiredHandoffHistory(
+                        from: expiredRecord,
+                        limit: normalizedRequestTurnLimit
+                    )
+                    if !handoffHistory.isEmpty {
+                        history = handoffHistory
+                        resolutionSource += "+expired-handoff"
+                        expiredHandoffRecordToConsume = expiredRecord
+                    }
+                } else {
+                    let mergedWithSummary = historyWithPreviousSummary(
+                        history,
+                        from: expiredRecord,
+                        limit: normalizedRequestTurnLimit
+                    )
+                    if mergedWithSummary.count != history.count || mergedWithSummary != history {
+                        history = mergedWithSummary
+                        resolutionSource += "+expired-summary"
+                    }
                 }
             }
         }
@@ -680,6 +713,101 @@ final class PromptRewriteConversationStore: ObservableObject {
         }
 
         return nil
+    }
+
+    func nextDeterministicMappingCandidate(
+        capturedContext: PromptRewriteConversationContext,
+        userText: String
+    ) -> DeterministicConversationMappingCandidate? {
+        guard FeatureFlags.conversationTupleSQLiteEnabled else {
+            return nil
+        }
+        guard let store = resolvedSQLiteStore() else {
+            return nil
+        }
+
+        let inferredTags = canonicalizedTags(
+            tagInferenceService.inferTags(
+                capturedContext: capturedContext,
+                userText: userText
+            )
+        )
+        let currentTupleKey = tagInferenceService.tupleKey(
+            capturedContext: capturedContext,
+            tags: inferredTags
+        )
+        let normalizedCurrentBundle = normalizedClarificationBundle(currentTupleKey.bundleID)
+        guard !normalizedCurrentBundle.isEmpty else {
+            return nil
+        }
+
+        let scanLimit = min(
+            sqliteStartupThreadScanHardLimit,
+            max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
+        )
+        let allThreads = (try? store.fetchConversationThreads(limit: scanLimit)) ?? []
+        guard !allThreads.isEmpty else {
+            return nil
+        }
+
+        let crossAppThreads = allThreads.filter { thread in
+            normalizedClarificationBundle(thread.bundleID) != normalizedCurrentBundle
+        }
+        guard !crossAppThreads.isEmpty else {
+            return nil
+        }
+
+        let currentIdentityType = normalizedClarificationIdentityType(inferredTags.identityType)
+        let personPrompt: ConversationClarificationPrompt?
+        if currentIdentityType == "person" {
+            personPrompt = clarificationPrompt(
+                axis: .person,
+                currentKey: inferredTags.identityKey,
+                currentLabel: inferredTags.identityLabel,
+                currentBundleIdentifier: normalizedCurrentBundle,
+                threads: crossAppThreads,
+                store: store
+            )
+        } else {
+            personPrompt = nil
+        }
+
+        let projectPrompt: ConversationClarificationPrompt?
+        if isMeaningfulProjectClarificationKey(inferredTags.projectKey) {
+            projectPrompt = clarificationPrompt(
+                axis: .project,
+                currentKey: inferredTags.projectKey,
+                currentLabel: inferredTags.projectLabel,
+                currentBundleIdentifier: normalizedCurrentBundle,
+                threads: crossAppThreads,
+                store: store
+            )
+        } else {
+            projectPrompt = nil
+        }
+
+        if deterministicPromptsConflict(
+            personPrompt: personPrompt,
+            projectPrompt: projectPrompt
+        ) {
+            return nil
+        }
+
+        let personCandidate = personPrompt.flatMap { prompt in
+            deterministicMappingCandidate(from: prompt, axis: .person)
+        }
+        let projectCandidate = projectPrompt.flatMap { prompt in
+            deterministicMappingCandidate(from: prompt, axis: .project)
+        }
+
+        switch (personCandidate, projectCandidate) {
+        case let (lhs?, rhs?):
+            return shouldPreferDeterministicCandidate(lhs, over: rhs) ? lhs : rhs
+        case let (candidate?, nil), let (nil, candidate?):
+            return candidate
+        case (nil, nil):
+            return nil
+        }
     }
 
     func applyClarificationDecision(
@@ -1453,6 +1581,74 @@ final class PromptRewriteConversationStore: ObservableObject {
         return candidate.candidate.lastActivityAt > existing.candidate.lastActivityAt
     }
 
+    private func deterministicMappingCandidate(
+        from prompt: ConversationClarificationPrompt,
+        axis: ClarificationAxis
+    ) -> DeterministicConversationMappingCandidate? {
+        guard let primary = prompt.primaryCandidate else {
+            return nil
+        }
+        let boundedConfidence = max(0, min(1, primary.similarity))
+        let isExact = prompt.kind.isExact || boundedConfidence >= 0.999
+        if !isExact && boundedConfidence < deterministicMappingSimilarityThreshold {
+            return nil
+        }
+        return DeterministicConversationMappingCandidate(
+            prompt: prompt,
+            candidateKey: primary.canonicalKey,
+            candidateLabel: primary.label,
+            candidateBundleIdentifier: primary.bundleIdentifier,
+            confidence: boundedConfidence,
+            matchAxis: axis == .project ? .project : .person,
+            matchType: isExact ? .exact : .highSimilar
+        )
+    }
+
+    private func deterministicPromptsConflict(
+        personPrompt: ConversationClarificationPrompt?,
+        projectPrompt: ConversationClarificationPrompt?
+    ) -> Bool {
+        guard let personPrompt, let projectPrompt else {
+            return false
+        }
+        let personBundles = deterministicHighConfidenceCandidateBundles(from: personPrompt)
+        let projectBundles = deterministicHighConfidenceCandidateBundles(from: projectPrompt)
+        guard !personBundles.isEmpty, !projectBundles.isEmpty else {
+            return false
+        }
+        return personBundles.intersection(projectBundles).isEmpty
+    }
+
+    private func deterministicHighConfidenceCandidateBundles(
+        from prompt: ConversationClarificationPrompt
+    ) -> Set<String> {
+        Set(
+            prompt.candidates
+                .filter { candidate in
+                    let bounded = max(0, min(1, candidate.similarity))
+                    return bounded >= deterministicMappingSimilarityThreshold || bounded >= 0.999
+                }
+                .map { normalizedClarificationBundle($0.bundleIdentifier) }
+                .filter { !$0.isEmpty }
+        )
+    }
+
+    private func shouldPreferDeterministicCandidate(
+        _ lhs: DeterministicConversationMappingCandidate,
+        over rhs: DeterministicConversationMappingCandidate
+    ) -> Bool {
+        if lhs.matchType != rhs.matchType {
+            return lhs.matchType == .exact
+        }
+        if lhs.confidence != rhs.confidence {
+            return lhs.confidence > rhs.confidence
+        }
+        if lhs.matchAxis != rhs.matchAxis {
+            return lhs.matchAxis == .person
+        }
+        return lhs.candidateLabel.localizedCaseInsensitiveCompare(rhs.candidateLabel) == .orderedAscending
+    }
+
     private func clarificationRuleResolution(
         axis: ClarificationAxis,
         currentBundleIdentifier: String,
@@ -1692,7 +1888,9 @@ final class PromptRewriteConversationStore: ObservableObject {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input"
+            "focused-input",
+            "automation-folder",
+            "automation-folders"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
@@ -1890,8 +2088,8 @@ final class PromptRewriteConversationStore: ObservableObject {
             // Browser tabs/windows are now consolidated into one thread.
             return []
         }
-        let projectKey = contextLinkingKey(context.projectKey)
-        let identityKey = contextLinkingKey(context.identityKey)
+        let projectKey = contextLinkingKey(context.projectKey, aliasTypeHint: "project")
+        let identityKey = contextLinkingKey(context.identityKey, aliasTypeHint: "identity")
         guard projectKey != nil || identityKey != nil else {
             return []
         }
@@ -1926,26 +2124,84 @@ final class PromptRewriteConversationStore: ObservableObject {
         projectKey: String?,
         identityKey: String?
     ) -> Bool {
-        let candidateProject = contextLinkingKey(candidate.projectKey)
-        let candidateIdentity = contextLinkingKey(candidate.identityKey)
+        let candidateProject = contextLinkingKey(candidate.projectKey, aliasTypeHint: "project")
+        let candidateIdentity = contextLinkingKey(candidate.identityKey, aliasTypeHint: "identity")
         let projectMatches = (projectKey != nil && candidateProject == projectKey)
         let identityMatches = (identityKey != nil && candidateIdentity == identityKey)
         return projectMatches || identityMatches
     }
 
-    private func contextLinkingKey(_ value: String?) -> String? {
+    private func contextLinkingKey(
+        _ value: String?,
+        aliasTypeHint: String? = nil
+    ) -> String? {
         guard let value else { return nil }
         let normalized = value
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard !normalized.isEmpty else { return nil }
-        if normalized == "project:unknown"
-            || normalized == "identity:unknown"
-            || normalized == "person:unknown"
-            || normalized == "unknown" {
+        if isUnknownContextLinkingKey(normalized) {
             return nil
         }
+        guard let store = resolvedSQLiteStore() else {
+            return normalized
+        }
+        let aliasType = clarificationAliasType(for: normalized, hint: aliasTypeHint)
+        let cacheKey = "\(aliasType)|\(normalized)"
+        if let cached = ContextLinkingKeyCache.get(for: cacheKey) {
+            return cached
+        }
+        if let resolvedAlias = try? store.resolveConversationTagAlias(
+            aliasType: aliasType,
+            aliasKey: normalized
+        ) {
+            let canonical = normalizedClarificationKey(resolvedAlias)
+            if !canonical.isEmpty, !isUnknownContextLinkingKey(canonical) {
+                ContextLinkingKeyCache.set(canonical, for: cacheKey)
+                return canonical
+            }
+        }
+        ContextLinkingKeyCache.set(normalized, for: cacheKey)
         return normalized
+    }
+
+    private enum ContextLinkingKeyCache {
+        private static var cache: [String: String] = [:]
+        private static let lock = NSLock()
+
+        static func get(for key: String) -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return cache[key]
+        }
+
+        static func set(_ value: String, for key: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            cache[key] = value
+        }
+    }
+    private func clarificationAliasType(for normalizedKey: String, hint: String?) -> String {
+        if let hint {
+            let normalizedHint = normalizedClarificationKey(hint)
+            if normalizedHint == "project" {
+                return "project"
+            }
+            if normalizedHint == "identity" {
+                return "identity"
+            }
+        }
+        if normalizedKey.hasPrefix("project:") {
+            return "project"
+        }
+        return "identity"
+    }
+
+    private func isUnknownContextLinkingKey(_ normalizedKey: String) -> Bool {
+        normalizedKey == "project:unknown"
+            || normalizedKey == "identity:unknown"
+            || normalizedKey == "person:unknown"
+            || normalizedKey == "unknown"
     }
 
     private func dedupedMergedPromptHistory(
@@ -2515,8 +2771,8 @@ final class PromptRewriteConversationStore: ObservableObject {
             normalizedBundleID: normalizedBundleID
         )
 
-        let projectKey = contextLinkingKey(context.projectKey)
-        let identityKey = contextLinkingKey(context.identityKey)
+        let projectKey = contextLinkingKey(context.projectKey, aliasTypeHint: "project")
+        let identityKey = contextLinkingKey(context.identityKey, aliasTypeHint: "identity")
 
         if let projectKey, let identityKey {
             if crossIDESharingEnabled {
@@ -2569,8 +2825,8 @@ final class PromptRewriteConversationStore: ObservableObject {
             context: context,
             normalizedBundleID: normalizedBundleID
         )
-        let projectKey = contextLinkingKey(context.projectKey)
-        let identityKey = contextLinkingKey(context.identityKey)
+        let projectKey = contextLinkingKey(context.projectKey, aliasTypeHint: "project")
+        let identityKey = contextLinkingKey(context.identityKey, aliasTypeHint: "identity")
         if let projectKey, let identityKey {
             if crossIDESharingEnabled {
                 return "expired-scope|project=\(projectKey)|identity=\(identityKey)"
@@ -2636,6 +2892,53 @@ final class PromptRewriteConversationStore: ObservableObject {
                 output.remove(at: dropIndex)
             } else {
                 break
+            }
+        }
+
+        return output
+    }
+
+    private func historyWithPreviousSummary(
+        _ history: [PromptRewriteConversationTurn],
+        from record: ExpiredConversationContextRecord,
+        limit: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedLimit = normalizedTurnLimit(limit)
+        guard normalizedLimit > 1 else { return history }
+
+        let summaryCandidate = expiredHandoffHistory(from: record, limit: 1).first
+        guard let summaryTurn = summaryCandidate,
+              summaryTurn.isSummary else {
+            return history
+        }
+
+        let normalizedSummaryText = collapsedWhitespace(summaryTurn.assistantText).lowercased()
+        guard !normalizedSummaryText.isEmpty else { return history }
+
+        if history.contains(where: { turn in
+            guard turn.isSummary else { return false }
+            return collapsedWhitespace(turn.assistantText).lowercased() == normalizedSummaryText
+        }) {
+            return history
+        }
+
+        var output = history
+        output.insert(summaryTurn, at: 0)
+
+        while output.count > normalizedLimit {
+            if let dropIndex = output.firstIndex(where: { !$0.isSummary }) {
+                output.remove(at: dropIndex)
+            } else {
+                output.removeFirst()
+            }
+        }
+
+        while estimatedContextCharacters(output) > maxPromptContextCharacters,
+              output.count > 1 {
+            if let dropIndex = output.firstIndex(where: { !$0.isSummary }) {
+                output.remove(at: dropIndex)
+            } else {
+                output.removeFirst()
             }
         }
 
@@ -2866,8 +3169,8 @@ final class PromptRewriteConversationStore: ObservableObject {
                             scopeKey: scopeKey,
                             threadID: stored.context.id,
                             bundleID: stored.context.bundleIdentifier,
-                            projectKey: contextLinkingKey(stored.context.projectKey),
-                            identityKey: contextLinkingKey(stored.context.identityKey),
+                            projectKey: contextLinkingKey(stored.context.projectKey, aliasTypeHint: "project"),
+                            identityKey: contextLinkingKey(stored.context.identityKey, aliasTypeHint: "identity"),
                             summaryText: summaryText,
                             summaryMethod: .fallback,
                             summaryConfidence: nil,
@@ -4595,6 +4898,7 @@ enum PromptRewriteConversationContextResolver {
             "codex",
             "new thread",
             "threads",
+            "automation folders",
             "automations",
             "skills",
             "settings",
@@ -4693,6 +4997,9 @@ enum PromptRewriteConversationContextResolver {
         ) {
             return normalizedProjectName(captured)
         }
+        if isCodexNonProjectPlaceholderLabel(normalized) {
+            return nil
+        }
         let lowered = normalized.lowercased()
         let blocked: Set<String> = [
             "thread",
@@ -4712,6 +5019,25 @@ enum PromptRewriteConversationContextResolver {
             return nil
         }
         return normalized
+    }
+
+    private static func isCodexNonProjectPlaceholderLabel(_ value: String) -> Bool {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .lowercased()
+        guard !normalized.isEmpty else { return true }
+
+        let blocked: Set<String> = [
+            "automation folder",
+            "automation folders",
+            "automations",
+            "threads",
+            "pinned threads",
+            "unknown project",
+            "unknown workspace",
+            "unknown identity"
+        ]
+        return blocked.contains(normalized)
     }
 
     private static func isLikelyVersionControlReferenceLabel(_ value: String) -> Bool {
@@ -4790,6 +5116,7 @@ enum PromptRewriteConversationContextResolver {
         let blocked: Set<String> = [
             "new thread",
             "threads",
+            "automation folders",
             "settings",
             "automations",
             "skills",
@@ -4825,6 +5152,7 @@ enum PromptRewriteConversationContextResolver {
             "toggle diff panel",
             "pop out",
             "new thread",
+            "automation folders",
             "automations",
             "skills",
             "settings"

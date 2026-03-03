@@ -248,6 +248,7 @@ actor ConversationMemoryPromotionService {
                     rationale: lessonDraft.rationale,
                     validationConfidence: lessonDraft.validationConfidence,
                     sourceMetadata: mergedMetadata(
+                        payload: preparedPayload,
                         base: lessonDraft.sourceMetadata,
                         scope: scope,
                         trigger: preparedPayload.trigger,
@@ -607,6 +608,7 @@ actor ConversationMemoryPromotionService {
         summaryMethod: String,
         decision: ConversationPromotionDecision
     ) -> [String: String] {
+        let canonicalKeys = resolvedCanonicalContextKeys(payload: payload, scope: scope)
         var metadata: [String: String] = [
             "origin": "conversation-history",
             "scope_key": scope.scopeKey,
@@ -614,8 +616,12 @@ actor ConversationMemoryPromotionService {
             "bundle_id": scope.bundleID,
             "surface_label": scope.surfaceLabel,
             "project_name": scope.projectName ?? "",
+            "project_label": scope.projectName ?? "",
+            "project_key": canonicalKeys.projectKey ?? "",
+            "canonical_project_key": canonicalKeys.projectKey ?? "",
             "repository_name": scope.repositoryName ?? "",
-            "identity_key": scope.identityKey ?? "",
+            "identity_key": canonicalKeys.identityKey ?? scope.identityKey ?? "",
+            "canonical_identity_key": canonicalKeys.identityKey ?? scope.identityKey ?? "",
             "identity_type": scope.identityType ?? "",
             "identity_label": scope.identityLabel ?? "",
             "native_thread_key": nativeThreadKey,
@@ -629,6 +635,12 @@ actor ConversationMemoryPromotionService {
             "summary_method": summaryMethod,
             "ai_timeout_seconds": "\(aiSummaryTimeoutSeconds)"
         ]
+        if let source = canonicalKeys.projectKeySource {
+            metadata["canonical_project_key_source"] = source
+        }
+        if let source = canonicalKeys.identityKeySource {
+            metadata["canonical_identity_key_source"] = source
+        }
         if let compactionVersion = payload.compactionVersion {
             metadata["compaction_version"] = "\(compactionVersion)"
         }
@@ -746,6 +758,7 @@ actor ConversationMemoryPromotionService {
     }
 
     private func mergedMetadata(
+        payload: ConversationMemoryPromotionPayload,
         base: [String: String],
         scope: MemoryScopeContext,
         trigger: MemoryPromotionTrigger,
@@ -757,6 +770,7 @@ actor ConversationMemoryPromotionService {
         summaryMethod: String,
         summaryGenerationMetadata: [String: String]
     ) -> [String: String] {
+        let canonicalKeys = resolvedCanonicalContextKeys(payload: payload, scope: scope)
         var merged = base
         merged["origin"] = "conversation-history"
         merged["scope_key"] = scope.scopeKey
@@ -764,8 +778,12 @@ actor ConversationMemoryPromotionService {
         merged["bundle_id"] = scope.bundleID
         merged["surface_label"] = scope.surfaceLabel
         merged["project_name"] = scope.projectName ?? ""
+        merged["project_label"] = scope.projectName ?? ""
+        merged["project_key"] = canonicalKeys.projectKey ?? ""
+        merged["canonical_project_key"] = canonicalKeys.projectKey ?? ""
         merged["repository_name"] = scope.repositoryName ?? ""
-        merged["identity_key"] = scope.identityKey ?? ""
+        merged["identity_key"] = canonicalKeys.identityKey ?? scope.identityKey ?? ""
+        merged["canonical_identity_key"] = canonicalKeys.identityKey ?? scope.identityKey ?? ""
         merged["identity_type"] = scope.identityType ?? ""
         merged["identity_label"] = scope.identityLabel ?? ""
         merged["context_id"] = contextID
@@ -784,6 +802,12 @@ actor ConversationMemoryPromotionService {
         }
         if !summaryGenerationMetadata.isEmpty {
             merged["summary_generation_metadata"] = encodedStringMap(summaryGenerationMetadata)
+        }
+        if let source = canonicalKeys.projectKeySource {
+            merged["canonical_project_key_source"] = source
+        }
+        if let source = canonicalKeys.identityKeySource {
+            merged["canonical_identity_key_source"] = source
         }
         if merged["validation_state"] == nil {
             merged["validation_state"] = MemoryRewriteLessonValidationState.unvalidated.rawValue
@@ -809,6 +833,7 @@ actor ConversationMemoryPromotionService {
                 appName: context.appName,
                 bundleID: context.bundleIdentifier,
                 surfaceLabel: surfaceLabel,
+                projectKey: tupleTags.projectKey,
                 projectName: tupleTags.projectLabel,
                 repositoryName: nil,
                 identityKey: tupleTags.identityKey,
@@ -862,6 +887,7 @@ actor ConversationMemoryPromotionService {
             appName: appName,
             bundleID: bundleID,
             surfaceLabel: surfaceLabel,
+            projectKey: context.projectKey,
             projectName: projectName,
             repositoryName: repositoryName,
             identityKey: context.identityKey,
@@ -870,6 +896,60 @@ actor ConversationMemoryPromotionService {
             scopeKey: payload.promotionScopeKey,
             isCodingContext: isCoding
         )
+    }
+
+    private func resolvedCanonicalContextKeys(
+        payload: ConversationMemoryPromotionPayload,
+        scope: MemoryScopeContext
+    ) -> (
+        projectKey: String?,
+        projectKeySource: String?,
+        identityKey: String?,
+        identityKeySource: String?
+    ) {
+        let projectCandidates: [(value: String?, source: String)] = [
+            (payload.tupleTags?.projectKey, "tuple-tags"),
+            (payload.context.projectKey, "context"),
+            (scope.projectName, "scope-project")
+        ]
+        let identityCandidates: [(value: String?, source: String)] = [
+            (payload.tupleTags?.identityKey, "tuple-tags"),
+            (payload.context.identityKey, "context"),
+            (scope.identityKey, "scope")
+        ]
+
+        let project = firstCanonicalContextKey(from: projectCandidates)
+        let identity = firstCanonicalContextKey(from: identityCandidates)
+        return (
+            projectKey: project?.value,
+            projectKeySource: project?.source,
+            identityKey: identity?.value,
+            identityKeySource: identity?.source
+        )
+    }
+
+    private func firstCanonicalContextKey(
+        from candidates: [(value: String?, source: String)]
+    ) -> (value: String, source: String)? {
+        for candidate in candidates {
+            guard let normalized = normalizedCanonicalContextKey(candidate.value),
+                  isCanonicalContextKey(normalized) else {
+                continue
+            }
+            return (normalized, candidate.source)
+        }
+        return nil
+    }
+
+    private func normalizedCanonicalContextKey(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = MemoryTextNormalizer.collapsedWhitespace(value).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        return normalized
+    }
+
+    private func isCanonicalContextKey(_ value: String) -> Bool {
+        value.contains(":") && !value.contains(" ") && !value.contains("|")
     }
 
     private func inferCodingContext(

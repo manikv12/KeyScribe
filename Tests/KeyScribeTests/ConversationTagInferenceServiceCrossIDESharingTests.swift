@@ -26,6 +26,17 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
         XCTAssertFalse(result)
     }
 
+    func testShouldNotShareCrossIDECodingContextWithAutomationFoldersPlaceholderProjectKey() {
+        let result = service.shouldShareCrossIDECodingContext(
+            bundleID: "com.apple.dt.xcode",
+            appName: "Xcode",
+            projectKey: "project:automation-folders",
+            featureEnabled: true
+        )
+
+        XCTAssertFalse(result)
+    }
+
     func testShouldNotShareCrossIDECodingContextWhenFeatureDisabled() {
         let result = service.shouldShareCrossIDECodingContext(
             bundleID: "com.apple.dt.xcode",
@@ -90,5 +101,78 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
         )
 
         XCTAssertFalse(result)
+    }
+
+    func testAppleMessagesInfersPersonIdentityFromScreenLabel() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-messages",
+            appName: "Messages",
+            bundleIdentifier: "com.apple.MobileSMS",
+            screenLabel: "Scott Boy - Text Message • SMS",
+            fieldLabel: "Message"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.identityType, "person")
+        XCTAssertEqual(tags.identityLabel, "Scott Boy")
+        XCTAssertEqual(tags.identityKey, "person:scott-boy")
+    }
+
+    func testAppleMessagesInfersPersonIdentityFromSimpleHeader() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-messages-2",
+            appName: "Messages",
+            bundleIdentifier: "com.apple.MobileSMS",
+            screenLabel: "Scott",
+            fieldLabel: "Message"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.identityType, "person")
+        XCTAssertEqual(tags.identityLabel, "Scott")
+        XCTAssertEqual(tags.identityKey, "person:scott")
+    }
+
+    func testAppleMessagesStripsMaybePrefixFromPersonName() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-messages-3",
+            appName: "Messages",
+            bundleIdentifier: "com.apple.MobileSMS",
+            screenLabel: "Maybe: Contact Person - Text Message • SMS",
+            fieldLabel: "Message"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.identityType, "person")
+        XCTAssertEqual(tags.identityLabel, "Contact Person")
+        XCTAssertEqual(tags.identityKey, "person:contact-person")
+    }
+
+    func testCodexTreatsAutomationFoldersLabelAsUnknownProject() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-codex-automation-folders",
+            appName: "Codex",
+            bundleIdentifier: "com.openai.codex",
+            screenLabel: "Project: Automation folders | Thread: Fix portion selector confirm",
+            fieldLabel: "Focused Input"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.projectLabel, "Unknown Project")
+        XCTAssertEqual(tags.projectKey, "project:unknown")
+    }
+
+    func testCodexStillInfersRealProjectLabelFromContext() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-codex-spike",
+            appName: "Codex",
+            bundleIdentifier: "com.openai.codex",
+            screenLabel: "Project: Spike | Thread: Fix portion selector confirm",
+            fieldLabel: "Focused Input"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.projectLabel, "Spike")
+        XCTAssertEqual(tags.projectKey, "project:spike")
     }
 }

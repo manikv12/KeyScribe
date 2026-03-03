@@ -80,6 +80,11 @@ struct AIMemoryStudioView: View {
     @State private var contextMappingsLoadRequestToken = UUID()
     @State private var contextMappingMutatingRowID: String?
     @State private var lastContextMappingMutation: ContextMappingMutation?
+    @State private var contextOverrideSourceContextID = ""
+    @State private var contextOverrideTargetContextID = ""
+    @State private var contextOverrideAxisRawValue = "project"
+    @State private var contextOverrideDecisionRawValue = "linked"
+    @State private var isContextOverrideSaving = false
     @State private var memoryBrowserRefreshWorkItem: DispatchWorkItem?
 
     private enum StudioPage: String, CaseIterable, Identifiable {
@@ -350,6 +355,7 @@ struct AIMemoryStudioView: View {
         }
         .onChange(of: showConversationContextMappingsSheet) { isPresented in
             if isPresented {
+                syncContextOverrideSelections()
                 loadContextMappings(showStatusMessage: false)
             }
         }
@@ -1156,18 +1162,18 @@ struct AIMemoryStudioView: View {
 
     private var conversationContextMappingsCard: some View {
         settingsCard(
-            title: "Context Mappings",
-            subtitle: "Manage cross-app project/person link decisions used for shared conversation context.",
+            title: "Context Overrides",
+            subtitle: "Manage manual project/person link decisions for shared conversation context.",
             symbol: "point.bottomleft.forward.to.point.topright.scurvepath",
             tint: AppVisualTheme.accentTint
         ) {
-            Text("Review project/person mappings, switch decisions between linked vs separate, and remove stale mappings.")
+            Text("Review project/person overrides, switch decisions between linked vs separate, and remove stale records.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 8) {
                 metricPill(
-                    label: "Mappings",
+                    label: "Overrides",
                     value: "\(contextMappingRows.count)",
                     tint: AppVisualTheme.accentTint
                 )
@@ -1185,7 +1191,7 @@ struct AIMemoryStudioView: View {
             }
 
             HStack(spacing: 8) {
-                Button("Open Context Mappings") {
+                Button("Open Context Overrides") {
                     showConversationContextMappingsSheet = true
                 }
                 .buttonStyle(.borderedProminent)
@@ -1447,9 +1453,9 @@ struct AIMemoryStudioView: View {
             VStack(spacing: 0) {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Context Mappings")
+                        Text("Context Overrides")
                             .font(.headline)
-                        Text("Project/person link rules for app pairs.")
+                        Text("Manual project/person link rules for app pairs.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1485,36 +1491,39 @@ struct AIMemoryStudioView: View {
                 Divider()
                     .overlay(Color.primary.opacity(0.08))
 
-                if isContextMappingsLoading, contextMappingRows.isEmpty {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                        Text("Loading context mappings...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if contextMappingRows.isEmpty {
-                    emptyStateRow(
-                        title: "No context mappings",
-                        message: "Mappings will appear after project/person clarification decisions are recorded.",
-                        systemImage: "tray"
-                    )
-                    .padding(18)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        contextMappingsTableHeader
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 8) {
-                                ForEach(contextMappingRows) { row in
-                                    contextMappingsRow(row)
+                VStack(alignment: .leading, spacing: 12) {
+                    contextOverrideComposer
+
+                    if isContextMappingsLoading, contextMappingRows.isEmpty {
+                        VStack(spacing: 10) {
+                            ProgressView()
+                            Text("Loading context overrides...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if contextMappingRows.isEmpty {
+                        emptyStateRow(
+                            title: "No context overrides",
+                            message: "Add an override above, or wait for project/person clarification decisions to create one automatically.",
+                            systemImage: "tray"
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            contextMappingsTableHeader
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 8) {
+                                    ForEach(contextMappingRows) { row in
+                                        contextMappingsRow(row)
+                                    }
                                 }
+                                .padding(.trailing, 2)
                             }
-                            .padding(.trailing, 2)
                         }
                     }
-                    .padding(18)
                 }
+                .padding(18)
             }
             .padding(10)
             .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.16)
@@ -1557,6 +1566,77 @@ struct AIMemoryStudioView: View {
 
             Spacer(minLength: 0)
         }
+    }
+
+    private var contextOverrideComposer: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Create Override")
+                .font(.subheadline.weight(.semibold))
+
+            if contextOverrideContextOptions.isEmpty {
+                Text("No contexts available yet. Use prompt rewrite in at least two contexts, then create an override.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    Picker("Type", selection: $contextOverrideAxisRawValue) {
+                        Text("Project").tag("project")
+                        Text("Person").tag("person")
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 220)
+
+                    Picker("Decision", selection: $contextOverrideDecisionRawValue) {
+                        Text("Linked").tag("linked")
+                        Text("Separate").tag("separate")
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 240)
+
+                    Spacer(minLength: 0)
+                }
+
+                HStack(spacing: 8) {
+                    Picker("From Context", selection: $contextOverrideSourceContextID) {
+                        ForEach(contextOverrideContextOptions) { detail in
+                            Text(detail.context.displayName).tag(detail.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    Picker("To Context", selection: $contextOverrideTargetContextID) {
+                        ForEach(contextOverrideContextOptions) { detail in
+                            Text(detail.context.displayName).tag(detail.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+
+                HStack(spacing: 8) {
+                    Button("Create Override") {
+                        createContextOverride()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canCreateContextOverride || isContextOverrideSaving)
+
+                    if isContextOverrideSaving {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(AppVisualTheme.adaptiveMaterialFill())
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.7)
+        )
     }
 
     private func contextMappingsRow(_ row: ContextMappingRow) -> some View {
@@ -3462,6 +3542,7 @@ struct AIMemoryStudioView: View {
         }
 
         if details.contains(where: { $0.id == selectedConversationContextID }) {
+            syncContextOverrideSelections()
             return
         }
 
@@ -3470,6 +3551,7 @@ struct AIMemoryStudioView: View {
         } else {
             selectedConversationContextID = ""
         }
+        syncContextOverrideSelections()
     }
 
     private func refreshConversationPatternStats() {
@@ -3638,6 +3720,150 @@ struct AIMemoryStudioView: View {
         refreshConversationContextDetails()
     }
 
+    private var contextOverrideContextOptions: [PromptRewriteConversationContextDetail] {
+        conversationContextDetails.sorted { lhs, rhs in
+            if lhs.lastUpdatedAt != rhs.lastUpdatedAt {
+                return lhs.lastUpdatedAt > rhs.lastUpdatedAt
+            }
+            return lhs.id < rhs.id
+        }
+    }
+
+    private var canCreateContextOverride: Bool {
+        guard let source = contextOverrideContextOptions.first(where: { $0.id == contextOverrideSourceContextID }),
+              let target = contextOverrideContextOptions.first(where: { $0.id == contextOverrideTargetContextID }),
+              source.id != target.id else {
+            return false
+        }
+        let mappingType: ConversationDisambiguationRuleType = contextOverrideAxisRawValue == "person" ? .person : .project
+        let sourceKey = normalizedContextOverrideKey(contextOverrideKey(for: source.context, type: mappingType))
+        let targetKey = normalizedContextOverrideKey(contextOverrideKey(for: target.context, type: mappingType))
+        let sourceBundle = normalizedContextOverrideKey(source.context.bundleIdentifier)
+        let targetBundle = normalizedContextOverrideKey(target.context.bundleIdentifier)
+        guard !sourceKey.isEmpty, !targetKey.isEmpty, !sourceBundle.isEmpty, !targetBundle.isEmpty else {
+            return false
+        }
+        return true
+    }
+
+    private func syncContextOverrideSelections() {
+        let options = contextOverrideContextOptions
+        guard !options.isEmpty else {
+            contextOverrideSourceContextID = ""
+            contextOverrideTargetContextID = ""
+            return
+        }
+
+        if !options.contains(where: { $0.id == contextOverrideSourceContextID }) {
+            contextOverrideSourceContextID = options[0].id
+        }
+
+        if !options.contains(where: { $0.id == contextOverrideTargetContextID }) || contextOverrideTargetContextID == contextOverrideSourceContextID {
+            contextOverrideTargetContextID = options.first(where: { $0.id != contextOverrideSourceContextID })?.id ?? options[0].id
+        }
+    }
+
+    @MainActor
+    private func createContextOverride() {
+        guard !isContextOverrideSaving else { return }
+        guard let source = contextOverrideContextOptions.first(where: { $0.id == contextOverrideSourceContextID }),
+              let target = contextOverrideContextOptions.first(where: { $0.id == contextOverrideTargetContextID }),
+              source.id != target.id else {
+            conversationActionMessage = "Choose two different contexts to create an override."
+            return
+        }
+
+        let mappingType: ConversationDisambiguationRuleType = contextOverrideAxisRawValue == "person" ? .person : .project
+        let decision: ConversationDisambiguationDecision =
+            normalizeContextMappingDecision(contextOverrideDecisionRawValue) == "linked" ? .link : .separate
+
+        let sourceKey = normalizedContextOverrideKey(contextOverrideKey(for: source.context, type: mappingType))
+        let targetKey = normalizedContextOverrideKey(contextOverrideKey(for: target.context, type: mappingType))
+        let sourceBundle = normalizedContextOverrideKey(source.context.bundleIdentifier)
+        let targetBundle = normalizedContextOverrideKey(target.context.bundleIdentifier)
+
+        guard !sourceKey.isEmpty, !targetKey.isEmpty, !sourceBundle.isEmpty, !targetBundle.isEmpty else {
+            conversationActionMessage = "Selected contexts are missing required project/person metadata."
+            return
+        }
+
+        let appPairKey = contextOverrideAppPairKey(sourceBundle, targetBundle)
+        guard !appPairKey.isEmpty else {
+            conversationActionMessage = "Could not derive app pair for the selected contexts."
+            return
+        }
+
+        let subjectKey = normalizedContextOverrideLabel(
+            contextOverrideSubjectLabel(for: source.context, type: mappingType),
+            fallbackKey: sourceKey
+        )
+        guard !subjectKey.isEmpty else {
+            conversationActionMessage = "Could not derive subject key for this override."
+            return
+        }
+
+        // Mark saving as in progress on the main actor
+        isContextOverrideSaving = true
+
+        let shouldCreateAlias = (decision == .link && sourceKey != targetKey)
+        let aliasType = mappingType == .project ? "project" : "identity"
+        let axisLabel = mappingType == .project ? "project" : "person"
+        let statusMessage = "Created \(axisLabel) override (\(decision == .link ? "linked" : "separate"))."
+        let canonicalKey = (decision == .link ? targetKey : nil)
+
+        Task.detached { [promptRewriteConversationStore] in
+            // Perform the potentially blocking persistence work off the main actor
+            promptRewriteConversationStore.upsertContextMappingDecision(
+                mappingType: mappingType,
+                appPairKey: appPairKey,
+                subjectKey: subjectKey,
+                contextScopeKey: targetKey,
+                decision: decision,
+                canonicalKey: canonicalKey,
+                source: .manual
+            )
+
+            if shouldCreateAlias {
+                _ = Self.persistContextTagAlias(
+                    aliasType: aliasType,
+                    aliasKey: sourceKey,
+                    canonicalKey: targetKey
+                )
+            }
+
+            // Once persistence is complete, update UI-related state on the main actor
+            await MainActor.run {
+                isContextOverrideSaving = false
+                conversationActionMessage = statusMessage
+                loadContextMappings(showStatusMessage: false)
+            }
+        }
+    }
+
+    private func contextOverrideKey(
+        for context: PromptRewriteConversationContext,
+        type: ConversationDisambiguationRuleType
+    ) -> String {
+        switch type {
+        case .project:
+            return context.projectKey ?? ""
+        case .person:
+            return context.identityKey ?? ""
+        }
+    }
+
+    private func contextOverrideSubjectLabel(
+        for context: PromptRewriteConversationContext,
+        type: ConversationDisambiguationRuleType
+    ) -> String {
+        switch type {
+        case .project:
+            return context.projectLabel ?? ""
+        case .person:
+            return context.identityLabel ?? ""
+        }
+    }
+
     private func contextMappingDecisionBinding(for rowID: String) -> Binding<String> {
         Binding(
             get: {
@@ -3669,8 +3895,8 @@ struct AIMemoryStudioView: View {
             isContextMappingsLoading = false
             if showStatusMessage {
                 conversationActionMessage = rows.isEmpty
-                    ? "No context mappings found."
-                    : "Loaded \(rows.count) context mapping(s)."
+                    ? "No context overrides found."
+                    : "Loaded \(rows.count) context override(s)."
             }
         }
     }
@@ -3929,6 +4155,74 @@ struct AIMemoryStudioView: View {
             return "linked"
         }
         return "separate"
+    }
+
+    private func contextOverrideAppPairKey(_ lhs: String, _ rhs: String) -> String {
+        let candidates = [lhs, rhs]
+            .map(normalizedContextOverrideKey)
+            .filter { !$0.isEmpty }
+            .sorted()
+        if candidates.count >= 2 {
+            return "\(candidates[0])|\(candidates[1])"
+        }
+        return candidates.first ?? ""
+    }
+
+    private func normalizedContextOverrideLabel(_ label: String, fallbackKey: String) -> String {
+        let fromLabel = normalizedContextOverrideLabelValue(label)
+        if !fromLabel.isEmpty {
+            return fromLabel
+        }
+        let split = fallbackKey.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: true)
+        let fallback = split.count == 2 ? String(split[1]) : fallbackKey
+        let readable = fallback
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        return normalizedContextOverrideLabelValue(readable)
+    }
+
+    private func normalizedContextOverrideLabelValue(_ value: String) -> String {
+        let collapsed = collapsedWhitespaceForContextOverride(value).lowercased()
+        guard !collapsed.isEmpty else {
+            return ""
+        }
+        let alphanumericOnly = collapsed.replacingOccurrences(
+            of: #"[^a-z0-9]+"#,
+            with: " ",
+            options: .regularExpression
+        )
+        return collapsedWhitespaceForContextOverride(alphanumericOnly)
+    }
+
+    private func normalizedContextOverrideKey(_ value: String) -> String {
+        collapsedWhitespaceForContextOverride(value).lowercased()
+    }
+
+    private func collapsedWhitespaceForContextOverride(_ value: String) -> String {
+        value
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    nonisolated private static func persistContextTagAlias(
+        aliasType: String,
+        aliasKey: String,
+        canonicalKey: String
+    ) -> Bool {
+        guard let store = try? MemorySQLiteStore() else {
+            return false
+        }
+        do {
+            try store.upsertConversationTagAlias(
+                aliasType: aliasType,
+                aliasKey: aliasKey,
+                canonicalKey: canonicalKey
+            )
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func sanitizeSelectedStudioPage() {
