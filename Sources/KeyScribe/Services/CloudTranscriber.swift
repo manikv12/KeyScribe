@@ -5,6 +5,7 @@ import Foundation
 final class CloudTranscriber: NSObject {
     var onFinalText: ((String) -> Void)?
     var onStatusUpdate: ((String) -> Void)?
+    var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
@@ -977,12 +978,15 @@ final class CloudTranscriber: NSObject {
                 CrashReporter.logWarning(
                     "Cloud audio setup recovery enabled: bypassing manual microphone selection after format error code=\(error.code)"
                 )
+                onHUDAlert?(.micFallbackToDefault)
                 return "Selected microphone failed. Switched to default microphone; try again."
             }
 
+            onHUDAlert?(.micUnavailable)
             return "Microphone unavailable (CoreAudio -10868). Check Sound Input settings and retry."
         }
 
+        onHUDAlert?(.micUnavailable)
         return "Audio setup failed: \(error.localizedDescription)"
     }
 

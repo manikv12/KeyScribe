@@ -8,6 +8,7 @@ import whisper
 final class WhisperTranscriber: NSObject {
     var onFinalText: ((String) -> Void)?
     var onStatusUpdate: ((String) -> Void)?
+    var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
@@ -457,6 +458,7 @@ final class WhisperTranscriber: NSObject {
             self.restoreMicSelection()
             self.resetTranscriptionQueueAfterTimeout()
             self.updateStatus("Whisper finalize timed out and was reset. Try again.")
+            self.onHUDAlert?(.whisperStalled)
             CrashReporter.logError("Whisper finalize timed out and transcription queue was reset run=\(runID) model=\(selectedModelID)")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + finalizeWatchdogTimeoutSeconds, execute: stuckRunWatchdog)
@@ -511,6 +513,7 @@ final class WhisperTranscriber: NSObject {
 
                 case let .failure(error):
                     self.updateStatus("Whisper error: \(error.localizedDescription)")
+                    self.onHUDAlert?(.whisperFailed)
                     CrashReporter.logError(
                         "Whisper finalize failed run=\(runID) model=\(selectedModelID) duration=\(elapsedText)s error=\(error.localizedDescription)"
                     )
@@ -978,6 +981,7 @@ final class WhisperTranscriber: NSObject {
 final class WhisperTranscriber: NSObject {
     var onFinalText: ((String) -> Void)?
     var onStatusUpdate: ((String) -> Void)?
+    var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
