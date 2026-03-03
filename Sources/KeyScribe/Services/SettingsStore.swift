@@ -29,6 +29,7 @@ enum RecognitionMode: String, CaseIterable, Identifiable {
 enum TranscriptionEngineType: String, CaseIterable, Identifiable {
     case appleSpeech = "Apple Speech"
     case whisperCpp = "whisper.cpp"
+    case cloudProviders = "Cloud Providers"
 
     var id: Self { self }
 
@@ -42,6 +43,60 @@ enum TranscriptionEngineType: String, CaseIterable, Identifiable {
             return "Uses Apple Speech recognition. Supports on-device and cloud recognition modes."
         case .whisperCpp:
             return "Uses local whisper.cpp models downloaded to this Mac. No cloud transcription is used."
+        case .cloudProviders:
+            return "Uses cloud transcription providers with your API key. Audio is uploaded for transcription."
+        }
+    }
+}
+
+enum CloudTranscriptionProvider: String, CaseIterable, Identifiable {
+    case openAI = "OpenAI"
+    case groq = "Groq"
+    case deepgram = "Deepgram"
+    case gemini = "Google Gemini (AI Studio)"
+
+    var id: Self { self }
+
+    var displayName: String {
+        rawValue
+    }
+
+    var defaultModel: String {
+        switch self {
+        case .openAI:
+            return "gpt-4o-mini-transcribe"
+        case .groq:
+            return "whisper-large-v3-turbo"
+        case .deepgram:
+            return "nova-3"
+        case .gemini:
+            return "gemini-2.5-flash"
+        }
+    }
+
+    var defaultBaseURL: String {
+        switch self {
+        case .openAI:
+            return "https://api.openai.com/v1"
+        case .groq:
+            return "https://api.groq.com/openai/v1"
+        case .deepgram:
+            return "https://api.deepgram.com/v1/listen"
+        case .gemini:
+            return "https://generativelanguage.googleapis.com/v1beta"
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .openAI:
+            return "OpenAI transcription models via /audio/transcriptions."
+        case .groq:
+            return "Groq-hosted Whisper transcription models via OpenAI-compatible endpoint."
+        case .deepgram:
+            return "Deepgram speech-to-text API with low-latency cloud transcription."
+        case .gemini:
+            return "Google Gemini generateContent audio transcription using AI Studio API key."
         }
     }
 }
@@ -424,6 +479,10 @@ final class SettingsStore: ObservableObject {
         static let appChromeStyle = "KeyScribe.appChromeStyle"
         static let colorTheme = "KeyScribe.colorTheme"
         static let transcriptionEngine = "KeyScribe.transcriptionEngine"
+        static let cloudTranscriptionProvider = "KeyScribe.cloudTranscriptionProvider"
+        static let cloudTranscriptionModel = "KeyScribe.cloudTranscriptionModel"
+        static let cloudTranscriptionBaseURL = "KeyScribe.cloudTranscriptionBaseURL"
+        static let cloudTranscriptionRequestTimeoutSeconds = "KeyScribe.cloudTranscriptionRequestTimeoutSeconds"
         static let selectedWhisperModelID = "KeyScribe.selectedWhisperModelID"
         static let whisperUseCoreML = "KeyScribe.whisperUseCoreML"
         static let whisperAutoUnloadIdleContextEnabled = "KeyScribe.whisperAutoUnloadIdleContextEnabled"
@@ -481,6 +540,12 @@ final class SettingsStore: ObservableObject {
         static let minimumSeconds: Double = 3
         static let maximumSeconds: Double = 120
         static let fallbackSeconds: Double = 8
+    }
+
+    private enum CloudTranscriptionRequestTimeoutDefaults {
+        static let minimumSeconds: Double = 5
+        static let maximumSeconds: Double = 180
+        static let fallbackSeconds: Double = 30
     }
 
     private enum WhisperContextRetentionDefaults {
@@ -613,6 +678,62 @@ final class SettingsStore: ObservableObject {
 
     @Published var transcriptionEngineRawValue: String {
         didSet {
+            save()
+        }
+    }
+
+    @Published var cloudTranscriptionProviderRawValue: String {
+        didSet {
+            if oldValue != cloudTranscriptionProviderRawValue {
+                cloudTranscriptionAPIKey = Self.loadCloudTranscriptionProviderAPIKey(for: cloudTranscriptionProvider)
+                applyCloudTranscriptionProviderDefaultsIfNeeded(force: true)
+            }
+            save()
+        }
+    }
+
+    @Published var cloudTranscriptionModel: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(cloudTranscriptionModel)
+            if normalized != cloudTranscriptionModel {
+                cloudTranscriptionModel = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var cloudTranscriptionBaseURL: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(cloudTranscriptionBaseURL)
+            if normalized != cloudTranscriptionBaseURL {
+                cloudTranscriptionBaseURL = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var cloudTranscriptionRequestTimeoutSeconds: Double {
+        didSet {
+            let normalized = min(
+                CloudTranscriptionRequestTimeoutDefaults.maximumSeconds,
+                max(CloudTranscriptionRequestTimeoutDefaults.minimumSeconds, cloudTranscriptionRequestTimeoutSeconds)
+            )
+            guard normalized == cloudTranscriptionRequestTimeoutSeconds else {
+                cloudTranscriptionRequestTimeoutSeconds = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var cloudTranscriptionAPIKey: String {
+        didSet {
+            Self.storeCloudTranscriptionProviderAPIKey(
+                cloudTranscriptionAPIKey,
+                for: cloudTranscriptionProvider
+            )
             save()
         }
     }
@@ -1127,6 +1248,32 @@ final class SettingsStore: ObservableObject {
             transcriptionEngineRawValue = storedEngine
         }
 
+        let storedCloudProviderRawValue = defaults.string(forKey: Keys.cloudTranscriptionProvider)
+            ?? CloudTranscriptionProvider.openAI.rawValue
+        let resolvedCloudProviderRawValue: String
+        if CloudTranscriptionProvider(rawValue: storedCloudProviderRawValue) == nil {
+            resolvedCloudProviderRawValue = CloudTranscriptionProvider.openAI.rawValue
+        } else {
+            resolvedCloudProviderRawValue = storedCloudProviderRawValue
+        }
+        cloudTranscriptionProviderRawValue = resolvedCloudProviderRawValue
+        let selectedCloudProvider = CloudTranscriptionProvider(rawValue: resolvedCloudProviderRawValue) ?? .openAI
+        let sanitizedCloudConfiguration = Self.sanitizedCloudTranscriptionConfiguration(
+            provider: selectedCloudProvider,
+            model: defaults.string(forKey: Keys.cloudTranscriptionModel) ?? selectedCloudProvider.defaultModel,
+            baseURL: defaults.string(forKey: Keys.cloudTranscriptionBaseURL) ?? selectedCloudProvider.defaultBaseURL
+        )
+        cloudTranscriptionModel = sanitizedCloudConfiguration.model
+        cloudTranscriptionBaseURL = sanitizedCloudConfiguration.baseURL
+        let storedCloudRequestTimeoutSeconds = defaults.object(forKey: Keys.cloudTranscriptionRequestTimeoutSeconds) == nil
+            ? CloudTranscriptionRequestTimeoutDefaults.fallbackSeconds
+            : defaults.double(forKey: Keys.cloudTranscriptionRequestTimeoutSeconds)
+        cloudTranscriptionRequestTimeoutSeconds = min(
+            CloudTranscriptionRequestTimeoutDefaults.maximumSeconds,
+            max(CloudTranscriptionRequestTimeoutDefaults.minimumSeconds, storedCloudRequestTimeoutSeconds)
+        )
+        cloudTranscriptionAPIKey = Self.loadCloudTranscriptionProviderAPIKey(for: selectedCloudProvider)
+
         selectedWhisperModelID = defaults.string(forKey: Keys.selectedWhisperModelID) ?? ""
 
         if defaults.object(forKey: Keys.whisperUseCoreML) == nil {
@@ -1451,6 +1598,10 @@ final class SettingsStore: ObservableObject {
         defaults.set(appChromeStyleRawValue, forKey: Keys.appChromeStyle)
         defaults.set(colorThemeRawValue, forKey: Keys.colorTheme)
         defaults.set(transcriptionEngineRawValue, forKey: Keys.transcriptionEngine)
+        defaults.set(cloudTranscriptionProviderRawValue, forKey: Keys.cloudTranscriptionProvider)
+        defaults.set(cloudTranscriptionModel.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.cloudTranscriptionModel)
+        defaults.set(cloudTranscriptionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.cloudTranscriptionBaseURL)
+        defaults.set(cloudTranscriptionRequestTimeoutSeconds, forKey: Keys.cloudTranscriptionRequestTimeoutSeconds)
         defaults.set(selectedWhisperModelID, forKey: Keys.selectedWhisperModelID)
         defaults.set(whisperUseCoreML, forKey: Keys.whisperUseCoreML)
         defaults.set(whisperAutoUnloadIdleContextEnabled, forKey: Keys.whisperAutoUnloadIdleContextEnabled)
@@ -1566,6 +1717,11 @@ final class SettingsStore: ObservableObject {
         set { transcriptionEngineRawValue = newValue.rawValue }
     }
 
+    var cloudTranscriptionProvider: CloudTranscriptionProvider {
+        get { CloudTranscriptionProvider(rawValue: cloudTranscriptionProviderRawValue) ?? .openAI }
+        set { cloudTranscriptionProviderRawValue = newValue.rawValue }
+    }
+
     var promptRewriteProviderMode: PromptRewriteProviderMode {
         get { PromptRewriteProviderMode(rawValue: promptRewriteProviderModeRawValue) ?? .openAI }
         set { promptRewriteProviderModeRawValue = newValue.rawValue }
@@ -1584,6 +1740,24 @@ final class SettingsStore: ObservableObject {
         guard providerMode.requiresAPIKey else { return true }
         let key = Self.loadPromptRewriteProviderAPIKey(for: providerMode)
         return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func hasCloudTranscriptionAPIKey(for provider: CloudTranscriptionProvider) -> Bool {
+        let key = Self.loadCloudTranscriptionProviderAPIKey(for: provider)
+        return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func applyCloudTranscriptionProviderDefaultsIfNeeded(force: Bool) {
+        let provider = cloudTranscriptionProvider
+        let normalizedModel = cloudTranscriptionModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if force || normalizedModel.isEmpty {
+            cloudTranscriptionModel = provider.defaultModel
+        }
+
+        let normalizedBaseURL = cloudTranscriptionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if force || normalizedBaseURL.isEmpty {
+            cloudTranscriptionBaseURL = provider.defaultBaseURL
+        }
     }
 
     func isPromptRewriteProviderConnected(_ providerMode: PromptRewriteProviderMode) -> Bool {
@@ -1816,6 +1990,29 @@ final class SettingsStore: ObservableObject {
         return normalized
     }
 
+    private static func sanitizedCloudTranscriptionConfiguration(
+        provider: CloudTranscriptionProvider,
+        model: String,
+        baseURL: String
+    ) -> (model: String, baseURL: String) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedModel = trimmedModel.isEmpty ? provider.defaultModel : trimmedModel
+        let resolvedBaseURL = trimmedBaseURL.isEmpty ? provider.defaultBaseURL : trimmedBaseURL
+        return (resolvedModel, resolvedBaseURL)
+    }
+
+    private static let openAIOAuthFallbackModelID = "gpt-5.2"
+
+    private static func isOpenAIOAuthCompatibleModelID(_ modelID: String) -> Bool {
+        let normalized = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+        if normalized.contains("codex") {
+            return true
+        }
+        return normalized == openAIOAuthFallbackModelID
+    }
+
     private static func sanitizedPromptRewriteProviderConfiguration(
         mode: PromptRewriteProviderMode,
         model: String,
@@ -1838,10 +2035,91 @@ final class SettingsStore: ObservableObject {
         }
 
         resolvedBaseURL = mode.defaultBaseURL
-        if !PromptRewriteModelCatalogService.isOpenAIOAuthCompatibleModelID(resolvedModel) {
-            resolvedModel = PromptRewriteModelCatalogService.defaultOpenAIOAuthModelID
+        if !isOpenAIOAuthCompatibleModelID(resolvedModel) {
+            resolvedModel = openAIOAuthFallbackModelID
         }
         return (resolvedModel, resolvedBaseURL)
+    }
+
+    private static let cloudTranscriptionProviderAPIKeychainService = "com.keyscribe.KeyScribe"
+    private static let cloudTranscriptionProviderAPIKeychainAccountPrefix = "cloud-transcription-provider-api-key"
+
+    private static func cloudTranscriptionKeychainAccount(for provider: CloudTranscriptionProvider) -> String {
+        let normalized = provider.rawValue
+            .lowercased()
+            .replacingOccurrences(of: "(", with: "")
+            .replacingOccurrences(of: ")", with: "")
+            .replacingOccurrences(of: " ", with: "-")
+        return "\(cloudTranscriptionProviderAPIKeychainAccountPrefix).\(normalized)"
+    }
+
+    private static func loadCloudTranscriptionProviderAPIKey(for provider: CloudTranscriptionProvider) -> String {
+        let account = cloudTranscriptionKeychainAccount(for: provider)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: cloudTranscriptionProviderAPIKeychainService,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return value
+    }
+
+    private static func storeCloudTranscriptionProviderAPIKey(
+        _ rawValue: String,
+        for provider: CloudTranscriptionProvider
+    ) {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            deleteCloudTranscriptionProviderAPIKey(for: provider)
+            return
+        }
+
+        let data = Data(value.utf8)
+        let account = cloudTranscriptionKeychainAccount(for: provider)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: cloudTranscriptionProviderAPIKeychainService,
+            kSecAttrAccount as String: account
+        ]
+
+        let updateStatus = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus == errSecItemNotFound {
+            var create = query
+            create[kSecValueData as String] = data
+            _ = SecItemAdd(create as CFDictionary, nil)
+        }
+    }
+
+    private static func deleteCloudTranscriptionProviderAPIKey(for provider: CloudTranscriptionProvider) {
+        let account = cloudTranscriptionKeychainAccount(for: provider)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: cloudTranscriptionProviderAPIKeychainService,
+            kSecAttrAccount as String: account
+        ]
+        _ = SecItemDelete(query as CFDictionary)
+    }
+
+    private static func deleteAllCloudTranscriptionProviderAPIKeys() {
+        for provider in CloudTranscriptionProvider.allCases {
+            deleteCloudTranscriptionProviderAPIKey(for: provider)
+        }
     }
 
     private static let promptRewriteProviderAPIKeychainService = "com.keyscribe.KeyScribe"
@@ -1974,6 +2252,7 @@ final class SettingsStore: ObservableObject {
         deleteProviderCredentials: Bool = false
     ) {
         if deleteProviderCredentials {
+            deleteAllCloudTranscriptionProviderAPIKeys()
             deleteAllPromptRewriteProviderAPIKeys()
             PromptRewriteOAuthCredentialStore.deleteAllSessions()
         }

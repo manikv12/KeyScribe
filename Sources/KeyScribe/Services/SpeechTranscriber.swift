@@ -1,13 +1,22 @@
 import Foundation
 
+enum SpeechTranscriberHUDAlert {
+    case whisperStalled
+    case whisperFailed
+    case micFallbackToDefault
+    case micUnavailable
+}
+
 final class SpeechTranscriber: NSObject {
     var onFinalText: ((String) -> Void)?
     var onStatusUpdate: ((String) -> Void)?
+    var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
     private let appleTranscriber = AppleSpeechTranscriber()
     private let whisperTranscriber = WhisperTranscriber()
+    private let cloudTranscriber = CloudTranscriber()
 
     private var currentEngineType: TranscriptionEngineType = .appleSpeech
     private var isRecording = false
@@ -31,8 +40,19 @@ final class SpeechTranscriber: NSObject {
         var biasPhrases: [String] = []
     }
 
+    private struct CloudSettings {
+        var provider: CloudTranscriptionProvider = .openAI
+        var model = CloudTranscriptionProvider.openAI.defaultModel
+        var baseURL = CloudTranscriptionProvider.openAI.defaultBaseURL
+        var apiKey = ""
+        var requestTimeoutSeconds: TimeInterval = 30
+        var finalizeDelaySeconds: TimeInterval = 0.35
+        var biasPhrases: [String] = []
+    }
+
     private var lastAppleRecognitionSettings = AppleRecognitionSettings()
     private var lastWhisperSettings = WhisperSettings()
+    private var lastCloudSettings = CloudSettings()
 
     override init() {
         super.init()
@@ -46,6 +66,8 @@ final class SpeechTranscriber: NSObject {
                 self.appleTranscriber.requestPermissions(promptIfNeeded: promptIfNeeded)
             case .whisperCpp:
                 self.whisperTranscriber.requestPermissions(promptIfNeeded: promptIfNeeded)
+            case .cloudProviders:
+                self.cloudTranscriber.requestPermissions(promptIfNeeded: promptIfNeeded)
             }
         }
     }
@@ -61,6 +83,7 @@ final class SpeechTranscriber: NSObject {
 
             self.currentEngineType = engineType
             self.applyCachedSettingsToActiveEngine()
+            CrashReporter.logInfo("Speech transcriber engine switched to \(engineType.rawValue)")
         }
     }
 
@@ -68,6 +91,7 @@ final class SpeechTranscriber: NSObject {
         performOnMain {
             self.appleTranscriber.applyMicrophoneSettings(autoDetect: autoDetect, microphoneUID: microphoneUID)
             self.whisperTranscriber.applyMicrophoneSettings(autoDetect: autoDetect, microphoneUID: microphoneUID)
+            self.cloudTranscriber.applyMicrophoneSettings(autoDetect: autoDetect, microphoneUID: microphoneUID)
         }
     }
 
@@ -94,6 +118,11 @@ final class SpeechTranscriber: NSObject {
                 customContextPhrases: customContextPhrases,
                 adaptiveBiasPhrases: adaptiveBiasPhrases
             )
+            self.lastCloudSettings.finalizeDelaySeconds = finalizeDelaySeconds
+            self.lastCloudSettings.biasPhrases = RecognitionTuning.whisperBiasPhrases(
+                customContextPhrases: customContextPhrases,
+                adaptiveBiasPhrases: adaptiveBiasPhrases
+            )
 
             self.appleTranscriber.applyRecognitionSettings(
                 enableContextualBias: enableContextualBias,
@@ -106,6 +135,8 @@ final class SpeechTranscriber: NSObject {
             )
             self.whisperTranscriber.applyBiasPhrases(self.lastWhisperSettings.biasPhrases)
             self.whisperTranscriber.applyFinalizeDelaySeconds(finalizeDelaySeconds)
+            self.cloudTranscriber.applyBiasPhrases(self.lastCloudSettings.biasPhrases)
+            self.cloudTranscriber.applyFinalizeDelaySeconds(finalizeDelaySeconds)
         }
     }
 
@@ -124,6 +155,29 @@ final class SpeechTranscriber: NSObject {
             self.whisperTranscriber.applyContextRetentionSettings(
                 autoUnloadIdleContext: autoUnloadIdleContext,
                 idleContextUnloadDelaySeconds: idleContextUnloadDelaySeconds
+            )
+        }
+    }
+
+    func applyCloudTranscriptionSettings(
+        provider: CloudTranscriptionProvider,
+        model: String,
+        baseURL: String,
+        apiKey: String,
+        requestTimeoutSeconds: TimeInterval
+    ) {
+        performOnMain {
+            self.lastCloudSettings.provider = provider
+            self.lastCloudSettings.model = model
+            self.lastCloudSettings.baseURL = baseURL
+            self.lastCloudSettings.apiKey = apiKey
+            self.lastCloudSettings.requestTimeoutSeconds = requestTimeoutSeconds
+            self.cloudTranscriber.applyProviderSettings(
+                provider: provider,
+                model: model,
+                baseURL: baseURL,
+                apiKey: apiKey,
+                requestTimeoutSeconds: requestTimeoutSeconds
             )
         }
     }
@@ -149,12 +203,15 @@ final class SpeechTranscriber: NSObject {
         performOnMain {
             self.appleTranscriber.trimMemoryUsage(aggressive: aggressive)
             self.whisperTranscriber.trimMemoryUsage(aggressive: aggressive)
+            self.cloudTranscriber.trimMemoryUsage(aggressive: aggressive)
         }
     }
 
     @discardableResult
     private func startRecordingOnMain() -> Bool {
+        CrashReporter.logInfo("Speech transcriber start requested engine=\(currentEngineType.rawValue)")
         let started = activeTranscriber.startRecording()
+        CrashReporter.logInfo("Speech transcriber start result engine=\(currentEngineType.rawValue) started=\(started)")
         if !started {
             isRecording = false
         }
@@ -167,6 +224,8 @@ final class SpeechTranscriber: NSObject {
             return .apple(appleTranscriber)
         case .whisperCpp:
             return .whisper(whisperTranscriber)
+        case .cloudProviders:
+            return .cloud(cloudTranscriber)
         }
     }
 
@@ -194,6 +253,16 @@ final class SpeechTranscriber: NSObject {
             )
             whisperTranscriber.applyBiasPhrases(lastWhisperSettings.biasPhrases)
             whisperTranscriber.applyFinalizeDelaySeconds(lastWhisperSettings.finalizeDelaySeconds)
+        case .cloudProviders:
+            cloudTranscriber.applyProviderSettings(
+                provider: lastCloudSettings.provider,
+                model: lastCloudSettings.model,
+                baseURL: lastCloudSettings.baseURL,
+                apiKey: lastCloudSettings.apiKey,
+                requestTimeoutSeconds: lastCloudSettings.requestTimeoutSeconds
+            )
+            cloudTranscriber.applyBiasPhrases(lastCloudSettings.biasPhrases)
+            cloudTranscriber.applyFinalizeDelaySeconds(lastCloudSettings.finalizeDelaySeconds)
         }
     }
 
@@ -229,6 +298,11 @@ final class SpeechTranscriber: NSObject {
             self.onStatusUpdate?(message)
         }
 
+        whisperTranscriber.onHUDAlert = { [weak self] alert in
+            guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.onHUDAlert?(alert)
+        }
+
         whisperTranscriber.onAudioLevel = { [weak self] level in
             guard let self, self.currentEngineType == .whisperCpp else { return }
             self.onAudioLevel?(level)
@@ -236,6 +310,32 @@ final class SpeechTranscriber: NSObject {
 
         whisperTranscriber.onRecordingStateChange = { [weak self] recording in
             guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.isRecording = recording
+            self.onRecordingStateChange?(recording)
+        }
+
+        cloudTranscriber.onFinalText = { [weak self] text in
+            guard let self, self.currentEngineType == .cloudProviders else { return }
+            self.onFinalText?(text)
+        }
+
+        cloudTranscriber.onStatusUpdate = { [weak self] message in
+            guard let self, self.currentEngineType == .cloudProviders else { return }
+            self.onStatusUpdate?(message)
+        }
+
+        cloudTranscriber.onHUDAlert = { [weak self] alert in
+            guard let self, self.currentEngineType == .cloudProviders else { return }
+            self.onHUDAlert?(alert)
+        }
+
+        cloudTranscriber.onAudioLevel = { [weak self] level in
+            guard let self, self.currentEngineType == .cloudProviders else { return }
+            self.onAudioLevel?(level)
+        }
+
+        cloudTranscriber.onRecordingStateChange = { [weak self] recording in
+            guard let self, self.currentEngineType == .cloudProviders else { return }
             self.isRecording = recording
             self.onRecordingStateChange?(recording)
         }
@@ -252,6 +352,7 @@ final class SpeechTranscriber: NSObject {
     private enum EngineTranscriber {
         case apple(AppleSpeechTranscriber)
         case whisper(WhisperTranscriber)
+        case cloud(CloudTranscriber)
 
         @discardableResult
         func startRecording() -> Bool {
@@ -259,6 +360,8 @@ final class SpeechTranscriber: NSObject {
             case let .apple(transcriber):
                 return transcriber.startRecording()
             case let .whisper(transcriber):
+                return transcriber.startRecording()
+            case let .cloud(transcriber):
                 return transcriber.startRecording()
             }
         }
@@ -268,6 +371,8 @@ final class SpeechTranscriber: NSObject {
             case let .apple(transcriber):
                 transcriber.stopRecording(emitFinalText: emitFinalText)
             case let .whisper(transcriber):
+                transcriber.stopRecording(emitFinalText: emitFinalText)
+            case let .cloud(transcriber):
                 transcriber.stopRecording(emitFinalText: emitFinalText)
             }
         }

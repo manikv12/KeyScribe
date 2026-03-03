@@ -72,6 +72,7 @@ swiftc \
 swiftc \
   Sources/KeyScribe/Services/ShortcutValidationRules.swift \
   Sources/KeyScribe/Support/ShortcutValidation.swift \
+  Sources/KeyScribe/Support/FeatureFlags.swift \
   Sources/KeyScribe/Services/MicrophoneManager.swift \
   Sources/KeyScribe/Services/TextCleanup.swift \
   Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
@@ -95,8 +96,11 @@ swiftc \
   Sources/KeyScribe/Services/TextCleanup.swift \
   Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
   Sources/KeyScribe/Services/CrashReporter.swift \
+  Sources/KeyScribe/Services/ConversationTagInferenceService.swift \
   Sources/KeyScribe/Services/SettingsStore.swift \
   Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
+  Sources/KeyScribe/Services/PromptRewriteConversationStore.swift \
+  Sources/KeyScribe/Services/Memory/ConversationMemoryPromotionService.swift \
   Sources/KeyScribe/Services/Memory/MemoryRewriteExtractionProvider.swift \
   Sources/KeyScribe/Services/Memory/MemorySQLiteStore.swift \
   Sources/KeyScribe/Services/Memory/MemoryIndexingService.swift \
