@@ -3813,7 +3813,7 @@ struct AIMemoryStudioView: View {
 
         Task.detached { [promptRewriteConversationStore] in
             // Perform the potentially blocking persistence work off the main actor
-            promptRewriteConversationStore.upsertContextMappingDecision(
+            await promptRewriteConversationStore.upsertContextMappingDecision(
                 mappingType: mappingType,
                 appPairKey: appPairKey,
                 subjectKey: subjectKey,
