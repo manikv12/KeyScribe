@@ -2147,18 +2147,40 @@ final class PromptRewriteConversationStore: ObservableObject {
             return normalized
         }
         let aliasType = clarificationAliasType(for: normalized, hint: aliasTypeHint)
+        let cacheKey = "\(aliasType)|\(normalized)"
+        if let cached = ContextLinkingKeyCache.get(for: cacheKey) {
+            return cached
+        }
         if let resolvedAlias = try? store.resolveConversationTagAlias(
             aliasType: aliasType,
             aliasKey: normalized
         ) {
             let canonical = normalizedClarificationKey(resolvedAlias)
             if !canonical.isEmpty, !isUnknownContextLinkingKey(canonical) {
+                ContextLinkingKeyCache.set(canonical, for: cacheKey)
                 return canonical
             }
         }
+        ContextLinkingKeyCache.set(normalized, for: cacheKey)
         return normalized
     }
 
+    private enum ContextLinkingKeyCache {
+        private static var cache: [String: String] = [:]
+        private static let lock = NSLock()
+
+        static func get(for key: String) -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return cache[key]
+        }
+
+        static func set(_ value: String, for key: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            cache[key] = value
+        }
+    }
     private func clarificationAliasType(for normalizedKey: String, hint: String?) -> String {
         if let hint {
             let normalizedHint = normalizedClarificationKey(hint)
