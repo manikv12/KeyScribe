@@ -87,6 +87,7 @@ jobs:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          BUILD_NUMBER="$(git rev-list --count HEAD)"
           DMG_FILE="dist/KeyScribe.dmg"
           DOWNLOAD_URL="https://github.com/manikv12/KeyScribe/releases/download/${{ github.ref_name }}/KeyScribe.dmg"
           SPARKLE_KEY_FILE="$(mktemp -t sparkle_ed25519)"
@@ -111,7 +112,7 @@ jobs:
           cat >> dist/appcast.xml <<EOF
               <item>
                 <title>Version ${VERSION}</title>
-                <sparkle:version>${VERSION}</sparkle:version>
+                <sparkle:version>${BUILD_NUMBER}</sparkle:version>
                 <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
                 <pubDate>$(date -R)</pubDate>
                 <enclosure
