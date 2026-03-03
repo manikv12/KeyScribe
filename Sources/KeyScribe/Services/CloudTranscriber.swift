@@ -569,14 +569,20 @@ final class CloudTranscriber: NSObject {
     }
 
     private func transcribeWithDeepgram(audioWAVData: Data, config: RequestConfiguration) async throws -> String {
-        guard var components = URLComponents(string: config.baseURL) else {
+        guard var components = validatedBaseURLComponents(baseURL: config.baseURL) else {
             throw CloudTranscriberError.invalidBaseURL
         }
 
-        let path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if path.isEmpty {
-            components.path = "/v1/listen"
+        var path = components.path
+        while path.hasSuffix("/") && !path.isEmpty {
+            path.removeLast()
         }
+        if path.isEmpty {
+            path = "/v1/listen"
+        } else if !path.hasSuffix("/listen") {
+            path += "/listen"
+        }
+        components.path = path
 
         var queryItems = components.queryItems ?? []
         if !queryItems.contains(where: { $0.name == "model" }) {
@@ -901,7 +907,7 @@ final class CloudTranscriber: NSObject {
     }
 
     private func urlByAppendingPath(baseURL: String, path: String) -> URL? {
-        guard var components = URLComponents(string: baseURL) else { return nil }
+        guard var components = validatedBaseURLComponents(baseURL: baseURL) else { return nil }
 
         let existingPath = components.path
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -913,6 +919,32 @@ final class CloudTranscriber: NSObject {
         components.path = "/\(merged)"
 
         return components.url
+    }
+
+    private func validatedBaseURLComponents(baseURL: String) -> URLComponents? {
+        guard var components = URLComponents(string: baseURL),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(),
+              !host.isEmpty else {
+            return nil
+        }
+
+        let allowsInsecureLocalhost = scheme == "http" && isLoopbackHost(host)
+        guard scheme == "https" || allowsInsecureLocalhost else {
+            return nil
+        }
+
+        components.fragment = nil
+        return components
+    }
+
+    private func isLoopbackHost(_ host: String) -> Bool {
+        switch host {
+        case "localhost", "127.0.0.1", "::1", "[::1]":
+            return true
+        default:
+            return false
+        }
     }
 
     private func applyMicSelection() {

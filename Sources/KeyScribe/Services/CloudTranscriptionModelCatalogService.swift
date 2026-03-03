@@ -46,31 +46,26 @@ actor CloudTranscriptionModelCatalogService {
         apiKey: String
     ) async -> CloudTranscriptionModelFetchResult {
         let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallbackCatalogModels = await fallbackModels(for: provider)
+        func fallbackResult(reason: String) async -> CloudTranscriptionModelFetchResult {
+            let fallbackCatalogModels = await fallbackModels(for: provider)
+            return CloudTranscriptionModelFetchResult(
+                models: fallbackCatalogModels,
+                source: .fallback,
+                message: fallbackMessage(
+                    providerName: provider.displayName,
+                    fallbackCount: fallbackCatalogModels.count,
+                    failureReason: reason
+                )
+            )
+        }
 
         switch provider {
         case .openAI, .groq:
             guard !trimmedAPIKey.isEmpty else {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Add API key to load live transcription models."
-                    )
-                )
+                return await fallbackResult(reason: "Add API key to load live transcription models.")
             }
             guard let endpoint = openAIModelsEndpoint(from: baseURL) else {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Invalid provider base URL."
-                    )
-                )
+                return await fallbackResult(reason: "Invalid provider base URL.")
             }
             do {
                 let remoteModels = try await fetchModelOptions(
@@ -87,49 +82,17 @@ actor CloudTranscriptionModelCatalogService {
                         message: "Loaded \(filteredModels.count) \(provider.displayName) transcription models."
                     )
                 }
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "\(provider.displayName) returned no transcription-suitable models."
-                    )
-                )
+                return await fallbackResult(reason: "\(provider.displayName) returned no transcription-suitable models.")
             } catch {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Could not load \(provider.displayName) models: \(error.localizedDescription)"
-                    )
-                )
+                return await fallbackResult(reason: "Could not load \(provider.displayName) models: \(error.localizedDescription)")
             }
 
         case .deepgram:
             guard !trimmedAPIKey.isEmpty else {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Add API key to load live Deepgram models."
-                    )
-                )
+                return await fallbackResult(reason: "Add API key to load live Deepgram models.")
             }
             guard let endpoint = deepgramModelsEndpoint(from: baseURL) else {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Invalid Deepgram base URL."
-                    )
-                )
+                return await fallbackResult(reason: "Invalid Deepgram base URL.")
             }
             do {
                 let remoteModels = try await fetchModelOptions(
@@ -146,49 +109,17 @@ actor CloudTranscriptionModelCatalogService {
                         message: "Loaded \(filteredModels.count) Deepgram transcription models."
                     )
                 }
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Deepgram returned no transcription-suitable models."
-                    )
-                )
+                return await fallbackResult(reason: "Deepgram returned no transcription-suitable models.")
             } catch {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Could not load Deepgram models: \(error.localizedDescription)"
-                    )
-                )
+                return await fallbackResult(reason: "Could not load Deepgram models: \(error.localizedDescription)")
             }
 
         case .gemini:
             guard !trimmedAPIKey.isEmpty else {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Add API key to load live Gemini models."
-                    )
-                )
+                return await fallbackResult(reason: "Add API key to load live Gemini models.")
             }
             guard let endpoint = geminiModelsEndpoint(from: baseURL, apiKey: trimmedAPIKey) else {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Invalid Gemini base URL."
-                    )
-                )
+                return await fallbackResult(reason: "Invalid Gemini base URL.")
             }
             do {
                 let remoteModels = try await fetchModelOptions(
@@ -205,25 +136,9 @@ actor CloudTranscriptionModelCatalogService {
                         message: "Loaded \(filteredModels.count) Gemini models."
                     )
                 }
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Gemini returned no transcription-suitable models."
-                    )
-                )
+                return await fallbackResult(reason: "Gemini returned no transcription-suitable models.")
             } catch {
-                return CloudTranscriptionModelFetchResult(
-                    models: fallbackCatalogModels,
-                    source: .fallback,
-                    message: fallbackMessage(
-                        providerName: provider.displayName,
-                        fallbackCount: fallbackCatalogModels.count,
-                        failureReason: "Could not load Gemini models: \(error.localizedDescription)"
-                    )
-                )
+                return await fallbackResult(reason: "Could not load Gemini models: \(error.localizedDescription)")
             }
         }
     }
@@ -265,24 +180,18 @@ actor CloudTranscriptionModelCatalogService {
                 return []
             }
 
-            // models.dev exposes a dictionary keyed by model ID; prefer parsing it directly.
-            if let modelsDict = modelPayload as? [String: Any] {
+            if let modelsDictionary = modelPayload as? [String: Any] {
                 var options: [CloudTranscriptionModelOption] = []
-                options.reserveCapacity(modelsDict.count)
+                options.reserveCapacity(modelsDictionary.count)
 
-                for (modelID, rawValue) in modelsDict {
+                for (modelID, rawValue) in modelsDictionary {
                     let displayName: String
-
-                    if let dict = rawValue as? [String: Any] {
-                        // Try several likely keys for a human-readable name.
-                        if let explicitName = (dict["displayName"] as? String)
-                            ?? (dict["name"] as? String)
-                            ?? (dict["label"] as? String)
-                            ?? (dict["title"] as? String) {
-                            displayName = explicitName
-                        } else {
-                            displayName = modelID
-                        }
+                    if let dictionary = rawValue as? [String: Any] {
+                        displayName = (dictionary["displayName"] as? String)
+                            ?? (dictionary["name"] as? String)
+                            ?? (dictionary["label"] as? String)
+                            ?? (dictionary["title"] as? String)
+                            ?? modelID
                     } else if let nameString = rawValue as? String, !nameString.isEmpty {
                         displayName = nameString
                     } else {
@@ -298,20 +207,19 @@ actor CloudTranscriptionModelCatalogService {
                 }
 
                 return Self.normalizeModelOptions(options)
-            } else {
-                // Fallback: if the payload is not a dictionary, reuse the generic parser.
-                let promptModels = PromptRewriteModelCatalogService.parseModelOptions(
-                    from: try JSONSerialization.data(withJSONObject: modelPayload)
-                )
-                return Self.normalizeModelOptions(
-                    promptModels.map {
-                        CloudTranscriptionModelOption(
-                            id: Self.normalizedModelID($0.id, for: nil),
-                            displayName: $0.displayName
-                        )
-                    }
-                )
             }
+
+            let promptModels = PromptRewriteModelCatalogService.parseModelOptions(
+                from: try JSONSerialization.data(withJSONObject: modelPayload)
+            )
+            return Self.normalizeModelOptions(
+                promptModels.map {
+                    CloudTranscriptionModelOption(
+                        id: Self.normalizedModelID($0.id, for: nil),
+                        displayName: $0.displayName
+                    )
+                }
+            )
         } catch {
             return []
         }
@@ -615,9 +523,33 @@ actor CloudTranscriptionModelCatalogService {
     private func normalizedBaseURL(from rawValue: String) -> String? {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        if trimmed.hasSuffix("/") {
-            return String(trimmed.dropLast())
+        guard var components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(),
+              !host.isEmpty else {
+            return nil
         }
-        return trimmed
+        let allowsInsecureLocalhost = scheme == "http" && Self.isLoopbackHost(host)
+        guard scheme == "https" || allowsInsecureLocalhost else {
+            return nil
+        }
+
+        components.query = nil
+        components.fragment = nil
+
+        var normalized = components.string ?? trimmed
+        if normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        return normalized
+    }
+
+    private static func isLoopbackHost(_ host: String) -> Bool {
+        switch host {
+        case "localhost", "127.0.0.1", "::1", "[::1]":
+            return true
+        default:
+            return false
+        }
     }
 }
