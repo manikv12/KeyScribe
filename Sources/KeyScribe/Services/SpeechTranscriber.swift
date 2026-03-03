@@ -1,8 +1,16 @@
 import Foundation
 
+enum SpeechTranscriberHUDAlert {
+    case whisperStalled
+    case whisperFailed
+    case micFallbackToDefault
+    case micUnavailable
+}
+
 final class SpeechTranscriber: NSObject {
     var onFinalText: ((String) -> Void)?
     var onStatusUpdate: ((String) -> Void)?
+    var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
@@ -290,6 +298,11 @@ final class SpeechTranscriber: NSObject {
             self.onStatusUpdate?(message)
         }
 
+        whisperTranscriber.onHUDAlert = { [weak self] alert in
+            guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.onHUDAlert?(alert)
+        }
+
         whisperTranscriber.onAudioLevel = { [weak self] level in
             guard let self, self.currentEngineType == .whisperCpp else { return }
             self.onAudioLevel?(level)
@@ -309,6 +322,11 @@ final class SpeechTranscriber: NSObject {
         cloudTranscriber.onStatusUpdate = { [weak self] message in
             guard let self, self.currentEngineType == .cloudProviders else { return }
             self.onStatusUpdate?(message)
+        }
+
+        cloudTranscriber.onHUDAlert = { [weak self] alert in
+            guard let self, self.currentEngineType == .cloudProviders else { return }
+            self.onHUDAlert?(alert)
         }
 
         cloudTranscriber.onAudioLevel = { [weak self] level in

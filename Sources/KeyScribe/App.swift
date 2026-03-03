@@ -965,11 +965,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             Task { @MainActor in
                 guard let self else { return }
                 let status = DictationUIStatus.fromTranscriberMessage(message)
-                self.showHUDAlertIfNeeded(forTranscriberMessage: message)
                 if status == .finalizing {
                     self.playDictationFeedbackSound(.processing)
                 }
                 self.setUIStatus(status)
+            }
+        }
+
+        transcriber.onHUDAlert = { [weak self] alert in
+            Task { @MainActor in
+                guard let self else { return }
+                switch alert {
+                case .whisperStalled:
+                    self.waveform.flashEvent(
+                        message: "Whisper stalled and was reset. Retry now.",
+                        symbolName: "exclamationmark.triangle.fill",
+                        duration: 3.0
+                    )
+                case .whisperFailed:
+                    self.waveform.flashEvent(
+                        message: "Whisper failed. Check model and Core ML settings.",
+                        symbolName: "xmark.octagon.fill",
+                        duration: 2.4
+                    )
+                case .micFallbackToDefault:
+                    self.waveform.flashEvent(
+                        message: "Selected mic failed. Using default mic now.",
+                        symbolName: "mic.slash.fill",
+                        duration: 3.0
+                    )
+                case .micUnavailable:
+                    let now = Date()
+                    if let lastShown = self.lastAudioSetupHUDAlertAt,
+                       now.timeIntervalSince(lastShown) < 2.0 {
+                        return
+                    }
+                    self.lastAudioSetupHUDAlertAt = now
+                    self.waveform.flashEvent(
+                        message: "Microphone unavailable. Check macOS Sound Input, then retry.",
+                        symbolName: "mic.slash.fill",
+                        duration: 3.0
+                    )
+                }
             }
         }
 
@@ -2851,50 +2888,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
 
         setUIStatus(.message(statusMessage))
-    }
-
-    private func showHUDAlertIfNeeded(forTranscriberMessage message: String) {
-        if message.hasPrefix("Whisper finalize timed out and was reset") {
-            waveform.flashEvent(
-                message: "Whisper stalled and was reset. Retry now.",
-                symbolName: "exclamationmark.triangle.fill",
-                duration: 3.0
-            )
-            return
-        }
-
-        if message.hasPrefix("Whisper error:") {
-            waveform.flashEvent(
-                message: "Whisper failed. Check model and Core ML settings.",
-                symbolName: "xmark.octagon.fill",
-                duration: 2.4
-            )
-            return
-        }
-
-        if message.hasPrefix("Selected microphone failed. Switched to default microphone") {
-            waveform.flashEvent(
-                message: "Selected mic failed. Using default mic now.",
-                symbolName: "mic.slash.fill",
-                duration: 3.0
-            )
-            return
-        }
-
-        if message.hasPrefix("Microphone unavailable (CoreAudio -10868)") ||
-            message.hasPrefix("Audio setup failed:") {
-            let now = Date()
-            if let lastShown = lastAudioSetupHUDAlertAt,
-               now.timeIntervalSince(lastShown) < 2.0 {
-                return
-            }
-            lastAudioSetupHUDAlertAt = now
-            waveform.flashEvent(
-                message: "Microphone unavailable. Check macOS Sound Input, then retry.",
-                symbolName: "mic.slash.fill",
-                duration: 3.0
-            )
-        }
     }
 
     private func setUIStatus(_ status: DictationUIStatus) {
