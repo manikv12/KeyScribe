@@ -232,6 +232,14 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
             bundleIDConstraint: "com.keyscribe.coding-workspace"
         )
         XCTAssertNil(afterConsume)
+
+        let includeConsumed = try store.fetchLatestExpiredConversationContext(
+            scopeKey: scopeKey,
+            bundleIDConstraint: "com.keyscribe.coding-workspace",
+            includeConsumed: true
+        )
+        XCTAssertEqual(includeConsumed?.id, expiredID)
+        XCTAssertEqual(includeConsumed?.consumedByThreadID, "thread-new-target")
     }
 
     func testScopeMatchingWithCrossIDEOnOff() throws {

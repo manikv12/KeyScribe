@@ -542,8 +542,7 @@ final class PromptRewriteConversationStore: ObservableObject {
             usesPinnedContext = false
         }
 
-        if history.isEmpty,
-           promptRewriteConversationHistoryEnabled,
+        if promptRewriteConversationHistoryEnabled,
            let store {
             let crossIDESharingEnabled = promptRewriteCrossIDEConversationSharingEnabled
             let scopeKeys = scopeKeysForExpiredHandoffLookup(
@@ -557,7 +556,8 @@ final class PromptRewriteConversationStore: ObservableObject {
             for scopeKey in scopeKeys {
                 guard let candidate = try? store.fetchLatestExpiredConversationContext(
                     scopeKey: scopeKey,
-                    bundleIDConstraint: bundleIDConstraint
+                    bundleIDConstraint: bundleIDConstraint,
+                    includeConsumed: true
                 ) else {
                     continue
                 }
@@ -571,14 +571,26 @@ final class PromptRewriteConversationStore: ObservableObject {
             }
 
             if let expiredRecord {
-                let handoffHistory = expiredHandoffHistory(
-                    from: expiredRecord,
-                    limit: normalizedRequestTurnLimit
-                )
-                if !handoffHistory.isEmpty {
-                    history = handoffHistory
-                    resolutionSource += "+expired-handoff"
-                    expiredHandoffRecordToConsume = expiredRecord
+                if history.isEmpty {
+                    let handoffHistory = expiredHandoffHistory(
+                        from: expiredRecord,
+                        limit: normalizedRequestTurnLimit
+                    )
+                    if !handoffHistory.isEmpty {
+                        history = handoffHistory
+                        resolutionSource += "+expired-handoff"
+                        expiredHandoffRecordToConsume = expiredRecord
+                    }
+                } else {
+                    let mergedWithSummary = historyWithPreviousSummary(
+                        history,
+                        from: expiredRecord,
+                        limit: normalizedRequestTurnLimit
+                    )
+                    if mergedWithSummary.count != history.count || mergedWithSummary != history {
+                        history = mergedWithSummary
+                        resolutionSource += "+expired-summary"
+                    }
                 }
             }
         }
@@ -1876,7 +1888,9 @@ final class PromptRewriteConversationStore: ObservableObject {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input"
+            "focused-input",
+            "automation-folder",
+            "automation-folders"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
@@ -2856,6 +2870,53 @@ final class PromptRewriteConversationStore: ObservableObject {
                 output.remove(at: dropIndex)
             } else {
                 break
+            }
+        }
+
+        return output
+    }
+
+    private func historyWithPreviousSummary(
+        _ history: [PromptRewriteConversationTurn],
+        from record: ExpiredConversationContextRecord,
+        limit: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let normalizedLimit = normalizedTurnLimit(limit)
+        guard normalizedLimit > 1 else { return history }
+
+        let summaryCandidate = expiredHandoffHistory(from: record, limit: 1).first
+        guard let summaryTurn = summaryCandidate,
+              summaryTurn.isSummary else {
+            return history
+        }
+
+        let normalizedSummaryText = collapsedWhitespace(summaryTurn.assistantText).lowercased()
+        guard !normalizedSummaryText.isEmpty else { return history }
+
+        if history.contains(where: { turn in
+            guard turn.isSummary else { return false }
+            return collapsedWhitespace(turn.assistantText).lowercased() == normalizedSummaryText
+        }) {
+            return history
+        }
+
+        var output = history
+        output.insert(summaryTurn, at: 0)
+
+        while output.count > normalizedLimit {
+            if let dropIndex = output.firstIndex(where: { !$0.isSummary }) {
+                output.remove(at: dropIndex)
+            } else {
+                output.removeFirst()
+            }
+        }
+
+        while estimatedContextCharacters(output) > maxPromptContextCharacters,
+              output.count > 1 {
+            if let dropIndex = output.firstIndex(where: { !$0.isSummary }) {
+                output.remove(at: dropIndex)
+            } else {
+                output.removeFirst()
             }
         }
 
@@ -4815,6 +4876,7 @@ enum PromptRewriteConversationContextResolver {
             "codex",
             "new thread",
             "threads",
+            "automation folders",
             "automations",
             "skills",
             "settings",
@@ -4913,6 +4975,9 @@ enum PromptRewriteConversationContextResolver {
         ) {
             return normalizedProjectName(captured)
         }
+        if isCodexNonProjectPlaceholderLabel(normalized) {
+            return nil
+        }
         let lowered = normalized.lowercased()
         let blocked: Set<String> = [
             "thread",
@@ -4932,6 +4997,25 @@ enum PromptRewriteConversationContextResolver {
             return nil
         }
         return normalized
+    }
+
+    private static func isCodexNonProjectPlaceholderLabel(_ value: String) -> Bool {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .lowercased()
+        guard !normalized.isEmpty else { return true }
+
+        let blocked: Set<String> = [
+            "automation folder",
+            "automation folders",
+            "automations",
+            "threads",
+            "pinned threads",
+            "unknown project",
+            "unknown workspace",
+            "unknown identity"
+        ]
+        return blocked.contains(normalized)
     }
 
     private static func isLikelyVersionControlReferenceLabel(_ value: String) -> Bool {
@@ -5010,6 +5094,7 @@ enum PromptRewriteConversationContextResolver {
         let blocked: Set<String> = [
             "new thread",
             "threads",
+            "automation folders",
             "settings",
             "automations",
             "skills",
@@ -5045,6 +5130,7 @@ enum PromptRewriteConversationContextResolver {
             "toggle diff panel",
             "pop out",
             "new thread",
+            "automation folders",
             "automations",
             "skills",
             "settings"

@@ -150,13 +150,13 @@ final class ConversationTagInferenceService {
             if let codexProject = firstMatch(
                 pattern: #"(?i)\b(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ) {
+            ), !isBlockedProjectLabel(codexProject) {
                 return codexProject
             }
             if let codexBuildProject = firstMatch(
                 pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ) {
+            ), !isBlockedProjectLabel(codexBuildProject) {
                 return codexBuildProject
             }
         }
@@ -164,7 +164,7 @@ final class ConversationTagInferenceService {
         if let regexMatch = firstMatch(
             pattern: #"(?i)\b(?:project|workspace|repo|repository)\s*[:\-]?\s*([a-z0-9._()\-][a-z0-9._()\- /]{1,80})\b"#,
             in: primaryText
-        ) {
+        ), !isBlockedProjectLabel(regexMatch) {
             return regexMatch
         }
 
@@ -179,6 +179,46 @@ final class ConversationTagInferenceService {
         }
 
         return "Unknown Project"
+    }
+
+    private func isBlockedProjectLabel(_ value: String) -> Bool {
+        let normalized = collapseWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .lowercased()
+        guard !normalized.isEmpty else {
+            return true
+        }
+        let blocked: Set<String> = [
+            "unknown",
+            "unknown project",
+            "unknown workspace",
+            "current screen",
+            "focused input",
+            "automation folder",
+            "automation folders",
+            "automations"
+        ]
+        if blocked.contains(normalized) {
+            return true
+        }
+        let slugged = slug(normalized)
+        return isBlockedProjectSlug(slugged)
+    }
+
+    private func isBlockedProjectSlug(_ value: String) -> Bool {
+        guard !value.isEmpty else {
+            return true
+        }
+        let blocked: Set<String> = [
+            "unknown",
+            "unknown-project",
+            "current-screen",
+            "focused-input",
+            "automation-folder",
+            "automation-folders",
+            "automations"
+        ]
+        return blocked.contains(value) || value.hasPrefix("unknown-")
     }
 
     private func canonicalBundleID(
@@ -284,7 +324,10 @@ final class ConversationTagInferenceService {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input"
+            "focused-input",
+            "automation-folder",
+            "automation-folders",
+            "automations"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
@@ -736,11 +779,7 @@ final class ConversationTagInferenceService {
 
     private func canonicalProjectKey(_ label: String) -> String {
         let normalized = slug(label)
-        if normalized.isEmpty
-            || normalized == "unknown"
-            || normalized == "unknown-project"
-            || normalized == "current-screen"
-            || normalized == "focused-input" {
+        if isBlockedProjectSlug(normalized) {
             return "project:unknown"
         }
         let aliasMap: [String: String] = [

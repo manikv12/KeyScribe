@@ -966,7 +966,8 @@ final class MemorySQLiteStore {
 
     func fetchLatestExpiredConversationContext(
         scopeKey: String,
-        bundleIDConstraint: String?
+        bundleIDConstraint: String?,
+        includeConsumed: Bool = false
     ) throws -> ExpiredConversationContextRecord? {
         let normalizedScopeKey = normalizeLookupKey(scopeKey)
         guard !normalizedScopeKey.isEmpty else { return nil }
@@ -980,7 +981,7 @@ final class MemorySQLiteStore {
             consumed_at, consumed_by_thread_id, metadata_json
         FROM conversation_expired_contexts
         WHERE scope_key = ?
-            AND consumed_at IS NULL
+            AND (? = 1 OR consumed_at IS NULL)
             AND delete_after_at > ?
             AND (? IS NULL OR bundle_id = ?)
         ORDER BY expired_at DESC
@@ -989,9 +990,10 @@ final class MemorySQLiteStore {
 
         let rows: [ExpiredConversationContextRecord] = try query(sql: sql, bind: { statement in
             self.bind(normalizedScopeKey, at: 1, in: statement)
-            self.bind(Date().timeIntervalSince1970, at: 2, in: statement)
-            self.bind(normalizedBundleConstraint, at: 3, in: statement)
+            self.bind(includeConsumed ? 1 : 0, at: 2, in: statement)
+            self.bind(Date().timeIntervalSince1970, at: 3, in: statement)
             self.bind(normalizedBundleConstraint, at: 4, in: statement)
+            self.bind(normalizedBundleConstraint, at: 5, in: statement)
         }, mapRow: { statement in
             self.expiredConversationContext(from: statement)
         })

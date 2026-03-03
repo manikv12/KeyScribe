@@ -15,6 +15,7 @@ private enum PromptRewriteBubbleEdge {
 }
 
 struct PromptRewriteInsertionHUDContext: Equatable {
+    let sessionID: UUID
     let anchorRect: NSRect
     let screenNumber: UInt32?
     let screenName: String
@@ -54,6 +55,7 @@ private struct PromptRewriteHUDPlacement {
 }
 
 private struct PromptRewriteHUDSessionKey: Hashable {
+    let sessionID: UUID
     let screenNumber: UInt32?
     let processIdentifier: Int?
 }
@@ -356,6 +358,7 @@ final class PromptRewriteHUDManager {
         )
 
         return PromptRewriteInsertionHUDContext(
+            sessionID: UUID(),
             anchorRect: anchorRect,
             screenNumber: screenNumber,
             screenName: screenName,
@@ -399,6 +402,7 @@ final class PromptRewriteHUDManager {
 
     private func sessionKey(for insertionContext: PromptRewriteInsertionHUDContext) -> PromptRewriteHUDSessionKey {
         PromptRewriteHUDSessionKey(
+            sessionID: insertionContext.sessionID,
             screenNumber: insertionContext.screenNumber,
             processIdentifier: insertionContext.targetProcessIdentifier.map { Int($0) }
         )
@@ -752,15 +756,20 @@ final class PromptRewriteHUDManager {
             ?? NSScreen.screens.first
         let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
 
+        // Stack multiple loading HUDs vertically when they share similar anchor regions
+        let sessionKey = sessionKey(for: context)
+        let stackIndex = activeLoadingSessionOrder.firstIndex(of: sessionKey) ?? activeLoadingSessionOrder.count
+        let stackOffset = CGFloat(stackIndex) * (size.height + 8)
+
         let proposedX = anchorRect.midX - (size.width * 0.5)
-        let proposedY = anchorRect.midY + PromptRewriteHUDLayout.loadingOffsetY
+        let proposedY = anchorRect.midY + PromptRewriteHUDLayout.loadingOffsetY - stackOffset
         let minX = visibleFrame.minX + PromptRewriteHUDLayout.screenMargin
         let maxX = max(minX, visibleFrame.maxX - size.width - PromptRewriteHUDLayout.screenMargin)
         let minY = visibleFrame.minY + PromptRewriteHUDLayout.screenMargin
         let maxY = max(minY, visibleFrame.maxY - size.height - PromptRewriteHUDLayout.screenMargin)
         let baseX = min(max(proposedX, minX), maxX)
         let baseY = min(max(proposedY, minY), maxY)
-        
+
         let translatedX = baseX + manualOffset.width
         let translatedY = baseY + manualOffset.height
         let clampedX = min(max(translatedX, minX), maxX)
@@ -1280,13 +1289,7 @@ private struct PromptRewriteLoadingView: View {
 
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
-                AppIconBadge(
-                    symbol: "waveform.and.sparkles",
-                    tint: AppVisualTheme.accentTint,
-                    size: 20,
-                    symbolSize: 9,
-                    isEmphasized: true
-                )
+                AppLogoView(size: 20)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Refining Transcript")
@@ -1296,7 +1299,7 @@ private struct PromptRewriteLoadingView: View {
                         text: stepText,
                         font: .system(size: 11, weight: .medium, design: .rounded),
                         foregroundColor: Color.white.opacity(0.70),
-                        wordsPerSecond: 9,
+                        wordsPerSecond: 4,
                         lineLimit: 1
                     )
                 }
@@ -1341,7 +1344,7 @@ private struct PromptRewriteLoadingView: View {
                         text: transcriptPreview,
                         font: .system(size: 11.5, weight: .medium, design: .rounded),
                         foregroundColor: Color.white.opacity(0.90),
-                        wordsPerSecond: 10,
+                        wordsPerSecond: 4,
                         lineLimit: 2
                     )
                 }
@@ -1413,7 +1416,7 @@ private struct PromptRewriteLoadingView: View {
                 animatedProgressValue = clampedTarget
             } else {
                 animatedProgressValue = 0.08
-                withAnimation(.timingCurve(0.22, 0.88, 0.24, 1.0, duration: 0.34)) {
+                withAnimation(.timingCurve(0.25, 0.1, 0.25, 1.0, duration: 0.9)) {
                     animatedProgressValue = clampedTarget
                 }
             }
@@ -1424,8 +1427,8 @@ private struct PromptRewriteLoadingView: View {
                 animatedProgressValue = clampedTarget
             } else {
                 let distance = abs(clampedTarget - animatedProgressValue)
-                let duration = max(0.18, min(0.46, 0.22 + (distance * 0.45)))
-                withAnimation(.timingCurve(0.22, 0.88, 0.24, 1.0, duration: duration)) {
+                let duration = max(0.8, min(1.6, 0.7 + (distance * 1.8)))
+                withAnimation(.timingCurve(0.25, 0.1, 0.25, 1.0, duration: duration)) {
                     animatedProgressValue = clampedTarget
                 }
             }
@@ -1475,6 +1478,7 @@ private struct PromptRewriteActivityBar: View {
                                 .frame(width: max(18, fillWidth * 0.38))
                                 .offset(x: reduceMotion ? 0 : shimmerPosition * max(fillWidth, 18))
                         }
+                        .clipShape(Capsule(style: .continuous))
                         .overlay(alignment: .trailing) {
                             Circle()
                                 .fill(Color.white.opacity(0.94))
@@ -1518,16 +1522,22 @@ private enum PromptRewriteProgressEstimate {
             return 0.92
         }
         if normalized.contains("receiving") || normalized.contains("normalizing") {
-            return 0.74
+            return 0.82
+        }
+        if normalized.contains("analyzing") {
+            return 0.70
+        }
+        if normalized.contains("waiting") {
+            return 0.56
         }
         if normalized.contains("sending") {
-            return 0.50
+            return 0.46
         }
         if normalized.contains("connecting") {
-            return 0.28
+            return 0.30
         }
         if normalized.contains("preparing") {
-            return 0.16
+            return 0.14
         }
         return 0.36
     }

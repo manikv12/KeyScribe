@@ -566,7 +566,9 @@ private enum PromptRewriteAIMappingEvaluator {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input"
+            "focused-input",
+            "automation-folder",
+            "automation-folders"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
@@ -2039,8 +2041,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         PromptRewriteHUDManager.shared.clearLoadingBypassRequest(insertionContext: insertionContext)
         PromptRewriteHUDManager.shared.updateLoadingIndicator(
             insertionContext: insertionContext,
+            displayState: loadingNarrative.displayState(step: "Preparing rewrite request")
+        )
+
+        try? await Task.sleep(nanoseconds: 800_000_000)
+
+        PromptRewriteHUDManager.shared.updateLoadingIndicator(
+            insertionContext: insertionContext,
             displayState: loadingNarrative.displayState(step: "Connecting to AI suggestion service")
         )
+
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
 
         return try await withThrowingTaskGroup(of: PromptRewriteRetrievalOutcome.self) { group in
             group.addTask {
@@ -2048,15 +2059,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     insertionContext: insertionContext,
                     displayState: loadingNarrative.displayState(step: "Sending transcript for rewrite suggestion")
                 )
-                let suggestion = try await PromptRewriteService.shared.retrieveSuggestion(
+
+                async let suggestionResult = PromptRewriteService.shared.retrieveSuggestion(
                     for: cleanedTranscript,
                     conversationContext: conversationContext,
                     conversationHistory: conversationHistory
                 )
-                await PromptRewriteHUDManager.shared.updateLoadingIndicator(
-                    insertionContext: insertionContext,
-                    displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
-                )
+
+                // Drip-feed progress while waiting for the API response
+                async let progressDrip: Void = {
+                    try? await Task.sleep(nanoseconds: 1_800_000_000)
+                    guard !Task.isCancelled else { return }
+                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                        insertionContext: insertionContext,
+                        displayState: loadingNarrative.displayState(step: "Waiting for AI response")
+                    )
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    guard !Task.isCancelled else { return }
+                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                        insertionContext: insertionContext,
+                        displayState: loadingNarrative.displayState(step: "Analyzing transcript context")
+                    )
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    guard !Task.isCancelled else { return }
+                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                        insertionContext: insertionContext,
+                        displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
+                    )
+                }()
+
+                let suggestion = try await suggestionResult
+                _ = await progressDrip
                 return .suggestion(suggestion)
             }
 
