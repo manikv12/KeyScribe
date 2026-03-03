@@ -2044,15 +2044,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             displayState: loadingNarrative.displayState(step: "Preparing rewrite request")
         )
 
-        try? await Task.sleep(nanoseconds: 800_000_000)
-
         PromptRewriteHUDManager.shared.updateLoadingIndicator(
             insertionContext: insertionContext,
             displayState: loadingNarrative.displayState(step: "Connecting to AI suggestion service")
         )
-
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
-
         return try await withThrowingTaskGroup(of: PromptRewriteRetrievalOutcome.self) { group in
             group.addTask {
                 await PromptRewriteHUDManager.shared.updateLoadingIndicator(
