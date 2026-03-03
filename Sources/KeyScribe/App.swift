@@ -1174,6 +1174,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
 
         updateCheckStatusStore.beginCheck()
+
+        // LSUIElement apps must temporarily activate to show Sparkle's update window
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+
         updaterController.checkForUpdates(nil)
     }
 
@@ -1190,6 +1195,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: (any Error)?) {
+        // Restore LSUIElement (accessory) mode after Sparkle's update UI is dismissed
+        NSApp.setActivationPolicy(.accessory)
+
         guard updateCheckStatusStore.isChecking else { return }
 
         if let error {
