@@ -715,6 +715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var hasScheduledPermissionRestart = false
     private var settingsApplyWorkItem: DispatchWorkItem?
     private var lastAppliedSettingsSnapshot: SettingsApplySnapshot?
+    private var lastAudioSetupHUDAlertAt: Date?
 
     private enum PromptRewriteFailureChoice {
         case retry
@@ -784,6 +785,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         let continuousToggleShortcutModifiers: UInt
         let muteSystemSoundsWhileHoldingShortcut: Bool
         let transcriptionEngineRawValue: String
+        let cloudTranscriptionProviderRawValue: String
+        let cloudTranscriptionModel: String
+        let cloudTranscriptionBaseURL: String
+        let cloudTranscriptionRequestTimeoutSeconds: Double
+        let cloudTranscriptionAPIKey: String
         let selectedWhisperModelID: String
         let whisperUseCoreML: Bool
         let whisperAutoUnloadIdleContextEnabled: Bool
@@ -934,6 +940,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         transcriber.applyWhisperContextRetentionSettings(
             autoUnloadIdleContext: settings.whisperAutoUnloadIdleContextEnabled,
             idleContextUnloadDelaySeconds: settings.whisperIdleContextUnloadSeconds
+        )
+        transcriber.applyCloudTranscriptionSettings(
+            provider: settings.cloudTranscriptionProvider,
+            model: settings.cloudTranscriptionModel,
+            baseURL: settings.cloudTranscriptionBaseURL,
+            apiKey: settings.cloudTranscriptionAPIKey,
+            requestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds
         )
         transcriber.setTranscriptionEngine(settings.transcriptionEngine)
         lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
@@ -1406,6 +1419,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             continuousToggleShortcutModifiers: settings.continuousToggleShortcutModifiers,
             muteSystemSoundsWhileHoldingShortcut: settings.muteSystemSoundsWhileHoldingShortcut,
             transcriptionEngineRawValue: settings.transcriptionEngineRawValue,
+            cloudTranscriptionProviderRawValue: settings.cloudTranscriptionProviderRawValue,
+            cloudTranscriptionModel: settings.cloudTranscriptionModel,
+            cloudTranscriptionBaseURL: settings.cloudTranscriptionBaseURL,
+            cloudTranscriptionRequestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds,
+            cloudTranscriptionAPIKey: settings.cloudTranscriptionAPIKey,
             selectedWhisperModelID: settings.selectedWhisperModelID,
             whisperUseCoreML: settings.whisperUseCoreML,
             whisperAutoUnloadIdleContextEnabled: settings.whisperAutoUnloadIdleContextEnabled,
@@ -1454,6 +1472,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             || previousSnapshot?.whisperUseCoreML != snapshot.whisperUseCoreML
             || previousSnapshot?.whisperAutoUnloadIdleContextEnabled != snapshot.whisperAutoUnloadIdleContextEnabled
             || previousSnapshot?.whisperIdleContextUnloadSeconds != snapshot.whisperIdleContextUnloadSeconds
+        let cloudRuntimeChanged = previousSnapshot == nil
+            || previousSnapshot?.cloudTranscriptionProviderRawValue != snapshot.cloudTranscriptionProviderRawValue
+            || previousSnapshot?.cloudTranscriptionModel != snapshot.cloudTranscriptionModel
+            || previousSnapshot?.cloudTranscriptionBaseURL != snapshot.cloudTranscriptionBaseURL
+            || previousSnapshot?.cloudTranscriptionRequestTimeoutSeconds != snapshot.cloudTranscriptionRequestTimeoutSeconds
+            || previousSnapshot?.cloudTranscriptionAPIKey != snapshot.cloudTranscriptionAPIKey
         if engineChanged || whisperRuntimeChanged {
             syncWhisperModelSelectionIfNeeded()
             transcriber.applyWhisperSettings(
@@ -1463,6 +1487,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             transcriber.applyWhisperContextRetentionSettings(
                 autoUnloadIdleContext: settings.whisperAutoUnloadIdleContextEnabled,
                 idleContextUnloadDelaySeconds: settings.whisperIdleContextUnloadSeconds
+            )
+        }
+        if engineChanged || cloudRuntimeChanged {
+            transcriber.applyCloudTranscriptionSettings(
+                provider: settings.cloudTranscriptionProvider,
+                model: settings.cloudTranscriptionModel,
+                baseURL: settings.cloudTranscriptionBaseURL,
+                apiKey: settings.cloudTranscriptionAPIKey,
+                requestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds
             )
         }
 
@@ -1677,6 +1710,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             if settings.transcriptionEngine == .whisperCpp,
                !whisperModelManager.hasInstalledModel(id: settings.selectedWhisperModelID) {
                 setUIStatus(.message("Install a whisper model in Settings > Recognition to start dictation"))
+                windowCoordinator?.openSettingsWindow()
+            } else if settings.transcriptionEngine == .cloudProviders,
+                      settings.cloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                setUIStatus(.message("Add a cloud provider API key in Settings > Recognition to start dictation"))
                 windowCoordinator?.openSettingsWindow()
             }
         }
@@ -2832,6 +2869,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 symbolName: "xmark.octagon.fill",
                 duration: 2.4
             )
+            return
+        }
+
+        if message.hasPrefix("Selected microphone failed. Switched to default microphone") {
+            waveform.flashEvent(
+                message: "Selected mic failed. Using default mic now.",
+                symbolName: "mic.slash.fill",
+                duration: 3.0
+            )
+            return
+        }
+
+        if message.hasPrefix("Microphone unavailable (CoreAudio -10868)") ||
+            message.hasPrefix("Audio setup failed:") {
+            let now = Date()
+            if let lastShown = lastAudioSetupHUDAlertAt,
+               now.timeIntervalSince(lastShown) < 2.0 {
+                return
+            }
+            lastAudioSetupHUDAlertAt = now
+            waveform.flashEvent(
+                message: "Microphone unavailable. Check macOS Sound Input, then retry.",
+                symbolName: "mic.slash.fill",
+                duration: 3.0
+            )
         }
     }
 
@@ -3114,6 +3176,11 @@ struct SettingsView: View {
     @State private var memoryBrowserHighSignalOnly = true
     @State private var memoryBrowserEntries: [MemoryIndexedEntry] = []
     @State private var promptRewriteOpenAIKeyVisible = false
+    @State private var cloudTranscriptionAPIKeyVisible = false
+    @State private var cloudTranscriptionModelsLoading = false
+    @State private var cloudTranscriptionAvailableModels: [CloudTranscriptionModelOption] = []
+    @State private var cloudTranscriptionModelStatusMessage: String?
+    @State private var cloudTranscriptionModelRequestToken = UUID()
     @State private var memoryActionMessage: String?
     @State private var showingProvidersSheet = false
     @State private var showingSourceFoldersSheet = false
@@ -3914,7 +3981,7 @@ struct SettingsView: View {
                         .padding(.top, 8)
                     }
                 }
-            } else {
+            } else if settings.transcriptionEngine == .whisperCpp {
                 settingsCard(
                     title: "Model Runtime",
                     subtitle: "Control whisper.cpp runtime options and active model.",
@@ -4018,6 +4085,143 @@ struct SettingsView: View {
                         }
                     }
                 }
+            } else {
+                settingsCard(
+                    title: "Cloud Provider",
+                    subtitle: "Bring your own API key and model for cloud transcription.",
+                    symbol: "network",
+                    tint: AppVisualTheme.accentTint
+                ) {
+                    HStack {
+                        Text("Provider")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Picker("", selection: $settings.cloudTranscriptionProviderRawValue) {
+                            ForEach(CloudTranscriptionProvider.allCases) { provider in
+                                Text(provider.displayName).tag(provider.rawValue)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 260)
+                    }
+
+                    Text(settings.cloudTranscriptionProvider.helpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Model")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            TextField("Model ID", text: $settings.cloudTranscriptionModel)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 260)
+                                .autocorrectionDisabled()
+                        }
+
+                        HStack(spacing: 8) {
+                            Button {
+                                refreshCloudTranscriptionModels(showMessage: true)
+                            } label: {
+                                if cloudTranscriptionModelsLoading {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Label("Load Models", systemImage: "arrow.clockwise")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(cloudTranscriptionModelsLoading)
+
+                            if !cloudTranscriptionAvailableModels.isEmpty {
+                                Menu("Use Fetched Model") {
+                                    ForEach(cloudTranscriptionAvailableModels.prefix(80)) { option in
+                                        Button(option.displayName) {
+                                            settings.cloudTranscriptionModel = option.id
+                                        }
+                                    }
+                                }
+                                .menuStyle(.borderlessButton)
+                            }
+
+                            Spacer()
+
+                            if !cloudTranscriptionAvailableModels.isEmpty {
+                                Text("\(cloudTranscriptionAvailableModels.count) models")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        if let cloudTranscriptionModelStatusMessage {
+                            Text(cloudTranscriptionModelStatusMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    HStack {
+                        Text("Base URL")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        TextField("Base URL", text: $settings.cloudTranscriptionBaseURL)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 260)
+                            .autocorrectionDisabled()
+                    }
+
+                    HStack {
+                        Text("Request timeout")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Text("\(Int(settings.cloudTranscriptionRequestTimeoutSeconds.rounded())) sec")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $settings.cloudTranscriptionRequestTimeoutSeconds, in: 5...180, step: 1)
+
+                    HStack(spacing: 8) {
+                        if cloudTranscriptionAPIKeyVisible {
+                            TextField("\(settings.cloudTranscriptionProvider.displayName) API key", text: $settings.cloudTranscriptionAPIKey)
+                                .textFieldStyle(.roundedBorder)
+                                .autocorrectionDisabled()
+                        } else {
+                            SecureField("\(settings.cloudTranscriptionProvider.displayName) API key", text: $settings.cloudTranscriptionAPIKey)
+                                .textFieldStyle(.roundedBorder)
+                        }
+
+                        Toggle("Show", isOn: $cloudTranscriptionAPIKeyVisible)
+                            .toggleStyle(.checkbox)
+                            .fixedSize()
+
+                        Button {
+                            let pasteboard = NSPasteboard.general
+                            pasteboard.clearContents()
+                            _ = pasteboard.setString(settings.cloudTranscriptionAPIKey, forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy API key to clipboard")
+                        .disabled(settings.cloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+
+                    Text("Credentials are stored in macOS Keychain.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    HStack {
+                        Button("Reset Provider Defaults") {
+                            settings.applyCloudTranscriptionProviderDefaultsIfNeeded(force: true)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Spacer()
+                    }
+                }
             }
 
             settingsCard(
@@ -4096,12 +4300,23 @@ struct SettingsView: View {
             if settings.transcriptionEngine == .whisperCpp {
                 refreshWhisperModelBrowserState()
                 showWhisperModelFilters = false
+            } else if settings.transcriptionEngine == .cloudProviders {
+                refreshCloudTranscriptionModels(showMessage: false)
             }
         }
         .onChange(of: settings.transcriptionEngineRawValue) { _ in
             if settings.transcriptionEngine == .whisperCpp {
                 refreshWhisperModelBrowserState()
                 showWhisperModelFilters = false
+            } else if settings.transcriptionEngine == .cloudProviders {
+                refreshCloudTranscriptionModels(showMessage: false)
+            }
+        }
+        .onChange(of: settings.cloudTranscriptionProviderRawValue) { _ in
+            cloudTranscriptionAvailableModels = []
+            cloudTranscriptionModelStatusMessage = nil
+            if settings.transcriptionEngine == .cloudProviders {
+                refreshCloudTranscriptionModels(showMessage: false)
             }
         }
         .onChange(of: whisperModelSearchQuery) { _ in
@@ -5152,6 +5367,63 @@ struct SettingsView: View {
         }
     }
 
+    private func refreshCloudTranscriptionModels(showMessage: Bool) {
+        let provider = settings.cloudTranscriptionProvider
+        let baseURL = settings.cloudTranscriptionBaseURL
+        let apiKey = settings.cloudTranscriptionAPIKey
+
+        let requestToken = UUID()
+        cloudTranscriptionModelRequestToken = requestToken
+        cloudTranscriptionModelsLoading = true
+        if showMessage {
+            cloudTranscriptionModelStatusMessage = "Loading \(provider.displayName) models..."
+        }
+
+        Task {
+            let result = await CloudTranscriptionModelCatalogService.shared.fetchModels(
+                provider: provider,
+                baseURL: baseURL,
+                apiKey: apiKey
+            )
+
+            await MainActor.run {
+                guard requestToken == cloudTranscriptionModelRequestToken else { return }
+                cloudTranscriptionModelsLoading = false
+
+                let currentModel = settings.cloudTranscriptionModel
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if result.models.isEmpty, !currentModel.isEmpty {
+                    cloudTranscriptionAvailableModels = [
+                        CloudTranscriptionModelOption(
+                            id: currentModel,
+                            displayName: currentModel
+                        )
+                    ]
+                } else {
+                    cloudTranscriptionAvailableModels = result.models
+                }
+
+                if currentModel.isEmpty {
+                    if let preferredDefault = result.models.first(where: {
+                        $0.id.caseInsensitiveCompare(provider.defaultModel) == .orderedSame
+                    }) {
+                        settings.cloudTranscriptionModel = preferredDefault.id
+                    } else if let firstModel = result.models.first {
+                        settings.cloudTranscriptionModel = firstModel.id
+                    }
+                }
+
+                if showMessage || result.source == .fallback {
+                    cloudTranscriptionModelStatusMessage = result.message
+                } else if let resultMessage = result.message,
+                          resultMessage.localizedCaseInsensitiveContains("loaded") {
+                    cloudTranscriptionModelStatusMessage = resultMessage
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     @MainActor
     private func settingsCard<Content: View>(
@@ -5376,7 +5648,7 @@ struct SettingsView: View {
             .init(section: .shortcuts, title: "Paste last transcript", detail: "Reserved shortcut: ⌥⌘V", keywords: ["paste", "last transcript", "reserved"]),
             .init(section: .speech, title: "Auto-detect microphone", detail: "Automatically use best available input", keywords: ["microphone", "input", "auto"]),
             .init(section: .speech, title: "Microphone device picker", detail: "Choose a specific microphone manually", keywords: ["microphone", "device", "picker"]),
-            .init(section: .speech, title: "Transcription engine", detail: "Switch between Apple Speech and whisper.cpp", keywords: ["engine", "whisper", "apple", "recognition"]),
+            .init(section: .speech, title: "Transcription engine", detail: "Switch between Apple Speech, whisper.cpp, and cloud providers", keywords: ["engine", "whisper", "apple", "cloud", "openai", "groq", "deepgram", "gemini", "api key", "recognition"]),
             .init(section: .speech, title: "Contextual language bias", detail: "Improve recognition with likely words", keywords: ["context", "bias", "recognition"]),
             .init(section: .speech, title: "Preserve words across pauses", detail: "Prevent dropped words in short pauses", keywords: ["pause", "preserve", "recognition"]),
             .init(section: .speech, title: "Recognition mode", detail: "Choose local/cloud behavior for Apple Speech", keywords: ["on-device", "cloud", "privacy", "recognition"]),
