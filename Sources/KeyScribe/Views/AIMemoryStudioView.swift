@@ -3802,29 +3802,42 @@ struct AIMemoryStudioView: View {
             return
         }
 
+        // Mark saving as in progress on the main actor
         isContextOverrideSaving = true
-        promptRewriteConversationStore.upsertContextMappingDecision(
-            mappingType: mappingType,
-            appPairKey: appPairKey,
-            subjectKey: subjectKey,
-            contextScopeKey: targetKey,
-            decision: decision,
-            canonicalKey: decision == .link ? targetKey : nil,
-            source: .manual
-        )
-        if decision == .link, sourceKey != targetKey {
-            let aliasType = mappingType == .project ? "project" : "identity"
-            _ = Self.persistContextTagAlias(
-                aliasType: aliasType,
-                aliasKey: sourceKey,
-                canonicalKey: targetKey
-            )
-        }
-        isContextOverrideSaving = false
 
+        let shouldCreateAlias = (decision == .link && sourceKey != targetKey)
+        let aliasType = mappingType == .project ? "project" : "identity"
         let axisLabel = mappingType == .project ? "project" : "person"
-        conversationActionMessage = "Created \(axisLabel) override (\(decision == .link ? "linked" : "separate"))."
-        loadContextMappings(showStatusMessage: false)
+        let statusMessage = "Created \(axisLabel) override (\(decision == .link ? "linked" : "separate"))."
+        let canonicalKey = (decision == .link ? targetKey : nil)
+
+        Task.detached { [promptRewriteConversationStore] in
+            // Perform the potentially blocking persistence work off the main actor
+            promptRewriteConversationStore.upsertContextMappingDecision(
+                mappingType: mappingType,
+                appPairKey: appPairKey,
+                subjectKey: subjectKey,
+                contextScopeKey: targetKey,
+                decision: decision,
+                canonicalKey: canonicalKey,
+                source: .manual
+            )
+
+            if shouldCreateAlias {
+                _ = Self.persistContextTagAlias(
+                    aliasType: aliasType,
+                    aliasKey: sourceKey,
+                    canonicalKey: targetKey
+                )
+            }
+
+            // Once persistence is complete, update UI-related state on the main actor
+            await MainActor.run {
+                isContextOverrideSaving = false
+                conversationActionMessage = statusMessage
+                loadContextMappings(showStatusMessage: false)
+            }
+        }
     }
 
     private func contextOverrideKey(
