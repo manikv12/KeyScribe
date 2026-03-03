@@ -911,6 +911,10 @@ private actor OpenAIPromptRewriteProvider {
         let styleGuidance = styleGuidanceBlock(configuration: configuration)
         let conversationContextLine = conversationContextLine(from: conversationContext)
         let conversationHistoryPayload = formattedConversationPayload(from: conversationHistory)
+        let contextTermHints = contextTermHintsLine(
+            from: conversationContext,
+            conversationHistory: conversationHistory
+        )
         let systemPrompt: String
         let userPrompt: String
         if includeMemoryContext {
@@ -927,6 +931,11 @@ private actor OpenAIPromptRewriteProvider {
             Rules:
             - Rewrite only. Never answer, solve, explain, or execute the user's task.
             - Keep edits minimal: fix grammar, phrasing, and clarity while preserving the original wording when possible.
+            - Input originates from speech transcription and may contain homophone or misrecognition errors.
+            - Recover likely intent when wording is semantically broken due to dictation artifacts.
+            - Prefer context-backed terminology fixes (for example, "Obsidian wall" -> "Obsidian vault") over preserving nonsensical phrases.
+            - Never introduce a new domain term unless it appears in the original prompt, conversation context, recent turns, or memory payload.
+            - If correction confidence is low, keep the original uncertain term instead of inventing a replacement.
             - Preserve task type: if the source is a question, output a better-phrased question, not an answer.
             - Do not reframe plain user text into document templates, section headers, or issue-report formats unless the source already uses that format.
             - Preserve narrative voice (for example first-person "I was trying...") instead of rewriting into impersonal documentation voice.
@@ -954,12 +963,16 @@ private actor OpenAIPromptRewriteProvider {
 
             userPrompt = """
             Task: Rewrite the original prompt text only. Do not answer it.
+            Input note: The original prompt is speech-transcribed and may include recognition mistakes.
 
             Original prompt:
             \(cleanedTranscript)
 
             Conversation context (same app/screen bucket):
             \(conversationContextLine)
+
+            Context term hints (disambiguation only):
+            \(contextTermHints)
 
             Recent conversation turns (oldest -> newest):
             \(conversationHistoryPayload)
@@ -983,6 +996,11 @@ private actor OpenAIPromptRewriteProvider {
             Rules:
             - Rewrite only. Never answer, solve, explain, or execute the user's task.
             - Keep edits minimal: fix grammar, phrasing, and clarity while preserving the original wording when possible.
+            - Input originates from speech transcription and may contain homophone or misrecognition errors.
+            - Recover likely intent when wording is semantically broken due to dictation artifacts.
+            - Prefer context-backed terminology fixes (for example, "Obsidian wall" -> "Obsidian vault") over preserving nonsensical phrases.
+            - Never introduce a new domain term unless it appears in the original prompt, conversation context, or recent turns.
+            - If correction confidence is low, keep the original uncertain term instead of inventing a replacement.
             - Preserve task type: if the source is a question, output a better-phrased question, not an answer.
             - Do not reframe plain user text into document templates, section headers, or issue-report formats unless the source already uses that format.
             - Preserve narrative voice (for example first-person "I was trying...") instead of rewriting into impersonal documentation voice.
@@ -1005,12 +1023,16 @@ private actor OpenAIPromptRewriteProvider {
 
             userPrompt = """
             Task: Rewrite the original prompt text only. Do not answer it.
+            Input note: The original prompt is speech-transcribed and may include recognition mistakes.
 
             Original prompt:
             \(cleanedTranscript)
 
             Conversation context (same app/screen bucket):
             \(conversationContextLine)
+
+            Context term hints (disambiguation only):
+            \(contextTermHints)
 
             Recent conversation turns (oldest -> newest):
             \(conversationHistoryPayload)
@@ -1213,6 +1235,87 @@ private actor OpenAIPromptRewriteProvider {
             return item
         }
         return jsonString(for: payload)
+    }
+
+    private func contextTermHintsLine(
+        from context: PromptRewriteConversationContext?,
+        conversationHistory: [PromptRewriteConversationTurn]
+    ) -> String {
+        let hints = contextTermHints(
+            from: context,
+            conversationHistory: conversationHistory
+        )
+        guard !hints.isEmpty else { return "[]" }
+        return jsonString(for: hints)
+    }
+
+    private func contextTermHints(
+        from context: PromptRewriteConversationContext?,
+        conversationHistory: [PromptRewriteConversationTurn]
+    ) -> [String] {
+        var hints: [String] = []
+        var seen = Set<String>()
+
+        func appendHint(_ rawValue: String, maxLength: Int = 72) {
+            let normalized = MemoryTextNormalizer
+                .collapsedWhitespace(rawValue)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, normalized.count <= maxLength else { return }
+            let key = normalized.lowercased()
+            guard seen.insert(key).inserted else { return }
+            hints.append(normalized)
+        }
+
+        if let context {
+            appendHint(context.appName, maxLength: 36)
+            appendHint(context.projectLabel ?? "", maxLength: 48)
+            appendHint(context.identityLabel ?? "", maxLength: 48)
+            appendHint(context.screenLabel, maxLength: 56)
+            appendHint(context.fieldLabel, maxLength: 56)
+        }
+
+        let recentTurns = Array(conversationHistory.suffix(8))
+        if let appName = context?.appName.trimmingCharacters(in: .whitespacesAndNewlines),
+           !appName.isEmpty {
+            for turn in recentTurns {
+                for candidate in appScopedPhraseCandidates(in: turn.userText, appName: appName) {
+                    appendHint(candidate, maxLength: 48)
+                }
+                for candidate in appScopedPhraseCandidates(in: turn.assistantText, appName: appName) {
+                    appendHint(candidate, maxLength: 48)
+                }
+            }
+        }
+
+        return Array(hints.prefix(10))
+    }
+
+    private func appScopedPhraseCandidates(in text: String, appName: String) -> [String] {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return [] }
+
+        let escapedAppName = NSRegularExpression.escapedPattern(for: appName)
+        let pattern = #"(?i)\b\#(escapedAppName)\s+[a-z0-9][a-z0-9._/#\-]{1,24}(?:\s+[a-z0-9][a-z0-9._/#\-]{1,24})?\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+        let matches = regex.matches(in: normalized, options: [], range: range)
+
+        var output: [String] = []
+        var seen = Set<String>()
+        for match in matches {
+            guard let candidateRange = Range(match.range, in: normalized) else { continue }
+            let candidate = MemoryTextNormalizer
+                .collapsedWhitespace(String(normalized[candidateRange]))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard candidate.count >= appName.count + 2 else { continue }
+            let key = candidate.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            output.append(candidate)
+            if output.count >= 6 {
+                break
+            }
+        }
+        return output
     }
 
     private func buildRequest(
@@ -2843,6 +2946,16 @@ private actor OpenAIPromptRewriteProvider {
             return true
         }
 
+        if hasExcessiveSemanticDrift(
+            suggestion: normalizedSuggestion,
+            originalPrompt: originalPrompt
+        ) {
+            CrashReporter.logWarning(
+                "Prompt rewrite suggestion suppressed because output drifted too far from source intent provider=\(providerMode.rawValue)"
+            )
+            return true
+        }
+
         if providerMode == .ollama {
             if lowered.contains("how can i help")
                 || lowered.contains("can you provide more details")
@@ -2859,6 +2972,67 @@ private actor OpenAIPromptRewriteProvider {
         }
 
         return false
+    }
+
+    private func hasExcessiveSemanticDrift(suggestion: String, originalPrompt: String) -> Bool {
+        let suggestionTokens = contentTokens(from: suggestion)
+        let sourceTokens = contentTokens(from: originalPrompt)
+        guard suggestionTokens.count >= 4, sourceTokens.count >= 3 else { return false }
+
+        let overlapCount = suggestionTokens.intersection(sourceTokens).count
+        let novelCount = suggestionTokens.subtracting(sourceTokens).count
+        let overlapRatio = Double(overlapCount) / Double(max(1, suggestionTokens.count))
+
+        // Suppress rewrites that introduce mostly-new topical vocabulary.
+        if overlapRatio < 0.34,
+           novelCount >= max(3, suggestionTokens.count / 2) {
+            return true
+        }
+
+        // Extra guard for short prompts where 1-2 words can completely change intent.
+        if sourceTokens.count <= 6,
+           overlapCount <= 1,
+           novelCount >= 4 {
+            return true
+        }
+
+        return false
+    }
+
+    private func contentTokens(from text: String) -> Set<String> {
+        let normalized = MemoryTextNormalizer
+            .collapsedWhitespace(text)
+            .lowercased()
+        guard !normalized.isEmpty else { return [] }
+        guard let regex = try? NSRegularExpression(
+            pattern: #"[a-z0-9][a-z0-9'_-]{1,24}"#,
+            options: []
+        ) else {
+            return []
+        }
+
+        let stopWords: Set<String> = [
+            "a", "an", "and", "are", "as", "at", "be", "but", "by", "can",
+            "do", "does", "for", "from", "how", "i", "if", "in", "is", "it",
+            "me", "my", "of", "on", "or", "our", "please", "so", "that", "the",
+            "to", "too", "up", "we", "what", "when", "where", "which", "who",
+            "why", "with", "you", "your"
+        ]
+
+        let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+        let matches = regex.matches(in: normalized, options: [], range: range)
+        var tokens = Set<String>()
+        tokens.reserveCapacity(matches.count)
+
+        for match in matches {
+            guard let tokenRange = Range(match.range, in: normalized) else { continue }
+            let token = String(normalized[tokenRange])
+            if token.count < 2 { continue }
+            if stopWords.contains(token) { continue }
+            if token.range(of: #"^\d+$"#, options: .regularExpression) != nil { continue }
+            tokens.insert(token)
+        }
+        return tokens
     }
 
     private func internalPayloadMarkerMatchCount(in loweredText: String) -> Int {

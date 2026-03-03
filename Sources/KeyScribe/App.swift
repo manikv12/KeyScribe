@@ -1735,8 +1735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolution.insertionText)
         }
         if settings.promptRewriteEnabled,
-           let conversationContext = rewriteResolution.conversationContext,
-           settings.isPromptRewriteConversationHistoryEnabled(forContextID: conversationContext.id) {
+           let conversationContext = rewriteResolution.conversationContext {
             promptRewriteConversationStore.recordTurn(
                 originalText: cleaned,
                 finalText: readyForInsert,
@@ -2014,16 +2013,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             : configuredModel
         let styleLabel = settings.promptRewriteStylePreset.rawValue
             .replacingOccurrences(of: " (Default)", with: "")
-        let historyPhrase: String
-        if settings.promptRewriteConversationHistoryEnabled {
-            if conversationHistoryTurnCount > 0 {
-                historyPhrase = "\(conversationHistoryTurnCount) prior turn(s)"
-            } else {
-                historyPhrase = "current utterance only"
-            }
-        } else {
-            historyPhrase = "history disabled"
-        }
+        let historyPhrase = conversationHistoryTurnCount > 0
+            ? "\(conversationHistoryTurnCount) prior turn(s)"
+            : "current utterance only"
         let insertionPath = settings.promptRewriteAutoInsertEnabled
             ? "auto-insert for high confidence"
             : "manual preview before insert"
@@ -2132,7 +2124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         for capturedContext: PromptRewriteConversationContext,
         userText: String
     ) -> ConversationContextResolverV2.ResolvedContextBundle? {
-        guard settings.promptRewriteEnabled, settings.promptRewriteConversationHistoryEnabled else {
+        guard settings.promptRewriteEnabled else {
             return nil
         }
 
@@ -2158,17 +2150,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !pinnedID.isEmpty, !requestContext.usesPinnedContext {
             settings.promptRewriteConversationPinnedContextID = ""
-        }
-
-        if !settings.isPromptRewriteConversationHistoryEnabled(forContextID: requestContext.activeContext.id) {
-            return ConversationContextResolverV2.ResolvedContextBundle(
-                activeContext: requestContext.activeContext,
-                activeHistory: [],
-                linkedContextIDs: requestContext.linkedContextIDs,
-                mergedHistory: [],
-                usesPinnedContext: requestContext.usesPinnedContext,
-                resolutionTrace: requestContext.resolutionTrace
-            )
         }
 
         return requestContext
