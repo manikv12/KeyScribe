@@ -1003,12 +1003,7 @@ final class CloudTranscriber: NSObject {
             error.localizedDescription.contains("error -10868")
 
         if isFormatNotSupported {
-            let preferredRecoveryUID: String?
-            if !autoDetectMicrophone, !selectedMicrophoneUID.isEmpty {
-                preferredRecoveryUID = selectedMicrophoneUID
-            } else {
-                preferredRecoveryUID = MicrophoneManager.builtInMicrophoneUID()
-            }
+            let preferredRecoveryUID = MicrophoneManager.builtInMicrophoneUID()
 
             if let recoveredUID = MicrophoneManager.recoverDefaultInputDevice(preferredUID: preferredRecoveryUID) {
                 let recoveredName = MicrophoneManager.availableMicrophones()

@@ -2755,14 +2755,14 @@ final class PromptRewriteConversationStore: ObservableObject {
             let normalized = collapsedWhitespace(value)
             guard !normalized.isEmpty else { return nil }
             let concise = snippet(normalized, limit: snippetLimit)
-            guard isMeaningfulCompactionSnippet(concise) else { return nil }
-            let keywordCount = min(
-                10,
-                MemoryTextNormalizer.keywords(
-                    from: concise.lowercased(),
-                    limit: 16
-                ).count
+            let keywords = MemoryTextNormalizer.keywords(
+                from: concise.lowercased(),
+                limit: 16
             )
+            guard concise.count >= 6,
+                  concise.unicodeScalars.contains(where: { CharacterSet.letters.contains($0) }),
+                  keywords.count >= 2 else { return nil }
+            let keywordCount = min(10, keywords.count)
             let recencyWeight = Double(index + 1) / Double(normalizedCount)
             let keywordWeight = Double(keywordCount) / 10.0
             let score = (recencyWeight * 0.75) + (keywordWeight * 0.25)
@@ -4605,7 +4605,12 @@ enum PromptRewriteConversationContextResolver {
             controlsGroup,
             thread: thread
         )
-        let project = topBarProject ?? {
+        let filteredTopBar: String? = if let topBarProject, !isLikelyVersionControlReferenceLabel(topBarProject) {
+            topBarProject
+        } else {
+            nil
+        }
+        let project = filteredTopBar ?? {
             guard let nearControlsProject else { return nil }
             guard !isLikelyVersionControlReferenceLabel(nearControlsProject) else {
                 return nil
