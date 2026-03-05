@@ -1264,6 +1264,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             if let url = URL(string: UpdateCheckFallback.latestReleaseURLString) {
                 NSWorkspace.shared.open(url)
             }
+            self.pendingUpdateCheckFallbackWorkItem = nil
+            NSApp.setActivationPolicy(.accessory)
             CrashReporter.logWarning(
                 "Update check timed out after \(Int(UpdateCheckFallback.timeoutSeconds))s feed=\(feedURL.absoluteString)"
             )
@@ -2975,7 +2977,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     private func setUIStatus(_ status: DictationUIStatus) {
         if status == .ready, isDictating {
-            CrashReporter.logInfo("Ignored stale ready status while dictation is active")
             return
         }
 
