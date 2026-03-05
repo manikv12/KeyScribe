@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="KeyScribe.png" alt="KeyScribe" width="120" />
+  <img src="Assets/KeyScribeLogo.svg" alt="KeyScribe" width="120" />
 </p>
 
 <h1 align="center">KeyScribe</h1>

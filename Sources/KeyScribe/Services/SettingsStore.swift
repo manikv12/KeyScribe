@@ -256,6 +256,7 @@ enum ColorTheme: String, CaseIterable, Identifiable {
     case arctic = "Arctic"
     case slate = "Slate"
     case amethyst = "Amethyst"
+    case noirGold = "Noir Gold"
 
     var id: Self { self }
     var displayName: String { rawValue }
@@ -414,6 +415,23 @@ enum ColorTheme: String, CaseIterable, Identifiable {
                 glowCool: Color(red: 0.45, green: 0.28, blue: 0.70),
                 surfaceTop: Color(red: 0.18, green: 0.10, blue: 0.28),
                 surfaceBottom: Color(red: 0.10, green: 0.06, blue: 0.16)
+            )
+        case .noirGold:
+            return ColorPalette(
+                baseTint: Color(red: 0.10, green: 0.09, blue: 0.07),
+                accentTint: Color(red: 0.79, green: 0.66, blue: 0.30),
+                canvasBase: Color(red: 0.06, green: 0.06, blue: 0.05),
+                canvasDeep: Color(red: 0.03, green: 0.03, blue: 0.02),
+                sidebarTint: Color(red: 0.10, green: 0.09, blue: 0.07),
+                panelTint: Color(red: 0.08, green: 0.07, blue: 0.06),
+                rowSelection: Color(red: 0.22, green: 0.18, blue: 0.10),
+                historyTint: Color(red: 0.91, green: 0.83, blue: 0.55),
+                aiStudioTint: Color(red: 0.79, green: 0.66, blue: 0.30),
+                settingsTint: Color(red: 0.85, green: 0.72, blue: 0.35),
+                glowWarm: Color(red: 0.79, green: 0.66, blue: 0.30),
+                glowCool: Color(red: 0.55, green: 0.46, blue: 0.22),
+                surfaceTop: Color(red: 0.14, green: 0.12, blue: 0.09),
+                surfaceBottom: Color(red: 0.06, green: 0.05, blue: 0.04)
             )
         }
     }

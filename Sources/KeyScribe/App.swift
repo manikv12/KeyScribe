@@ -665,6 +665,11 @@ struct KeyScribeApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
+    private enum UpdateCheckFallback {
+        static let timeoutSeconds: TimeInterval = 8
+        static let latestReleaseURLString = "https://github.com/manikv12/KeyScribe/releases/latest"
+    }
+
     private enum PasteLastTranscriptShortcut {
         static let keyCode: UInt16 = 9 // V
         static let modifiers: NSEvent.ModifierFlags = [.command, .option]
@@ -713,6 +718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
     private var hasScheduledPermissionRestart = false
+    private var pendingUpdateCheckFallbackWorkItem: DispatchWorkItem?
     private var settingsApplyWorkItem: DispatchWorkItem?
     private var lastAppliedSettingsSnapshot: SettingsApplySnapshot?
     private var lastAudioSetupHUDAlertAt: Date?
@@ -1210,51 +1216,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     func checkForUpdatesFromSettings() {
+        let shortVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let buildVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
         guard let feedURLRaw = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
               !feedURLRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              URL(string: feedURLRaw) != nil else {
-            updateCheckStatusStore.markFailed(message: "Update feed URL is missing or invalid.")
+              let feedURL = URL(string: feedURLRaw) else {
+            let message = "Update feed URL is missing or invalid."
+            updateCheckStatusStore.markFailed(message: message)
+            setUIStatus(.message(message))
+            waveform.flashEvent(message: message, symbolName: "exclamationmark.triangle.fill")
+            CrashReporter.logError("Update check blocked: invalid feed URL")
             return
         }
 
         let updater = updaterController.updater
         guard updater.canCheckForUpdates else {
-            updateCheckStatusStore.markFailed(message: "An update check is already in progress.")
+            let message = "An update check is already in progress."
+            updateCheckStatusStore.markFailed(message: message)
+            setUIStatus(.message(message))
+            waveform.flashEvent(message: message, symbolName: "arrow.triangle.2.circlepath.circle.fill")
+            CrashReporter.logWarning(
+                "Update check blocked: updater busy version=\(shortVersion) build=\(buildVersion)"
+            )
             return
         }
 
+        cancelPendingUpdateCheckFallback()
         updateCheckStatusStore.beginCheck()
+        CrashReporter.logInfo(
+            "Update check started version=\(shortVersion) build=\(buildVersion) feed=\(feedURL.absoluteString)"
+        )
+
+        let fallbackWorkItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.updateCheckStatusStore.isChecking else { return }
+
+            let message = "Update check timed out. Opening Releases page."
+            self.updateCheckStatusStore.markFailed(message: message)
+            self.setUIStatus(.message(message))
+            self.waveform.flashEvent(
+                message: "Couldn't open update window. Opening Releases.",
+                symbolName: "arrow.up.right.square.fill"
+            )
+            if let url = URL(string: UpdateCheckFallback.latestReleaseURLString) {
+                NSWorkspace.shared.open(url)
+            }
+            self.pendingUpdateCheckFallbackWorkItem = nil
+            NSApp.setActivationPolicy(.accessory)
+            CrashReporter.logWarning(
+                "Update check timed out after \(Int(UpdateCheckFallback.timeoutSeconds))s feed=\(feedURL.absoluteString)"
+            )
+        }
+        pendingUpdateCheckFallbackWorkItem = fallbackWorkItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + UpdateCheckFallback.timeoutSeconds,
+            execute: fallbackWorkItem
+        )
 
         // LSUIElement apps must temporarily activate to show Sparkle's update window
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
+        CrashReporter.logInfo("Update check dispatched to Sparkle")
         updaterController.checkForUpdates(nil)
     }
 
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        cancelPendingUpdateCheckFallback()
+        CrashReporter.logInfo(
+            "Update check found valid update version=\(item.displayVersionString) build=\(item.versionString)"
+        )
         updateCheckStatusStore.markUpdateAvailable(version: item.displayVersionString)
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: any Error) {
+        cancelPendingUpdateCheckFallback()
+        CrashReporter.logInfo("Update check completed with no update available")
         updateCheckStatusStore.markUpToDate()
     }
 
     func updater(_ updater: SPUUpdater, didAbortWithError error: any Error) {
-        updateCheckStatusStore.markFailed(message: readableUpdateErrorMessage(error))
+        cancelPendingUpdateCheckFallback()
+        let message = readableUpdateErrorMessage(error)
+        CrashReporter.logError("Update check aborted: \(message)")
+        updateCheckStatusStore.markFailed(message: message)
+        setUIStatus(.message(message))
+        waveform.flashEvent(message: message, symbolName: "exclamationmark.triangle.fill")
     }
 
     func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: (any Error)?) {
+        cancelPendingUpdateCheckFallback()
+
         // Restore LSUIElement (accessory) mode after Sparkle's update UI is dismissed
         NSApp.setActivationPolicy(.accessory)
 
         guard updateCheckStatusStore.isChecking else { return }
 
         if let error {
-            updateCheckStatusStore.markFailed(message: readableUpdateErrorMessage(error))
+            let message = readableUpdateErrorMessage(error)
+            CrashReporter.logError("Update check finished with error: \(message)")
+            updateCheckStatusStore.markFailed(message: message)
+            setUIStatus(.message(message))
+            waveform.flashEvent(message: message, symbolName: "exclamationmark.triangle.fill")
         } else {
+            CrashReporter.logInfo("Update check finished successfully with no update available")
             updateCheckStatusStore.markUpToDate()
         }
+    }
+
+    private func cancelPendingUpdateCheckFallback() {
+        pendingUpdateCheckFallbackWorkItem?.cancel()
+        pendingUpdateCheckFallbackWorkItem = nil
     }
 
     private func readableUpdateErrorMessage(_ error: any Error) -> String {
@@ -1779,7 +1854,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func handleFinalTranscript(_ text: String) async {
         let cleaned = TextCleanup.process(text, mode: settings.textCleanupMode)
         guard !cleaned.isEmpty else {
-            setUIStatus(.ready)
+            if !isDictating {
+                setUIStatus(.ready)
+            }
             return
         }
 
@@ -1790,7 +1867,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 for: cleaned,
                 insertionSessionContext: insertionSessionContext
             ) else {
-                setUIStatus(.ready)
+                if !isDictating {
+                    setUIStatus(.ready)
+                }
                 return
             }
             rewriteResolution = resolved
@@ -1825,7 +1904,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             insertionContext: rewriteResolution.insertionHUDContext,
             forceActivateTargetBeforeInsert: rewriteResolution.forceTargetRefocusBeforeInsert
         )
-        setUIStatus(.ready)
+        if !isDictating {
+            setUIStatus(.ready)
+        }
     }
 
     private func resolvePromptRewriteInsertionText(
@@ -2129,36 +2210,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                     displayState: loadingNarrative.displayState(step: "Sending transcript for rewrite suggestion")
                 )
 
-                async let suggestionResult = PromptRewriteService.shared.retrieveSuggestion(
+                // Drip-feed progress while waiting for the API response
+                let progressDripTask = Task {
+                    do {
+                        try await Task.sleep(nanoseconds: 1_800_000_000)
+                        guard !Task.isCancelled else { return }
+                        await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                            insertionContext: insertionContext,
+                            displayState: loadingNarrative.displayState(step: "Waiting for AI response")
+                        )
+                        try await Task.sleep(nanoseconds: 2_500_000_000)
+                        guard !Task.isCancelled else { return }
+                        await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                            insertionContext: insertionContext,
+                            displayState: loadingNarrative.displayState(step: "Analyzing transcript context")
+                        )
+                        try await Task.sleep(nanoseconds: 2_500_000_000)
+                        guard !Task.isCancelled else { return }
+                        await PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                            insertionContext: insertionContext,
+                            displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
+                        )
+                    } catch {
+                        // Cancellation is expected when the suggestion returns quickly.
+                    }
+                }
+                defer { progressDripTask.cancel() }
+
+                let suggestion = try await PromptRewriteService.shared.retrieveSuggestion(
                     for: cleanedTranscript,
                     conversationContext: conversationContext,
                     conversationHistory: conversationHistory
                 )
-
-                // Drip-feed progress while waiting for the API response
-                async let progressDrip: Void = {
-                    try? await Task.sleep(nanoseconds: 1_800_000_000)
-                    guard !Task.isCancelled else { return }
-                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
-                        insertionContext: insertionContext,
-                        displayState: loadingNarrative.displayState(step: "Waiting for AI response")
-                    )
-                    try? await Task.sleep(nanoseconds: 2_500_000_000)
-                    guard !Task.isCancelled else { return }
-                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
-                        insertionContext: insertionContext,
-                        displayState: loadingNarrative.displayState(step: "Analyzing transcript context")
-                    )
-                    try? await Task.sleep(nanoseconds: 2_500_000_000)
-                    guard !Task.isCancelled else { return }
-                    await PromptRewriteHUDManager.shared.updateLoadingIndicator(
-                        insertionContext: insertionContext,
-                        displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
-                    )
-                }()
-
-                let suggestion = try await suggestionResult
-                _ = await progressDrip
                 return .suggestion(suggestion)
             }
 
@@ -2865,7 +2948,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
 
         if statusMessage == "Ready" {
-            setUIStatus(.ready)
+            if !isDictating {
+                setUIStatus(.ready)
+            }
             return
         }
 
@@ -2891,6 +2976,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     private func setUIStatus(_ status: DictationUIStatus) {
+        if status == .ready, isDictating {
+            return
+        }
+
         statusBarViewModel.uiStatus = status
 
         if status.resetsDictationIndicators {

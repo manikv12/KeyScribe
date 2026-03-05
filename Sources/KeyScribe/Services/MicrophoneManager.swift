@@ -3,9 +3,14 @@ import CoreAudio
 import Foundation
 
 enum MicrophoneManager {
+    private static let microphoneDiscoveryDeviceTypes: [AVCaptureDevice.DeviceType] = [
+        .builtInMicrophone,
+        .externalUnknown
+    ]
+
     static func availableMicrophones() -> [MicrophoneOption] {
         let session = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInMicrophone, .externalUnknown],
+            deviceTypes: microphoneDiscoveryDeviceTypes,
             mediaType: .audio,
             position: .unspecified
         )
@@ -21,6 +26,15 @@ enum MicrophoneManager {
 
     static func defaultMicrophoneUID() -> String? {
         AVCaptureDevice.default(for: .audio)?.uniqueID
+    }
+
+    static func builtInMicrophoneUID() -> String? {
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInMicrophone],
+            mediaType: .audio,
+            position: .unspecified
+        )
+        return session.devices.first?.uniqueID
     }
 
     static func defaultInputDeviceID() -> AudioDeviceID? {
@@ -98,6 +112,36 @@ enum MicrophoneManager {
         )
 
         return status == noErr
+    }
+
+    static func recoverDefaultInputDevice(preferredUID: String? = nil) -> String? {
+        var candidateUIDs: [String] = []
+
+        func appendCandidate(_ value: String?) {
+            guard let value else { return }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            guard !candidateUIDs.contains(trimmed) else { return }
+            candidateUIDs.append(trimmed)
+        }
+
+        appendCandidate(preferredUID)
+        appendCandidate(builtInMicrophoneUID())
+        appendCandidate(defaultMicrophoneUID())
+        availableMicrophones().forEach { appendCandidate($0.uid) }
+
+        let currentDefaultInput = defaultInputDeviceID()
+        for uid in candidateUIDs {
+            guard let deviceID = deviceID(forUID: uid) else { continue }
+            if currentDefaultInput == deviceID {
+                return uid
+            }
+            if setDefaultInput(deviceID: deviceID) {
+                return uid
+            }
+        }
+
+        return nil
     }
 }
 
