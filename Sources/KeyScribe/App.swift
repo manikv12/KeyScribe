@@ -665,6 +665,8 @@ struct KeyScribeApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
+    static weak var shared: AppDelegate?
+
     private enum UpdateCheckFallback {
         static let timeoutSeconds: TimeInterval = 8
         static let latestReleaseURLString = "https://github.com/manikv12/KeyScribe/releases/latest"
@@ -911,6 +913,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.shared = self
         CrashReporter.install()
         NSApp.setActivationPolicy(.accessory)
         _ = updaterController
@@ -1300,6 +1303,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     func updater(_ updater: SPUUpdater, didAbortWithError error: any Error) {
         cancelPendingUpdateCheckFallback()
+        if isSparkleNoUpdateFoundError(error) {
+            CrashReporter.logInfo("Update check aborted with no-update-found status (up to date)")
+            updateCheckStatusStore.markUpToDate()
+            return
+        }
         let message = readableUpdateErrorMessage(error)
         CrashReporter.logError("Update check aborted: \(message)")
         updateCheckStatusStore.markFailed(message: message)
@@ -1316,15 +1324,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         guard updateCheckStatusStore.isChecking else { return }
 
         if let error {
-            let message = readableUpdateErrorMessage(error)
-            CrashReporter.logError("Update check finished with error: \(message)")
-            updateCheckStatusStore.markFailed(message: message)
-            setUIStatus(.message(message))
-            waveform.flashEvent(message: message, symbolName: "exclamationmark.triangle.fill")
+            if isSparkleNoUpdateFoundError(error) {
+                CrashReporter.logInfo("Update check finished with no-update-found status (up to date)")
+                updateCheckStatusStore.markUpToDate()
+            } else {
+                let message = readableUpdateErrorMessage(error)
+                CrashReporter.logError("Update check finished with error: \(message)")
+                updateCheckStatusStore.markFailed(message: message)
+                setUIStatus(.message(message))
+                waveform.flashEvent(message: message, symbolName: "exclamationmark.triangle.fill")
+            }
         } else {
             CrashReporter.logInfo("Update check finished successfully with no update available")
             updateCheckStatusStore.markUpToDate()
         }
+    }
+
+    private func isSparkleNoUpdateFoundError(_ error: any Error) -> Bool {
+        let nsError = error as NSError
+        // Sparkle uses domain "SUSparkleErrorDomain" with code 5001 for SPUNoUpdateFoundError
+        if nsError.domain == "SUSparkleErrorDomain" && nsError.code == 5001 {
+            return true
+        }
+        // Fallback: detect by message content
+        let desc = nsError.localizedDescription.lowercased()
+        return desc.contains("up to date") || desc.contains("no update")
     }
 
     private func cancelPendingUpdateCheckFallback() {
@@ -1465,26 +1489,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         // Wire view model actions
         statusBarViewModel.onToggleDictation = { [weak self] in
-            self?.popover?.performClose(nil)
+            self?.popover?.close()
             self?.toggleContinuousDictation()
         }
         statusBarViewModel.onPasteLastTranscript = { [weak self] in
-            self?.popover?.performClose(nil)
+            self?.popover?.close()
             self?.pasteLastTranscriptFromHistory()
         }
         statusBarViewModel.onOpenHistory = { [weak self] in
-            self?.popover?.performClose(nil)
+            self?.popover?.close()
             self?.windowCoordinator?.openHistoryWindow()
         }
         statusBarViewModel.onOpenAIMemoryStudio = { [weak self] in
-            self?.popover?.performClose(nil)
+            self?.popover?.close()
             self?.windowCoordinator?.openAIMemoryStudioWindow()
         }
         statusBarViewModel.onOpenSettings = { [weak self] in
-            self?.popover?.performClose(nil)
+            self?.popover?.close()
             self?.windowCoordinator?.openSettingsWindow()
         }
-        statusBarViewModel.onQuit = {
+        statusBarViewModel.onQuit = { [weak self] in
+            self?.popover?.close()
             NSApplication.shared.terminate(nil)
         }
 
@@ -3335,13 +3360,16 @@ struct SettingsView: View {
 
             HStack(spacing: 0) {
                 settingsSidebar
+                    .padding(.leading, 10)
+                    .padding(.vertical, 10)
                 Rectangle()
                     .fill(Color.white.opacity(0.12))
                     .frame(width: 1)
                     .frame(maxHeight: .infinity)
                 settingsDetailPane
+                    .padding(.trailing, 10)
+                    .padding(.vertical, 10)
             }
-            .padding(10)
 
             ShortcutCaptureMonitor(
                 isCapturing: $isCapturingShortcut,
@@ -3423,7 +3451,7 @@ struct SettingsView: View {
         .padding(18)
         .appThemedSurface(
             cornerRadius: 16,
-            tint: section.tint,
+            tint: AppVisualTheme.accentTint,
             strokeOpacity: 0.18,
             tintOpacity: 0.035
         )
@@ -3887,9 +3915,25 @@ struct SettingsView: View {
                 Toggle("Mute system sounds while this shortcut is held", isOn: $settings.muteSystemSoundsWhileHoldingShortcut)
                     .help("Suppresses this hold-to-talk key chord in other apps to avoid system alert beeps.")
 
-                DisclosureGroup("Manual map (advanced)", isExpanded: $showHoldManualMap) {
-                    manualShortcutBuilder(for: .holdToTalk)
-                        .padding(.top, 6)
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showHoldManualMap.toggle() }
+                    } label: {
+                        HStack {
+                            Text("Manual map (advanced)")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .rotationEffect(.degrees(showHoldManualMap ? 90 : 0))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    if showHoldManualMap {
+                        manualShortcutBuilder(for: .holdToTalk)
+                            .padding(.top, 6)
+                    }
                 }
 
                 if isCapturingShortcut && shortcutCaptureTarget == .holdToTalk {
@@ -3926,9 +3970,25 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                DisclosureGroup("Manual map (advanced)", isExpanded: $showContinuousManualMap) {
-                    manualShortcutBuilder(for: .continuousToggle)
-                        .padding(.top, 6)
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showContinuousManualMap.toggle() }
+                    } label: {
+                        HStack {
+                            Text("Manual map (advanced)")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .rotationEffect(.degrees(showContinuousManualMap ? 90 : 0))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    if showContinuousManualMap {
+                        manualShortcutBuilder(for: .continuousToggle)
+                            .padding(.top, 6)
+                    }
                 }
 
                 if isCapturingShortcut && shortcutCaptureTarget == .continuousToggle {
@@ -4036,31 +4096,47 @@ struct SettingsView: View {
                     Toggle("Preserve words across short pauses", isOn: $settings.keepTextAcrossPauses)
                         .help("Helps avoid dropping earlier words when you pause briefly mid-sentence.")
 
-                    DisclosureGroup("Advanced Apple Speech options", isExpanded: $showAppleSpeechAdvancedSettings) {
-                        VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) { showAppleSpeechAdvancedSettings.toggle() }
+                        } label: {
                             HStack {
-                                Text("Recognition mode")
-                                    .font(.callout.weight(.medium))
+                                Text("Advanced Apple Speech options")
                                 Spacer()
-                                Picker("", selection: $settings.recognitionModeRawValue) {
-                                    ForEach(RecognitionMode.allCases) { mode in
-                                        Text(mode.displayName).tag(mode.rawValue)
-                                    }
-                                }
-                                .pickerStyle(.menu)
-                                .frame(width: 150)
+                                Image(systemName: "chevron.right")
+                                    .rotationEffect(.degrees(showAppleSpeechAdvancedSettings ? 90 : 0))
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
                             }
-                            .help(settings.recognitionMode.helpText)
-
-                            Text(settings.recognitionMode.helpText)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-
-                            Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
-                                .help("Uses Apple Speech punctuation generation during recognition.")
+                            .contentShape(Rectangle())
                         }
-                        .padding(.top, 8)
+                        .buttonStyle(.plain)
+                        if showAppleSpeechAdvancedSettings {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Text("Recognition mode")
+                                        .font(.callout.weight(.medium))
+                                    Spacer()
+                                    Picker("", selection: $settings.recognitionModeRawValue) {
+                                        ForEach(RecognitionMode.allCases) { mode in
+                                            Text(mode.displayName).tag(mode.rawValue)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .frame(width: 150)
+                                }
+                                .help(settings.recognitionMode.helpText)
+
+                                Text(settings.recognitionMode.helpText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+
+                                Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
+                                    .help("Uses Apple Speech punctuation generation during recognition.")
+                            }
+                            .padding(.top, 8)
+                        }
                     }
                 }
             } else if settings.transcriptionEngine == .whisperCpp {
@@ -4110,31 +4186,47 @@ struct SettingsView: View {
                             .foregroundStyle(AppVisualTheme.accentTint)
                     } else {
                         VStack(alignment: .leading, spacing: 10) {
-                            DisclosureGroup("Find a model", isExpanded: $showWhisperModelFilters) {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack(spacing: 10) {
-                                        TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
-                                            .textFieldStyle(.roundedBorder)
-
-                                        Toggle("Installed only", isOn: $whisperShowInstalledOnly)
-                                            .toggleStyle(.switch)
-                                            .fixedSize()
-                                    }
-
-                                    HStack(spacing: 10) {
-                                        Picker("Family", selection: $whisperFamilyFilter) {
-                                            ForEach(whisperFamilyFilterOptions, id: \.self) { family in
-                                                Text(family == "all" ? "All families" : family.capitalized)
-                                                    .tag(family)
-                                            }
-                                        }
-                                        .pickerStyle(.menu)
-                                        .frame(width: 180)
-
+                            VStack(alignment: .leading, spacing: 0) {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) { showWhisperModelFilters.toggle() }
+                                } label: {
+                                    HStack {
+                                        Text("Find a model")
                                         Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .rotationEffect(.degrees(showWhisperModelFilters ? 90 : 0))
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.secondary)
                                     }
+                                    .contentShape(Rectangle())
                                 }
-                                .padding(.top, 8)
+                                .buttonStyle(.plain)
+                                if showWhisperModelFilters {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        HStack(spacing: 10) {
+                                            TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
+                                                .textFieldStyle(.roundedBorder)
+
+                                            Toggle("Installed only", isOn: $whisperShowInstalledOnly)
+                                                .toggleStyle(.switch)
+                                                .fixedSize()
+                                        }
+
+                                        HStack(spacing: 10) {
+                                            Picker("Family", selection: $whisperFamilyFilter) {
+                                                ForEach(whisperFamilyFilterOptions, id: \.self) { family in
+                                                    Text(family == "all" ? "All families" : family.capitalized)
+                                                        .tag(family)
+                                                }
+                                            }
+                                            .pickerStyle(.menu)
+                                            .frame(width: 180)
+
+                                            Spacer()
+                                        }
+                                    }
+                                    .padding(.top, 8)
+                                }
                             }
 
                             HStack(spacing: 10) {
@@ -4286,7 +4378,8 @@ struct SettingsView: View {
                         } label: {
                             Image(systemName: "doc.on.doc")
                         }
-                        .buttonStyle(.borderless)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                         .help("Copy API key to clipboard")
                         .disabled(settings.cloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
@@ -4320,38 +4413,54 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    DisclosureGroup("Advanced text processing", isExpanded: $showRecognitionAdvancedSettings) {
-                        VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) { showRecognitionAdvancedSettings.toggle() }
+                        } label: {
                             HStack {
-                                Text("Cleanup mode")
-                                    .font(.callout.weight(.medium))
+                                Text("Advanced text processing")
                                 Spacer()
-                                Picker("", selection: $settings.textCleanupModeRawValue) {
-                                    ForEach(TextCleanupMode.allCases) { mode in
-                                        Text(mode.displayName).tag(mode.rawValue)
-                                    }
-                                }
-                                .pickerStyle(.menu)
-                                .frame(width: 170)
-                            }
-                            .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
-
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Custom phrases (comma or new line separated)")
-                                    .font(.callout.weight(.medium))
-                                TextEditor(text: $settings.customContextPhrases)
-                                    .frame(height: 120)
-                                    .font(.callout)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(Color.primary.opacity(0.15), lineWidth: 1)
-                                    )
-                                Text("Examples: names, products, acronyms, slang")
-                                    .font(.caption)
+                                Image(systemName: "chevron.right")
+                                    .rotationEffect(.degrees(showRecognitionAdvancedSettings ? 90 : 0))
+                                    .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                             }
+                            .contentShape(Rectangle())
                         }
-                        .padding(.top, 8)
+                        .buttonStyle(.plain)
+                        if showRecognitionAdvancedSettings {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Text("Cleanup mode")
+                                        .font(.callout.weight(.medium))
+                                    Spacer()
+                                    Picker("", selection: $settings.textCleanupModeRawValue) {
+                                        ForEach(TextCleanupMode.allCases) { mode in
+                                            Text(mode.displayName).tag(mode.rawValue)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .frame(width: 170)
+                                }
+                                .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
+
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Custom phrases (comma or new line separated)")
+                                        .font(.callout.weight(.medium))
+                                    TextEditor(text: $settings.customContextPhrases)
+                                        .frame(height: 120)
+                                        .font(.callout)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                                        )
+                                    Text("Examples: names, products, acronyms, slang")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.top, 8)
+                        }
                     }
                 }
             }
@@ -4602,18 +4711,20 @@ struct SettingsView: View {
                                     .font(.callout.monospaced())
                                 Image(systemName: "arrow.right")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.tertiary)
                                 Text(correction.replacement)
                                     .font(.callout.monospaced())
                                 Spacer()
                                 Button("Edit") {
                                     beginEditingCorrection(correction)
                                 }
-                                .buttonStyle(.borderless)
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
                                 Button("Remove") {
                                     adaptiveCorrectionStore.removeCorrection(source: correction.source)
                                 }
-                                .buttonStyle(.borderless)
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
                             }
                         }
 
@@ -4690,18 +4801,20 @@ struct SettingsView: View {
                                                 .font(.callout.monospaced())
                                             Image(systemName: "arrow.right")
                                                 .font(.caption.weight(.semibold))
-                                                .foregroundStyle(.secondary)
+                                                .foregroundStyle(.tertiary)
                                             Text(correction.replacement)
                                                 .font(.callout.monospaced())
                                             Spacer()
                                             Button("Edit") {
                                                 beginEditingCorrection(correction)
                                             }
-                                            .buttonStyle(.borderless)
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
                                             Button("Remove") {
                                                 adaptiveCorrectionStore.removeCorrection(source: correction.source)
                                             }
-                                            .buttonStyle(.borderless)
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
                                         }
                                     }
                                 }
@@ -5565,11 +5678,8 @@ struct SettingsView: View {
     ) -> some View {
         let tint = tint ?? AppVisualTheme.accentTint
         VStack(alignment: .leading, spacing: 10) {
-            DisclosureGroup(isExpanded: isExpanded) {
-                VStack(alignment: .leading, spacing: 10) {
-                    content()
-                }
-                .padding(.top, 6)
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.wrappedValue.toggle() }
             } label: {
                 HStack(alignment: .top, spacing: 10) {
                     if let symbol {
@@ -5592,7 +5702,24 @@ struct SettingsView: View {
                                 .foregroundStyle(AppVisualTheme.mutedText)
                         }
                     }
+
+                    Spacer(minLength: 0)
+
+                    Image(systemName: "chevron.right")
+                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
                 }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded.wrappedValue {
+                VStack(alignment: .leading, spacing: 10) {
+                    content()
+                }
+                .padding(.top, 6)
             }
         }
         .padding(15)
@@ -6096,7 +6223,7 @@ struct SettingsView: View {
                     }
                     Spacer()
                     Button(updateCheckStatusStore.isChecking ? "Checking…" : "Check for Updates…") {
-                        (NSApp.delegate as? AppDelegate)?.checkForUpdatesFromSettings()
+                        AppDelegate.shared?.checkForUpdatesFromSettings()
                     }
                     .disabled(updateCheckStatusStore.isChecking)
                 }

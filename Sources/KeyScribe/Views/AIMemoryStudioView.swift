@@ -741,7 +741,7 @@ struct AIMemoryStudioView: View {
                         Button("Manage Providers…") {
                             showingProvidersSheet = true
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
                     }
 
                     if !memoryProviderFilterQuery.isEmpty || memoryShowSelectedProvidersOnly {
@@ -814,7 +814,7 @@ struct AIMemoryStudioView: View {
                         Button("Manage Folders…") {
                             showingSourceFoldersSheet = true
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
                     }
 
                     if !memoryFolderFilterQuery.isEmpty || memoryShowSelectedFoldersOnly || !memoryFoldersOnlyEnabledProviders {
@@ -1247,7 +1247,7 @@ struct AIMemoryStudioView: View {
                 Button("Refresh Patterns") {
                     refreshConversationPatternStats()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
 
                 Button("Purge Expired") {
                     purgeExpiredConversationPatterns()
