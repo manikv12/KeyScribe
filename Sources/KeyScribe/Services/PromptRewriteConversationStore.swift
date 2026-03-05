@@ -334,6 +334,8 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let autoCompactionExchangeThreshold = 40
     private let autoCompactionRetainedExchangeTurns = 8
     private let maxPromptContextCharacters = 1_800
+    private let expiredHandoffNoAnchorMaxAgeSeconds: TimeInterval = 6 * 60 * 60
+    private let expiredSummaryMergeNoAnchorMaxAgeSeconds: TimeInterval = 2 * 60 * 60
     private let compactionVersion = 1
     private let expiredSummaryAITimeoutSeconds = 60
     private let expiredSummaryRetentionDays = 30
@@ -351,6 +353,15 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let aliasMappingIDPrefix = "tag-alias|"
     private let redirectWriteFlagUserDefaultsKey = "feature.conversation.redirectWrites.enabled"
     private let redirectWriteFlagEnvironmentKey = "KEYSCRIBE_CONVERSATION_REDIRECT_WRITES_ENABLED"
+    private let expiredHandoffTopicAnchorNoiseTokens: Set<String> = [
+        "the", "and", "for", "with", "that", "this", "from", "into",
+        "about", "what", "when", "where", "which", "while", "just",
+        "only", "page", "screen", "project", "context", "goal",
+        "accomplished", "handoff", "user", "users", "app", "issue",
+        "fix", "check", "make", "using", "should", "would", "could",
+        "can", "not", "too", "very", "more", "less", "same",
+        "conversation", "history", "recent", "turns", "summary"
+    ]
     private let sqliteStoreFactory: () throws -> MemorySQLiteStore
     private let tagInferenceService: ConversationTagInferenceService
 
@@ -571,26 +582,43 @@ final class PromptRewriteConversationStore: ObservableObject {
             }
 
             if let expiredRecord {
-                if history.isEmpty {
-                    let handoffHistory = expiredHandoffHistory(
-                        from: expiredRecord,
-                        limit: normalizedRequestTurnLimit
-                    )
-                    if !handoffHistory.isEmpty {
-                        history = handoffHistory
-                        resolutionSource += "+expired-handoff"
-                        expiredHandoffRecordToConsume = expiredRecord
+                let reuseDecision = expiredHandoffReuseDecision(
+                    for: expiredRecord,
+                    userText: userText,
+                    hasActiveHistory: !history.isEmpty
+                )
+                if reuseDecision.shouldUse {
+                    if history.isEmpty {
+                        let handoffHistory = expiredHandoffHistory(
+                            from: expiredRecord,
+                            limit: normalizedRequestTurnLimit
+                        )
+                        if !handoffHistory.isEmpty {
+                            history = handoffHistory
+                            resolutionSource += "+expired-handoff"
+                            expiredHandoffRecordToConsume = expiredRecord
+                        }
+                    } else {
+                        let mergedWithSummary = historyWithPreviousSummary(
+                            history,
+                            from: expiredRecord,
+                            limit: normalizedRequestTurnLimit
+                        )
+                        if mergedWithSummary.count != history.count || mergedWithSummary != history {
+                            history = mergedWithSummary
+                            resolutionSource += "+expired-summary"
+                        }
                     }
                 } else {
-                    let mergedWithSummary = historyWithPreviousSummary(
-                        history,
-                        from: expiredRecord,
-                        limit: normalizedRequestTurnLimit
+                    resolutionSource += "+expired-skipped"
+                    CrashReporter.logInfo(
+                        """
+                        Prompt rewrite expired handoff skipped \
+                        reason=\(reuseDecision.reason) \
+                        age_seconds=\(reuseDecision.ageSeconds) \
+                        topic_anchor=\(reuseDecision.hasTopicAnchor)
+                        """
                     )
-                    if mergedWithSummary.count != history.count || mergedWithSummary != history {
-                        history = mergedWithSummary
-                        resolutionSource += "+expired-summary"
-                    }
                 }
             }
         }
@@ -2712,23 +2740,67 @@ final class PromptRewriteConversationStore: ObservableObject {
         limit: Int,
         snippetLimit: Int
     ) -> [String] {
+        guard limit > 0, !values.isEmpty else {
+            return []
+        }
+
+        struct RankedSnippet {
+            let text: String
+            let index: Int
+            let score: Double
+        }
+
+        let normalizedCount = max(1, values.count)
+        let rankedCandidates: [RankedSnippet] = values.enumerated().compactMap { index, value in
+            let normalized = collapsedWhitespace(value)
+            guard !normalized.isEmpty else { return nil }
+            let concise = snippet(normalized, limit: snippetLimit)
+            guard isMeaningfulCompactionSnippet(concise) else { return nil }
+            let keywordCount = min(
+                10,
+                MemoryTextNormalizer.keywords(
+                    from: concise.lowercased(),
+                    limit: 16
+                ).count
+            )
+            let recencyWeight = Double(index + 1) / Double(normalizedCount)
+            let keywordWeight = Double(keywordCount) / 10.0
+            let score = (recencyWeight * 0.75) + (keywordWeight * 0.25)
+            return RankedSnippet(text: concise, index: index, score: score)
+        }
+
+        let ranked = rankedCandidates.sorted { lhs, rhs in
+            if lhs.score == rhs.score {
+                return lhs.index > rhs.index
+            }
+            return lhs.score > rhs.score
+        }
+
         var output: [String] = []
         var seen: Set<String> = []
-
-        for value in values {
-            let normalized = collapsedWhitespace(value)
-            guard !normalized.isEmpty else { continue }
-            let concise = snippet(normalized, limit: snippetLimit)
-            let key = concise.lowercased()
-            guard !seen.contains(key) else { continue }
-            seen.insert(key)
-            output.append(concise)
+        for candidate in ranked {
+            let key = candidate.text.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            output.append(candidate.text)
             if output.count >= limit {
                 break
             }
         }
 
         return output
+    }
+
+    private func isMeaningfulCompactionSnippet(_ value: String) -> Bool {
+        let normalized = collapsedWhitespace(value)
+        guard normalized.count >= 6 else { return false }
+        guard normalized.unicodeScalars.contains(where: { CharacterSet.letters.contains($0) }) else {
+            return false
+        }
+        let tokenCount = MemoryTextNormalizer.keywords(
+            from: normalized.lowercased(),
+            limit: 12
+        ).count
+        return tokenCount >= 2
     }
 
     private func normalizedTurnLimit(_ value: Int) -> Int {
@@ -2896,6 +2968,102 @@ final class PromptRewriteConversationStore: ObservableObject {
         }
 
         return output
+    }
+
+    private func expiredHandoffReuseDecision(
+        for record: ExpiredConversationContextRecord,
+        userText: String,
+        hasActiveHistory: Bool
+    ) -> (shouldUse: Bool, reason: String, ageSeconds: Int, hasTopicAnchor: Bool) {
+        let ageSeconds = max(0, Int(Date().timeIntervalSince(record.expiredAt).rounded()))
+        let hasTopicAnchor = hasExplicitExpiredTopicAnchor(
+            userText: userText,
+            record: record
+        )
+        if hasTopicAnchor {
+            return (true, "explicit-topic-anchor", ageSeconds, true)
+        }
+
+        let freshnessThreshold = hasActiveHistory
+            ? expiredSummaryMergeNoAnchorMaxAgeSeconds
+            : expiredHandoffNoAnchorMaxAgeSeconds
+        if Double(ageSeconds) <= freshnessThreshold {
+            return (true, "fresh", ageSeconds, false)
+        }
+
+        return (false, "stale-without-anchor", ageSeconds, false)
+    }
+
+    private func hasExplicitExpiredTopicAnchor(
+        userText: String,
+        record: ExpiredConversationContextRecord
+    ) -> Bool {
+        let userTokenSet = expiredHandoffTopicAnchorTokenSet(from: userText, limit: 28)
+        guard userTokenSet.count >= 2 else {
+            return false
+        }
+
+        let archiveCorpus = expiredHandoffTopicAnchorCorpus(record: record)
+        let archiveTokenSet = expiredHandoffTopicAnchorTokenSet(
+            from: archiveCorpus,
+            limit: 120
+        )
+        guard !archiveTokenSet.isEmpty else {
+            return false
+        }
+
+        let sharedTokens = userTokenSet.intersection(archiveTokenSet)
+        if sharedTokens.count >= 2 {
+            return true
+        }
+        if sharedTokens.contains(where: { $0.count >= 9 }) {
+            return true
+        }
+
+        let overlapRatio = Double(sharedTokens.count) / Double(max(1, userTokenSet.count))
+        return overlapRatio >= 0.35
+    }
+
+    private func expiredHandoffTopicAnchorCorpus(record: ExpiredConversationContextRecord) -> String {
+        let normalizedSummary = collapsedWhitespace(record.summaryText)
+        let recentArchiveTurns = decodedArchivedTurns(from: record.recentTurnsJSON)
+        let archiveTurns = recentArchiveTurns.isEmpty
+            ? decodedArchivedTurns(from: record.rawTurnsJSON)
+            : recentArchiveTurns
+
+        var segments: [String] = []
+        if !normalizedSummary.isEmpty {
+            segments.append(normalizedSummary)
+        }
+        for turn in archiveTurns.suffix(8) {
+            if !turn.userText.isEmpty {
+                segments.append(turn.userText)
+            }
+            if !turn.assistantText.isEmpty {
+                segments.append(turn.assistantText)
+            }
+        }
+        return segments.joined(separator: " ")
+    }
+
+    private func expiredHandoffTopicAnchorTokenSet(from text: String, limit: Int) -> Set<String> {
+        let normalized = collapsedWhitespace(text).lowercased()
+        guard !normalized.isEmpty else {
+            return []
+        }
+
+        let rawTokens = MemoryTextNormalizer.keywords(
+            from: normalized,
+            limit: max(limit * 2, limit)
+        )
+        let filtered = rawTokens.filter { token in
+            guard token.count >= 3 else { return false }
+            if expiredHandoffTopicAnchorNoiseTokens.contains(token) {
+                return false
+            }
+            return !token.unicodeScalars.allSatisfy(CharacterSet.decimalDigits.contains)
+        }
+        return Set(filtered.prefix(limit))
     }
 
     private func historyWithPreviousSummary(
@@ -4408,13 +4576,19 @@ enum PromptRewriteConversationContextResolver {
         topBarProject: String?,
         sidebarProject: String?
     ) -> String? {
-        let candidates = [topBarProject, sidebarProject]
-            .compactMap(normalizedLabel)
-            .compactMap(normalizedProjectName)
-        if let bestNonVCS = candidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
-            return bestNonVCS
+        let normalizedTop = normalizedLabel(topBarProject).flatMap(normalizedProjectName)
+        let normalizedSidebar = normalizedLabel(sidebarProject).flatMap(normalizedProjectName)
+
+        // Sidebar source is generally the most stable project signal in Codex.
+        if let normalizedSidebar,
+           !isLikelyVersionControlReferenceLabel(normalizedSidebar) {
+            return normalizedSidebar
         }
-        return candidates.first
+        if let normalizedTop,
+           !isLikelyVersionControlReferenceLabel(normalizedTop) {
+            return normalizedTop
+        }
+        return normalizedSidebar ?? normalizedTop
     }
 
     private static func inferCodexTopBarSelection(
@@ -4425,14 +4599,19 @@ enum PromptRewriteConversationContextResolver {
         }
         let entries = codexDirectChildLabels(of: controlsGroup)
         let thread = codexThreadNearTopBarControls(controlsGroup, project: nil)
-        let project = preferredCodexProjectCandidate(
-            topBarProject: codexProjectFromTopBarControls(entries),
-            sidebarProject: codexProjectNearTopBarControls(
-                from: windowElement,
-                controlsGroup,
-                thread: thread
-            )
+        let topBarProject = codexProjectFromTopBarControls(entries)
+        let nearControlsProject = codexProjectNearTopBarControls(
+            from: windowElement,
+            controlsGroup,
+            thread: thread
         )
+        let project = topBarProject ?? {
+            guard let nearControlsProject else { return nil }
+            guard !isLikelyVersionControlReferenceLabel(nearControlsProject) else {
+                return nil
+            }
+            return nearControlsProject
+        }()
         if project == nil, thread == nil {
             return nil
         }
@@ -5045,6 +5224,12 @@ enum PromptRewriteConversationContextResolver {
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
             .lowercased()
         guard !normalized.isEmpty else { return false }
+
+        // Codex top-bar branch selector can expose labels such as "Hand off"/"Handoff".
+        // Treat these as non-project references so sidebar/workspace project names win.
+        if normalized.range(of: #"^hand[\s-]?off$"#, options: .regularExpression) != nil {
+            return true
+        }
 
         // Pull request / issue style badges.
         if normalized.range(

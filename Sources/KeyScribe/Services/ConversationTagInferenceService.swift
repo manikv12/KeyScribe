@@ -145,6 +145,10 @@ final class ConversationTagInferenceService {
            let projectFromPath = derivePathLabel(from: path) {
             return projectFromPath
         }
+        if let path = extractPathLikeValue(from: supplementalText),
+           let projectFromPath = derivePathLabel(from: path) {
+            return projectFromPath
+        }
 
         if isCodexApp(bundleID: bundleID, appName: appName) {
             if let codexProject = firstMatch(

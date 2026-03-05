@@ -1003,6 +1003,35 @@ final class CloudTranscriber: NSObject {
             error.localizedDescription.contains("error -10868")
 
         if isFormatNotSupported {
+            let preferredRecoveryUID: String?
+            if !autoDetectMicrophone, !selectedMicrophoneUID.isEmpty {
+                preferredRecoveryUID = selectedMicrophoneUID
+            } else {
+                preferredRecoveryUID = MicrophoneManager.builtInMicrophoneUID()
+            }
+
+            if let recoveredUID = MicrophoneManager.recoverDefaultInputDevice(preferredUID: preferredRecoveryUID) {
+                let recoveredName = MicrophoneManager.availableMicrophones()
+                    .first(where: { $0.uid == recoveredUID })?
+                    .name ?? recoveredUID
+
+                if !autoDetectMicrophone,
+                   !selectedMicrophoneUID.isEmpty,
+                   !bypassManualMicSelectionUntilSettingsChange {
+                    bypassManualMicSelectionUntilSettingsChange = true
+                    CrashReporter.logWarning(
+                        "Cloud audio setup recovery enabled: bypassing manual microphone selection after format error code=\(error.code) recoveredUID=\(recoveredUID)"
+                    )
+                } else {
+                    CrashReporter.logWarning(
+                        "Cloud audio setup recovery switched default input after format error code=\(error.code) recoveredUID=\(recoveredUID)"
+                    )
+                }
+
+                onHUDAlert?(.micFallbackToDefault)
+                return "Microphone route recovered (\(recoveredName)). Try again."
+            }
+
             if !autoDetectMicrophone,
                !selectedMicrophoneUID.isEmpty,
                !bypassManualMicSelectionUntilSettingsChange {
