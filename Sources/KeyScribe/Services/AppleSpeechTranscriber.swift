@@ -9,7 +9,7 @@ final class AppleSpeechTranscriber: NSObject {
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
-    private let audioEngine = AVAudioEngine()
+    private var audioEngine = AVAudioEngine()
     private var recognitionTask: SFSpeechRecognitionTask?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionEngine: SFSpeechRecognizer?
@@ -255,12 +255,13 @@ final class AppleSpeechTranscriber: NSObject {
             return false
         }
 
-        let inputNode = audioEngine.inputNode
+        let inputNode = rebuildAudioEngine()
 
-        // Reset the engine before installing a fresh tap to avoid stale I/O format state
-        // when input devices/rates have changed between sessions.
-        audioEngine.stop()
-        audioEngine.reset()
+        // Rebuild the engine before installing a fresh tap so the input node picks up
+        // the current hardware format after device or sample-rate changes.
+        CrashReporter.logInfo(
+            "Apple Speech audio input prepared hardwareFormat=\(inputNode.inputFormat(forBus: 0)) autoMic=\(autoDetectMicrophone)"
+        )
 
         inputNode.removeTap(onBus: 0)
         // Use nil format so AVAudioEngine uses the node bus format directly.
@@ -313,6 +314,16 @@ final class AppleSpeechTranscriber: NSObject {
         }
         pendingFinalizeWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + finalizeDelaySeconds, execute: workItem)
+    }
+
+    private func rebuildAudioEngine() -> AVAudioInputNode {
+        let previousEngine = audioEngine
+        previousEngine.stop()
+        previousEngine.reset()
+        previousEngine.inputNode.removeTap(onBus: 0)
+
+        audioEngine = AVAudioEngine()
+        return audioEngine.inputNode
     }
 
     private func finalizeStop(emitFinalText: Bool) {

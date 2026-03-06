@@ -5,8 +5,8 @@
 <h1 align="center">KeyScribe</h1>
 
 <p align="center">
-  Fast dictation for macOS — types directly into your active app.<br/>
-  Local-first, AI-enhanced, open source.
+  A macOS menu-bar dictation app that inserts text into your current app.<br/>
+  Local-first speech, optional AI help, and simple setup.
 </p>
 
 <p align="center">
@@ -18,197 +18,267 @@
 
 ---
 
-## What is KeyScribe?
+## What KeyScribe Is
 
-KeyScribe is a macOS menu-bar app that transcribes your voice and types the result directly into whatever app you're using — no copy-pasting, no switching windows.
+KeyScribe is a menu-bar app for macOS.
 
-Press a shortcut, speak, and your words appear. That's it.
+You press a shortcut, speak, and KeyScribe inserts the text into the app you are using right now. It is built for fast dictation, low friction, and local-first use.
 
-It runs entirely as a menu-bar utility (no Dock icon). Everything is stored locally on your Mac — no account, no sign-in, no telemetry.
+Important behavior today:
 
----
-
-## User Guide
-
-For a full step-by-step walkthrough (setup, permissions, daily workflows, AI features, updates, and troubleshooting), see:
-
-- [KeyScribe User Guide](Docs/User-Guide.md)
-
----
-
-## Features
-
-### 🎙️ Transcription
-
-- **Apple Speech** — works out of the box, local-first by default using `SFSpeechRecognizer`
-- **Whisper.cpp** — fully on-device using downloaded model files (`tiny.en`, `base.en`, `small.en`). No network dependency once the model is installed.
-- Automatic text cleanup: spacing, punctuation, capitalization, duplicate-word removal
-- Transcript history: last 20 entries stored locally
-- Paste last transcript instantly with `⌥⌘V`
-
-### ✨ AI Rewrite (optional)
-
-Optionally refine your dictated text using an AI model before it's inserted. Supports:
-
-| Provider | Notes |
-|---|---|
-| **Ollama (Local)** | Fully on-device, no API key needed — one-click setup built in |
-| **OpenAI** | API key or OAuth |
-| **Anthropic (Claude)** | API key |
-| **Google Gemini** | API key |
-| **Groq** | API key |
-| **OpenRouter** | API key |
-
-Rewrite strength is adjustable: `Light`, `Balanced`, or `Strong`.
-
-### 🧠 Conversation Context
-
-KeyScribe tracks conversation history per app and thread so AI rewrites stay coherent with what you've already said — even across pauses and multiple dictation bursts.
-
-- Infers project, identity, and thread automatically from screen context
-- Maintains per-app history with configurable timeout and turn limits
-- Cross-IDE context linking (e.g. your editor and your AI assistant treated as one session)
-
-### 🗂️ AI Memory Studio
-
-A built-in dashboard (accessible from Settings → AI Models → Open AI Studio) to:
-
-- View conversation thread history and pattern stats
-- Manage context mappings across apps
-- Inspect how conversation context is resolved per app and thread
-
-> **Note:** Memory indexing (reading local AI tool files from Claude, Cursor, Copilot, etc.) is implemented but currently disabled by default as a feature flag. Conversation tracking and AI rewrite are fully active.
+- It runs as a menu-bar utility with no Dock icon.
+- The menu-bar popover gives quick actions for dictation, history, AI Studio, and Settings.
+- It can insert text directly, paste through a temporary clipboard, or fall back to typed keystrokes.
+- It keeps recent transcript history on your Mac.
+- It can learn from quick fixes you make after insertion.
+- It supports both local and cloud-based speech/AI flows.
 
 ---
 
-## Shortcuts
+## Current Features
 
-| Action | Default shortcut |
-|---|---|
-| Hold-to-talk (burst dictation) | `⌥⌘Space` |
-| Toggle continuous dictation | `⌃⌥⌘Space` |
-| Paste last transcript | `⌥⌘V` |
+### Dictation
 
-All shortcuts are customizable in Settings.
+- **Apple Speech** with selectable recognition mode (`Local Only`, `Cloud Only`, `Automatic`)
+- **Local `whisper.cpp`** with curated model downloads, Core ML support, and idle unload controls
+- **Cloud transcription providers**:
+  - OpenAI
+  - Groq
+  - Deepgram
+  - Google Gemini (AI Studio)
+
+### Text Insertion
+
+- Direct Accessibility-based insertion when possible
+- Privacy-friendly transient clipboard fallback when clipboard copy is off
+- Optional "also copy transcript to system clipboard" mode
+- Hold-to-talk and continuous dictation modes
+- Paste last transcript shortcut
+- Transcript history window with search, copy, delete, and reinsert actions
+
+### AI Prompt Assistant
+
+- Optional AI prompt correction before insertion
+- Suggestion preview when auto-insert is not used
+- Optional auto-insert for high-confidence suggestions
+- Optional Markdown-preserving output for structured suggestions
+- Rewrite provider options:
+  - Ollama (local)
+  - OpenAI
+  - Anthropic
+  - Google AI Studio (Gemini)
+  - Groq
+  - OpenRouter
+- Built-in **AI Studio** for provider setup, model selection, timeouts, and conversation controls
+- Rewrite style presets such as `Balanced`, `Formal`, `Casual`, `Architect`, and more
+- OpenAI and Anthropic OAuth support, plus API-key support where needed
+
+### Conversation and Memory Tools
+
+- Optional conversation-aware rewrite history with timeout and turn-limit controls
+- Pinned or automatic rewrite context selection in AI Studio
+- Cross-IDE conversation sharing for matching coding contexts
+- Context mappings and conversation inspection are available in AI Studio
+- External memory indexing exists, but it is still behind the `KEYSCRIBE_FEATURE_AI_MEMORY=1` feature flag
+
+### Quality-of-Life Features
+
+- Adaptive corrections that learn from your edits
+- Custom correction management
+- Configurable sounds, waveform themes, and app chrome themes
+- Sparkle-based update checks from the app
 
 ---
 
-## Local AI Setup (no API key needed)
+## Privacy Notes
 
-KeyScribe includes a zero-terminal setup for local AI — no API key, no account, no command line.
-
-1. Open **Settings → AI Models → Open AI Studio**
-2. Go to **Prompt Models**
-3. Under **Local AI Setup**, pick a model and click **Install Selected Model**
-4. Wait for the wizard to complete: `Select` → `Install Runtime` → `Download` → `Verify` → `Done`
-
-KeyScribe auto-configures Ollama with your chosen model. AI rewrite and conversation tracking are enabled automatically.
-
-**Recovery:** If local AI becomes unavailable, open AI Studio → Prompt Models → **Repair Local AI**.
-
----
-
-## How text insertion works
-
-1. If Accessibility insertion is explicitly enabled: attempts direct AX text insert
-2. If clipboard copy mode is **ON**: writes to clipboard, sends paste shortcut, falls back to typed unicode events
-3. If clipboard copy mode is **OFF** (default): uses transient clipboard — pastes, then restores your prior clipboard contents
-
-The default mode keeps dictation text out of persistent clipboard managers.
-
----
-
-## Privacy
-
-- No account required
-- No telemetry or analytics
-- All data (transcripts, conversation history, settings) stored locally on your Mac
-- Clipboard copy mode is OFF by default — dictation does not pollute clipboard history
-- No content is sent anywhere without your explicit AI provider configuration
+- No account is required for local dictation
+- No telemetry is enabled by default
+- Settings, transcript history, and learned corrections stay on your Mac
+- API keys and OAuth sessions are stored in macOS Keychain
+- If you choose cloud transcription or cloud rewrite providers, your audio/text is sent to that provider
+- Clipboard copying is off by default, so KeyScribe tries to avoid leaving dictation in clipboard history
+- Local crash logs stay on disk in `~/Library/Logs/KeyScribe/`
 
 ---
 
 ## Requirements
 
-- macOS 13.3 or later
-- **Microphone** and **Accessibility** permissions required
-- **Speech Recognition** permission required only when using Apple Speech engine
+- macOS 13.3 or newer
+- **Microphone** permission
+- **Accessibility** permission for reliable insertion and global shortcuts
+- **Speech Recognition** permission when using the Apple Speech engine
+
+You may also need internet access for:
+
+- cloud transcription
+- cloud rewrite providers
+- downloading `whisper.cpp` models
+- local AI runtime/model setup
+- app update checks
 
 ---
 
-## Build & Install
+## Default Shortcuts
+
+| Action | Default shortcut |
+|---|---|
+| Hold-to-talk | `⌥⌘Space` |
+| Toggle continuous dictation | `⌃⌥⌘Space` |
+| Paste last transcript | `⌥⌘V` |
+
+All shortcuts can be changed in Settings.
+
+---
+
+## Quick Start
+
+1. Download the latest release from [GitHub Releases](https://github.com/manikv12/KeyScribe/releases).
+2. Open `KeyScribe.app`.
+3. Grant **Accessibility** and **Microphone** access when prompted.
+4. If you use **Apple Speech**, also grant **Speech Recognition**.
+5. Open **Settings** from the menu bar.
+6. Choose your transcription engine:
+   - `Apple Speech` for built-in system speech
+   - `whisper.cpp` for fully local speech after model install
+   - `Cloud Providers` for OpenAI/Groq/Deepgram/Gemini transcription
+7. If you only want plain dictation, you can turn off **AI prompt correction** in **Settings -> AI & Models**.
+8. If you want AI rewrite, open **AI Studio** and either:
+   - connect a cloud provider, or
+   - install local AI with the built-in Ollama setup flow
+
+For a step-by-step walkthrough, see the [User Guide](Docs/User-Guide.md).
+
+---
+
+## Build From Source
+
+### Prerequisites
+
+- This repo is a **Swift Package Manager** macOS app
+- Xcode 15+ or Apple developer tools with Swift 5.9 support
+- Node/npm only if you want to create a DMG with `--make-dmg`
+- A Developer ID certificate plus Apple notarization credentials only if you want a public signed release
+
+### Main build
 
 ```bash
 ./build.sh
 ```
 
-Builds `dist/KeyScribe.app` and `dist/KeyScribe.dmg` (drag-and-drop installer). Whisper XCFramework is fetched automatically if missing.
+This creates:
+
+- `dist/KeyScribe.app`
+
+What `build.sh` does today:
+
+- Downloads `Vendor/Whisper/whisper.xcframework` automatically if it is missing
+- Runs `swift build -c release`
+- Bundles the app into `dist/KeyScribe.app`
+- Uses ad-hoc signing by default unless `DEVELOPER_ID` is set
+
+### Useful build options
 
 ```bash
-./build.sh --install     # build + install to /Applications
-./build.sh --no-dmg      # skip DMG generation
+./build.sh --install
+./build.sh --make-dmg
 ```
 
-**Public distribution (notarized):**
+- `--install` copies the app to `/Applications/KeyScribe.app`
+- `--make-dmg` also creates `dist/KeyScribe.dmg`
+- `--install` also resets Accessibility permission, so you will need to grant it again after install
+
+### Signed / distribution builds
 
 ```bash
 export DEVELOPER_ID="Your Name (TEAMID)"
-./build.sh
+./build.sh --make-dmg
 Scripts/notarize.sh
 ```
 
+There is also a project-specific helper:
+
+```bash
+./build-local.sh --make-dmg
+```
+
+`Scripts/notarize.sh` notarizes `dist/KeyScribe.dmg` and expects these environment variables:
+
+- `APPLE_ID`
+- `APPLE_TEAM_ID`
+- `APPLE_APP_PASSWORD`
+
 ---
 
-## Project Structure
+## Tests
 
+Run package tests with:
+
+```bash
+swift test
 ```
-Sources/KeyScribe/
-├── App.swift                          # App lifecycle, menu bar, permission flow
-├── Services/
-│   ├── SpeechTranscriber.swift        # Transcription engine router
-│   ├── AppleSpeechTranscriber.swift   # Apple Speech pipeline
-│   ├── WhisperTranscriber.swift       # Whisper.cpp pipeline
-│   ├── WhisperModelCatalog.swift      # Curated model metadata
-│   ├── WhisperModelManager.swift      # Model download/install/delete
-│   ├── TextInserter.swift             # Insertion engine + fallbacks
-│   ├── HotkeyManager.swift            # Hold-to-talk and toggle hotkeys
-│   ├── TranscriptHistoryStore.swift   # Local transcript history
-│   ├── PromptRewriteService.swift     # AI rewrite orchestration
-│   ├── PromptRewriteConversationStore.swift  # Conversation history
-│   ├── ConversationContextResolverV2.swift   # Context + thread resolution
-│   ├── ConversationTagInferenceService.swift # Project/identity inference
-│   └── Memory/
-│       ├── MemoryIndexingService.swift        # Memory scan + indexing
-│       ├── MemorySQLiteStore.swift            # Local SQLite persistence
-│       ├── ConversationAgentStateService.swift # Per-thread agent state
-│       └── MemoryModels.swift                 # Data models
-└── Views/
-    ├── AIMemoryStudioView.swift        # Memory + conversation dashboard
-    ├── PromptRewriteHUD.swift          # Rewrite preview HUD
-    └── StatusBarPopoverView.swift      # Menu bar popover
+
+Run the smoke/regression suite with:
+
+```bash
+Scripts/run-tests.sh
 ```
+
+Run insertion reliability checks directly with:
+
+```bash
+Scripts/run-insertion-reliability.sh --regression
+```
+
+The repo also contains `XCTest` coverage for some conversation and settings behavior in `Tests/KeyScribeTests/`.
 
 ---
 
 ## Diagnostics
 
-Enable insertion diagnostics for debugging:
+If insertion is not behaving the way you expect, you can enable insertion diagnostics:
 
-- **Settings → General → Enable insertion diagnostics**
-- Or set `KEYSCRIBE_INSERTION_DIAGNOSTICS=1`
-- Log output: `/tmp/keyscribe-insertion-diagnostics.log`
+- Turn it on in app settings, or set `KEYSCRIBE_INSERTION_DIAGNOSTICS=1`
+- Default log path: `/tmp/keyscribe-insertion-diagnostics.log`
+- You can override the log path with `KEYSCRIBE_INSERTION_DIAGNOSTICS_PATH`
 
-Run test suite:
-
-```bash
-Scripts/run-tests.sh
-Scripts/run-insertion-reliability.sh --regression
-```
+Crash logs, when present, are stored locally at `~/Library/Logs/KeyScribe/crash.log`.
 
 ---
 
-## Reset permissions (dev/testing)
+## Repo Layout
 
-```bash
-sudo tccutil reset Accessibility com.keyscribe.KeyScribe
+```text
+Sources/KeyScribe/      App code
+Resources/              Info.plist, icons, entitlements
+Scripts/                Build, test, release, and utility scripts
+Tests/KeyScribeTests/   XCTest coverage
+Docs/                   User-facing docs
+Wiki/                   Extra product notes
+Vendor/Whisper/         Bundled whisper.cpp XCFramework
 ```
+
+Main app areas:
+
+- `Sources/KeyScribe/App.swift` wires the app lifecycle, menu bar, settings, and windows.
+- `Sources/KeyScribe/Services/` contains transcription, insertion, AI, memory, and settings logic.
+- `Sources/KeyScribe/Views/` contains SwiftUI screens such as the status popover and AI Studio.
+- `Sources/KeyScribe/Support/` contains feature flags, permissions, and window helpers.
+
+---
+
+## Docs
+
+- [User Guide](Docs/User-Guide.md)
+- [Wiki Home](Wiki/Home.md)
+- [Quick Start Wiki](Wiki/Quick-Start.md)
+- [Privacy-First Design](Wiki/Privacy-First-Design.md)
+
+---
+
+## Current State Notes
+
+- The app currently supports three speech paths: Apple Speech, local `whisper.cpp`, and cloud providers.
+- AI Studio is already integrated and is the main place for rewrite provider setup and local AI setup.
+- The advanced external memory-indexing workflow is present in the codebase, but it is still gated behind `KEYSCRIBE_FEATURE_AI_MEMORY=1`.
+- The old README said the default build created both `.app` and `.dmg`; today, the default build creates the `.app`, and DMG creation is opt-in with `--make-dmg`.

@@ -12,7 +12,7 @@ final class WhisperTranscriber: NSObject {
     var onAudioLevel: ((Float) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
-    private let audioEngine = AVAudioEngine()
+    private var audioEngine = AVAudioEngine()
     private let sampleQueue = DispatchQueue(label: "KeyScribe.WhisperSamples")
     private var transcriptionQueue = DispatchQueue(label: "KeyScribe.WhisperTranscription")
     private var transcriptionQueueGeneration = 0
@@ -242,7 +242,11 @@ final class WhisperTranscriber: NSObject {
         isRecording = true
         onRecordingStateChange?(true)
 
-        let inputNode = audioEngine.inputNode
+        let inputNode = rebuildAudioEngine()
+        let hardwareFormat = inputNode.inputFormat(forBus: 0)
+        CrashReporter.logInfo(
+            "Whisper audio input prepared hardwareFormat=\(hardwareFormat) autoMic=\(autoDetectMicrophone)"
+        )
 
         guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
         else {
@@ -260,8 +264,6 @@ final class WhisperTranscriber: NSObject {
         var converterInputSignature: String?
         var converterFailureHandled = false
 
-        audioEngine.stop()
-        audioEngine.reset()
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
@@ -366,6 +368,16 @@ final class WhisperTranscriber: NSObject {
         }
 
         completeStopRecording(emitFinalText: emitFinalText)
+    }
+
+    private func rebuildAudioEngine() -> AVAudioInputNode {
+        let previousEngine = audioEngine
+        previousEngine.stop()
+        previousEngine.reset()
+        previousEngine.inputNode.removeTap(onBus: 0)
+
+        audioEngine = AVAudioEngine()
+        return audioEngine.inputNode
     }
 
     private func completeStopRecording(emitFinalText: Bool) {
