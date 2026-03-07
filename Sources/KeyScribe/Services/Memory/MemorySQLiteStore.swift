@@ -865,14 +865,26 @@ final class MemorySQLiteStore {
         })
     }
 
-    func deleteConversationThread(id: String) throws {
+    func deleteConversationThread(
+        id: String,
+        preserveRedirects: Bool = false
+    ) throws {
+        try execute(sql: "DELETE FROM conversation_turns WHERE thread_id = ?;", bind: { statement in
+            self.bind(id, at: 1, in: statement)
+        })
         try execute(sql: "DELETE FROM conversation_threads WHERE id = ?;", bind: { statement in
             self.bind(id, at: 1, in: statement)
         })
-        try execute(sql: "DELETE FROM conversation_thread_redirects WHERE old_thread_id = ? OR new_thread_id = ?;", bind: { statement in
-            self.bind(id, at: 1, in: statement)
-            self.bind(id, at: 2, in: statement)
-        })
+        if preserveRedirects {
+            try execute(sql: "DELETE FROM conversation_thread_redirects WHERE new_thread_id = ?;", bind: { statement in
+                self.bind(id, at: 1, in: statement)
+            })
+        } else {
+            try execute(sql: "DELETE FROM conversation_thread_redirects WHERE old_thread_id = ? OR new_thread_id = ?;", bind: { statement in
+                self.bind(id, at: 1, in: statement)
+                self.bind(id, at: 2, in: statement)
+            })
+        }
     }
 
     func clearAllConversationThreads() throws {

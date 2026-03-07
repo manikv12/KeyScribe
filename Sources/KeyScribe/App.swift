@@ -689,6 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private let transcriber = SpeechTranscriber()
     private let whisperModelManager = WhisperModelManager.shared
     private let settings = SettingsStore.shared
+    private let automationAPICoordinator = AutomationAPICoordinator.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     private let promptRewriteService = PromptRewriteService.shared
     private let promptRewriteConversationStore = PromptRewriteConversationStore.shared
@@ -936,6 +937,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self?.insertText(text)
             }
         )
+        automationAPICoordinator.setNotificationInteractionHandler { [weak self] in
+            self?.windowCoordinator?.openSettingsWindow()
+        }
 
         settings.refreshMicrophones(notifyChange: false)
         syncWhisperModelSelectionIfNeeded()
@@ -973,11 +977,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         transcriber.onStatusUpdate = { [weak self] message in
             Task { @MainActor in
                 guard let self else { return }
-                let status = DictationUIStatus.fromTranscriberMessage(message)
-                if status == .finalizing {
-                    self.playDictationFeedbackSound(.processing)
+                let presentation = TranscriberStatusInterpreter.interpret(message)
+
+                switch presentation {
+                case .persistent(let status):
+                    if status == .finalizing {
+                        self.playDictationFeedbackSound(.processing)
+                    }
+                    self.setUIStatus(status)
+
+                case .transientFailure(let failureMessage):
+                    self.waveform.flashEvent(
+                        message: failureMessage,
+                        symbolName: "exclamationmark.triangle.fill",
+                        duration: 3.2
+                    )
+                    if !self.isDictating {
+                        self.setUIStatus(.ready)
+                    }
                 }
-                self.setUIStatus(status)
             }
         }
 
@@ -1031,11 +1049,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             Task { @MainActor in
                 self?.isDictating = isRecording
                 if !isRecording {
-        if let currentMode = self?.dictationInputMode {
+                    self?.currentAudioLevel = 0
+                    if let currentMode = self?.dictationInputMode {
                         self?.dictationInputMode = DictationInputModeStateMachine.onRecordingEnded(currentMode)
                     }
                     self?.stopStatusIconAnimation()
-                    self?.setUIStatus(.ready)
+                    self?.updateMenuState()
                 } else {
                     self?.startStatusIconAnimation()
                     self?.updateMenuState()
@@ -1055,6 +1074,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self?.scheduleApplySettingsChanges()
             }
         }
+
+        automationAPICoordinator.applySettings(settings)
 
         workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
@@ -1137,6 +1158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         settingsApplyWorkItem?.cancel()
         settingsApplyWorkItem = nil
         settings.onChange = nil
+        automationAPICoordinator.stop()
         adaptiveCorrectionObserver?.cancel()
         adaptiveCorrectionObserver = nil
         pasteLastTranscriptHotkeyManager?.stop()
@@ -1656,6 +1678,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
         }
 
+        automationAPICoordinator.applySettings(settings)
         lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
         updateMenuState()
     }
@@ -3110,6 +3133,7 @@ struct SettingsView: View {
         case shortcuts
         case speech
         case aiModels
+        case integrations
         case corrections
         case about
 
@@ -3121,6 +3145,7 @@ struct SettingsView: View {
             case .shortcuts: return "Shortcuts"
             case .speech: return "Speech & Input"
             case .aiModels: return "AI & Models"
+            case .integrations: return "Integrations"
             case .corrections: return "Corrections"
             case .about: return "About & Permissions"
             }
@@ -3132,6 +3157,7 @@ struct SettingsView: View {
             case .shortcuts: return "Hold-to-talk and continuous toggle keys"
             case .speech: return "Microphone, engine, whisper models, timing, and text quality"
             case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
+            case .integrations: return "Local automation and agent notifications"
             case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
@@ -3143,6 +3169,7 @@ struct SettingsView: View {
             case .shortcuts: return "keyboard"
             case .speech: return "waveform.and.mic"
             case .aiModels: return "shippingbox.fill"
+            case .integrations: return "point.3.connected.trianglepath.dotted"
             case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"
             }
@@ -3158,6 +3185,8 @@ struct SettingsView: View {
                 return Color(red: 0.27, green: 0.72, blue: 0.54)
             case .aiModels:
                 return Color(red: 0.45, green: 0.56, blue: 0.92)
+            case .integrations:
+                return Color(red: 0.84, green: 0.52, blue: 0.28)
             case .corrections:
                 return Color(red: 0.21, green: 0.70, blue: 0.73)
             case .about:
@@ -3175,6 +3204,8 @@ struct SettingsView: View {
                 return ["recognition", "engine", "punctuation", "context", "cleanup", "delay", "text quality", "speech", "whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large"]
             case .aiModels:
                 return ["ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "style", "conversation", "history"]
+            case .integrations:
+                return ["integrations", "automation", "api", "localhost", "claude", "codex", "cloud", "hooks", "notification", "speech", "sound", "token", "port"]
             case .corrections:
                 return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
             case .about:
@@ -3186,6 +3217,11 @@ struct SettingsView: View {
     private enum ShortcutCaptureTarget {
         case holdToTalk
         case continuousToggle
+    }
+
+    private enum IntegrationsPage {
+        case overview
+        case automationNotifications
     }
 
     private struct ShortcutBinding: Equatable {
@@ -3213,6 +3249,21 @@ struct SettingsView: View {
         let title: String
         let detail: String
         let keywords: [String]
+        let integrationsPage: IntegrationsPage?
+
+        init(
+            section: SettingsSection,
+            title: String,
+            detail: String,
+            keywords: [String],
+            integrationsPage: IntegrationsPage? = nil
+        ) {
+            self.section = section
+            self.title = title
+            self.detail = detail
+            self.keywords = keywords
+            self.integrationsPage = integrationsPage
+        }
 
         var id: String {
             "\(section.title)-\(title)"
@@ -3239,7 +3290,9 @@ struct SettingsView: View {
     @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
     @StateObject private var localAISetupService = LocalAISetupService.shared
     @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
+    @StateObject private var automationAPICoordinator = AutomationAPICoordinator.shared
     @State private var selectedSection: SettingsSection = .essentials
+    @State private var selectedIntegrationsPage: IntegrationsPage = .overview
     @State private var searchQuery = ""
     @State private var hoveredSection: SettingsSection?
     @State private var isCapturingShortcut = false
@@ -3293,6 +3346,11 @@ struct SettingsView: View {
     @State private var showingSourceFoldersSheet = false
     @State private var showingCorrectionsListSheet = false
     @State private var correctionsSearchQuery = ""
+    @State private var automationActionMessage: String?
+    @State private var installClaudeNotificationHook = false
+    @State private var installClaudeStopHook = false
+    @State private var installClaudeSubagentStopHook = false
+    @State private var installedClaudeHookOptions: Set<ClaudeHookInstallOption> = []
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let settingsSidebarWidth: CGFloat = 304
     private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
@@ -3404,13 +3462,16 @@ struct SettingsView: View {
         .onChange(of: searchQuery) { _ in
             guard !trimmedSearchQuery.isEmpty else { return }
             if let firstMatch = filteredSearchEntries.first {
-                selectedSection = firstMatch.section
+                navigateToSearchEntry(firstMatch)
             } else if let firstSection = filteredSections.first {
                 selectedSection = firstSection
             }
         }
         .onChange(of: selectedSection) { _ in
             cancelShortcutCapture()
+            if selectedSection != .integrations {
+                selectedIntegrationsPage = .overview
+            }
         }
         .onAppear {
             sanitizePinnedConversationContextSelection()
@@ -3663,7 +3724,7 @@ struct SettingsView: View {
             } else {
                 ForEach(Array(filteredSearchEntries.prefix(7))) { entry in
                     Button {
-                        selectedSection = entry.section
+                        navigateToSearchEntry(entry)
                     } label: {
                         HStack(alignment: .top, spacing: 10) {
                             AppIconBadge(
@@ -3717,6 +3778,8 @@ struct SettingsView: View {
             speechSection
         case .aiModels:
             aiModelsSection
+        case .integrations:
+            integrationsSection
         case .corrections:
             correctionsSection
         case .about:
@@ -4655,6 +4718,439 @@ struct SettingsView: View {
                 return localAISetupService.runtimeDetection.isHealthy ? "Runtime installed" : "Runtime unavailable"
             }
             return "Not installed"
+        }
+    }
+
+    private var maskedAutomationToken: String {
+        automationAPICoordinator.maskedToken(for: settings)
+    }
+
+    private var automationAPIPortTextBinding: Binding<String> {
+        Binding(
+            get: { String(settings.automationAPIPort) },
+            set: { newValue in
+                let digits = newValue.filter(\.isNumber)
+                guard !digits.isEmpty else { return }
+                if let parsed = Int(digits), (1024...Int(UInt16.max)).contains(parsed) {
+                    settings.automationAPIPort = UInt16(parsed)
+                }
+            }
+        )
+    }
+
+    private var automationNotificationPermissionGranted: Bool {
+        switch automationAPICoordinator.notificationAuthorizationState {
+        case .authorized, .provisional, .ephemeral:
+            return true
+        case .notDetermined, .denied, .unknown:
+            return false
+        }
+    }
+
+    private var automationNotificationPermissionHint: String {
+        switch automationAPICoordinator.notificationAuthorizationState {
+        case .authorized:
+            return "Desktop notifications are allowed for automation alerts."
+        case .provisional:
+            return "Desktop notifications are provisionally allowed."
+        case .ephemeral:
+            return "Desktop notifications are temporarily allowed."
+        case .notDetermined:
+            return "Grant notification access so local API alerts can appear on your desktop."
+        case .denied:
+            return "Notifications are denied. Enable KeyScribe in macOS Notification settings."
+        case .unknown:
+            return "Notification permission status is unavailable."
+        }
+    }
+
+    private var codexCLINotifySnippet: String {
+        automationAPICoordinator.codexCLINotifyExample(for: settings)
+    }
+
+    private var selectedClaudeHookInstallOptions: Set<ClaudeHookInstallOption> {
+        var options: Set<ClaudeHookInstallOption> = []
+        if installClaudeStopHook {
+            options.insert(.stop)
+        }
+        if installClaudeSubagentStopHook {
+            options.insert(.subagentStop)
+        }
+        if installClaudeNotificationHook {
+            options.insert(.notification)
+        }
+        return options
+    }
+
+    private var installedClaudeHooksSummary: String {
+        let installedOptions = ClaudeHookInstallOption.allCases.filter { installedClaudeHookOptions.contains($0) }
+        guard !installedOptions.isEmpty else {
+            return "No KeyScribe Claude hooks are installed yet."
+        }
+
+        let labels = installedOptions.map(\.displayName).joined(separator: ", ")
+        return "Already installed from KeyScribe: \(labels)."
+    }
+
+    private var automationServerStatusLabel: String {
+        switch automationAPICoordinator.serverState {
+        case "running":
+            return "Server is running"
+        case "starting":
+            return "Server is starting"
+        case "failed":
+            return "Server failed"
+        default:
+            return "Server is stopped"
+        }
+    }
+
+    private var automationServerStatusColor: Color {
+        switch automationAPICoordinator.serverState {
+        case "running":
+            return Color.green.opacity(0.92)
+        case "starting":
+            return Color.orange.opacity(0.92)
+        case "failed":
+            return Color.red.opacity(0.92)
+        default:
+            return Color.orange.opacity(0.92)
+        }
+    }
+
+    private var integrationsOverviewSummary: String {
+        let enabledSources = [
+            settings.automationClaudeEnabled ? AutomationAPISource.claudeCode.displayName : nil,
+            settings.automationCodexCLIEnabled ? AutomationAPISource.codexCLI.displayName : nil,
+            settings.automationCodexCloudEnabled ? AutomationAPISource.codexCloud.displayName : nil
+        ].compactMap { $0 }
+
+        if enabledSources.isEmpty {
+            return "No notification sources are enabled yet. Open Automation & Notifications to turn on Claude Code, Codex CLI, or Codex Cloud alerts."
+        }
+
+        return "Enabled sources: \(enabledSources.joined(separator: ", ")). Delivery settings are shared so users only configure sound, speech, and desktop alerts once."
+    }
+
+    @ViewBuilder
+    private var integrationsDetailHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                selectedIntegrationsPage = .overview
+            } label: {
+                Label("Back to Integrations", systemImage: "chevron.left")
+                    .font(.callout.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(AppVisualTheme.accentTint)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Automation & Notifications")
+                    .font(.title3.bold())
+                    .foregroundStyle(.white.opacity(0.97))
+                Text("Manage sources, shared delivery settings, local API access, and Codex status in one place.")
+                    .font(.callout)
+                    .foregroundStyle(AppVisualTheme.mutedText)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var integrationsSection: some View {
+        Group {
+            switch selectedIntegrationsPage {
+            case .overview:
+                VStack(alignment: .leading, spacing: 14) {
+                    settingsSectionHeader(for: .integrations)
+
+                    settingsCard(
+                        title: "Automation & Notifications",
+                        subtitle: "Keep integrations simple here, then open the focused page when you need the details.",
+                        symbol: "point.3.connected.trianglepath.dotted",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        Text(integrationsOverviewSummary)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+
+                        HStack {
+                            Text(settings.automationAPIEnabled ? "Local API is on." : "Local API is off.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Open Automation & Notifications") {
+                                selectedIntegrationsPage = .automationNotifications
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+
+            case .automationNotifications:
+                VStack(alignment: .leading, spacing: 14) {
+                    integrationsDetailHeader
+
+                    if let automationActionMessage {
+                        Text(automationActionMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    settingsCard(
+                        title: "Sources",
+                        subtitle: "Choose which tools are allowed to notify through KeyScribe.",
+                        symbol: "switch.2",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        Toggle(AutomationAPISource.claudeCode.displayName, isOn: $settings.automationClaudeEnabled)
+                        Toggle(AutomationAPISource.codexCLI.displayName, isOn: $settings.automationCodexCLIEnabled)
+                        Toggle(AutomationAPISource.codexCloud.displayName, isOn: $settings.automationCodexCloudEnabled)
+
+                        Text("Claude Code and Codex CLI use the local API. Codex Cloud beta watches your local codex tasks while KeyScribe stays open.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    settingsCard(
+                        title: "Delivery",
+                        subtitle: "These sound, speech, and desktop alert choices are shared across every source.",
+                        symbol: "speaker.wave.3.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        permissionRow(
+                            name: "Notifications",
+                            granted: automationNotificationPermissionGranted,
+                            hint: automationNotificationPermissionHint
+                        ) {
+                            Task {
+                                await automationAPICoordinator.requestNotificationPermissionIfNeeded()
+                            }
+                        }
+
+                        Toggle("Desktop notification", isOn: $settings.automationAPINotificationsEnabled)
+                        Toggle("Speak message", isOn: $settings.automationAPISpeechEnabled)
+                        Toggle("Play sound", isOn: $settings.automationAPISoundEnabled)
+
+                        HStack {
+                            Text("Default voice")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            Picker("Default voice", selection: $settings.automationAPIDefaultVoiceIdentifier) {
+                                ForEach(automationAPICoordinator.availableVoices) { voice in
+                                    Text(voice.displayLabel).tag(voice.id)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .frame(width: 280)
+                        }
+
+                        HStack {
+                            Text("Default sound")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            Picker("Default sound", selection: $settings.automationAPIDefaultSoundRawValue) {
+                                ForEach(AutomationAPISound.allCases) { sound in
+                                    Text(sound.displayName).tag(sound.rawValue)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .frame(width: 220)
+                        }
+
+                        HStack {
+                            Button("Test Notification") {
+                                Task {
+                                    automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.notification])
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.automationAPINotificationsEnabled)
+
+                            Button("Test Speech") {
+                                Task {
+                                    automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.speech])
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.automationAPISpeechEnabled)
+
+                            Button("Test Sound") {
+                                Task {
+                                    automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.sound])
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.automationAPISoundEnabled)
+                        }
+                    }
+
+                    settingsCard(
+                        title: "Local API & Examples",
+                        subtitle: "Set up Claude Code from this page, then copy the Codex CLI example if you need it.",
+                        symbol: "terminal.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        Toggle("Enable Automation API", isOn: $settings.automationAPIEnabled)
+
+                        HStack {
+                            Text("Bind address")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            Text("127.0.0.1")
+                                .font(.callout.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack {
+                            Text("Port")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            TextField("Port", text: automationAPIPortTextBinding)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 120)
+                                .multilineTextAlignment(.trailing)
+                                .disabled(!settings.automationAPIEnabled)
+                        }
+
+                        HStack(alignment: .top, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Bearer token")
+                                    .font(.callout.weight(.medium))
+                                Text(maskedAutomationToken)
+                                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+
+                            Button("Copy") {
+                                copyTextToPasteboard(settings.automationAPIToken)
+                                automationActionMessage = "Token copied."
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(settings.automationAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                            Button("Rotate") {
+                                let token = settings.rotateAutomationAPIToken()
+                                copyTextToPasteboard(token)
+                                automationActionMessage = "Token rotated and copied."
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!settings.automationAPIEnabled)
+                        }
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Claude Code")
+                                .font(.callout.weight(.medium))
+
+                            Text("Select the Claude events you want, then KeyScribe updates ~/.claude/settings.json for you.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            Text(installedClaudeHooksSummary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Toggle("Stop", isOn: $installClaudeStopHook)
+                                    .toggleStyle(.checkbox)
+                                Text(ClaudeHookInstallOption.stop.detailText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                Toggle("SubagentStop", isOn: $installClaudeSubagentStopHook)
+                                    .toggleStyle(.checkbox)
+                                Text(ClaudeHookInstallOption.subagentStop.detailText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                Toggle("Notification", isOn: $installClaudeNotificationHook)
+                                    .toggleStyle(.checkbox)
+                                Text(ClaudeHookInstallOption.notification.detailText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            HStack(alignment: .center, spacing: 10) {
+                                Button("Add Selected Hooks") {
+                                    installSelectedClaudeHooks()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(selectedClaudeHookInstallOptions.isEmpty)
+
+                                Text("Writes to ~/.claude/settings.json")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let automationActionMessage {
+                                Text(automationActionMessage)
+                                    .font(.caption)
+                                    .foregroundStyle(AppVisualTheme.accentTint)
+                            }
+
+                            Divider()
+
+                            Text("Codex CLI")
+                                .font(.callout.weight(.medium))
+
+                            automationSnippetCard(
+                                title: "Codex CLI notify config",
+                                snippet: codexCLINotifySnippet
+                            )
+                        }
+                    }
+
+                    settingsCard(
+                        title: "Status",
+                        subtitle: "Quick status for the local API, Codex CLI, and Codex Cloud beta.",
+                        symbol: "info.circle.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        automationStatusRow(
+                            title: "Local API",
+                            badgeText: automationServerStatusLabel,
+                            badgeColor: automationServerStatusColor,
+                            detail: automationAPICoordinator.serverStatusText
+                        )
+
+                        automationStatusRow(
+                            title: "Codex CLI",
+                            badgeText: settings.automationCodexCLIEnabled ? "Enabled" : "Off",
+                            badgeColor: settings.automationCodexCLIEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                            detail: automationAPICoordinator.codexCLIStatusMessage
+                        )
+
+                        automationStatusRow(
+                            title: "Codex Cloud (beta)",
+                            badgeText: settings.automationCodexCloudEnabled ? "Enabled" : "Off",
+                            badgeColor: settings.automationCodexCloudEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                            detail: automationAPICoordinator.codexCloudStatusMessage
+                        )
+                    }
+                }
+                .onAppear {
+                    automationActionMessage = nil
+                    syncInstalledClaudeHooksFromDisk()
+                    Task {
+                        await automationAPICoordinator.refreshNotificationAuthorizationState()
+                    }
+                }
+                .onChange(of: settings.automationAPIEnabled) { isEnabled in
+                    if isEnabled && settings.automationAPINotificationsEnabled {
+                        Task {
+                            await automationAPICoordinator.requestNotificationPermissionIfNeeded()
+                        }
+                    }
+                }
+                .onChange(of: settings.automationAPINotificationsEnabled) { isEnabled in
+                    if isEnabled && settings.automationAPIEnabled {
+                        Task {
+                            await automationAPICoordinator.requestNotificationPermissionIfNeeded()
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -5881,6 +6377,13 @@ struct SettingsView: View {
             .init(section: .aiModels, title: "Rewrite history source switch", detail: "Pin to a saved context or use automatic app/screen context", keywords: ["switch", "pin", "context", "history", "conversation"]),
             .init(section: .aiModels, title: "Provider connection status", detail: "See OAuth and API key status for OpenAI, Anthropic, and Google Gemini", keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]),
             .init(section: .aiModels, title: "Open AI Studio", detail: "Launch dedicated AI page for provider and prompt model controls", keywords: ["ai", "studio", "providers", "models", "rewrite"]),
+            .init(section: .integrations, title: "Automation & notifications", detail: "Open the focused page for Claude Code, Codex CLI, and Codex Cloud alerts", keywords: ["automation", "notifications", "sources", "codex", "claude"], integrationsPage: .automationNotifications),
+            .init(section: .integrations, title: "Enable automation API", detail: "Run a localhost API for Claude Code and Codex CLI", keywords: ["automation", "api", "localhost", "server", "claude", "codex"], integrationsPage: .automationNotifications),
+            .init(section: .integrations, title: "Automation API token", detail: "Copy or rotate the local bearer token", keywords: ["token", "bearer", "auth", "copy", "rotate"], integrationsPage: .automationNotifications),
+            .init(section: .integrations, title: "Claude hook examples", detail: "Copy sample Notification and Stop hook snippets", keywords: ["claude", "hook", "notification", "stop", "subagent", "curl"], integrationsPage: .automationNotifications),
+            .init(section: .integrations, title: "Codex CLI notify config", detail: "Copy the Codex CLI notify snippet for ~/.codex/config.toml", keywords: ["codex", "notify", "config", "toml", "cloud"], integrationsPage: .automationNotifications),
+            .init(section: .integrations, title: "Codex Cloud beta", detail: "Watch local codex cloud tasks and alert when they are ready or fail", keywords: ["codex", "cloud", "beta", "polling", "ready", "failed"], integrationsPage: .automationNotifications),
+            .init(section: .integrations, title: "Automation notification permission", detail: "Allow desktop notifications for local API alerts", keywords: ["notification", "permission", "desktop", "grant"], integrationsPage: .automationNotifications),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall KeyScribe", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
@@ -5892,6 +6395,13 @@ struct SettingsView: View {
         return searchEntries.filter { entry in
             let haystack = ([entry.title, entry.detail] + entry.keywords).joined(separator: " ").lowercased()
             return haystack.contains(trimmedSearchQuery)
+        }
+    }
+
+    private func navigateToSearchEntry(_ entry: SettingSearchEntry) {
+        selectedSection = entry.section
+        if entry.section == .integrations {
+            selectedIntegrationsPage = entry.integrationsPage ?? .overview
         }
     }
 
@@ -6369,6 +6879,114 @@ struct SettingsView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
+    }
+
+    @ViewBuilder
+    private func automationSnippetCard(title: String, snippet: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Button("Copy") {
+                    copyTextToPasteboard(snippet)
+                    automationActionMessage = "\(title) copied."
+                }
+                .buttonStyle(.bordered)
+            }
+
+            ScrollView(.horizontal) {
+                Text(snippet)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .textSelection(.enabled)
+                    .foregroundStyle(.white.opacity(0.92))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.black.opacity(0.22))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+                    )
+            )
+        }
+    }
+
+    private func installSelectedClaudeHooks() {
+        settings.ensureAutomationAPIToken()
+
+        do {
+            let result = try ClaudeHookInstaller().installSelectedHooks(
+                selectedClaudeHookInstallOptions,
+                port: settings.automationAPIPort,
+                token: settings.automationAPIToken
+            )
+
+            if result.changedCount > 0 {
+                if result.unchangedCount > 0 {
+                    automationActionMessage = "Added or updated \(result.changedCount) Claude hook(s). \(result.unchangedCount) selected hook(s) were already ready."
+                } else {
+                    automationActionMessage = "Added or updated \(result.changedCount) Claude hook(s) in ~/.claude/settings.json."
+                }
+            } else {
+                automationActionMessage = "The selected Claude hooks are already in ~/.claude/settings.json."
+            }
+            syncInstalledClaudeHooksFromDisk()
+        } catch {
+            automationActionMessage = "Could not update ~/.claude/settings.json. \(error.localizedDescription)"
+        }
+    }
+
+    private func syncInstalledClaudeHooksFromDisk() {
+        do {
+            let installedOptions = try ClaudeHookInstaller().installedOptions()
+            installedClaudeHookOptions = installedOptions
+            installClaudeStopHook = installedOptions.contains(.stop)
+            installClaudeSubagentStopHook = installedOptions.contains(.subagentStop)
+            installClaudeNotificationHook = installedOptions.contains(.notification)
+        } catch {
+            installedClaudeHookOptions = []
+            automationActionMessage = "Could not read ~/.claude/settings.json. \(error.localizedDescription)"
+        }
+    }
+
+    @ViewBuilder
+    private func automationStatusRow(
+        title: String,
+        badgeText: String,
+        badgeColor: Color,
+        detail: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                Text(badgeText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(badgeColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(badgeColor.opacity(0.14))
+                    )
+                Spacer()
+            }
+
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func copyTextToPasteboard(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        _ = pasteboard.setString(trimmed, forType: .string)
     }
 
     private var uninstallSummaryText: String {

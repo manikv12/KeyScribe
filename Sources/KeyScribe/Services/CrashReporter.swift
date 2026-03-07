@@ -23,6 +23,7 @@ enum CrashReporter {
     private static let logDirectoryName = "KeyScribe"
     private static let crashLogName = "crash.log"
     private static let maxLogSizeBytes = 512 * 1024 // 512 KB
+    private static let defaultDiagnosticLogSizeBytes = 2 * 1024 * 1024 // 2 MB
 
     /// Install signal and exception handlers. Call once at app launch.
     static func install() {
@@ -80,6 +81,20 @@ enum CrashReporter {
         NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: url.deletingLastPathComponent().path)
     }
 
+    /// Returns the URL for a diagnostic log file inside the KeyScribe log directory.
+    static func diagnosticLogURL(named fileName: String) -> URL {
+        logDirectory.appendingPathComponent(fileName)
+    }
+
+    /// Appends test-oriented diagnostics to a named log file.
+    static func appendDiagnosticLog(
+        _ text: String,
+        fileName: String,
+        maxSizeBytes: Int = defaultDiagnosticLogSizeBytes
+    ) {
+        append(text, fileName: fileName, maxSizeBytes: maxSizeBytes)
+    }
+
     // MARK: - Private
 
     private static var logDirectory: URL {
@@ -88,8 +103,12 @@ enum CrashReporter {
     }
 
     fileprivate static func appendToLog(_ text: String) {
+        append(text, fileName: crashLogName, maxSizeBytes: maxLogSizeBytes)
+    }
+
+    private static func append(_ text: String, fileName: String, maxSizeBytes: Int) {
         let dir = logDirectory
-        let fileURL = dir.appendingPathComponent(crashLogName)
+        let fileURL = dir.appendingPathComponent(fileName)
 
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -104,7 +123,7 @@ enum CrashReporter {
             // Truncate if too large
             if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
                let size = attrs[.size] as? Int,
-               size > maxLogSizeBytes {
+               size > maxSizeBytes {
                 // Keep last half of the log
                 if let data = try? Data(contentsOf: fileURL) {
                     let halfIndex = data.count / 2

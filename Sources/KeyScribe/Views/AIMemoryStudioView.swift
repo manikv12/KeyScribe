@@ -73,7 +73,9 @@ struct AIMemoryStudioView: View {
     @State private var lastConversationHandoffSummaryMethod = "fallback"
     @State private var lastConversationPromotionDecisionSummary = "No promotion decision yet."
     @State private var showConversationContextInspectSheet = false
+    @State private var showConversationContextInspectFullscreen = false
     @State private var inspectedConversationContextID = ""
+    @State private var shouldRestoreAIMemoryStudioWindowAfterFullscreenInspector = false
     @State private var showConversationContextMappingsSheet = false
     @State private var contextMappingRows: [ContextMappingRow] = []
     @State private var isContextMappingsLoading = false
@@ -200,6 +202,33 @@ struct AIMemoryStudioView: View {
         }
     }
 
+    private enum ConversationContextInspectorPresentation {
+        case sheet
+        case fullscreen
+
+        var payloadEditorMinHeight: CGFloat {
+            switch self {
+            case .sheet:
+                return 220
+            case .fullscreen:
+                return 360
+            }
+        }
+
+        var turnsViewportHeight: CGFloat {
+            switch self {
+            case .sheet:
+                return 330
+            case .fullscreen:
+                return 540
+            }
+        }
+    }
+
+    fileprivate final class WeakWindowReference {
+        weak var window: NSWindow?
+    }
+
     private struct ContextMappingRow: Identifiable, Equatable {
         let id: String
         let mappingTypeRawValue: String
@@ -285,6 +314,7 @@ struct AIMemoryStudioView: View {
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let studioSidebarWidth: CGFloat = 244
     private let aiCorePages: [StudioPage] = [.dashboard, .models, .conversationMemory]
+    private let aiStudioWindowReference = WeakWindowReference()
 
     var body: some View {
         ZStack {
@@ -306,9 +336,18 @@ struct AIMemoryStudioView: View {
                 }
             }
             .padding(10)
+
+            if showConversationContextInspectFullscreen {
+                conversationContextInspectFullscreenCover
+                    .transition(.opacity)
+                    .zIndex(10)
+            }
         }
         .appScrollbars()
         .tint(AppVisualTheme.accentTint)
+        .background(
+            AIMemoryStudioWindowAccessor(windowReference: aiStudioWindowReference)
+        )
         .sheet(isPresented: $showingProvidersSheet) {
             providersSelectionSheet
         }
@@ -350,7 +389,12 @@ struct AIMemoryStudioView: View {
         }
         .onChange(of: showConversationContextInspectSheet) { isPresented in
             if !isPresented {
-                inspectedConversationContextID = ""
+                clearInspectedConversationContextIfNeeded()
+            }
+        }
+        .onChange(of: showConversationContextInspectFullscreen) { isPresented in
+            if !isPresented {
+                clearInspectedConversationContextIfNeeded()
             }
         }
         .onChange(of: showConversationContextMappingsSheet) { isPresented in
@@ -1124,6 +1168,11 @@ struct AIMemoryStudioView: View {
                                     }
                                     .buttonStyle(.borderedProminent)
 
+                                    Button("Full Screen") {
+                                        openConversationContextInspectorFullScreen(for: detail.id)
+                                    }
+                                    .buttonStyle(.bordered)
+
                                     Button("Compact") {
                                         compactConversationContext(id: detail.id)
                                     }
@@ -1412,6 +1461,12 @@ struct AIMemoryStudioView: View {
                     if let detail = inspectedConversationContextDetail {
                         memoryEntryBadge(detail.context.appName, tint: AppVisualTheme.accentTint)
                     }
+                    if let detail = inspectedConversationContextDetail {
+                        Button("Open Full Screen") {
+                            openConversationContextInspectorFullScreen(for: detail.id)
+                        }
+                        .buttonStyle(.bordered)
+                    }
                     Button("Done") {
                         showConversationContextInspectSheet = false
                     }
@@ -1426,7 +1481,7 @@ struct AIMemoryStudioView: View {
 
                 ScrollView {
                     if let detail = inspectedConversationContextDetail {
-                        conversationContextInspectorContent(detail)
+                        conversationContextInspectorContent(detail, presentation: .sheet)
                             .padding(18)
                     } else {
                         emptyStateRow(
@@ -1443,6 +1498,72 @@ struct AIMemoryStudioView: View {
             .padding(10)
         }
         .frame(width: 860, height: 700)
+    }
+
+    @ViewBuilder
+    private var conversationContextInspectFullscreenCover: some View {
+        ZStack {
+            AppChromeBackground()
+
+            VStack(spacing: 0) {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Inspect Context")
+                            .font(.title3.weight(.semibold))
+                        Text("Full-screen view for larger JSON and longer conversation history.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if let detail = inspectedConversationContextDetail {
+                            Text(detail.context.displayName)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Text(detail.context.providerContextLabel)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(2)
+                        }
+                    }
+
+                    Spacer()
+
+                    if let detail = inspectedConversationContextDetail {
+                        memoryEntryBadge(detail.context.appName, tint: AppVisualTheme.accentTint)
+                    }
+
+                    Button("Back to AI Studio") {
+                        closeConversationContextInspectorFullScreen()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+                .padding(.bottom, 14)
+
+                Divider()
+                    .overlay(Color.primary.opacity(0.08))
+
+                ScrollView {
+                    if let detail = inspectedConversationContextDetail {
+                        conversationContextInspectorContent(detail, presentation: .fullscreen)
+                            .padding(24)
+                    } else {
+                        emptyStateRow(
+                            title: "Context unavailable",
+                            message: "This context may have been cleared. Go back to AI Studio and inspect another context.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .padding(24)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(18)
+            .appThemedSurface(cornerRadius: 24, strokeOpacity: 0.18)
+            .padding(18)
+        }
+        .ignoresSafeArea()
+        .appScrollbars()
     }
 
     @ViewBuilder
@@ -1709,7 +1830,8 @@ struct AIMemoryStudioView: View {
     }
 
     private func conversationContextInspectorContent(
-        _ detail: PromptRewriteConversationContextDetail
+        _ detail: PromptRewriteConversationContextDetail,
+        presentation: ConversationContextInspectorPresentation
     ) -> some View {
         let payload = formattedConversationContextPayload(for: detail.id)
         let exchangeTurns = detail.turns.filter { !$0.isSummary }
@@ -1773,7 +1895,10 @@ struct AIMemoryStudioView: View {
                     ? "Formatted for readability."
                     : "Raw content shown because JSON parsing failed."
             ) {
-                jsonPayloadEditor(text: payload.text)
+                jsonPayloadEditor(
+                    text: payload.text,
+                    minHeight: presentation.payloadEditorMinHeight
+                )
 
                 if !payload.isJSON {
                     Text("Could not parse the payload as JSON. Showing raw content.")
@@ -1794,7 +1919,7 @@ struct AIMemoryStudioView: View {
                     }
                     .padding(.trailing, 2)
                 }
-                .frame(maxHeight: 330)
+                .frame(maxHeight: presentation.turnsViewportHeight)
             }
         }
     }
@@ -1867,12 +1992,12 @@ struct AIMemoryStudioView: View {
         )
     }
 
-    private func jsonPayloadEditor(text: String) -> some View {
+    private func jsonPayloadEditor(text: String, minHeight: CGFloat) -> some View {
         TextEditor(text: .constant(text))
             .font(.system(size: 12, weight: .regular, design: .monospaced))
             .textSelection(.enabled)
             .scrollContentBackground(.hidden)
-            .frame(minHeight: 220)
+            .frame(minHeight: minHeight)
             .padding(10)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -3539,6 +3664,7 @@ struct AIMemoryStudioView: View {
            !details.contains(where: { $0.id == normalizedInspectedID }) {
             inspectedConversationContextID = ""
             showConversationContextInspectSheet = false
+            dismissConversationContextInspectorFullScreen()
         }
 
         if details.contains(where: { $0.id == selectedConversationContextID }) {
@@ -3677,6 +3803,31 @@ struct AIMemoryStudioView: View {
         }
     }
 
+    private func openConversationContextInspectorFullScreen(for id: String) {
+        selectedConversationContextID = id
+        inspectedConversationContextID = id
+        showConversationContextInspectSheet = false
+
+        let hostWindow = aiStudioWindowReference.window
+        let windowWasAlreadyFullscreen = hostWindow?.styleMask.contains(.fullScreen) ?? false
+        shouldRestoreAIMemoryStudioWindowAfterFullscreenInspector = hostWindow != nil && !windowWasAlreadyFullscreen
+        showConversationContextInspectFullscreen = true
+
+        if let hostWindow, !windowWasAlreadyFullscreen {
+            hostWindow.toggleFullScreen(nil)
+        }
+
+        if let detail = conversationContextDetails.first(where: { $0.id == id }) {
+            conversationActionMessage = "Opened full-screen inspector for \(detail.context.displayName)."
+        } else {
+            conversationActionMessage = "Opened full-screen inspector for \(id)."
+        }
+    }
+
+    private func closeConversationContextInspectorFullScreen() {
+        dismissConversationContextInspectorFullScreen()
+    }
+
     private func compactConversationContext(id: String) {
         guard let report = promptRewriteConversationStore.compactContext(
             id: id,
@@ -3715,6 +3866,7 @@ struct AIMemoryStudioView: View {
         if inspectedConversationContextID == id {
             inspectedConversationContextID = ""
             showConversationContextInspectSheet = false
+            dismissConversationContextInspectorFullScreen()
         }
         conversationActionMessage = "Cleared conversation context \(id)."
         refreshConversationContextDetails()
@@ -3744,6 +3896,39 @@ struct AIMemoryStudioView: View {
             return false
         }
         return true
+    }
+
+    private func clearInspectedConversationContextIfNeeded() {
+        if !showConversationContextInspectSheet && !showConversationContextInspectFullscreen {
+            inspectedConversationContextID = ""
+        }
+    }
+
+    private func dismissConversationContextInspectorFullScreen() {
+        let wasPresented = showConversationContextInspectFullscreen
+        showConversationContextInspectFullscreen = false
+
+        guard wasPresented else { return }
+        DispatchQueue.main.async {
+            handleConversationContextFullscreenDismissed()
+        }
+    }
+
+    private func handleConversationContextFullscreenDismissed() {
+        let shouldRestoreWindow = shouldRestoreAIMemoryStudioWindowAfterFullscreenInspector
+        shouldRestoreAIMemoryStudioWindowAfterFullscreenInspector = false
+
+        guard shouldRestoreWindow,
+              let hostWindow = aiStudioWindowReference.window,
+              hostWindow.styleMask.contains(.fullScreen) else {
+            aiStudioWindowReference.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            hostWindow.toggleFullScreen(nil)
+            hostWindow.makeKeyAndOrderFront(nil)
+        }
     }
 
     private func syncContextOverrideSelections() {
@@ -5126,5 +5311,25 @@ struct AIMemoryStudioView: View {
             strokeOpacity: 0.16,
             tintOpacity: 0.035
         )
+    }
+}
+
+private struct AIMemoryStudioWindowAccessor: NSViewRepresentable {
+    let windowReference: AIMemoryStudioView.WeakWindowReference
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        updateWindowReference(from: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        updateWindowReference(from: nsView)
+    }
+
+    private func updateWindowReference(from view: NSView) {
+        DispatchQueue.main.async {
+            windowReference.window = view.window
+        }
     }
 }

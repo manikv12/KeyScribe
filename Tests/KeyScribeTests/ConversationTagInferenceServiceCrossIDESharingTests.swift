@@ -26,17 +26,6 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
         XCTAssertFalse(result)
     }
 
-    func testShouldNotShareCrossIDECodingContextWithAutomationFoldersPlaceholderProjectKey() {
-        let result = service.shouldShareCrossIDECodingContext(
-            bundleID: "com.apple.dt.xcode",
-            appName: "Xcode",
-            projectKey: "project:automation-folders",
-            featureEnabled: true
-        )
-
-        XCTAssertFalse(result)
-    }
-
     func testShouldNotShareCrossIDECodingContextWhenFeatureDisabled() {
         let result = service.shouldShareCrossIDECodingContext(
             bundleID: "com.apple.dt.xcode",
@@ -52,6 +41,17 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
         let result = service.shouldShareCrossIDECodingContext(
             bundleID: "com.apple.Safari",
             appName: "Safari",
+            projectKey: "project:keyscribe",
+            featureEnabled: true
+        )
+
+        XCTAssertFalse(result)
+    }
+
+    func testShouldNotShareCrossIDECodingContextForCodex() {
+        let result = service.shouldShareCrossIDECodingContext(
+            bundleID: "com.openai.codex",
+            appName: "Codex",
             projectKey: "project:keyscribe",
             featureEnabled: true
         )
@@ -103,6 +103,86 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
         XCTAssertFalse(result)
     }
 
+    func testCodexInferTagsStayAppWide() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-codex-tags",
+            appName: "Codex",
+            bundleIdentifier: "com.openai.codex",
+            screenLabel: "Project: KeyScribe | Thread: Hand off",
+            fieldLabel: "Prompt"
+        )
+
+        let tags = service.inferTags(
+            capturedContext: context,
+            userText: "Please update workspace: Another Project and continue the Run thread."
+        )
+
+        XCTAssertEqual(tags.projectKey, "project:codex-app")
+        XCTAssertEqual(tags.projectLabel, "Unknown Project")
+        XCTAssertEqual(tags.identityKey, "identity:codex-app")
+        XCTAssertEqual(tags.identityType, "unknown")
+        XCTAssertEqual(tags.identityLabel, "Unknown Identity")
+        XCTAssertEqual(tags.nativeThreadKey, "thread:codex-app")
+    }
+
+    func testCodexTupleKeyIgnoresProjectAndThreadLabels() {
+        let firstContext = PromptRewriteConversationContext(
+            id: "ctx-codex-1",
+            appName: "Codex",
+            bundleIdentifier: "com.openai.codex",
+            screenLabel: "Run",
+            fieldLabel: "Prompt"
+        )
+        let secondContext = PromptRewriteConversationContext(
+            id: "ctx-codex-2",
+            appName: "Codex",
+            bundleIdentifier: "com.openai.codex",
+            screenLabel: "Hand off",
+            fieldLabel: "Another Field"
+        )
+        let firstTags = ConversationTupleTags(
+            projectKey: "project:keyscribe",
+            projectLabel: "KeyScribe",
+            identityKey: "thread:run",
+            identityType: "channel",
+            identityLabel: "Run",
+            nativeThreadKey: "thread:run"
+        )
+        let secondTags = ConversationTupleTags(
+            projectKey: "project:other-project",
+            projectLabel: "Other Project",
+            identityKey: "thread:hand-off",
+            identityType: "channel",
+            identityLabel: "Hand off",
+            nativeThreadKey: "thread:hand-off"
+        )
+
+        let firstTuple = service.tupleKey(capturedContext: firstContext, tags: firstTags)
+        let secondTuple = service.tupleKey(capturedContext: secondContext, tags: secondTags)
+
+        XCTAssertEqual(firstTuple, secondTuple)
+        XCTAssertEqual(service.threadID(for: firstTuple), service.threadID(for: secondTuple))
+    }
+
+    func testCodexContextDisplayUsesOnlyAppName() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-codex-display",
+            appName: "Codex",
+            bundleIdentifier: "com.openai.codex",
+            screenLabel: "Project: KeyScribe | Thread: Review changes",
+            fieldLabel: "Prompt",
+            projectKey: "project:codex-app",
+            projectLabel: "Unknown Project",
+            identityKey: "identity:codex-app",
+            identityType: "unknown",
+            identityLabel: "Unknown Identity",
+            nativeThreadKey: "thread:codex-app"
+        )
+
+        XCTAssertEqual(context.displayName, "Codex")
+        XCTAssertEqual(context.providerContextLabel, "Codex")
+    }
+
     func testAppleMessagesInfersPersonIdentityFromScreenLabel() {
         let context = PromptRewriteConversationContext(
             id: "ctx-messages",
@@ -146,33 +226,5 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
         XCTAssertEqual(tags.identityType, "person")
         XCTAssertEqual(tags.identityLabel, "Contact Person")
         XCTAssertEqual(tags.identityKey, "person:contact-person")
-    }
-
-    func testCodexTreatsAutomationFoldersLabelAsUnknownProject() {
-        let context = PromptRewriteConversationContext(
-            id: "ctx-codex-automation-folders",
-            appName: "Codex",
-            bundleIdentifier: "com.openai.codex",
-            screenLabel: "Project: Automation folders | Thread: Fix portion selector confirm",
-            fieldLabel: "Focused Input"
-        )
-
-        let tags = service.inferTags(capturedContext: context, userText: "")
-        XCTAssertEqual(tags.projectLabel, "Unknown Project")
-        XCTAssertEqual(tags.projectKey, "project:unknown")
-    }
-
-    func testCodexStillInfersRealProjectLabelFromContext() {
-        let context = PromptRewriteConversationContext(
-            id: "ctx-codex-spike",
-            appName: "Codex",
-            bundleIdentifier: "com.openai.codex",
-            screenLabel: "Project: Spike | Thread: Fix portion selector confirm",
-            fieldLabel: "Focused Input"
-        )
-
-        let tags = service.inferTags(capturedContext: context, userText: "")
-        XCTAssertEqual(tags.projectLabel, "Spike")
-        XCTAssertEqual(tags.projectKey, "project:spike")
     }
 }

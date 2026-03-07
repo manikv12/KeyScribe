@@ -100,6 +100,65 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
         XCTAssertEqual(archived?.trigger, "timeout")
     }
 
+    func testDeleteConversationThreadPreserveRedirectsDropsIncomingRedirectsToDeletedThread() throws {
+        let store = try makeIsolatedStore()
+        let now = Date()
+        let deletedThreadID = "thread-deleted-\(UUID().uuidString)"
+        let canonicalThreadID = "thread-canonical-\(UUID().uuidString)"
+        let incomingThreadID = "thread-incoming-\(UUID().uuidString)"
+
+        for (id, screenLabel) in [
+            (deletedThreadID, "Deleted Thread"),
+            (canonicalThreadID, "Canonical Thread"),
+            (incomingThreadID, "Incoming Thread")
+        ] {
+            try store.upsertConversationThread(
+                ConversationThreadRecord(
+                    id: id,
+                    appName: "Codex",
+                    bundleID: "com.openai.codex",
+                    logicalSurfaceKey: "surface-\(id)",
+                    screenLabel: screenLabel,
+                    fieldLabel: "Focused Input",
+                    projectKey: "project:keyscribe",
+                    projectLabel: "KeyScribe",
+                    identityKey: "thread:\(id)",
+                    identityType: "channel",
+                    identityLabel: screenLabel,
+                    nativeThreadKey: "thread:\(id)",
+                    people: [],
+                    runningSummary: "",
+                    totalExchangeTurns: 0,
+                    createdAt: now,
+                    lastActivityAt: now,
+                    updatedAt: now
+                )
+            )
+        }
+
+        try store.upsertConversationThreadRedirect(
+            oldThreadID: deletedThreadID,
+            newThreadID: canonicalThreadID,
+            reason: "Preserve redirect for merged duplicate."
+        )
+        try store.upsertConversationThreadRedirect(
+            oldThreadID: incomingThreadID,
+            newThreadID: deletedThreadID,
+            reason: "This redirect should be removed because its target is deleted."
+        )
+
+        try store.deleteConversationThread(
+            id: deletedThreadID,
+            preserveRedirects: true
+        )
+
+        XCTAssertEqual(
+            try store.resolveConversationThreadRedirect(deletedThreadID),
+            canonicalThreadID
+        )
+        XCTAssertNil(try store.resolveConversationThreadRedirect(incomingThreadID))
+    }
+
     func testAISummaryUpdateBefore60SecondsUpgradesMethod() async throws {
         let databaseURL = try makeIsolatedDatabaseURL()
         let provider = ControlledRewriteProvider(
@@ -242,7 +301,7 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
         XCTAssertEqual(includeConsumed?.consumedByThreadID, "thread-new-target")
     }
 
-    func testScopeMatchingWithCrossIDEOnOff() throws {
+    func testScopeMatchingKeepsCodexAppWideEvenWhenCrossIDEIsOn() throws {
         let inference = ConversationTagInferenceService.shared
         let tags = ConversationTupleTags(
             projectKey: "project:keyscribe",
@@ -272,9 +331,9 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
             let onTupleXcode = inference.tupleKey(capturedContext: xcodeContext, tags: tags)
             let onTupleCodex = inference.tupleKey(capturedContext: codexContext, tags: tags)
 
-            XCTAssertEqual(onTupleXcode.bundleID, onTupleCodex.bundleID)
-            XCTAssertEqual(onTupleXcode.logicalSurfaceKey, onTupleCodex.logicalSurfaceKey)
-            XCTAssertEqual(
+            XCTAssertNotEqual(onTupleXcode.bundleID, onTupleCodex.bundleID)
+            XCTAssertNotEqual(onTupleXcode.logicalSurfaceKey, onTupleCodex.logicalSurfaceKey)
+            XCTAssertNotEqual(
                 inference.threadID(for: onTupleXcode),
                 inference.threadID(for: onTupleCodex)
             )

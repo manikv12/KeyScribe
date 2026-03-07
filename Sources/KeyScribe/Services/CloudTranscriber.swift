@@ -11,12 +11,13 @@ final class CloudTranscriber: NSObject {
 
     private var audioEngine = AVAudioEngine()
     private let sampleQueue = DispatchQueue(label: "KeyScribe.CloudSamples")
-    private let transcriptionQueue = DispatchQueue(label: "KeyScribe.CloudTranscription")
 
     private var granted = false
     private(set) var isRecording = false
     private var isTranscribing = false
     private var pendingStopWorkItem: DispatchWorkItem?
+    private var activeFinalizeTask: Task<Void, Never>?
+    private var activeFinalizeRunID: String?
     private var previousDefaultInputDevice: AudioDeviceID?
 
     private var pcmSamples: [Float] = []
@@ -35,6 +36,7 @@ final class CloudTranscriber: NSObject {
 
     private let targetSampleRate: Double = 16_000
     private let audioSetupRetryCooldownSeconds: TimeInterval = 1.5
+    private let finalizeWatchdogGraceSeconds: TimeInterval = 5
     private let formatNotSupportedOSStatus = -10868
 
     private struct RequestConfiguration {
@@ -449,20 +451,48 @@ final class CloudTranscriber: NSObject {
             biasPhrases: biasPhrases
         )
         let wavData = makeWAVData(from: samplesToTranscribe, sampleRate: Int(targetSampleRate))
+        activeFinalizeRunID = runID
 
-        transcriptionQueue.async { [weak self] in
+        let watchdogTimeoutSeconds = max(requestConfiguration.requestTimeoutSeconds + finalizeWatchdogGraceSeconds, 15)
+        let stuckRunWatchdog = DispatchWorkItem { [weak self] in
+            guard let self, self.isTranscribing, self.activeFinalizeRunID == runID else { return }
+
+            self.activeFinalizeTask?.cancel()
+            self.activeFinalizeTask = nil
+            self.activeFinalizeRunID = nil
+            self.isTranscribing = false
+            self.updateStatus("Cloud transcription failed: The request timed out.")
+            CrashReporter.logError(
+                "Cloud finalize watchdog timed out run=\(runID) provider=\(requestConfiguration.provider.rawValue) model=\(requestConfiguration.model) timeout=\(Int(watchdogTimeoutSeconds.rounded()))s"
+            )
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + watchdogTimeoutSeconds, execute: stuckRunWatchdog)
+
+        activeFinalizeTask?.cancel()
+        activeFinalizeTask = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            Task {
-                do {
-                    let transcript = try await self.performTranscription(audioWAVData: wavData, config: requestConfiguration)
-                    DispatchQueue.main.async { [weak self] in
-                        self?.finishTranscription(runID: runID, emitFinalText: emitFinalText, result: .success(transcript))
-                    }
-                } catch {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.finishTranscription(runID: runID, emitFinalText: emitFinalText, result: .failure(error))
-                    }
+
+            let result: Result<String, Error>
+            do {
+                let transcript = try await self.performTranscription(audioWAVData: wavData, config: requestConfiguration)
+                result = .success(transcript)
+            } catch {
+                result = .failure(error)
+            }
+
+            await MainActor.run {
+                stuckRunWatchdog.cancel()
+
+                guard self.activeFinalizeRunID == runID else {
+                    CrashReporter.logWarning(
+                        "Cloud finalize completion ignored (stale run) run=\(runID) provider=\(requestConfiguration.provider.rawValue) model=\(requestConfiguration.model)"
+                    )
+                    return
                 }
+
+                self.activeFinalizeTask = nil
+                self.activeFinalizeRunID = nil
+                self.finishTranscription(runID: runID, emitFinalText: emitFinalText, result: result)
             }
         }
     }

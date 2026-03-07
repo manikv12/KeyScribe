@@ -466,6 +466,7 @@ final class SettingsStore: ObservableObject {
     static let defaultDictationPastedSoundName = "Pop"
     static let defaultDictationCorrectionLearnedSoundName = "Purr"
     static let defaultDictationFeedbackVolume: Double = 0.10
+    static let defaultAutomationAPIPort: UInt16 = 45831
     nonisolated static let crossIDEConversationSharingMigrationDefaultsKey =
         "KeyScribe.migration.crossIDEConversationSharingDefaultedV1"
 
@@ -513,6 +514,16 @@ final class SettingsStore: ObservableObject {
         static let dictationPastedSoundName = "KeyScribe.dictationPastedSoundName"
         static let dictationCorrectionLearnedSoundName = "KeyScribe.dictationCorrectionLearnedSoundName"
         static let dictationFeedbackVolume = "KeyScribe.dictationFeedbackVolume"
+        static let automationAPIEnabled = "KeyScribe.automationAPIEnabled"
+        static let automationAPIPort = "KeyScribe.automationAPIPort"
+        static let automationAPINotificationsEnabled = "KeyScribe.automationAPINotificationsEnabled"
+        static let automationAPISpeechEnabled = "KeyScribe.automationAPISpeechEnabled"
+        static let automationAPISoundEnabled = "KeyScribe.automationAPISoundEnabled"
+        static let automationAPIDefaultVoiceIdentifier = "KeyScribe.automationAPIDefaultVoiceIdentifier"
+        static let automationAPIDefaultSound = "KeyScribe.automationAPIDefaultSound"
+        static let automationClaudeEnabled = "KeyScribe.automationClaudeEnabled"
+        static let automationCodexCLIEnabled = "KeyScribe.automationCodexCLIEnabled"
+        static let automationCodexCloudEnabled = "KeyScribe.automationCodexCloudEnabled"
         static let promptRewriteEnabled = "KeyScribe.promptRewriteEnabled"
         static let promptRewriteAutoInsertEnabled = "KeyScribe.promptRewriteAutoInsertEnabled"
         static let memoryIndexingEnabled = "KeyScribe.memoryIndexingEnabled"
@@ -832,6 +843,83 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var dictationFeedbackVolume: Double {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var automationAPIEnabled: Bool {
+        didSet {
+            if automationAPIEnabled {
+                ensureAutomationAPIToken()
+            }
+            save()
+        }
+    }
+
+    @Published var automationAPIPort: UInt16 {
+        didSet {
+            let normalized = UInt16(min(Int(UInt16.max), max(1024, Int(automationAPIPort))))
+            guard normalized == automationAPIPort else {
+                automationAPIPort = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var automationAPINotificationsEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var automationAPISpeechEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var automationAPISoundEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var automationAPIDefaultVoiceIdentifier: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(automationAPIDefaultVoiceIdentifier)
+            guard normalized == automationAPIDefaultVoiceIdentifier else {
+                automationAPIDefaultVoiceIdentifier = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var automationAPIDefaultSoundRawValue: String {
+        didSet {
+            if AutomationAPISound(rawValue: automationAPIDefaultSoundRawValue) == nil {
+                automationAPIDefaultSoundRawValue = AutomationAPISound.processing.rawValue
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var automationClaudeEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var automationCodexCLIEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var automationCodexCloudEnabled: Bool {
         didSet {
             save()
         }
@@ -1355,6 +1443,60 @@ final class SettingsStore: ObservableObject {
             ? Self.defaultDictationFeedbackVolume
             : min(1, max(0, defaults.double(forKey: Keys.dictationFeedbackVolume)))
 
+        if defaults.object(forKey: Keys.automationAPIEnabled) == nil {
+            automationAPIEnabled = false
+        } else {
+            automationAPIEnabled = defaults.bool(forKey: Keys.automationAPIEnabled)
+        }
+        let storedAutomationPort = defaults.object(forKey: Keys.automationAPIPort) == nil
+            ? Int(Self.defaultAutomationAPIPort)
+            : defaults.integer(forKey: Keys.automationAPIPort)
+        automationAPIPort = UInt16(min(Int(UInt16.max), max(1024, storedAutomationPort)))
+
+        if defaults.object(forKey: Keys.automationAPINotificationsEnabled) == nil {
+            automationAPINotificationsEnabled = true
+        } else {
+            automationAPINotificationsEnabled = defaults.bool(forKey: Keys.automationAPINotificationsEnabled)
+        }
+
+        if defaults.object(forKey: Keys.automationAPISpeechEnabled) == nil {
+            automationAPISpeechEnabled = false
+        } else {
+            automationAPISpeechEnabled = defaults.bool(forKey: Keys.automationAPISpeechEnabled)
+        }
+
+        if defaults.object(forKey: Keys.automationAPISoundEnabled) == nil {
+            automationAPISoundEnabled = false
+        } else {
+            automationAPISoundEnabled = defaults.bool(forKey: Keys.automationAPISoundEnabled)
+        }
+
+        automationAPIDefaultVoiceIdentifier = defaults.string(forKey: Keys.automationAPIDefaultVoiceIdentifier)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let storedAutomationSound = defaults.string(forKey: Keys.automationAPIDefaultSound)
+            ?? AutomationAPISound.processing.rawValue
+        automationAPIDefaultSoundRawValue = AutomationAPISound(rawValue: storedAutomationSound) == nil
+            ? AutomationAPISound.processing.rawValue
+            : storedAutomationSound
+
+        if defaults.object(forKey: Keys.automationClaudeEnabled) == nil {
+            automationClaudeEnabled = true
+        } else {
+            automationClaudeEnabled = defaults.bool(forKey: Keys.automationClaudeEnabled)
+        }
+
+        if defaults.object(forKey: Keys.automationCodexCLIEnabled) == nil {
+            automationCodexCLIEnabled = false
+        } else {
+            automationCodexCLIEnabled = defaults.bool(forKey: Keys.automationCodexCLIEnabled)
+        }
+
+        if defaults.object(forKey: Keys.automationCodexCloudEnabled) == nil {
+            automationCodexCloudEnabled = false
+        } else {
+            automationCodexCloudEnabled = defaults.bool(forKey: Keys.automationCodexCloudEnabled)
+        }
+
         if defaults.object(forKey: Keys.promptRewriteEnabled) == nil {
             promptRewriteEnabled = true
         } else {
@@ -1632,6 +1774,16 @@ final class SettingsStore: ObservableObject {
         defaults.set(dictationPastedSoundName, forKey: Keys.dictationPastedSoundName)
         defaults.set(dictationCorrectionLearnedSoundName, forKey: Keys.dictationCorrectionLearnedSoundName)
         defaults.set(dictationFeedbackVolume, forKey: Keys.dictationFeedbackVolume)
+        defaults.set(automationAPIEnabled, forKey: Keys.automationAPIEnabled)
+        defaults.set(Int(automationAPIPort), forKey: Keys.automationAPIPort)
+        defaults.set(automationAPINotificationsEnabled, forKey: Keys.automationAPINotificationsEnabled)
+        defaults.set(automationAPISpeechEnabled, forKey: Keys.automationAPISpeechEnabled)
+        defaults.set(automationAPISoundEnabled, forKey: Keys.automationAPISoundEnabled)
+        defaults.set(automationAPIDefaultVoiceIdentifier.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.automationAPIDefaultVoiceIdentifier)
+        defaults.set(automationAPIDefaultSoundRawValue, forKey: Keys.automationAPIDefaultSound)
+        defaults.set(automationClaudeEnabled, forKey: Keys.automationClaudeEnabled)
+        defaults.set(automationCodexCLIEnabled, forKey: Keys.automationCodexCLIEnabled)
+        defaults.set(automationCodexCloudEnabled, forKey: Keys.automationCodexCloudEnabled)
         defaults.set(promptRewriteEnabled, forKey: Keys.promptRewriteEnabled)
         defaults.set(promptRewriteAutoInsertEnabled, forKey: Keys.promptRewriteAutoInsertEnabled)
         defaults.set(memoryIndexingEnabled, forKey: Keys.memoryIndexingEnabled)
@@ -1735,6 +1887,52 @@ final class SettingsStore: ObservableObject {
         set { transcriptionEngineRawValue = newValue.rawValue }
     }
 
+    var automationAPIDefaultSound: AutomationAPISound {
+        get { AutomationAPISound(rawValue: automationAPIDefaultSoundRawValue) ?? .processing }
+        set { automationAPIDefaultSoundRawValue = newValue.rawValue }
+    }
+
+    var automationAPIDefaultVoiceIdentifierOrNil: String? {
+        let value = automationAPIDefaultVoiceIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    var automationAPIEnabledChannels: [AutomationAPIChannel] {
+        var channels: [AutomationAPIChannel] = []
+        if automationAPINotificationsEnabled {
+            channels.append(.notification)
+        }
+        if automationAPISpeechEnabled {
+            channels.append(.speech)
+        }
+        if automationAPISoundEnabled {
+            channels.append(.sound)
+        }
+        return channels
+    }
+
+    var automationAPIServerConfiguration: AutomationAPIServerConfiguration {
+        AutomationAPIServerConfiguration(
+            enabled: automationAPIEnabled,
+            port: automationAPIPort,
+            token: automationAPIToken,
+            defaultChannels: automationAPIEnabledChannels,
+            defaultVoiceIdentifier: automationAPIDefaultVoiceIdentifierOrNil,
+            defaultSound: automationAPIDefaultSound
+        )
+    }
+
+    func isAutomationSourceEnabled(_ source: AutomationAPISource) -> Bool {
+        switch source {
+        case .claudeCode:
+            return automationClaudeEnabled
+        case .codexCLI:
+            return automationCodexCLIEnabled
+        case .codexCloud:
+            return automationCodexCloudEnabled
+        }
+    }
+
     var cloudTranscriptionProvider: CloudTranscriptionProvider {
         get { CloudTranscriptionProvider(rawValue: cloudTranscriptionProviderRawValue) ?? .openAI }
         set { cloudTranscriptionProviderRawValue = newValue.rawValue }
@@ -1776,6 +1974,28 @@ final class SettingsStore: ObservableObject {
         if force || normalizedBaseURL.isEmpty {
             cloudTranscriptionBaseURL = provider.defaultBaseURL
         }
+    }
+
+    var automationAPIToken: String {
+        get { Self.loadAutomationAPIToken() }
+        set {
+            Self.storeAutomationAPIToken(newValue)
+            save()
+        }
+    }
+
+    func ensureAutomationAPIToken() {
+        if automationAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            rotateAutomationAPIToken()
+        }
+    }
+
+    @discardableResult
+    func rotateAutomationAPIToken() -> String {
+        let token = Self.generateAutomationAPIToken()
+        Self.storeAutomationAPIToken(token)
+        save()
+        return token
     }
 
     func isPromptRewriteProviderConnected(_ providerMode: PromptRewriteProviderMode) -> Bool {
@@ -2061,6 +2281,80 @@ final class SettingsStore: ObservableObject {
 
     private static let cloudTranscriptionProviderAPIKeychainService = "com.keyscribe.KeyScribe"
     private static let cloudTranscriptionProviderAPIKeychainAccountPrefix = "cloud-transcription-provider-api-key"
+    private static let automationAPIKeychainService = "com.keyscribe.KeyScribe"
+    private static let automationAPIKeychainAccount = "automation-api-bearer-token"
+
+    private static func generateAutomationAPIToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+
+        if status == errSecSuccess {
+            let hexString = bytes.map { String(format: "%02x", $0) }.joined()
+            return "ks_" + hexString
+        }
+
+        let fallback = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+        return "ks_" + fallback
+    }
+
+    private static func loadAutomationAPIToken() -> String {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: automationAPIKeychainService,
+            kSecAttrAccount as String: automationAPIKeychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return value
+    }
+
+    private static func storeAutomationAPIToken(_ rawValue: String) {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            deleteAutomationAPIToken()
+            return
+        }
+
+        let data = Data(value.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: automationAPIKeychainService,
+            kSecAttrAccount as String: automationAPIKeychainAccount
+        ]
+
+        let updateStatus = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus == errSecItemNotFound {
+            var create = query
+            create[kSecValueData as String] = data
+            _ = SecItemAdd(create as CFDictionary, nil)
+        }
+    }
+
+    private static func deleteAutomationAPIToken() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: automationAPIKeychainService,
+            kSecAttrAccount as String: automationAPIKeychainAccount
+        ]
+        _ = SecItemDelete(query as CFDictionary)
+    }
 
     private static func cloudTranscriptionKeychainAccount(for provider: CloudTranscriptionProvider) -> String {
         let normalized = provider.rawValue
@@ -2272,6 +2566,7 @@ final class SettingsStore: ObservableObject {
         if deleteProviderCredentials {
             deleteAllCloudTranscriptionProviderAPIKeys()
             deleteAllPromptRewriteProviderAPIKeys()
+            deleteAutomationAPIToken()
             PromptRewriteOAuthCredentialStore.deleteAllSessions()
         }
 

@@ -22,6 +22,11 @@ final class ConversationTagInferenceService {
     private let browserWorkspaceProjectKey = "project:browser-workspace"
     private let browserWorkspaceIdentityKey = "identity:browser-workspace"
     private let browserWorkspaceNativeThreadKey = "thread:browser-workspace"
+    private let codexConversationProjectKey = "project:codex-app"
+    private let codexConversationProjectLabel = "Unknown Project"
+    private let codexConversationIdentityKey = "identity:codex-app"
+    private let codexConversationIdentityLabel = "Unknown Identity"
+    private let codexConversationNativeThreadKey = "thread:codex-app"
 
     private init() {}
 
@@ -38,6 +43,18 @@ final class ConversationTagInferenceService {
         let supplementalText = [userText, assistantText ?? ""]
             .joined(separator: "\n")
         let normalizedSupplementalText = collapseWhitespace(supplementalText)
+
+        if isCodexApp(bundleID: capturedContext.bundleIdentifier, appName: capturedContext.appName) {
+            return ConversationTupleTags(
+                projectKey: codexConversationProjectKey,
+                projectLabel: codexConversationProjectLabel,
+                identityKey: codexConversationIdentityKey,
+                identityType: ConversationIdentityKind.unknown.rawValue,
+                identityLabel: codexConversationIdentityLabel,
+                people: [],
+                nativeThreadKey: codexConversationNativeThreadKey
+            )
+        }
 
         let projectLabel = inferProjectLabel(
             bundleID: capturedContext.bundleIdentifier,
@@ -89,6 +106,22 @@ final class ConversationTagInferenceService {
         capturedContext: PromptRewriteConversationContext,
         tags: ConversationTupleTags
     ) -> ConversationThreadTupleKey {
+        if isCodexApp(bundleID: capturedContext.bundleIdentifier, appName: capturedContext.appName) {
+            let normalizedBundle = collapseWhitespace(capturedContext.bundleIdentifier).lowercased()
+            let canonicalBundle = normalizedBundle.isEmpty ? "com.openai.codex" : normalizedBundle
+            let logicalSurface = stableKey(
+                prefix: "surface",
+                value: "\(canonicalBundle)|codex-app"
+            )
+            return ConversationThreadTupleKey(
+                bundleID: canonicalBundle,
+                logicalSurfaceKey: logicalSurface,
+                projectKey: codexConversationProjectKey,
+                identityKey: codexConversationIdentityKey,
+                nativeThreadKey: codexConversationNativeThreadKey
+            )
+        }
+
         let isBrowserContext = isBrowser(bundleID: capturedContext.bundleIdentifier, appName: capturedContext.appName)
         let canonicalBundle = canonicalBundleID(
             bundleID: capturedContext.bundleIdentifier,
@@ -154,13 +187,13 @@ final class ConversationTagInferenceService {
             if let codexProject = firstMatch(
                 pattern: #"(?i)\b(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ), !isBlockedProjectLabel(codexProject) {
+            ) {
                 return codexProject
             }
             if let codexBuildProject = firstMatch(
                 pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ), !isBlockedProjectLabel(codexBuildProject) {
+            ) {
                 return codexBuildProject
             }
         }
@@ -197,10 +230,7 @@ final class ConversationTagInferenceService {
             "unknown project",
             "unknown workspace",
             "current screen",
-            "focused input",
-            "automation folder",
-            "automation folders",
-            "automations"
+            "focused input"
         ]
         if blocked.contains(normalized) {
             return true
@@ -217,12 +247,12 @@ final class ConversationTagInferenceService {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input",
-            "automation-folder",
-            "automation-folders",
-            "automations"
+            "focused-input"
         ]
-        return blocked.contains(value) || value.hasPrefix("unknown-")
+        if blocked.contains(value) || value.hasPrefix("unknown-") {
+            return true
+        }
+        return false
     }
 
     private func canonicalBundleID(
@@ -306,6 +336,9 @@ final class ConversationTagInferenceService {
         guard featureEnabled else {
             return false
         }
+        guard !isCodexApp(bundleID: bundleID, appName: appName) else {
+            return false
+        }
         guard hasMeaningfulProjectKey(projectKey) else {
             return false
         }
@@ -328,10 +361,7 @@ final class ConversationTagInferenceService {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input",
-            "automation-folder",
-            "automation-folders",
-            "automations"
+            "focused-input"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
