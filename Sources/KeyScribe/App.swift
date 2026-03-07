@@ -4936,7 +4936,6 @@ struct SettingsView: View {
                                 .font(.callout.weight(.medium))
                             Spacer()
                             Picker("Default voice", selection: $settings.automationAPIDefaultVoiceIdentifier) {
-                                Text("System Default").tag("")
                                 ForEach(automationAPICoordinator.availableVoices) { voice in
                                     Text(voice.displayLabel).tag(voice.id)
                                 }

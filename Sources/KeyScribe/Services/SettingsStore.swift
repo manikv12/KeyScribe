@@ -2285,11 +2285,18 @@ final class SettingsStore: ObservableObject {
     private static let automationAPIKeychainAccount = "automation-api-bearer-token"
 
     private static func generateAutomationAPIToken() -> String {
-        let characters = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-        let randomCharacters = (0..<40).compactMap { _ in
-            characters.randomElement()
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+
+        if status == errSecSuccess {
+            let hexString = bytes.map { String(format: "%02x", $0) }.joined()
+            return "ks_" + hexString
         }
-        return "ks_" + String(randomCharacters)
+
+        let fallback = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+        return "ks_" + fallback
     }
 
     private static func loadAutomationAPIToken() -> String {
