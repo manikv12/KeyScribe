@@ -1,6 +1,8 @@
 import AppKit
+import CoreGraphics
 import CryptoKit
 import Foundation
+import Vision
 
 struct PromptRewriteConversationTurn: Codable, Equatable {
     let userText: String
@@ -94,19 +96,23 @@ struct PromptRewriteConversationContext: Codable, Equatable, Identifiable {
     var displayName: String {
         let normalizedProject = projectLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let normalizedIdentity = identityLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let normalizedScreen = screenLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedScreen = Self.displayScreenLabel(
+            screenLabel,
+            projectLabel: normalizedProject,
+            identityLabel: normalizedIdentity
+        )
         let normalizedField = fieldLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         var segments: [String] = [appName]
-        if !normalizedProject.isEmpty {
+        if Self.isMeaningfulProjectLabel(normalizedProject) {
             segments.append(normalizedProject)
         }
-        if !normalizedIdentity.isEmpty {
+        if Self.isMeaningfulIdentityLabel(normalizedIdentity) {
             segments.append(normalizedIdentity)
         }
-        if !normalizedScreen.isEmpty {
+        if Self.isMeaningfulScreenLabel(normalizedScreen) {
             segments.append(normalizedScreen)
         }
-        if !normalizedField.isEmpty {
+        if Self.isMeaningfulFieldLabel(normalizedField) {
             segments.append(normalizedField)
         }
         return segments.joined(separator: " - ")
@@ -177,6 +183,42 @@ struct PromptRewriteConversationContext: Codable, Equatable, Identifiable {
             "input"
         ]
         return !genericFields.contains(lowered)
+    }
+
+    private static func displayScreenLabel(
+        _ value: String,
+        projectLabel: String,
+        identityLabel: String
+    ) -> String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return "" }
+
+        let lowered = normalized.lowercased()
+        let loweredProject = projectLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let loweredIdentity = identityLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if !loweredProject.isEmpty {
+            let duplicateProjectPrefix = "project: \(loweredProject)"
+            if lowered == duplicateProjectPrefix {
+                return ""
+            }
+            if lowered.hasPrefix(duplicateProjectPrefix + " |"),
+               let threadSegment = normalized
+                .components(separatedBy: "|")
+                .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+                .first(where: { $0.lowercased().hasPrefix("thread:") }) {
+                return threadSegment
+            }
+        }
+
+        if !loweredIdentity.isEmpty {
+            let duplicateIdentityPrefix = "identity: \(loweredIdentity)"
+            if lowered == duplicateIdentityPrefix {
+                return ""
+            }
+        }
+
+        return normalized
     }
 }
 
@@ -343,6 +385,7 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let sqliteStartupThreadScanHardLimit = 120
     private let duplicateMergeThreadScanMultiplier = 4
     private let duplicateMergeThreadScanHardLimit = 120
+    private let codexProjectCorrectionMaxAgeSeconds: TimeInterval = 6 * 60 * 60
     private let clarificationSimilarityThreshold = 0.92
     private let deterministicMappingSimilarityThreshold = 0.94
     private let clarificationCandidateLimit = 3
@@ -404,6 +447,16 @@ final class PromptRewriteConversationStore: ObservableObject {
         refreshSummaries()
     }
 
+    static func makeForTesting(
+        sqliteStoreFactory: @escaping () throws -> MemorySQLiteStore,
+        tagInferenceService: ConversationTagInferenceService = .shared
+    ) -> PromptRewriteConversationStore {
+        PromptRewriteConversationStore(
+            sqliteStoreFactory: sqliteStoreFactory,
+            tagInferenceService: tagInferenceService
+        )
+    }
+
     func prepareRequestContext(
         capturedContext: PromptRewriteConversationContext,
         userText: String = "",
@@ -448,6 +501,7 @@ final class PromptRewriteConversationStore: ObservableObject {
         var resolutionSource: String
         var expiredHandoffRecordToConsume: ExpiredConversationContextRecord?
         let resolvedTupleKey: ConversationThreadTupleKey
+        var codexProjectCorrectionApplied = false
         if let pinnedContext {
             resolvedContext = pinnedContext.context
             usesPinnedContext = true
@@ -459,16 +513,31 @@ final class PromptRewriteConversationStore: ObservableObject {
             resolutionSource = "pinned"
             resolvedTupleKey = pinnedContext.tupleKey
         } else {
-            let inferred = canonicalizedTags(
+            var inferred = canonicalizedTags(
                 tagInferenceService.inferTags(
                     capturedContext: capturedContext,
                     userText: ""
                 )
             )
+            if let store {
+                inferred = reuseKnownCodexProjectIfNeeded(
+                    capturedContext: capturedContext,
+                    tags: inferred,
+                    store: store
+                )
+            }
             let tupleKey = tagInferenceService.tupleKey(
                 capturedContext: capturedContext,
                 tags: inferred
             )
+            if let store {
+                codexProjectCorrectionApplied = attemptCodexProjectCorrectionIfNeeded(
+                    capturedContext: capturedContext,
+                    tags: inferred,
+                    tupleKey: tupleKey,
+                    store: store
+                )
+            }
             let resolvedExistingID = contextIDByTuple[tupleKey].map {
                 resolvedConversationThreadIDWithRedirect(
                     $0,
@@ -551,6 +620,10 @@ final class PromptRewriteConversationStore: ObservableObject {
                 resolvedTupleKey = tupleKey
             }
             usesPinnedContext = false
+        }
+
+        if codexProjectCorrectionApplied {
+            resolutionSource += "+codex-project-corrected"
         }
 
         if promptRewriteConversationHistoryEnabled,
@@ -1328,15 +1401,21 @@ final class PromptRewriteConversationStore: ObservableObject {
         tags: ConversationTupleTags,
         threadID: String
     ) -> PromptRewriteConversationContext {
-        PromptRewriteConversationContext(
+        let sanitizedProject = sanitizedCodexStoredProject(
+            appName: baseContext.appName,
+            screenLabel: baseContext.screenLabel,
+            projectKey: tags.projectKey,
+            projectLabel: tags.projectLabel
+        )
+        return PromptRewriteConversationContext(
             id: threadID,
             appName: baseContext.appName,
             bundleIdentifier: baseContext.bundleIdentifier,
-            screenLabel: baseContext.screenLabel,
+            screenLabel: sanitizedProject.screenLabel,
             fieldLabel: baseContext.fieldLabel,
             logicalSurfaceKey: tupleKey.logicalSurfaceKey,
-            projectKey: tags.projectKey,
-            projectLabel: tags.projectLabel,
+            projectKey: sanitizedProject.projectKey,
+            projectLabel: sanitizedProject.projectLabel,
             identityKey: tags.identityKey,
             identityType: tags.identityType,
             identityLabel: tags.identityLabel,
@@ -3451,11 +3530,27 @@ final class PromptRewriteConversationStore: ObservableObject {
         var nextTupleMap: [ConversationThreadTupleKey: String] = [:]
 
         for thread in threadRows {
+            let sanitizedProject = sanitizedCodexStoredProject(
+                appName: thread.appName,
+                screenLabel: thread.screenLabel,
+                projectKey: thread.projectKey,
+                projectLabel: thread.projectLabel
+            )
+            if sanitizedProject.screenLabel != thread.screenLabel
+                || sanitizedProject.projectKey != thread.projectKey
+                || sanitizedProject.projectLabel != thread.projectLabel {
+                var repairedThread = thread
+                repairedThread.screenLabel = sanitizedProject.screenLabel
+                repairedThread.projectKey = sanitizedProject.projectKey
+                repairedThread.projectLabel = sanitizedProject.projectLabel
+                repairedThread.updatedAt = Date()
+                try? store.upsertConversationThread(repairedThread)
+            }
             let turns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
                 .compactMap(conversationTurn(from:))
             let tags = ConversationTupleTags(
-                projectKey: thread.projectKey,
-                projectLabel: thread.projectLabel,
+                projectKey: sanitizedProject.projectKey,
+                projectLabel: sanitizedProject.projectLabel,
                 identityKey: thread.identityKey,
                 identityType: thread.identityType,
                 identityLabel: thread.identityLabel,
@@ -3466,11 +3561,11 @@ final class PromptRewriteConversationStore: ObservableObject {
                 id: thread.id,
                 appName: thread.appName,
                 bundleIdentifier: thread.bundleID,
-                screenLabel: thread.screenLabel,
+                screenLabel: sanitizedProject.screenLabel,
                 fieldLabel: thread.fieldLabel,
                 logicalSurfaceKey: thread.logicalSurfaceKey,
-                projectKey: thread.projectKey,
-                projectLabel: thread.projectLabel,
+                projectKey: sanitizedProject.projectKey,
+                projectLabel: sanitizedProject.projectLabel,
                 identityKey: thread.identityKey,
                 identityType: thread.identityType,
                 identityLabel: thread.identityLabel,
@@ -3517,11 +3612,11 @@ final class PromptRewriteConversationStore: ObservableObject {
                 id: thread.id,
                 appName: thread.appName,
                 bundleIdentifier: tupleKey.bundleID,
-                screenLabel: thread.screenLabel,
+                screenLabel: sanitizedProject.screenLabel,
                 fieldLabel: thread.fieldLabel,
                 logicalSurfaceKey: tupleKey.logicalSurfaceKey,
-                projectKey: thread.projectKey,
-                projectLabel: thread.projectLabel,
+                projectKey: sanitizedProject.projectKey,
+                projectLabel: sanitizedProject.projectLabel,
                 identityKey: thread.identityKey,
                 identityType: thread.identityType,
                 identityLabel: thread.identityLabel,
@@ -3562,6 +3657,12 @@ final class PromptRewriteConversationStore: ObservableObject {
         guard let store = resolvedSQLiteStore() else { return }
         let shouldCheckForDuplicateThreads = pendingDuplicateMergeContextIDs.contains(stored.context.id)
 
+        let sanitizedProject = sanitizedCodexStoredProject(
+            appName: stored.context.appName,
+            screenLabel: stored.context.screenLabel,
+            projectKey: stored.context.projectKey,
+            projectLabel: stored.context.projectLabel
+        )
         let runningSummary = stored.turns.reversed().first(where: \.isSummary)?.assistantText ?? ""
         let exchangeTurnCount = max(stored.totalExchangeTurns, stored.turns.filter { !$0.isSummary }.count)
         let thread = ConversationThreadRecord(
@@ -3569,10 +3670,10 @@ final class PromptRewriteConversationStore: ObservableObject {
             appName: stored.context.appName,
             bundleID: stored.tupleKey.bundleID,
             logicalSurfaceKey: stored.tupleKey.logicalSurfaceKey,
-            screenLabel: stored.context.screenLabel,
+            screenLabel: sanitizedProject.screenLabel,
             fieldLabel: stored.context.fieldLabel,
-            projectKey: stored.context.projectKey ?? "project:unknown",
-            projectLabel: stored.context.projectLabel ?? "Unknown Project",
+            projectKey: sanitizedProject.projectKey,
+            projectLabel: sanitizedProject.projectLabel,
             identityKey: stored.context.identityKey ?? "identity:unknown",
             identityType: stored.context.identityType ?? "unknown",
             identityLabel: stored.context.identityLabel ?? "Unknown Identity",
@@ -3609,6 +3710,40 @@ final class PromptRewriteConversationStore: ObservableObject {
         } catch {
             // Best-effort persistence to avoid blocking rewrite flow.
         }
+    }
+
+    private func sanitizedCodexStoredProject(
+        appName: String,
+        screenLabel: String,
+        projectKey: String?,
+        projectLabel: String?
+    ) -> (screenLabel: String, projectKey: String, projectLabel: String) {
+        let resolvedProjectKey = projectKey ?? "project:unknown"
+        let resolvedProjectLabel = projectLabel ?? "Unknown Project"
+
+        guard appName.localizedCaseInsensitiveContains("codex") else {
+            return (screenLabel, resolvedProjectKey, resolvedProjectLabel)
+        }
+
+        let projectCandidate: String
+        if let projectLabel, !projectLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            projectCandidate = projectLabel
+        } else {
+            let normalizedKey = resolvedProjectKey
+                .replacingOccurrences(of: #"(?i)^project:"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: "-", with: " ")
+            projectCandidate = normalizedKey
+        }
+
+        guard PromptRewriteConversationContextResolver.shouldTreatCodexProjectLabelAsUnknown(projectCandidate) else {
+            return (screenLabel, resolvedProjectKey, resolvedProjectLabel)
+        }
+
+        return (
+            PromptRewriteConversationContextResolver.sanitizedCodexScreenLabel(screenLabel),
+            "project:unknown",
+            "Unknown Project"
+        )
     }
 
     private func deleteContextFromSQLite(id: String) {
@@ -3754,6 +3889,332 @@ final class PromptRewriteConversationStore: ObservableObject {
         return loaded
     }
 
+    private func attemptCodexProjectCorrectionIfNeeded(
+        capturedContext: PromptRewriteConversationContext,
+        tags: ConversationTupleTags,
+        tupleKey: ConversationThreadTupleKey,
+        store: MemorySQLiteStore
+    ) -> Bool {
+        guard isCodexContext(capturedContext) else {
+            return false
+        }
+        guard isMeaningfulCodexProjectKey(tags.projectKey),
+              hasMeaningfulCodexCorrectionIdentity(tags) else {
+            return false
+        }
+
+        let allThreads: [ConversationThreadRecord]
+        if let fetched = try? store.fetchAllConversationThreads() {
+            allThreads = fetched
+        } else {
+            let scanLimit = min(
+                sqliteStartupThreadScanHardLimit,
+                max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
+            )
+            allThreads = (try? store.fetchConversationThreads(limit: scanLimit)) ?? []
+        }
+        guard !allThreads.isEmpty else {
+            return false
+        }
+
+        let now = Date()
+        let targetThreadID = tagInferenceService.threadID(for: tupleKey)
+        let correctionCandidates = allThreads.filter { thread in
+            isCodexUnknownProjectCorrectionCandidate(
+                thread,
+                tags: tags,
+                targetThreadID: targetThreadID,
+                now: now
+            )
+        }
+        guard !correctionCandidates.isEmpty else {
+            return false
+        }
+
+        let existingTargetThread = allThreads.first { thread in
+            thread.id == targetThreadID
+                || (
+                    thread.bundleID.caseInsensitiveCompare(tupleKey.bundleID) == .orderedSame
+                    && thread.logicalSurfaceKey.caseInsensitiveCompare(tupleKey.logicalSurfaceKey) == .orderedSame
+                    && thread.projectKey.caseInsensitiveCompare(tupleKey.projectKey) == .orderedSame
+                    && thread.identityKey.caseInsensitiveCompare(tupleKey.identityKey) == .orderedSame
+                    && thread.nativeThreadKey.caseInsensitiveCompare(tupleKey.nativeThreadKey) == .orderedSame
+                )
+        }
+
+        var relatedThreads = correctionCandidates
+        if let existingTargetThread,
+           !relatedThreads.contains(where: { $0.id == existingTargetThread.id }) {
+            relatedThreads.insert(existingTargetThread, at: 0)
+        }
+
+        let mergedTurns = mergedConversationTurns(
+            relatedThreads.compactMap { thread in
+                ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
+                    .compactMap(conversationTurn(from:))
+            }
+        )
+
+        let sanitizedProject = sanitizedCodexStoredProject(
+            appName: capturedContext.appName,
+            screenLabel: capturedContext.screenLabel,
+            projectKey: tags.projectKey,
+            projectLabel: tags.projectLabel
+        )
+        let createdAt = relatedThreads
+            .map(\.createdAt)
+            .min() ?? now
+        let lastActivityAt = relatedThreads
+            .map(\.lastActivityAt)
+            .max() ?? now
+        let runningSummary = mergedTurns.reversed().first(where: \.isSummary)?.assistantText
+            ?? existingTargetThread?.runningSummary
+            ?? correctionCandidates.first?.runningSummary
+            ?? ""
+        let totalExchangeTurns = max(
+            mergedTurns.filter { !$0.isSummary }.count,
+            relatedThreads
+                .map(\.totalExchangeTurns)
+                .max() ?? 0
+        )
+
+        let correctedThread = ConversationThreadRecord(
+            id: targetThreadID,
+            appName: capturedContext.appName,
+            bundleID: tupleKey.bundleID,
+            logicalSurfaceKey: tupleKey.logicalSurfaceKey,
+            screenLabel: sanitizedProject.screenLabel,
+            fieldLabel: capturedContext.fieldLabel,
+            projectKey: sanitizedProject.projectKey,
+            projectLabel: sanitizedProject.projectLabel,
+            identityKey: tags.identityKey,
+            identityType: tags.identityType,
+            identityLabel: tags.identityLabel,
+            nativeThreadKey: tags.nativeThreadKey,
+            people: tags.people,
+            runningSummary: runningSummary,
+            totalExchangeTurns: totalExchangeTurns,
+            createdAt: createdAt,
+            lastActivityAt: lastActivityAt,
+            updatedAt: now
+        )
+        let correctedTurnRecords = mergedTurns.map {
+            conversationTurnRecord($0, threadID: targetThreadID)
+        }
+
+        do {
+            try store.upsertConversationThread(correctedThread)
+            try store.replaceConversationTurns(
+                threadID: targetThreadID,
+                turns: correctedTurnRecords,
+                runningSummary: runningSummary,
+                totalExchangeTurns: totalExchangeTurns,
+                lastActivityAt: lastActivityAt,
+                updatedAt: now
+            )
+            if isConversationRedirectWriteEnabled {
+                for candidate in correctionCandidates where candidate.id != targetThreadID {
+                    try store.upsertConversationThreadRedirect(
+                        oldThreadID: candidate.id,
+                        newThreadID: targetThreadID,
+                        reason: "Codex project corrected from unknown to \(sanitizedProject.projectKey)."
+                    )
+                }
+            }
+            for candidate in correctionCandidates where candidate.id != targetThreadID {
+                try store.deleteConversationThread(
+                    id: candidate.id,
+                    preserveRedirects: isConversationRedirectWriteEnabled
+                )
+            }
+        } catch {
+            CrashReporter.logInfo("Codex project correction skipped reason=persistence-failed")
+            return false
+        }
+
+        loadFromSQLite()
+        refreshSummaries()
+        CrashReporter.logInfo(
+            """
+            Codex project correction applied \
+            corrected_project=\(sanitizedProject.projectKey) \
+            redirected_threads=\(correctionCandidates.map(\.id).sorted().joined(separator: ","))
+            """
+        )
+        return true
+    }
+
+    private func isCodexContext(_ context: PromptRewriteConversationContext) -> Bool {
+        let normalizedBundle = context.bundleIdentifier
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedBundle == "com.openai.codex" {
+            return true
+        }
+        return context.appName.localizedCaseInsensitiveContains("codex")
+    }
+
+    private func isMeaningfulCodexProjectKey(_ projectKey: String) -> Bool {
+        let normalized = projectKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.hasPrefix("project:")
+            && normalized != "project:unknown"
+    }
+
+    private func hasMeaningfulCodexCorrectionIdentity(_ tags: ConversationTupleTags) -> Bool {
+        let normalizedIdentity = tags.identityKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let normalizedNativeThread = tags.nativeThreadKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return !normalizedNativeThread.isEmpty
+            || (normalizedIdentity != "identity:unknown" && !normalizedIdentity.isEmpty)
+    }
+
+    private func reuseKnownCodexProjectIfNeeded(
+        capturedContext: PromptRewriteConversationContext,
+        tags: ConversationTupleTags,
+        store: MemorySQLiteStore
+    ) -> ConversationTupleTags {
+        guard isCodexContext(capturedContext) else {
+            return tags
+        }
+        guard !isMeaningfulCodexProjectKey(tags.projectKey) else {
+            return tags
+        }
+
+        let normalizedNativeThread = tags.nativeThreadKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalizedNativeThread.isEmpty else {
+            return tags
+        }
+
+        let allThreads = (try? store.fetchAllConversationThreads()) ?? []
+        guard !allThreads.isEmpty else {
+            return tags
+        }
+
+        let now = Date()
+        guard let matchedThread = allThreads
+            .filter({
+                isCodexKnownProjectReuseCandidate(
+                    $0,
+                    nativeThreadKey: normalizedNativeThread,
+                    now: now
+                )
+            })
+            .sorted(by: { lhs, rhs in
+                lhs.lastActivityAt > rhs.lastActivityAt
+            })
+            .first else {
+            return tags
+        }
+
+        return ConversationTupleTags(
+            projectKey: matchedThread.projectKey,
+            projectLabel: matchedThread.projectLabel,
+            identityKey: tags.identityKey,
+            identityType: tags.identityType,
+            identityLabel: tags.identityLabel,
+            people: tags.people,
+            nativeThreadKey: tags.nativeThreadKey
+        )
+    }
+
+    private func isCodexKnownProjectReuseCandidate(
+        _ thread: ConversationThreadRecord,
+        nativeThreadKey: String,
+        now: Date
+    ) -> Bool {
+        guard thread.appName.localizedCaseInsensitiveContains("codex") else {
+            return false
+        }
+        guard isMeaningfulCodexProjectKey(thread.projectKey) else {
+            return false
+        }
+        guard now.timeIntervalSince(thread.lastActivityAt) <= codexProjectCorrectionMaxAgeSeconds else {
+            return false
+        }
+
+        let candidateNativeThread = thread.nativeThreadKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return !candidateNativeThread.isEmpty
+            && candidateNativeThread == nativeThreadKey
+    }
+
+    private func isCodexUnknownProjectCorrectionCandidate(
+        _ thread: ConversationThreadRecord,
+        tags: ConversationTupleTags,
+        targetThreadID: String,
+        now: Date
+    ) -> Bool {
+        guard thread.id.caseInsensitiveCompare(targetThreadID) != .orderedSame else {
+            return false
+        }
+        guard thread.appName.localizedCaseInsensitiveContains("codex") else {
+            return false
+        }
+        guard thread.projectKey.caseInsensitiveCompare("project:unknown") == .orderedSame else {
+            return false
+        }
+        guard now.timeIntervalSince(thread.lastActivityAt) <= codexProjectCorrectionMaxAgeSeconds else {
+            return false
+        }
+
+        let normalizedNativeThread = tags.nativeThreadKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let candidateNativeThread = thread.nativeThreadKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !normalizedNativeThread.isEmpty {
+            if candidateNativeThread == normalizedNativeThread {
+                return true
+            }
+        }
+
+        let normalizedIdentity = tags.identityKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let candidateIdentity = thread.identityKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalizedIdentity != "identity:unknown" else {
+            return false
+        }
+        return candidateIdentity == normalizedIdentity
+    }
+
+    private func mergedConversationTurns(
+        _ turnGroups: [[PromptRewriteConversationTurn]]
+    ) -> [PromptRewriteConversationTurn] {
+        var seenTurnKeys = Set<String>()
+        return turnGroups
+            .flatMap { $0 }
+            .sorted { lhs, rhs in
+                lhs.timestamp < rhs.timestamp
+            }
+            .filter { turn in
+                let dedupeKey = [
+                    "\(Int((turn.timestamp.timeIntervalSince1970 * 1_000).rounded()))",
+                    turn.isSummary ? "1" : "0",
+                    turn.userText.lowercased(),
+                    turn.assistantText.lowercased(),
+                    "\(turn.sourceTurnCount ?? 0)",
+                    "\(turn.compactionVersion ?? -1)"
+                ].joined(separator: "|")
+                if seenTurnKeys.contains(dedupeKey) {
+                    return false
+                }
+                seenTurnKeys.insert(dedupeKey)
+                return true
+            }
+    }
+
     private func mergeDuplicateThreadsIfNeeded(
         for canonicalThreadID: String,
         tupleKey: ConversationThreadTupleKey
@@ -3785,7 +4246,10 @@ final class PromptRewriteConversationStore: ObservableObject {
                 newThreadID: canonicalThreadID,
                 reason: "Merged duplicate tuple thread."
             )
-            try store.deleteConversationThread(id: duplicate.id)
+            try store.deleteConversationThread(
+                id: duplicate.id,
+                preserveRedirects: true
+            )
             contextsByID.removeValue(forKey: duplicate.id)
             pendingDuplicateMergeContextIDs.remove(duplicate.id)
         }
@@ -4098,6 +4562,12 @@ enum PromptRewriteConversationContextResolver {
     private static let codexTextNodeScanLimit = 480
     private static let codexTopBarTraversalLimit = 1200
     private static let codexSidebarTraversalLimit = 1200
+    private static let codexVisualSidebarAncestorDepth = 8
+    private static let codexVisualMainContentMinXFraction: CGFloat = 0.30
+    private static let codexVisualSidebarMaxXFraction: CGFloat = 0.34
+    private static let codexVisualSidebarMinHighlightScore = 0.035
+    private static let codexVisualSidebarMinHighlightGap = 0.012
+    private static let codexVisualOCRMinimumTextHeight: Float = 0.009
     private static let telegramTextNodeScanLimit = 900
     private static let genericFocusedFieldRoles: Set<String> = [
         "axtextarea",
@@ -4297,6 +4767,37 @@ enum PromptRewriteConversationContextResolver {
         let element: AXUIElement
     }
 
+    private struct CodexWindowScreenshot {
+        let image: CGImage
+        let windowFrame: CGRect
+        let imageSize: CGSize
+    }
+
+    struct CodexVisualTextObservationCandidate {
+        let text: String
+        let bounds: CGRect
+
+        init(text: String, bounds: CGRect) {
+            self.text = text
+            self.bounds = bounds
+        }
+    }
+
+    private struct CodexVisualInference {
+        let mainContentProject: String?
+        let sidebarProject: String?
+    }
+
+    private struct CodexSidebarVisualCandidate {
+        let project: String
+        let frame: CGRect
+    }
+
+    private struct CodexVisualRegionStats {
+        let luminance: Double
+        let saturation: Double
+    }
+
     private static func codexContextLabel(
         app: NSRunningApplication?,
         windowElement: AXUIElement?,
@@ -4484,73 +4985,23 @@ enum PromptRewriteConversationContextResolver {
         from windowElement: AXUIElement,
         fallbackWindowTitle: String?
     ) -> (project: String?, thread: String?) {
+        let visualSelection = inferCodexVisualSelection(from: windowElement)
         let topBarSelection = inferCodexTopBarSelection(from: windowElement)
         let sidebarSelection = inferCodexSidebarSelection(from: windowElement)
-        var project = preferredCodexProjectCandidate(
+        let project = codexTrustedProjectCandidate(
+            visualProject: visualSelection?.mainContentProject,
             topBarProject: topBarSelection?.project,
-            sidebarProject: sidebarSelection?.project
+            sidebarProject: visualSelection?.sidebarProject ?? sidebarSelection?.project
         )
         var thread = topBarSelection?.thread ?? sidebarSelection?.thread
 
-        var cachedTextNodes: [AXTextNode]?
-        func textNodes() -> [AXTextNode] {
-            if let cachedTextNodes {
-                return cachedTextNodes
-            }
-            let fetched = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
-            cachedTextNodes = fetched
-            return fetched
-        }
-
-        func bestProjectFromVisibleText() -> String? {
-            let allTexts = textNodes().map(\.text)
-            let controlCandidates = allTexts.compactMap {
-                codexProjectFromControlLabel($0, includeProjectSectionLabels: false)
-            }
-            if let candidate = controlCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
-                return candidate
-            }
-            let pathCandidates = allTexts.compactMap(codexProjectFromPathLikeLabel)
-            if let candidate = pathCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
-                return candidate
-            }
-            let genericCandidates = allTexts.compactMap(projectName(fromCodexText:))
-            if let candidate = genericCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
-                return candidate
-            }
-            return controlCandidates.first ?? pathCandidates.first ?? genericCandidates.first
-        }
-
-        func bestProjectFromThreadContext(_ threadCandidate: String?) -> String? {
-            codexSidebarProjectFromThreadContext(
-                from: windowElement,
-                thread: threadCandidate
-            )
-        }
-
-        // If the initial top bar/sidebar pick looks like a branch/PR/ref label,
-        // try to recover using broader visible text before accepting it.
-        if let currentProject = project,
-           isLikelyVersionControlReferenceLabel(currentProject),
-           let replacement = bestProjectFromThreadContext(thread)
-           ?? bestProjectFromVisibleText() {
-            project = replacement
-        }
-
-        if project == nil {
-            project = bestProjectFromThreadContext(thread)
-                ?? bestProjectFromVisibleText()
-        }
         if thread == nil {
-            let selectedTexts = textNodes()
+            let selectedTexts = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
                 .filter { $0.selected }
                 .map(\.text)
             thread = selectedTexts.first {
                 looksLikeCodexThreadTitle($0, project: project)
             }
-        }
-        if project == nil {
-            project = bestProjectFromThreadContext(thread)
         }
 
         if let fallbackWindowTitle = normalizedLabel(fallbackWindowTitle),
@@ -4559,36 +5010,480 @@ enum PromptRewriteConversationContextResolver {
                project: project
            ) {
             thread = thread ?? fromWindow
-            if project == nil {
-                project = codexProjectFromWindowTitle(fallbackWindowTitle, thread: fromWindow)
-            }
         }
 
-        if project == nil,
-           let fallbackWindowTitle = normalizedLabel(fallbackWindowTitle) {
-            project = projectName(fromCodexText: fallbackWindowTitle)
+        let inferenceSource: String
+        if let visualSelection, let mainContentProject = visualSelection.mainContentProject,
+           project?.caseInsensitiveCompare(mainContentProject) == .orderedSame {
+            inferenceSource = "main-content"
+        } else if let visualSelection, let sidebarProject = visualSelection.sidebarProject,
+                  project?.caseInsensitiveCompare(sidebarProject) == .orderedSame {
+            inferenceSource = "sidebar-visual"
+        } else if let sidebarProject = sidebarSelection?.project,
+                  project?.caseInsensitiveCompare(sidebarProject) == .orderedSame {
+            inferenceSource = "sidebar-ax"
+        } else if let topBarProject = topBarSelection?.project,
+                  project?.caseInsensitiveCompare(topBarProject) == .orderedSame {
+            inferenceSource = "top-bar"
+        } else {
+            inferenceSource = "unknown"
         }
+        CrashReporter.logInfo(
+            """
+            Codex project inference \
+            source=\(inferenceSource) \
+            visual_main=\(visualSelection?.mainContentProject ?? "nil") \
+            visual_sidebar=\(visualSelection?.sidebarProject ?? "nil") \
+            top_bar=\(topBarSelection?.project ?? "nil") \
+            sidebar_ax=\(sidebarSelection?.project ?? "nil") \
+            chosen=\(project ?? "nil")
+            """
+        )
 
         return (project, thread)
     }
 
-    private static func preferredCodexProjectCandidate(
+    static func codexTrustedProjectCandidate(
+        visualProject: String? = nil,
         topBarProject: String?,
         sidebarProject: String?
     ) -> String? {
+        let normalizedVisual = normalizedLabel(visualProject).flatMap(normalizedProjectName)
         let normalizedTop = normalizedLabel(topBarProject).flatMap(normalizedProjectName)
         let normalizedSidebar = normalizedLabel(sidebarProject).flatMap(normalizedProjectName)
 
-        // Sidebar source is generally the most stable project signal in Codex.
+        // For Codex, trust what is visibly selected on screen before trusting
+        // Electron control labels, because the controls can expose action text
+        // like "Edit message" that is not a real project name.
+        if let normalizedVisual,
+           !isLikelyVersionControlReferenceLabel(normalizedVisual),
+           !shouldTreatCodexProjectLabelAsUnknown(normalizedVisual) {
+            return normalizedVisual
+        }
         if let normalizedSidebar,
-           !isLikelyVersionControlReferenceLabel(normalizedSidebar) {
+           !isLikelyVersionControlReferenceLabel(normalizedSidebar),
+           !shouldTreatCodexProjectLabelAsUnknown(normalizedSidebar) {
             return normalizedSidebar
         }
         if let normalizedTop,
-           !isLikelyVersionControlReferenceLabel(normalizedTop) {
+           !isLikelyVersionControlReferenceLabel(normalizedTop),
+           !shouldTreatCodexProjectLabelAsUnknown(normalizedTop) {
             return normalizedTop
         }
-        return normalizedSidebar ?? normalizedTop
+        return nil
+    }
+
+    private static func inferCodexVisualSelection(
+        from windowElement: AXUIElement
+    ) -> CodexVisualInference? {
+        guard let screenshot = captureCodexWindowScreenshot(from: windowElement) else {
+            return nil
+        }
+
+        let textObservations = recognizeCodexScreenshotText(in: screenshot.image)
+        let mainContentProject = codexMainContentProjectFromScreenshot(
+            textObservations,
+            imageSize: screenshot.imageSize
+        )
+        let sidebarProject = codexSidebarProjectFromScreenshot(
+            screenshot,
+            candidates: codexSidebarVisualCandidates(from: windowElement)
+        )
+
+        if mainContentProject == nil, sidebarProject == nil {
+            return nil
+        }
+        return CodexVisualInference(
+            mainContentProject: mainContentProject,
+            sidebarProject: sidebarProject
+        )
+    }
+
+    private static func captureCodexWindowScreenshot(
+        from windowElement: AXUIElement
+    ) -> CodexWindowScreenshot? {
+        guard let windowFrame = axFrame(of: windowElement),
+              windowFrame.width >= 240,
+              windowFrame.height >= 240 else {
+            return nil
+        }
+        guard CGPreflightScreenCaptureAccess() else {
+            return nil
+        }
+
+        let captureRect = CGRect(
+            x: floor(windowFrame.minX),
+            y: floor(windowFrame.minY),
+            width: ceil(windowFrame.width),
+            height: ceil(windowFrame.height)
+        )
+        guard let image = CGWindowListCreateImage(
+            captureRect,
+            .optionOnScreenOnly,
+            kCGNullWindowID,
+            [.bestResolution]
+        ) else {
+            return nil
+        }
+
+        let imageSize = CGSize(width: image.width, height: image.height)
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            return nil
+        }
+
+        return CodexWindowScreenshot(
+            image: image,
+            windowFrame: captureRect,
+            imageSize: imageSize
+        )
+    }
+
+    private static func recognizeCodexScreenshotText(
+        in image: CGImage
+    ) -> [CodexVisualTextObservationCandidate] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        request.minimumTextHeight = codexVisualOCRMinimumTextHeight
+
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return []
+        }
+
+        let imageSize = CGSize(width: image.width, height: image.height)
+        return (request.results ?? []).compactMap { observation in
+            guard let topCandidate = observation.topCandidates(1).first,
+                  let normalizedText = normalizedLabel(topCandidate.string) else {
+                return nil
+            }
+            return CodexVisualTextObservationCandidate(
+                text: normalizedText,
+                bounds: visionImageRect(
+                    from: observation.boundingBox,
+                    imageSize: imageSize
+                )
+            )
+        }
+    }
+
+    static func codexMainContentProjectFromScreenshot(
+        _ observations: [CodexVisualTextObservationCandidate],
+        imageSize: CGSize
+    ) -> String? {
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            return nil
+        }
+
+        let mainContentMinX = imageSize.width * codexVisualMainContentMinXFraction
+        let mainContentObservations = observations
+            .filter { $0.bounds.midX >= mainContentMinX }
+            .sorted { lhs, rhs in
+                if abs(lhs.bounds.minY - rhs.bounds.minY) < 4 {
+                    return lhs.bounds.minX < rhs.bounds.minX
+                }
+                return lhs.bounds.minY < rhs.bounds.minY
+            }
+
+        for observation in mainContentObservations {
+            if let project = codexProjectFromInlineMainContentLabel(observation.text) {
+                return project
+            }
+        }
+
+        let buildLabels = mainContentObservations.filter {
+            $0.text.range(
+                of: #"(?i)^let['’]s\s+build$"#,
+                options: .regularExpression
+            ) != nil
+        }
+        guard !buildLabels.isEmpty else {
+            return nil
+        }
+
+        let maxVerticalGap = max(52.0, imageSize.height * 0.13)
+        let maxHorizontalDrift = max(120.0, imageSize.width * 0.16)
+
+        for buildLabel in buildLabels {
+            let candidates = mainContentObservations
+                .filter { observation in
+                    guard observation.bounds.minY >= buildLabel.bounds.maxY - 8 else {
+                        return false
+                    }
+                    let verticalGap = observation.bounds.minY - buildLabel.bounds.maxY
+                    guard verticalGap <= maxVerticalGap else {
+                        return false
+                    }
+                    let horizontalDrift = abs(observation.bounds.midX - buildLabel.bounds.midX)
+                    return horizontalDrift <= maxHorizontalDrift
+                }
+                .sorted { lhs, rhs in
+                    let lhsGap = lhs.bounds.minY - buildLabel.bounds.maxY
+                    let rhsGap = rhs.bounds.minY - buildLabel.bounds.maxY
+                    if abs(lhsGap - rhsGap) < 3 {
+                        return lhs.bounds.minX < rhs.bounds.minX
+                    }
+                    return lhsGap < rhsGap
+                }
+
+            for candidate in candidates {
+                if let project = codexProjectFromStandaloneMainContentLabel(candidate.text) {
+                    return project
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private static func codexProjectFromInlineMainContentLabel(_ value: String) -> String? {
+        if let captured = firstRegexCapture(
+            pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+            in: value
+        ),
+           let normalized = normalizedProjectName(captured),
+           !shouldTreatCodexProjectLabelAsUnknown(normalized),
+           !isLikelyVersionControlReferenceLabel(normalized) {
+            return normalized
+        }
+
+        if let captured = firstRegexCapture(
+            pattern: #"(?i)\b(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+            in: value
+        ),
+           let normalized = normalizedProjectName(captured),
+           !shouldTreatCodexProjectLabelAsUnknown(normalized),
+           !isLikelyVersionControlReferenceLabel(normalized) {
+            return normalized
+        }
+
+        return nil
+    }
+
+    private static func codexProjectFromStandaloneMainContentLabel(_ value: String) -> String? {
+        guard let normalized = normalizedProjectName(value),
+              !shouldTreatCodexProjectLabelAsUnknown(normalized),
+              !isLikelyVersionControlReferenceLabel(normalized),
+              looksLikeLooseCodexProjectLabel(normalized) else {
+            return nil
+        }
+        return normalized
+    }
+
+    private static func codexSidebarProjectFromScreenshot(
+        _ screenshot: CodexWindowScreenshot,
+        candidates: [CodexSidebarVisualCandidate]
+    ) -> String? {
+        guard !candidates.isEmpty else {
+            return nil
+        }
+
+        let bitmap = NSBitmapImageRep(cgImage: screenshot.image)
+        let imageBounds = CGRect(origin: .zero, size: screenshot.imageSize)
+        let sidebarMaxX = screenshot.imageSize.width * codexVisualSidebarMaxXFraction
+
+        let scoredCandidates = candidates.compactMap { candidate -> (project: String, score: Double)? in
+            guard let localRect = localImageRect(for: candidate.frame, screenshot: screenshot) else {
+                return nil
+            }
+            let expandedRect = localRect
+                .insetBy(dx: -8, dy: -4)
+                .intersection(imageBounds)
+            guard expandedRect.width >= 60,
+                  expandedRect.height >= 20,
+                  expandedRect.minX <= sidebarMaxX else {
+                return nil
+            }
+
+            let outerRect = expandedRect
+                .insetBy(dx: -10, dy: -6)
+                .intersection(imageBounds)
+            let innerStats = averageVisualStats(
+                in: expandedRect,
+                bitmap: bitmap,
+                excluding: nil
+            )
+            let outerStats = averageVisualStats(
+                in: outerRect,
+                bitmap: bitmap,
+                excluding: expandedRect
+            )
+            let score = max(0, innerStats.luminance - outerStats.luminance) * 1.35
+                + max(0, innerStats.saturation - outerStats.saturation) * 0.75
+            return (candidate.project, score)
+        }
+            .sorted { lhs, rhs in
+                if lhs.score == rhs.score {
+                    return lhs.project.lowercased() < rhs.project.lowercased()
+                }
+                return lhs.score > rhs.score
+            }
+
+        guard let best = scoredCandidates.first,
+              best.score >= codexVisualSidebarMinHighlightScore else {
+            return nil
+        }
+        if let runnerUp = scoredCandidates.dropFirst().first,
+           (best.score - runnerUp.score) < codexVisualSidebarMinHighlightGap {
+            return nil
+        }
+        return best.project
+    }
+
+    private static func codexSidebarVisualCandidates(
+        from windowElement: AXUIElement
+    ) -> [CodexSidebarVisualCandidate] {
+        var queue: [AXUIElement] = [windowElement]
+        var cursor = 0
+        var bestByProject: [String: CodexSidebarVisualCandidate] = [:]
+
+        while cursor < queue.count, cursor < codexSidebarTraversalLimit {
+            let element = queue[cursor]
+            cursor += 1
+
+            let labels = [
+                axStringAttribute(kAXTitleAttribute as CFString, from: element),
+                axStringValueAttribute(kAXValueAttribute as CFString, from: element),
+                axStringAttribute(kAXDescriptionAttribute as CFString, from: element),
+                axStringAttribute(kAXHelpAttribute as CFString, from: element)
+            ]
+                .compactMap(normalizedLabel)
+
+            for label in labels {
+                guard let project = codexProjectSectionCandidate(from: label) else { continue }
+                let container = codexSidebarContainer(for: element)
+                guard let frame = container.flatMap(axFrame(of:)) ?? axFrame(of: element) else {
+                    continue
+                }
+                guard frame.width >= 80,
+                      frame.height >= 18,
+                      frame.height <= 90 else {
+                    continue
+                }
+
+                let candidate = CodexSidebarVisualCandidate(project: project, frame: frame)
+                let key = project.lowercased()
+                if let existing = bestByProject[key] {
+                    if frame.height < existing.frame.height
+                        || (abs(frame.height - existing.frame.height) < 1 && frame.width > existing.frame.width) {
+                        bestByProject[key] = candidate
+                    }
+                } else {
+                    bestByProject[key] = candidate
+                }
+            }
+
+            let children = axElementsAttribute(kAXChildrenAttribute as CFString, from: element)
+            if !children.isEmpty, queue.count < codexSidebarTraversalLimit {
+                queue.append(contentsOf: children.prefix(max(0, codexSidebarTraversalLimit - queue.count)))
+            }
+        }
+
+        return bestByProject.values.sorted { lhs, rhs in
+            if lhs.frame.minY == rhs.frame.minY {
+                return lhs.project.lowercased() < rhs.project.lowercased()
+            }
+            return lhs.frame.minY < rhs.frame.minY
+        }
+    }
+
+    private static func visionImageRect(
+        from normalizedRect: CGRect,
+        imageSize: CGSize
+    ) -> CGRect {
+        CGRect(
+            x: normalizedRect.minX * imageSize.width,
+            y: (1.0 - normalizedRect.maxY) * imageSize.height,
+            width: normalizedRect.width * imageSize.width,
+            height: normalizedRect.height * imageSize.height
+        )
+    }
+
+    private static func localImageRect(
+        for screenRect: CGRect,
+        screenshot: CodexWindowScreenshot
+    ) -> CGRect? {
+        guard screenshot.windowFrame.width > 0,
+              screenshot.windowFrame.height > 0 else {
+            return nil
+        }
+
+        let scaleX = screenshot.imageSize.width / screenshot.windowFrame.width
+        let scaleY = screenshot.imageSize.height / screenshot.windowFrame.height
+        let localRect = CGRect(
+            x: (screenRect.minX - screenshot.windowFrame.minX) * scaleX,
+            y: (screenRect.minY - screenshot.windowFrame.minY) * scaleY,
+            width: screenRect.width * scaleX,
+            height: screenRect.height * scaleY
+        )
+        guard localRect.width > 0, localRect.height > 0 else {
+            return nil
+        }
+        return localRect
+    }
+
+    private static func averageVisualStats(
+        in rect: CGRect,
+        bitmap: NSBitmapImageRep,
+        excluding excludedRect: CGRect?
+    ) -> CodexVisualRegionStats {
+        guard rect.width > 1, rect.height > 1 else {
+            return CodexVisualRegionStats(luminance: 0, saturation: 0)
+        }
+
+        let sampleColumns = max(5, min(18, Int(rect.width / 14)))
+        let sampleRows = max(5, min(12, Int(rect.height / 10)))
+        let clippedExcludedRect = excludedRect?.intersection(rect)
+
+        var luminanceTotal = 0.0
+        var saturationTotal = 0.0
+        var sampleCount = 0.0
+
+        for row in 0..<sampleRows {
+            for column in 0..<sampleColumns {
+                let samplePoint = CGPoint(
+                    x: rect.minX + (CGFloat(column) + 0.5) * rect.width / CGFloat(sampleColumns),
+                    y: rect.minY + (CGFloat(row) + 0.5) * rect.height / CGFloat(sampleRows)
+                )
+                if let clippedExcludedRect,
+                   clippedExcludedRect.contains(samplePoint) {
+                    continue
+                }
+
+                let pixelX = max(0, min(bitmap.pixelsWide - 1, Int(samplePoint.x.rounded(.down))))
+                let pixelYFromTop = Int(samplePoint.y.rounded(.down))
+                let pixelY = max(0, min(bitmap.pixelsHigh - 1, bitmap.pixelsHigh - 1 - pixelYFromTop))
+
+                guard let color = bitmap.colorAt(x: pixelX, y: pixelY)?
+                    .usingColorSpace(.deviceRGB) else {
+                    continue
+                }
+                let red = Double(color.redComponent)
+                let green = Double(color.greenComponent)
+                let blue = Double(color.blueComponent)
+                let alpha = Double(color.alphaComponent)
+                guard alpha > 0.08 else { continue }
+
+                let maxChannel = max(red, green, blue)
+                let minChannel = min(red, green, blue)
+                let saturation = maxChannel <= 0.0001 ? 0 : (maxChannel - minChannel) / maxChannel
+                let luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue)
+
+                luminanceTotal += luminance
+                saturationTotal += saturation
+                sampleCount += 1
+            }
+        }
+
+        guard sampleCount > 0 else {
+            return CodexVisualRegionStats(luminance: 0, saturation: 0)
+        }
+        return CodexVisualRegionStats(
+            luminance: luminanceTotal / sampleCount,
+            saturation: saturationTotal / sampleCount
+        )
     }
 
     private static func inferCodexTopBarSelection(
@@ -4749,6 +5644,7 @@ enum PromptRewriteConversationContextResolver {
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
         guard !normalized.isEmpty else { return false }
         guard !isLikelyVersionControlReferenceLabel(normalized) else { return false }
+        guard !shouldTreatCodexProjectLabelAsUnknown(normalized) else { return false }
 
         let lowered = normalized.lowercased()
         if lowered.contains("http://") || lowered.contains("https://") {
@@ -4777,14 +5673,14 @@ enum PromptRewriteConversationContextResolver {
             || normalized == "axcombobox"
     }
 
-    private static func codexNormalizedTopBarProjectCandidate(_ value: String) -> String? {
+    static func codexNormalizedTopBarProjectCandidate(_ value: String) -> String? {
         if let fromControl = codexProjectFromControlLabel(
             value,
             includeProjectSectionLabels: false
         ) {
             return fromControl
         }
-        if isCodexToolbarControlLabel(value) {
+        if isCodexToolbarControlLabel(value) || shouldTreatCodexProjectLabelAsUnknown(value) {
             return nil
         }
         if let fromPath = codexProjectFromPathLikeLabel(value) {
@@ -4793,7 +5689,7 @@ enum PromptRewriteConversationContextResolver {
         return normalizedProjectName(value)
     }
 
-    private static func codexProjectFromControlLabel(
+    static func codexProjectFromControlLabel(
         _ value: String,
         includeProjectSectionLabels: Bool = false
     ) -> String? {
@@ -5031,6 +5927,51 @@ enum PromptRewriteConversationContextResolver {
         return nil
     }
 
+    private static func codexSidebarContainer(for element: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+        var depth = 0
+
+        while depth < codexVisualSidebarAncestorDepth, let node = current {
+            let classList = axStringAttribute("AXDOMClassList" as CFString, from: node)?
+                .lowercased() ?? ""
+            if classList.contains("cursor-interaction")
+                || classList.contains("active-selection-background")
+                || classList.contains("group/cwd")
+                || classList.contains("nav-section")
+                || classList.contains("truncate")
+                || classList.contains("rounded-lg") {
+                return node
+            }
+            current = axElementAttribute(kAXParentAttribute as CFString, from: node)
+            depth += 1
+        }
+
+        return nil
+    }
+
+    private static func codexActiveSidebarRows(from windowElement: AXUIElement) -> [AXUIElement] {
+        let traversalLimit = codexSidebarTraversalLimit
+        var queue: [AXUIElement] = [windowElement]
+        var cursor = 0
+        var rows: [AXUIElement] = []
+
+        while cursor < queue.count, cursor < traversalLimit {
+            let element = queue[cursor]
+            cursor += 1
+
+            if isCodexActiveSidebarRow(element) {
+                rows.append(element)
+            }
+
+            let children = axElementsAttribute(kAXChildrenAttribute as CFString, from: element)
+            if !children.isEmpty, queue.count < traversalLimit {
+                queue.append(contentsOf: children.prefix(max(0, traversalLimit - queue.count)))
+            }
+        }
+
+        return rows
+    }
+
     private static func collectTextNodes(from root: AXUIElement, limit: Int) -> [AXTextNode] {
         var queue: [AXUIElement] = [root]
         var cursor = 0
@@ -5068,6 +6009,16 @@ enum PromptRewriteConversationContextResolver {
         }
 
         return nodes
+    }
+
+    private static func codexProjectSectionCandidate(from value: String) -> String? {
+        let lowered = value.lowercased()
+        guard lowered.contains("start new thread in")
+            || lowered.contains("project actions for")
+            || lowered.contains("automations in") else {
+            return nil
+        }
+        return codexProjectFromControlLabel(value, includeProjectSectionLabels: true)
     }
 
     private static func isLikelyCodexContextText(_ value: String) -> Bool {
@@ -5108,67 +6059,6 @@ enum PromptRewriteConversationContextResolver {
             return false
         }
         return true
-    }
-
-    private static func projectName(fromCodexText text: String) -> String? {
-        if let fromControl = codexProjectFromControlLabel(
-            text,
-            includeProjectSectionLabels: false
-        ) {
-            return fromControl
-        }
-        if let fromPath = codexProjectFromPathLikeLabel(text) {
-            return fromPath
-        }
-        if let captured = firstRegexCapture(
-            pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
-            in: text
-        ) {
-            return normalizedProjectName(captured)
-        }
-        if let captured = firstRegexCapture(
-            pattern: #"(?i)\b(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
-            in: text
-        ) {
-            return normalizedProjectName(captured)
-        }
-        return nil
-    }
-
-    private static func codexSidebarProjectFromThreadContext(
-        from windowElement: AXUIElement,
-        thread: String?
-    ) -> String? {
-        guard let normalizedThread = normalizedLabel(thread),
-              !normalizedThread.isEmpty else {
-            return nil
-        }
-        let textNodes = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
-        let threadIndices = textNodes.enumerated().compactMap { index, node -> Int? in
-            guard node.text.caseInsensitiveCompare(normalizedThread) == .orderedSame else {
-                return nil
-            }
-            guard looksLikeCodexThreadTitle(node.text, project: nil) else {
-                return nil
-            }
-            return index
-        }
-        guard !threadIndices.isEmpty else { return nil }
-
-        for index in threadIndices {
-            let lowerBound = max(0, index - 80)
-            guard index > lowerBound else { continue }
-            for cursor in stride(from: index - 1, through: lowerBound, by: -1) {
-                let text = textNodes[cursor].text
-                if let candidate = codexProjectFromControlLabel(
-                    text,
-                    includeProjectSectionLabels: true
-                ), !isLikelyVersionControlReferenceLabel(candidate) {
-                    return candidate
-                }
-            }
-        }
-        return nil
     }
 
     private static func normalizedProjectName(_ value: String) -> String? {
@@ -5217,11 +6107,98 @@ enum PromptRewriteConversationContextResolver {
             "automations",
             "threads",
             "pinned threads",
+            "user attachment",
+            "user attachments",
             "unknown project",
             "unknown workspace",
             "unknown identity"
         ]
-        return blocked.contains(normalized)
+        if blocked.contains(normalized) {
+            return true
+        }
+        if normalized.range(of: #"^(?:automations?|threads?|skills?)\s+\d+$"#, options: .regularExpression) != nil {
+            return true
+        }
+        if normalized.range(
+            of: #"^worked\s+for\s+\d+\s*[smhdw](?:\s+\d+\s*[smhdw])*$"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+        return false
+    }
+
+    static func shouldTreatCodexProjectLabelAsUnknown(_ value: String) -> Bool {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !normalized.isEmpty else { return true }
+        if isCodexNonProjectPlaceholderLabel(normalized) {
+            return true
+        }
+        return isLikelyCodexActionLabel(normalized)
+    }
+
+    static func sanitizedCodexScreenLabel(_ screenLabel: String) -> String {
+        let normalized = collapsedWhitespace(screenLabel)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return "Current Screen" }
+
+        if let project = firstRegexCapture(
+            pattern: #"(?i)\bproject\s*:\s*([^\|]+)"#,
+            in: normalized
+        ),
+           shouldTreatCodexProjectLabelAsUnknown(project) {
+            if let thread = firstRegexCapture(
+                pattern: #"(?i)\bthread\s*:\s*([^\|]+)$"#,
+                in: normalized
+            ) {
+                return "Thread: \(thread)"
+            }
+            return "Current Screen"
+        }
+
+        if shouldTreatCodexProjectLabelAsUnknown(normalized) {
+            return "Current Screen"
+        }
+
+        return normalized
+    }
+
+    private static func isLikelyCodexActionLabel(_ value: String) -> Bool {
+        let normalized = collapsedWhitespace(value)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .lowercased()
+        guard !normalized.isEmpty else { return true }
+
+        let blockedExact: Set<String> = [
+            "open in popout window",
+            "open in pop-up window",
+            "open in new window",
+            "open in browser",
+            "edit message",
+            "run",
+            "handoff",
+            "hand off",
+            "secondary action",
+            "copy link",
+            "share",
+            "undo",
+            "redo",
+            "copy",
+            "paste",
+            "cut",
+            "delete",
+            "select all"
+        ]
+        if blockedExact.contains(normalized) {
+            return true
+        }
+        if normalized.range(of: #"^(?:automations?|threads?|skills?)\s+\d+$"#, options: .regularExpression) != nil {
+            return true
+        }
+
+        let actionPattern = #"^(?:open|close|show|hide|toggle|copy|share|inspect|compact|clear|edit(?:\s+message)?|pop(?:[- ]?out)?|run|commit|handoff|hand off|undo|redo|paste|cut|delete|select all)\b"#
+        return normalized.range(of: actionPattern, options: .regularExpression) != nil
     }
 
     private static func isLikelyVersionControlReferenceLabel(_ value: String) -> Bool {
@@ -5786,6 +6763,16 @@ enum PromptRewriteConversationContextResolver {
             x: position.x + (size.width / 2.0),
             y: position.y + (size.height / 2.0)
         )
+    }
+
+    private static func axFrame(of element: AXUIElement) -> CGRect? {
+        guard let position = axCGPointAttribute(kAXPositionAttribute as CFString, from: element),
+              let size = axCGSizeAttribute(kAXSizeAttribute as CFString, from: element),
+              size.width > 0,
+              size.height > 0 else {
+            return nil
+        }
+        return CGRect(origin: position, size: size)
     }
 
     private static func normalizedLabel(_ raw: String?) -> String? {

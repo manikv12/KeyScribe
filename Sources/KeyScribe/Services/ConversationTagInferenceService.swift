@@ -163,6 +163,11 @@ final class ConversationTagInferenceService {
             ), !isBlockedProjectLabel(codexBuildProject) {
                 return codexBuildProject
             }
+
+            // Codex thread titles often contain words like "project lookup";
+            // if we did not find an explicit project signal, prefer unknown
+            // over inventing a project name from the chat title.
+            return "Unknown Project"
         }
 
         if let regexMatch = firstMatch(
@@ -205,6 +210,9 @@ final class ConversationTagInferenceService {
         if blocked.contains(normalized) {
             return true
         }
+        if normalized.range(of: #"^(?:automations?|threads?|skills?)\s+\d+$"#, options: .regularExpression) != nil {
+            return true
+        }
         let slugged = slug(normalized)
         return isBlockedProjectSlug(slugged)
     }
@@ -222,7 +230,13 @@ final class ConversationTagInferenceService {
             "automation-folders",
             "automations"
         ]
-        return blocked.contains(value) || value.hasPrefix("unknown-")
+        if blocked.contains(value) || value.hasPrefix("unknown-") {
+            return true
+        }
+        if value.range(of: #"^(?:automations?|threads?|skills?)-\d+$"#, options: .regularExpression) != nil {
+            return true
+        }
+        return false
     }
 
     private func canonicalBundleID(

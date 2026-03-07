@@ -162,6 +162,20 @@ final class ConversationTagInferenceServiceCrossIDESharingTests: XCTestCase {
         XCTAssertEqual(tags.projectKey, "project:unknown")
     }
 
+    func testCodexTreatsAutomationsCounterLabelAsUnknownProject() {
+        let context = PromptRewriteConversationContext(
+            id: "ctx-codex-automations-counter",
+            appName: "Codex",
+            bundleIdentifier: "com.openai.codex",
+            screenLabel: "Project: Automations 1",
+            fieldLabel: "Focused Input"
+        )
+
+        let tags = service.inferTags(capturedContext: context, userText: "")
+        XCTAssertEqual(tags.projectLabel, "Unknown Project")
+        XCTAssertEqual(tags.projectKey, "project:unknown")
+    }
+
     func testCodexStillInfersRealProjectLabelFromContext() {
         let context = PromptRewriteConversationContext(
             id: "ctx-codex-spike",
