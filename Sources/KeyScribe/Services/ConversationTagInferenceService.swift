@@ -154,20 +154,15 @@ final class ConversationTagInferenceService {
             if let codexProject = firstMatch(
                 pattern: #"(?i)\b(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ), !isBlockedProjectLabel(codexProject) {
+            ) {
                 return codexProject
             }
             if let codexBuildProject = firstMatch(
                 pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
                 in: primaryText
-            ), !isBlockedProjectLabel(codexBuildProject) {
+            ) {
                 return codexBuildProject
             }
-
-            // Codex thread titles often contain words like "project lookup";
-            // if we did not find an explicit project signal, prefer unknown
-            // over inventing a project name from the chat title.
-            return "Unknown Project"
         }
 
         if let regexMatch = firstMatch(
@@ -202,15 +197,9 @@ final class ConversationTagInferenceService {
             "unknown project",
             "unknown workspace",
             "current screen",
-            "focused input",
-            "automation folder",
-            "automation folders",
-            "automations"
+            "focused input"
         ]
         if blocked.contains(normalized) {
-            return true
-        }
-        if normalized.range(of: #"^(?:automations?|threads?|skills?)\s+\d+$"#, options: .regularExpression) != nil {
             return true
         }
         let slugged = slug(normalized)
@@ -225,15 +214,9 @@ final class ConversationTagInferenceService {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input",
-            "automation-folder",
-            "automation-folders",
-            "automations"
+            "focused-input"
         ]
         if blocked.contains(value) || value.hasPrefix("unknown-") {
-            return true
-        }
-        if value.range(of: #"^(?:automations?|threads?|skills?)-\d+$"#, options: .regularExpression) != nil {
             return true
         }
         return false
@@ -342,10 +325,7 @@ final class ConversationTagInferenceService {
             "unknown",
             "unknown-project",
             "current-screen",
-            "focused-input",
-            "automation-folder",
-            "automation-folders",
-            "automations"
+            "focused-input"
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false

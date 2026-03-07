@@ -1401,21 +1401,15 @@ final class PromptRewriteConversationStore: ObservableObject {
         tags: ConversationTupleTags,
         threadID: String
     ) -> PromptRewriteConversationContext {
-        let sanitizedProject = sanitizedCodexStoredProject(
-            appName: baseContext.appName,
-            screenLabel: baseContext.screenLabel,
-            projectKey: tags.projectKey,
-            projectLabel: tags.projectLabel
-        )
         return PromptRewriteConversationContext(
             id: threadID,
             appName: baseContext.appName,
             bundleIdentifier: baseContext.bundleIdentifier,
-            screenLabel: sanitizedProject.screenLabel,
+            screenLabel: baseContext.screenLabel,
             fieldLabel: baseContext.fieldLabel,
             logicalSurfaceKey: tupleKey.logicalSurfaceKey,
-            projectKey: sanitizedProject.projectKey,
-            projectLabel: sanitizedProject.projectLabel,
+            projectKey: tags.projectKey,
+            projectLabel: tags.projectLabel,
             identityKey: tags.identityKey,
             identityType: tags.identityType,
             identityLabel: tags.identityLabel,
@@ -3720,30 +3714,7 @@ final class PromptRewriteConversationStore: ObservableObject {
     ) -> (screenLabel: String, projectKey: String, projectLabel: String) {
         let resolvedProjectKey = projectKey ?? "project:unknown"
         let resolvedProjectLabel = projectLabel ?? "Unknown Project"
-
-        guard appName.localizedCaseInsensitiveContains("codex") else {
-            return (screenLabel, resolvedProjectKey, resolvedProjectLabel)
-        }
-
-        let projectCandidate: String
-        if let projectLabel, !projectLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            projectCandidate = projectLabel
-        } else {
-            let normalizedKey = resolvedProjectKey
-                .replacingOccurrences(of: #"(?i)^project:"#, with: "", options: .regularExpression)
-                .replacingOccurrences(of: "-", with: " ")
-            projectCandidate = normalizedKey
-        }
-
-        guard PromptRewriteConversationContextResolver.shouldTreatCodexProjectLabelAsUnknown(projectCandidate) else {
-            return (screenLabel, resolvedProjectKey, resolvedProjectLabel)
-        }
-
-        return (
-            PromptRewriteConversationContextResolver.sanitizedCodexScreenLabel(screenLabel),
-            "project:unknown",
-            "Unknown Project"
-        )
+        return (screenLabel, resolvedProjectKey, resolvedProjectLabel)
     }
 
     private func deleteContextFromSQLite(id: String) {
@@ -3895,153 +3866,7 @@ final class PromptRewriteConversationStore: ObservableObject {
         tupleKey: ConversationThreadTupleKey,
         store: MemorySQLiteStore
     ) -> Bool {
-        guard isCodexContext(capturedContext) else {
-            return false
-        }
-        guard isMeaningfulCodexProjectKey(tags.projectKey),
-              hasMeaningfulCodexCorrectionIdentity(tags) else {
-            return false
-        }
-
-        let allThreads: [ConversationThreadRecord]
-        if let fetched = try? store.fetchAllConversationThreads() {
-            allThreads = fetched
-        } else {
-            let scanLimit = min(
-                sqliteStartupThreadScanHardLimit,
-                max(maxStoredContexts, maxStoredContexts * sqliteStartupThreadScanMultiplier)
-            )
-            allThreads = (try? store.fetchConversationThreads(limit: scanLimit)) ?? []
-        }
-        guard !allThreads.isEmpty else {
-            return false
-        }
-
-        let now = Date()
-        let targetThreadID = tagInferenceService.threadID(for: tupleKey)
-        let correctionCandidates = allThreads.filter { thread in
-            isCodexUnknownProjectCorrectionCandidate(
-                thread,
-                tags: tags,
-                targetThreadID: targetThreadID,
-                now: now
-            )
-        }
-        guard !correctionCandidates.isEmpty else {
-            return false
-        }
-
-        let existingTargetThread = allThreads.first { thread in
-            thread.id == targetThreadID
-                || (
-                    thread.bundleID.caseInsensitiveCompare(tupleKey.bundleID) == .orderedSame
-                    && thread.logicalSurfaceKey.caseInsensitiveCompare(tupleKey.logicalSurfaceKey) == .orderedSame
-                    && thread.projectKey.caseInsensitiveCompare(tupleKey.projectKey) == .orderedSame
-                    && thread.identityKey.caseInsensitiveCompare(tupleKey.identityKey) == .orderedSame
-                    && thread.nativeThreadKey.caseInsensitiveCompare(tupleKey.nativeThreadKey) == .orderedSame
-                )
-        }
-
-        var relatedThreads = correctionCandidates
-        if let existingTargetThread,
-           !relatedThreads.contains(where: { $0.id == existingTargetThread.id }) {
-            relatedThreads.insert(existingTargetThread, at: 0)
-        }
-
-        let mergedTurns = mergedConversationTurns(
-            relatedThreads.compactMap { thread in
-                ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
-                    .compactMap(conversationTurn(from:))
-            }
-        )
-
-        let sanitizedProject = sanitizedCodexStoredProject(
-            appName: capturedContext.appName,
-            screenLabel: capturedContext.screenLabel,
-            projectKey: tags.projectKey,
-            projectLabel: tags.projectLabel
-        )
-        let createdAt = relatedThreads
-            .map(\.createdAt)
-            .min() ?? now
-        let lastActivityAt = relatedThreads
-            .map(\.lastActivityAt)
-            .max() ?? now
-        let runningSummary = mergedTurns.reversed().first(where: \.isSummary)?.assistantText
-            ?? existingTargetThread?.runningSummary
-            ?? correctionCandidates.first?.runningSummary
-            ?? ""
-        let totalExchangeTurns = max(
-            mergedTurns.filter { !$0.isSummary }.count,
-            relatedThreads
-                .map(\.totalExchangeTurns)
-                .max() ?? 0
-        )
-
-        let correctedThread = ConversationThreadRecord(
-            id: targetThreadID,
-            appName: capturedContext.appName,
-            bundleID: tupleKey.bundleID,
-            logicalSurfaceKey: tupleKey.logicalSurfaceKey,
-            screenLabel: sanitizedProject.screenLabel,
-            fieldLabel: capturedContext.fieldLabel,
-            projectKey: sanitizedProject.projectKey,
-            projectLabel: sanitizedProject.projectLabel,
-            identityKey: tags.identityKey,
-            identityType: tags.identityType,
-            identityLabel: tags.identityLabel,
-            nativeThreadKey: tags.nativeThreadKey,
-            people: tags.people,
-            runningSummary: runningSummary,
-            totalExchangeTurns: totalExchangeTurns,
-            createdAt: createdAt,
-            lastActivityAt: lastActivityAt,
-            updatedAt: now
-        )
-        let correctedTurnRecords = mergedTurns.map {
-            conversationTurnRecord($0, threadID: targetThreadID)
-        }
-
-        do {
-            try store.upsertConversationThread(correctedThread)
-            try store.replaceConversationTurns(
-                threadID: targetThreadID,
-                turns: correctedTurnRecords,
-                runningSummary: runningSummary,
-                totalExchangeTurns: totalExchangeTurns,
-                lastActivityAt: lastActivityAt,
-                updatedAt: now
-            )
-            if isConversationRedirectWriteEnabled {
-                for candidate in correctionCandidates where candidate.id != targetThreadID {
-                    try store.upsertConversationThreadRedirect(
-                        oldThreadID: candidate.id,
-                        newThreadID: targetThreadID,
-                        reason: "Codex project corrected from unknown to \(sanitizedProject.projectKey)."
-                    )
-                }
-            }
-            for candidate in correctionCandidates where candidate.id != targetThreadID {
-                try store.deleteConversationThread(
-                    id: candidate.id,
-                    preserveRedirects: isConversationRedirectWriteEnabled
-                )
-            }
-        } catch {
-            CrashReporter.logInfo("Codex project correction skipped reason=persistence-failed")
-            return false
-        }
-
-        loadFromSQLite()
-        refreshSummaries()
-        CrashReporter.logInfo(
-            """
-            Codex project correction applied \
-            corrected_project=\(sanitizedProject.projectKey) \
-            redirected_threads=\(correctionCandidates.map(\.id).sorted().joined(separator: ","))
-            """
-        )
-        return true
+        return false
     }
 
     private func isCodexContext(_ context: PromptRewriteConversationContext) -> Bool {
@@ -4078,50 +3903,7 @@ final class PromptRewriteConversationStore: ObservableObject {
         tags: ConversationTupleTags,
         store: MemorySQLiteStore
     ) -> ConversationTupleTags {
-        guard isCodexContext(capturedContext) else {
-            return tags
-        }
-        guard !isMeaningfulCodexProjectKey(tags.projectKey) else {
-            return tags
-        }
-
-        let normalizedNativeThread = tags.nativeThreadKey
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard !normalizedNativeThread.isEmpty else {
-            return tags
-        }
-
-        let allThreads = (try? store.fetchAllConversationThreads()) ?? []
-        guard !allThreads.isEmpty else {
-            return tags
-        }
-
-        let now = Date()
-        guard let matchedThread = allThreads
-            .filter({
-                isCodexKnownProjectReuseCandidate(
-                    $0,
-                    nativeThreadKey: normalizedNativeThread,
-                    now: now
-                )
-            })
-            .sorted(by: { lhs, rhs in
-                lhs.lastActivityAt > rhs.lastActivityAt
-            })
-            .first else {
-            return tags
-        }
-
-        return ConversationTupleTags(
-            projectKey: matchedThread.projectKey,
-            projectLabel: matchedThread.projectLabel,
-            identityKey: tags.identityKey,
-            identityType: tags.identityType,
-            identityLabel: tags.identityLabel,
-            people: tags.people,
-            nativeThreadKey: tags.nativeThreadKey
-        )
+        return tags
     }
 
     private func isCodexKnownProjectReuseCandidate(
@@ -4985,23 +4767,72 @@ enum PromptRewriteConversationContextResolver {
         from windowElement: AXUIElement,
         fallbackWindowTitle: String?
     ) -> (project: String?, thread: String?) {
-        let visualSelection = inferCodexVisualSelection(from: windowElement)
         let topBarSelection = inferCodexTopBarSelection(from: windowElement)
         let sidebarSelection = inferCodexSidebarSelection(from: windowElement)
-        let project = codexTrustedProjectCandidate(
-            visualProject: visualSelection?.mainContentProject,
+        var project = codexTrustedProjectCandidate(
             topBarProject: topBarSelection?.project,
-            sidebarProject: visualSelection?.sidebarProject ?? sidebarSelection?.project
+            sidebarProject: sidebarSelection?.project
         )
         var thread = topBarSelection?.thread ?? sidebarSelection?.thread
 
+        var cachedTextNodes: [AXTextNode]?
+        func textNodes() -> [AXTextNode] {
+            if let cachedTextNodes {
+                return cachedTextNodes
+            }
+            let fetched = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
+            cachedTextNodes = fetched
+            return fetched
+        }
+
+        func bestProjectFromVisibleText() -> String? {
+            let allTexts = textNodes().map(\.text)
+            let controlCandidates = allTexts.compactMap {
+                codexProjectFromControlLabel($0, includeProjectSectionLabels: false)
+            }
+            if let candidate = controlCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+                return candidate
+            }
+            let pathCandidates = allTexts.compactMap(codexProjectFromPathLikeLabel)
+            if let candidate = pathCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+                return candidate
+            }
+            let genericCandidates = allTexts.compactMap(projectName(fromCodexText:))
+            if let candidate = genericCandidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+                return candidate
+            }
+            return controlCandidates.first ?? pathCandidates.first ?? genericCandidates.first
+        }
+
+        func bestProjectFromThreadContext(_ threadCandidate: String?) -> String? {
+            codexSidebarProjectFromThreadContext(
+                from: windowElement,
+                thread: threadCandidate
+            )
+        }
+
+        if let currentProject = project,
+           isLikelyVersionControlReferenceLabel(currentProject),
+           let replacement = bestProjectFromThreadContext(thread)
+            ?? bestProjectFromVisibleText() {
+            project = replacement
+        }
+
+        if project == nil {
+            project = bestProjectFromThreadContext(thread)
+                ?? bestProjectFromVisibleText()
+        }
+
         if thread == nil {
-            let selectedTexts = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
+            let selectedTexts = textNodes()
                 .filter { $0.selected }
                 .map(\.text)
             thread = selectedTexts.first {
                 looksLikeCodexThreadTitle($0, project: project)
             }
+        }
+        if project == nil {
+            project = bestProjectFromThreadContext(thread)
         }
 
         if let fallbackWindowTitle = normalizedLabel(fallbackWindowTitle),
@@ -5010,35 +4841,14 @@ enum PromptRewriteConversationContextResolver {
                project: project
            ) {
             thread = thread ?? fromWindow
+            if project == nil {
+                project = codexProjectFromWindowTitle(fallbackWindowTitle, thread: fromWindow)
+            }
         }
-
-        let inferenceSource: String
-        if let visualSelection, let mainContentProject = visualSelection.mainContentProject,
-           project?.caseInsensitiveCompare(mainContentProject) == .orderedSame {
-            inferenceSource = "main-content"
-        } else if let visualSelection, let sidebarProject = visualSelection.sidebarProject,
-                  project?.caseInsensitiveCompare(sidebarProject) == .orderedSame {
-            inferenceSource = "sidebar-visual"
-        } else if let sidebarProject = sidebarSelection?.project,
-                  project?.caseInsensitiveCompare(sidebarProject) == .orderedSame {
-            inferenceSource = "sidebar-ax"
-        } else if let topBarProject = topBarSelection?.project,
-                  project?.caseInsensitiveCompare(topBarProject) == .orderedSame {
-            inferenceSource = "top-bar"
-        } else {
-            inferenceSource = "unknown"
+        if project == nil,
+           let fallbackWindowTitle = normalizedLabel(fallbackWindowTitle) {
+            project = projectName(fromCodexText: fallbackWindowTitle)
         }
-        CrashReporter.logInfo(
-            """
-            Codex project inference \
-            source=\(inferenceSource) \
-            visual_main=\(visualSelection?.mainContentProject ?? "nil") \
-            visual_sidebar=\(visualSelection?.sidebarProject ?? "nil") \
-            top_bar=\(topBarSelection?.project ?? "nil") \
-            sidebar_ax=\(sidebarSelection?.project ?? "nil") \
-            chosen=\(project ?? "nil")
-            """
-        )
 
         return (project, thread)
     }
@@ -5048,29 +4858,13 @@ enum PromptRewriteConversationContextResolver {
         topBarProject: String?,
         sidebarProject: String?
     ) -> String? {
-        let normalizedVisual = normalizedLabel(visualProject).flatMap(normalizedProjectName)
-        let normalizedTop = normalizedLabel(topBarProject).flatMap(normalizedProjectName)
-        let normalizedSidebar = normalizedLabel(sidebarProject).flatMap(normalizedProjectName)
-
-        // For Codex, trust what is visibly selected on screen before trusting
-        // Electron control labels, because the controls can expose action text
-        // like "Edit message" that is not a real project name.
-        if let normalizedVisual,
-           !isLikelyVersionControlReferenceLabel(normalizedVisual),
-           !shouldTreatCodexProjectLabelAsUnknown(normalizedVisual) {
-            return normalizedVisual
+        let candidates = [topBarProject, sidebarProject]
+            .compactMap(normalizedLabel)
+            .compactMap(normalizedProjectName)
+        if let bestNonVCS = candidates.first(where: { !isLikelyVersionControlReferenceLabel($0) }) {
+            return bestNonVCS
         }
-        if let normalizedSidebar,
-           !isLikelyVersionControlReferenceLabel(normalizedSidebar),
-           !shouldTreatCodexProjectLabelAsUnknown(normalizedSidebar) {
-            return normalizedSidebar
-        }
-        if let normalizedTop,
-           !isLikelyVersionControlReferenceLabel(normalizedTop),
-           !shouldTreatCodexProjectLabelAsUnknown(normalizedTop) {
-            return normalizedTop
-        }
-        return nil
+        return candidates.first
     }
 
     private static func inferCodexVisualSelection(
@@ -5494,24 +5288,14 @@ enum PromptRewriteConversationContextResolver {
         }
         let entries = codexDirectChildLabels(of: controlsGroup)
         let thread = codexThreadNearTopBarControls(controlsGroup, project: nil)
-        let topBarProject = codexProjectFromTopBarControls(entries)
-        let nearControlsProject = codexProjectNearTopBarControls(
-            from: windowElement,
-            controlsGroup,
-            thread: thread
+        let project = codexTrustedProjectCandidate(
+            topBarProject: codexProjectFromTopBarControls(entries),
+            sidebarProject: codexProjectNearTopBarControls(
+                from: windowElement,
+                controlsGroup,
+                thread: thread
+            )
         )
-        let filteredTopBar: String? = if let topBarProject, !isLikelyVersionControlReferenceLabel(topBarProject) {
-            topBarProject
-        } else {
-            nil
-        }
-        let project = filteredTopBar ?? {
-            guard let nearControlsProject else { return nil }
-            guard !isLikelyVersionControlReferenceLabel(nearControlsProject) else {
-                return nil
-            }
-            return nearControlsProject
-        }()
         if project == nil, thread == nil {
             return nil
         }
@@ -5644,7 +5428,6 @@ enum PromptRewriteConversationContextResolver {
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
         guard !normalized.isEmpty else { return false }
         guard !isLikelyVersionControlReferenceLabel(normalized) else { return false }
-        guard !shouldTreatCodexProjectLabelAsUnknown(normalized) else { return false }
 
         let lowered = normalized.lowercased()
         if lowered.contains("http://") || lowered.contains("https://") {
@@ -5680,7 +5463,7 @@ enum PromptRewriteConversationContextResolver {
         ) {
             return fromControl
         }
-        if isCodexToolbarControlLabel(value) || shouldTreatCodexProjectLabelAsUnknown(value) {
+        if isCodexToolbarControlLabel(value) {
             return nil
         }
         if let fromPath = codexProjectFromPathLikeLabel(value) {
@@ -6033,7 +5816,6 @@ enum PromptRewriteConversationContextResolver {
             "codex",
             "new thread",
             "threads",
-            "automation folders",
             "automations",
             "skills",
             "settings",
@@ -6061,6 +5843,67 @@ enum PromptRewriteConversationContextResolver {
         return true
     }
 
+    private static func projectName(fromCodexText text: String) -> String? {
+        if let fromControl = codexProjectFromControlLabel(
+            text,
+            includeProjectSectionLabels: false
+        ) {
+            return fromControl
+        }
+        if let fromPath = codexProjectFromPathLikeLabel(text) {
+            return fromPath
+        }
+        if let captured = firstRegexCapture(
+            pattern: #"(?i)\blet['’]s\s+build\s+([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+            in: text
+        ) {
+            return normalizedProjectName(captured)
+        }
+        if let captured = firstRegexCapture(
+            pattern: #"(?i)\b(?:project|workspace)\s*[:\-]\s*([a-z0-9][a-z0-9 ._()\-]{1,80})\b"#,
+            in: text
+        ) {
+            return normalizedProjectName(captured)
+        }
+        return nil
+    }
+
+    private static func codexSidebarProjectFromThreadContext(
+        from windowElement: AXUIElement,
+        thread: String?
+    ) -> String? {
+        guard let normalizedThread = normalizedLabel(thread),
+              !normalizedThread.isEmpty else {
+            return nil
+        }
+        let textNodes = collectTextNodes(from: windowElement, limit: codexTextNodeScanLimit)
+        let threadIndices = textNodes.enumerated().compactMap { index, node -> Int? in
+            guard node.text.caseInsensitiveCompare(normalizedThread) == .orderedSame else {
+                return nil
+            }
+            guard looksLikeCodexThreadTitle(node.text, project: nil) else {
+                return nil
+            }
+            return index
+        }
+        guard !threadIndices.isEmpty else { return nil }
+
+        for index in threadIndices {
+            let lowerBound = max(0, index - 80)
+            guard index > lowerBound else { continue }
+            for cursor in stride(from: index - 1, through: lowerBound, by: -1) {
+                let text = textNodes[cursor].text
+                if let candidate = codexProjectFromControlLabel(
+                    text,
+                    includeProjectSectionLabels: true
+                ), !isLikelyVersionControlReferenceLabel(candidate) {
+                    return candidate
+                }
+            }
+        }
+        return nil
+    }
+
     private static func normalizedProjectName(_ value: String) -> String? {
         let normalized = collapsedWhitespace(value)
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
@@ -6070,9 +5913,6 @@ enum PromptRewriteConversationContextResolver {
             in: normalized
         ) {
             return normalizedProjectName(captured)
-        }
-        if isCodexNonProjectPlaceholderLabel(normalized) {
-            return nil
         }
         let lowered = normalized.lowercased()
         let blocked: Set<String> = [
@@ -6207,12 +6047,6 @@ enum PromptRewriteConversationContextResolver {
             .lowercased()
         guard !normalized.isEmpty else { return false }
 
-        // Codex top-bar branch selector can expose labels such as "Hand off"/"Handoff".
-        // Treat these as non-project references so sidebar/workspace project names win.
-        if normalized.range(of: #"^hand[\s-]?off$"#, options: .regularExpression) != nil {
-            return true
-        }
-
         // Pull request / issue style badges.
         if normalized.range(
             of: #"^(?:pr|pull request)\s*#?\d+\b"#,
@@ -6283,7 +6117,6 @@ enum PromptRewriteConversationContextResolver {
         let blocked: Set<String> = [
             "new thread",
             "threads",
-            "automation folders",
             "settings",
             "automations",
             "skills",
@@ -6319,7 +6152,6 @@ enum PromptRewriteConversationContextResolver {
             "toggle diff panel",
             "pop out",
             "new thread",
-            "automation folders",
             "automations",
             "skills",
             "settings"
