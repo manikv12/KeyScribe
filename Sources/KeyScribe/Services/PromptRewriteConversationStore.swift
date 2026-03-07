@@ -94,6 +94,9 @@ struct PromptRewriteConversationContext: Codable, Equatable, Identifiable {
     }
 
     var displayName: String {
+        if Self.isCodexConversation(appName: appName, bundleIdentifier: bundleIdentifier) {
+            return appName
+        }
         let normalizedProject = projectLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let normalizedIdentity = identityLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let normalizedScreen = Self.displayScreenLabel(
@@ -119,6 +122,9 @@ struct PromptRewriteConversationContext: Codable, Equatable, Identifiable {
     }
 
     var providerContextLabel: String {
+        if Self.isCodexConversation(appName: appName, bundleIdentifier: bundleIdentifier) {
+            return appName
+        }
         let normalizedProject = projectLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let normalizedIdentity = identityLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let normalizedScreen = screenLabel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -137,6 +143,16 @@ struct PromptRewriteConversationContext: Codable, Equatable, Identifiable {
             segments.append("field: \(normalizedField)")
         }
         return segments.joined(separator: ", ")
+    }
+
+    private static func isCodexConversation(appName: String, bundleIdentifier: String) -> Bool {
+        let normalizedBundle = bundleIdentifier
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedBundle == "com.openai.codex" {
+            return true
+        }
+        return appName.localizedCaseInsensitiveContains("codex")
     }
 
     private static func isMeaningfulProjectLabel(_ value: String) -> Bool {
@@ -386,6 +402,13 @@ final class PromptRewriteConversationStore: ObservableObject {
     private let duplicateMergeThreadScanMultiplier = 4
     private let duplicateMergeThreadScanHardLimit = 120
     private let codexProjectCorrectionMaxAgeSeconds: TimeInterval = 6 * 60 * 60
+    private let codexConversationScreenLabel = "Current Screen"
+    private let codexConversationProjectKey = "project:codex-app"
+    private let codexConversationProjectLabel = "Unknown Project"
+    private let codexConversationIdentityKey = "identity:codex-app"
+    private let codexConversationIdentityType = "unknown"
+    private let codexConversationIdentityLabel = "Unknown Identity"
+    private let codexConversationNativeThreadKey = "thread:codex-app"
     private let clarificationSimilarityThreshold = 0.92
     private let deterministicMappingSimilarityThreshold = 0.94
     private let clarificationCandidateLimit = 3
@@ -1401,20 +1424,30 @@ final class PromptRewriteConversationStore: ObservableObject {
         tags: ConversationTupleTags,
         threadID: String
     ) -> PromptRewriteConversationContext {
-        return PromptRewriteConversationContext(
-            id: threadID,
+        let normalizedValues = sanitizedCodexStoredContextValues(
             appName: baseContext.appName,
-            bundleIdentifier: baseContext.bundleIdentifier,
             screenLabel: baseContext.screenLabel,
-            fieldLabel: baseContext.fieldLabel,
-            logicalSurfaceKey: tupleKey.logicalSurfaceKey,
             projectKey: tags.projectKey,
             projectLabel: tags.projectLabel,
             identityKey: tags.identityKey,
             identityType: tags.identityType,
             identityLabel: tags.identityLabel,
-            nativeThreadKey: tags.nativeThreadKey,
-            people: tags.people
+            nativeThreadKey: tags.nativeThreadKey
+        )
+        return PromptRewriteConversationContext(
+            id: threadID,
+            appName: baseContext.appName,
+            bundleIdentifier: baseContext.bundleIdentifier,
+            screenLabel: normalizedValues.screenLabel,
+            fieldLabel: baseContext.fieldLabel,
+            logicalSurfaceKey: tupleKey.logicalSurfaceKey,
+            projectKey: normalizedValues.projectKey,
+            projectLabel: normalizedValues.projectLabel,
+            identityKey: normalizedValues.identityKey,
+            identityType: normalizedValues.identityType,
+            identityLabel: normalizedValues.identityLabel,
+            nativeThreadKey: normalizedValues.nativeThreadKey,
+            people: isCodexContext(baseContext) ? [] : tags.people
         )
     }
 
@@ -3524,47 +3557,60 @@ final class PromptRewriteConversationStore: ObservableObject {
         var nextTupleMap: [ConversationThreadTupleKey: String] = [:]
 
         for thread in threadRows {
-            let sanitizedProject = sanitizedCodexStoredProject(
+            let sanitizedContext = sanitizedCodexStoredContextValues(
                 appName: thread.appName,
                 screenLabel: thread.screenLabel,
                 projectKey: thread.projectKey,
-                projectLabel: thread.projectLabel
+                projectLabel: thread.projectLabel,
+                identityKey: thread.identityKey,
+                identityType: thread.identityType,
+                identityLabel: thread.identityLabel,
+                nativeThreadKey: thread.nativeThreadKey
             )
-            if sanitizedProject.screenLabel != thread.screenLabel
-                || sanitizedProject.projectKey != thread.projectKey
-                || sanitizedProject.projectLabel != thread.projectLabel {
+            if sanitizedContext.screenLabel != thread.screenLabel
+                || sanitizedContext.projectKey != thread.projectKey
+                || sanitizedContext.projectLabel != thread.projectLabel
+                || sanitizedContext.identityKey != thread.identityKey
+                || sanitizedContext.identityType != thread.identityType
+                || sanitizedContext.identityLabel != thread.identityLabel
+                || sanitizedContext.nativeThreadKey != thread.nativeThreadKey {
                 var repairedThread = thread
-                repairedThread.screenLabel = sanitizedProject.screenLabel
-                repairedThread.projectKey = sanitizedProject.projectKey
-                repairedThread.projectLabel = sanitizedProject.projectLabel
+                repairedThread.screenLabel = sanitizedContext.screenLabel
+                repairedThread.projectKey = sanitizedContext.projectKey
+                repairedThread.projectLabel = sanitizedContext.projectLabel
+                repairedThread.identityKey = sanitizedContext.identityKey
+                repairedThread.identityType = sanitizedContext.identityType
+                repairedThread.identityLabel = sanitizedContext.identityLabel
+                repairedThread.nativeThreadKey = sanitizedContext.nativeThreadKey
+                repairedThread.people = isCodexConversationApp(thread.appName) ? [] : thread.people
                 repairedThread.updatedAt = Date()
                 try? store.upsertConversationThread(repairedThread)
             }
             let turns = ((try? store.fetchConversationTurns(threadID: thread.id, limit: maxStoredTurnsPerContext)) ?? [])
                 .compactMap(conversationTurn(from:))
             let tags = ConversationTupleTags(
-                projectKey: sanitizedProject.projectKey,
-                projectLabel: sanitizedProject.projectLabel,
-                identityKey: thread.identityKey,
-                identityType: thread.identityType,
-                identityLabel: thread.identityLabel,
-                people: thread.people,
-                nativeThreadKey: thread.nativeThreadKey
+                projectKey: sanitizedContext.projectKey,
+                projectLabel: sanitizedContext.projectLabel,
+                identityKey: sanitizedContext.identityKey,
+                identityType: sanitizedContext.identityType,
+                identityLabel: sanitizedContext.identityLabel,
+                people: isCodexConversationApp(thread.appName) ? [] : thread.people,
+                nativeThreadKey: sanitizedContext.nativeThreadKey
             )
             let context = PromptRewriteConversationContext(
                 id: thread.id,
                 appName: thread.appName,
                 bundleIdentifier: thread.bundleID,
-                screenLabel: sanitizedProject.screenLabel,
+                screenLabel: sanitizedContext.screenLabel,
                 fieldLabel: thread.fieldLabel,
                 logicalSurfaceKey: thread.logicalSurfaceKey,
-                projectKey: sanitizedProject.projectKey,
-                projectLabel: sanitizedProject.projectLabel,
-                identityKey: thread.identityKey,
-                identityType: thread.identityType,
-                identityLabel: thread.identityLabel,
-                nativeThreadKey: thread.nativeThreadKey,
-                people: thread.people
+                projectKey: sanitizedContext.projectKey,
+                projectLabel: sanitizedContext.projectLabel,
+                identityKey: sanitizedContext.identityKey,
+                identityType: sanitizedContext.identityType,
+                identityLabel: sanitizedContext.identityLabel,
+                nativeThreadKey: sanitizedContext.nativeThreadKey,
+                people: isCodexConversationApp(thread.appName) ? [] : thread.people
             )
             let tupleKey = tagInferenceService.tupleKey(
                 capturedContext: context,
@@ -3606,16 +3652,16 @@ final class PromptRewriteConversationStore: ObservableObject {
                 id: thread.id,
                 appName: thread.appName,
                 bundleIdentifier: tupleKey.bundleID,
-                screenLabel: sanitizedProject.screenLabel,
+                screenLabel: sanitizedContext.screenLabel,
                 fieldLabel: thread.fieldLabel,
                 logicalSurfaceKey: tupleKey.logicalSurfaceKey,
-                projectKey: sanitizedProject.projectKey,
-                projectLabel: sanitizedProject.projectLabel,
-                identityKey: thread.identityKey,
-                identityType: thread.identityType,
-                identityLabel: thread.identityLabel,
-                nativeThreadKey: thread.nativeThreadKey,
-                people: thread.people
+                projectKey: sanitizedContext.projectKey,
+                projectLabel: sanitizedContext.projectLabel,
+                identityKey: sanitizedContext.identityKey,
+                identityType: sanitizedContext.identityType,
+                identityLabel: sanitizedContext.identityLabel,
+                nativeThreadKey: sanitizedContext.nativeThreadKey,
+                people: isCodexConversationApp(thread.appName) ? [] : thread.people
             )
             nextContexts[thread.id] = StoredContext(
                 context: canonicalContext,
@@ -3651,11 +3697,15 @@ final class PromptRewriteConversationStore: ObservableObject {
         guard let store = resolvedSQLiteStore() else { return }
         let shouldCheckForDuplicateThreads = pendingDuplicateMergeContextIDs.contains(stored.context.id)
 
-        let sanitizedProject = sanitizedCodexStoredProject(
+        let sanitizedContext = sanitizedCodexStoredContextValues(
             appName: stored.context.appName,
             screenLabel: stored.context.screenLabel,
             projectKey: stored.context.projectKey,
-            projectLabel: stored.context.projectLabel
+            projectLabel: stored.context.projectLabel,
+            identityKey: stored.context.identityKey,
+            identityType: stored.context.identityType,
+            identityLabel: stored.context.identityLabel,
+            nativeThreadKey: stored.context.nativeThreadKey
         )
         let runningSummary = stored.turns.reversed().first(where: \.isSummary)?.assistantText ?? ""
         let exchangeTurnCount = max(stored.totalExchangeTurns, stored.turns.filter { !$0.isSummary }.count)
@@ -3664,15 +3714,15 @@ final class PromptRewriteConversationStore: ObservableObject {
             appName: stored.context.appName,
             bundleID: stored.tupleKey.bundleID,
             logicalSurfaceKey: stored.tupleKey.logicalSurfaceKey,
-            screenLabel: sanitizedProject.screenLabel,
+            screenLabel: sanitizedContext.screenLabel,
             fieldLabel: stored.context.fieldLabel,
-            projectKey: sanitizedProject.projectKey,
-            projectLabel: sanitizedProject.projectLabel,
-            identityKey: stored.context.identityKey ?? "identity:unknown",
-            identityType: stored.context.identityType ?? "unknown",
-            identityLabel: stored.context.identityLabel ?? "Unknown Identity",
-            nativeThreadKey: stored.tupleKey.nativeThreadKey,
-            people: stored.context.people,
+            projectKey: sanitizedContext.projectKey,
+            projectLabel: sanitizedContext.projectLabel,
+            identityKey: sanitizedContext.identityKey,
+            identityType: sanitizedContext.identityType,
+            identityLabel: sanitizedContext.identityLabel,
+            nativeThreadKey: sanitizedContext.nativeThreadKey,
+            people: isCodexContext(stored.context) ? [] : stored.context.people,
             runningSummary: runningSummary,
             totalExchangeTurns: exchangeTurnCount,
             createdAt: stored.turns.first?.timestamp ?? stored.lastUpdatedAt,
@@ -3706,15 +3756,54 @@ final class PromptRewriteConversationStore: ObservableObject {
         }
     }
 
-    private func sanitizedCodexStoredProject(
+    private func sanitizedCodexStoredContextValues(
         appName: String,
         screenLabel: String,
         projectKey: String?,
-        projectLabel: String?
-    ) -> (screenLabel: String, projectKey: String, projectLabel: String) {
+        projectLabel: String?,
+        identityKey: String?,
+        identityType: String?,
+        identityLabel: String?,
+        nativeThreadKey: String?
+    ) -> (
+        screenLabel: String,
+        projectKey: String,
+        projectLabel: String,
+        identityKey: String,
+        identityType: String,
+        identityLabel: String,
+        nativeThreadKey: String
+    ) {
+        if isCodexConversationApp(appName) {
+            return (
+                screenLabel: codexConversationScreenLabel,
+                projectKey: codexConversationProjectKey,
+                projectLabel: codexConversationProjectLabel,
+                identityKey: codexConversationIdentityKey,
+                identityType: codexConversationIdentityType,
+                identityLabel: codexConversationIdentityLabel,
+                nativeThreadKey: codexConversationNativeThreadKey
+            )
+        }
         let resolvedProjectKey = projectKey ?? "project:unknown"
         let resolvedProjectLabel = projectLabel ?? "Unknown Project"
-        return (screenLabel, resolvedProjectKey, resolvedProjectLabel)
+        let resolvedIdentityKey = identityKey ?? "identity:unknown"
+        let resolvedIdentityType = identityType ?? "unknown"
+        let resolvedIdentityLabel = identityLabel ?? "Unknown Identity"
+        let resolvedNativeThreadKey = nativeThreadKey ?? ""
+        return (
+            screenLabel: screenLabel,
+            projectKey: resolvedProjectKey,
+            projectLabel: resolvedProjectLabel,
+            identityKey: resolvedIdentityKey,
+            identityType: resolvedIdentityType,
+            identityLabel: resolvedIdentityLabel,
+            nativeThreadKey: resolvedNativeThreadKey
+        )
+    }
+
+    private func isCodexConversationApp(_ appName: String) -> Bool {
+        appName.localizedCaseInsensitiveContains("codex")
     }
 
     private func deleteContextFromSQLite(id: String) {
@@ -4585,29 +4674,8 @@ enum PromptRewriteConversationContextResolver {
         windowElement: AXUIElement?,
         fallbackWindowTitle: String?
     ) -> String? {
-        guard isCodexApp(app), let windowElement else { return nil }
-        let inferred = inferCodexProjectAndThread(
-            from: windowElement,
-            fallbackWindowTitle: fallbackWindowTitle
-        )
-        var segments: [String] = []
-        if let project = inferred.project,
-           !project.isEmpty {
-            segments.append("Project: \(project)")
-        }
-        if let thread = inferred.thread,
-           !thread.isEmpty {
-            segments.append("Thread: \(thread)")
-        }
-        guard !segments.isEmpty else { return nil }
-        CrashReporter.logInfo(
-            """
-            Codex context inferred \
-            project=\(inferred.project ?? "nil") \
-            thread=\(inferred.thread ?? "nil")
-            """
-        )
-        return segments.joined(separator: " | ")
+        guard isCodexApp(app) else { return nil }
+        return "Current Screen"
     }
 
     private static func antigravityContextLabel(

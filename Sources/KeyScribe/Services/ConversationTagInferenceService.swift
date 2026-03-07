@@ -22,6 +22,11 @@ final class ConversationTagInferenceService {
     private let browserWorkspaceProjectKey = "project:browser-workspace"
     private let browserWorkspaceIdentityKey = "identity:browser-workspace"
     private let browserWorkspaceNativeThreadKey = "thread:browser-workspace"
+    private let codexConversationProjectKey = "project:codex-app"
+    private let codexConversationProjectLabel = "Unknown Project"
+    private let codexConversationIdentityKey = "identity:codex-app"
+    private let codexConversationIdentityLabel = "Unknown Identity"
+    private let codexConversationNativeThreadKey = "thread:codex-app"
 
     private init() {}
 
@@ -38,6 +43,18 @@ final class ConversationTagInferenceService {
         let supplementalText = [userText, assistantText ?? ""]
             .joined(separator: "\n")
         let normalizedSupplementalText = collapseWhitespace(supplementalText)
+
+        if isCodexApp(bundleID: capturedContext.bundleIdentifier, appName: capturedContext.appName) {
+            return ConversationTupleTags(
+                projectKey: codexConversationProjectKey,
+                projectLabel: codexConversationProjectLabel,
+                identityKey: codexConversationIdentityKey,
+                identityType: ConversationIdentityKind.unknown.rawValue,
+                identityLabel: codexConversationIdentityLabel,
+                people: [],
+                nativeThreadKey: codexConversationNativeThreadKey
+            )
+        }
 
         let projectLabel = inferProjectLabel(
             bundleID: capturedContext.bundleIdentifier,
@@ -89,6 +106,22 @@ final class ConversationTagInferenceService {
         capturedContext: PromptRewriteConversationContext,
         tags: ConversationTupleTags
     ) -> ConversationThreadTupleKey {
+        if isCodexApp(bundleID: capturedContext.bundleIdentifier, appName: capturedContext.appName) {
+            let normalizedBundle = collapseWhitespace(capturedContext.bundleIdentifier).lowercased()
+            let canonicalBundle = normalizedBundle.isEmpty ? "com.openai.codex" : normalizedBundle
+            let logicalSurface = stableKey(
+                prefix: "surface",
+                value: "\(canonicalBundle)|codex-app"
+            )
+            return ConversationThreadTupleKey(
+                bundleID: canonicalBundle,
+                logicalSurfaceKey: logicalSurface,
+                projectKey: codexConversationProjectKey,
+                identityKey: codexConversationIdentityKey,
+                nativeThreadKey: codexConversationNativeThreadKey
+            )
+        }
+
         let isBrowserContext = isBrowser(bundleID: capturedContext.bundleIdentifier, appName: capturedContext.appName)
         let canonicalBundle = canonicalBundleID(
             bundleID: capturedContext.bundleIdentifier,
@@ -301,6 +334,9 @@ final class ConversationTagInferenceService {
         featureEnabled: Bool = FeatureFlags.crossIDEConversationSharingEnabled
     ) -> Bool {
         guard featureEnabled else {
+            return false
+        }
+        guard !isCodexApp(bundleID: bundleID, appName: appName) else {
             return false
         }
         guard hasMeaningfulProjectKey(projectKey) else {

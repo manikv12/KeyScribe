@@ -301,7 +301,7 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
         XCTAssertEqual(includeConsumed?.consumedByThreadID, "thread-new-target")
     }
 
-    func testScopeMatchingWithCrossIDEOnOff() throws {
+    func testScopeMatchingKeepsCodexAppWideEvenWhenCrossIDEIsOn() throws {
         let inference = ConversationTagInferenceService.shared
         let tags = ConversationTupleTags(
             projectKey: "project:keyscribe",
@@ -331,9 +331,9 @@ final class ConversationMemoryArchivePromotionTests: XCTestCase {
             let onTupleXcode = inference.tupleKey(capturedContext: xcodeContext, tags: tags)
             let onTupleCodex = inference.tupleKey(capturedContext: codexContext, tags: tags)
 
-            XCTAssertEqual(onTupleXcode.bundleID, onTupleCodex.bundleID)
-            XCTAssertEqual(onTupleXcode.logicalSurfaceKey, onTupleCodex.logicalSurfaceKey)
-            XCTAssertEqual(
+            XCTAssertNotEqual(onTupleXcode.bundleID, onTupleCodex.bundleID)
+            XCTAssertNotEqual(onTupleXcode.logicalSurfaceKey, onTupleCodex.logicalSurfaceKey)
+            XCTAssertNotEqual(
                 inference.threadID(for: onTupleXcode),
                 inference.threadID(for: onTupleCodex)
             )
