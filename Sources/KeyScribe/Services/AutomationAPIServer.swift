@@ -70,14 +70,15 @@ struct AutomationAPIHTTPResponse {
     }
 }
 
-private enum AutomationAPIHTTPParseResult {
+enum AutomationAPIHTTPParseResult {
     case incomplete
     case complete(AutomationAPIHTTPRequest)
 }
 
-private enum AutomationAPIHTTPParseError: LocalizedError {
+enum AutomationAPIHTTPParseError: LocalizedError, Equatable {
     case invalidRequestLine
     case invalidHeaderEncoding
+    case invalidContentLength
     case unsupportedTransferEncoding
     case payloadTooLarge
 
@@ -87,6 +88,8 @@ private enum AutomationAPIHTTPParseError: LocalizedError {
             return "Invalid HTTP request line."
         case .invalidHeaderEncoding:
             return "Invalid HTTP headers."
+        case .invalidContentLength:
+            return "Invalid Content-Length header."
         case .unsupportedTransferEncoding:
             return "Chunked transfer encoding is not supported."
         case .payloadTooLarge:
@@ -261,7 +264,7 @@ final class LocalAutomationServer {
         })
     }
 
-    private static func parseRequest(
+    static func parseRequest(
         from buffer: Data,
         maximumPayloadSize: Int
     ) throws -> AutomationAPIHTTPParseResult {
@@ -300,7 +303,16 @@ final class LocalAutomationServer {
             throw AutomationAPIHTTPParseError.unsupportedTransferEncoding
         }
 
-        let contentLength = Int(headers["content-length"] ?? "") ?? 0
+        let contentLengthHeader = headers["content-length"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contentLength: Int
+        if let contentLengthHeader, !contentLengthHeader.isEmpty {
+            guard let parsed = Int(contentLengthHeader), parsed >= 0 else {
+                throw AutomationAPIHTTPParseError.invalidContentLength
+            }
+            contentLength = parsed
+        } else {
+            contentLength = 0
+        }
         if contentLength > maximumPayloadSize {
             throw AutomationAPIHTTPParseError.payloadTooLarge
         }

@@ -377,6 +377,15 @@ protocol CodexCommandRunning {
     func cloudTaskStatus(taskID: String) async throws -> CodexCloudTaskStatusResponse
 }
 
+struct CodexCommandRunResult {
+    let terminationStatus: Int32
+    let output: Data
+}
+
+private final class CodexCommandOutputBox: @unchecked Sendable {
+    var data = Data()
+}
+
 struct CodexCommandRunner: CodexCommandRunning {
     func codexVersion() async throws -> String {
         let data = try await run(arguments: ["--version"])
@@ -410,30 +419,57 @@ struct CodexCommandRunner: CodexCommandRunning {
     }
 
     private func run(arguments: [String]) async throws -> Data {
+        let result = try await Self.runProcess(
+            commandName: "codex",
+            arguments: arguments
+        )
+
+        guard result.terminationStatus == 0 else {
+            let message = String(data: result.output, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw classifyError(message)
+        }
+
+        return result.output
+    }
+
+    static func runProcess(
+        commandName: String,
+        arguments: [String]
+    ) async throws -> CodexCommandRunResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                process.arguments = ["codex"] + arguments
+                process.arguments = [commandName] + arguments
 
                 let output = Pipe()
                 process.standardOutput = output
                 process.standardError = output
 
+                let outputBox = CodexCommandOutputBox()
+                let readGroup = DispatchGroup()
+                readGroup.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    outputBox.data = output.fileHandleForReading.readDataToEndOfFile()
+                    readGroup.leave()
+                }
+
                 do {
                     try process.run()
                     process.waitUntilExit()
-                    let data = output.fileHandleForReading.readDataToEndOfFile()
-
-                    guard process.terminationStatus == 0 else {
-                        let message = String(data: data, encoding: .utf8)?
-                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        continuation.resume(throwing: classifyError(message))
-                        return
-                    }
-
-                    continuation.resume(returning: data)
+                    output.fileHandleForWriting.closeFile()
+                    readGroup.wait()
+                    continuation.resume(
+                        returning: CodexCommandRunResult(
+                            terminationStatus: process.terminationStatus,
+                            output: outputBox.data
+                        )
+                    )
                 } catch {
+                    output.fileHandleForWriting.closeFile()
+                    output.fileHandleForReading.closeFile()
+                    readGroup.wait()
                     continuation.resume(throwing: CodexCommandError.cliNotInstalled)
                 }
             }
