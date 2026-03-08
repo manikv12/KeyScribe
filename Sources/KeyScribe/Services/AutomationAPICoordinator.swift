@@ -40,7 +40,7 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
     private weak var settings: SettingsStore?
     private var codexCloudMonitoringTask: Task<Void, Never>?
     private var lastCodexCloudLoggedError: String?
-    private var notificationInteractionHandler: (@MainActor () -> Void)?
+    private var notificationInteractionHandler: (@MainActor (_ source: String?) -> Void)?
 
     private override init() {
         super.init()
@@ -119,7 +119,7 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
         codexCloudStatusMessage = "Disabled"
     }
 
-    func setNotificationInteractionHandler(_ handler: @escaping @MainActor () -> Void) {
+    func setNotificationInteractionHandler(_ handler: @escaping @MainActor (_ source: String?) -> Void) {
         notificationInteractionHandler = handler
     }
 
@@ -448,6 +448,7 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
             Self.automationNotificationUserInfoKey: true,
             "source": announcement.source
         ]
+        content.sound = .default
 
         let request = UNNotificationRequest(
             identifier: "\(Self.automationNotificationIdentifierPrefix)\(UUID().uuidString)",
@@ -706,9 +707,9 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
         return response.notification.request.content.userInfo[Self.automationNotificationUserInfoKey] as? Bool == true
     }
 
-    private func handleAutomationNotificationInteraction() {
+    private func handleAutomationNotificationInteraction(source: String?) {
         NSApp.activate(ignoringOtherApps: true)
-        notificationInteractionHandler?()
+        notificationInteractionHandler?(source)
     }
 }
 
@@ -719,7 +720,8 @@ extension AutomationAPICoordinator: UNUserNotificationCenterDelegate {
     ) async {
         await MainActor.run {
             guard self.isAutomationNotification(response) else { return }
-            self.handleAutomationNotificationInteraction()
+            let source = response.notification.request.content.userInfo["source"] as? String
+            self.handleAutomationNotificationInteraction(source: source)
         }
     }
 }

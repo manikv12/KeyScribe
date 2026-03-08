@@ -86,4 +86,12 @@ enum PermissionCenter {
         let legacySecurityPaneURL = URL(fileURLWithPath: "/System/Library/PreferencePanes/Security.prefPane")
         _ = NSWorkspace.shared.open(legacySecurityPaneURL)
     }
+
+    static func openFullDiskAccessSettings() {
+        openPrivacySettingsPane(query: "Privacy_AllFiles")
+    }
+
+    static func openAutomationSettings() {
+        openPrivacySettingsPane(query: "Privacy_Automation")
+    }
 }

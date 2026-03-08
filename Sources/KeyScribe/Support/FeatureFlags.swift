@@ -7,6 +7,7 @@ enum FeatureFlags {
     private static let strictProjectIsolationEnvironmentKey = "KEYSCRIBE_FEATURE_STRICT_PROJECT_ISOLATION"
     private static let conversationTupleSQLiteEnvironmentKey = "KEYSCRIBE_FEATURE_CONVERSATION_TUPLE_SQLITE"
     private static let crossIDEConversationSharingEnvironmentKey = "KEYSCRIBE_FEATURE_CROSS_IDE_CONVERSATION_SHARING"
+    private static let personalAssistantEnvironmentKey = "KEYSCRIBE_FEATURE_PERSONAL_ASSISTANT"
     private static let crossIDEConversationSharingDefaultsKey = "KeyScribe.promptRewriteCrossIDEConversationSharingEnabled"
 
     enum CrossIDEConversationSharingSource: String {
@@ -60,6 +61,13 @@ enum FeatureFlags {
 
     static var crossIDEConversationSharingEnabled: Bool {
         crossIDEConversationSharingResolution().enabled
+    }
+
+    static var personalAssistantEnabled: Bool {
+        boolFlag(
+            environmentKey: personalAssistantEnvironmentKey,
+            defaultValue: true
+        )
     }
 
     static func crossIDEConversationSharingResolution(

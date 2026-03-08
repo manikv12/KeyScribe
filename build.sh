@@ -156,8 +156,10 @@ if [ "$INSTALL_APP" = true ]; then
     echo "Installing to /Applications..."
     osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
     sleep 1
+    rm -rf "${INSTALL_DIR}-new"
+    cp -R "$APP_DIR" "${INSTALL_DIR}-new"
     rm -rf "$INSTALL_DIR"
-    cp -R "$APP_DIR" "$INSTALL_DIR"
+    mv "${INSTALL_DIR}-new" "$INSTALL_DIR"
 
     echo "Resetting Accessibility permission..."
     sudo tccutil reset Accessibility "$APP_BUNDLE_ID" || echo "  (sudo failed — run manually: sudo tccutil reset Accessibility ${APP_BUNDLE_ID})"

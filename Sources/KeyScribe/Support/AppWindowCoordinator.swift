@@ -7,6 +7,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let settingsMinimumSize = NSSize(width: 820, height: 560)
     private let aiStudioDefaultSize = NSSize(width: 1120, height: 760)
     private let aiStudioMinimumSize = NSSize(width: 1000, height: 620)
+    private let assistantDefaultSize = NSSize(width: 1180, height: 760)
+    private let assistantMinimumSize = NSSize(width: 980, height: 620)
     private let historyDefaultSize = NSSize(width: 620, height: 500)
     private let historyMinimumSize = NSSize(width: 520, height: 360)
     private let onboardingDefaultSize = NSSize(width: 620, height: 460)
@@ -19,6 +21,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
     private var settingsWindowController: NSWindowController?
     private var aiStudioWindowController: NSWindowController?
+    private var assistantWindowController: NSWindowController?
     private var historyWindowController: NSWindowController?
     private var onboardingWindowController: NSWindowController?
     private var historyTargetApplication: NSRunningApplication?
@@ -193,9 +196,67 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         onStatusUpdate(.ready)
     }
 
+    func openAssistantWindow<Content: View>(rootView: Content) {
+        onStatusUpdate(.openingSettings)
+        requestDockActivation()
+
+        let hostingController = NSHostingController(rootView: rootView)
+
+        if assistantWindowController == nil {
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: assistantDefaultSize),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "KeyScribe Assistant"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.toolbarStyle = .unifiedCompact
+            window.isMovableByWindowBackground = false
+            window.contentViewController = hostingController
+            window.hidesOnDeactivate = false
+            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.isReleasedWhenClosed = false
+            window.minSize = assistantMinimumSize
+            centerWindowOnActiveScreen(window)
+            window.delegate = self
+
+            assistantWindowController = NSWindowController(window: window)
+        } else {
+            assistantWindowController?.window?.contentViewController = hostingController
+        }
+
+        guard let window = assistantWindowController?.window else {
+            onStatusUpdate(.message("Could not open assistant"))
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        assistantWindowController?.showWindow(nil)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        if window.frame.width < assistantMinimumSize.width || window.frame.height < assistantMinimumSize.height {
+            window.setContentSize(assistantDefaultSize)
+        }
+        centerWindowOnActiveScreen(window)
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        onStatusUpdate(.ready)
+    }
+
     func closePermissionOnboardingWindow() {
         onboardingWindowController?.close()
         onboardingWindowController = nil
+    }
+
+    func closeAssistantWindow() {
+        assistantWindowController?.close()
+        assistantWindowController = nil
+        setActivationPolicyForOpenWindows()
     }
 
     func openHistoryWindow() {
@@ -266,6 +327,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         settingsWindowController = nil
         aiStudioWindowController?.close()
         aiStudioWindowController = nil
+        assistantWindowController?.close()
+        assistantWindowController = nil
         historyWindowController?.close()
         historyWindowController = nil
         setActivationPolicyForOpenWindows()
@@ -277,6 +340,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
                 settingsWindowController = nil
             } else if closingWindow === aiStudioWindowController?.window {
                 aiStudioWindowController = nil
+            } else if closingWindow === assistantWindowController?.window {
+                assistantWindowController = nil
             } else if closingWindow === historyWindowController?.window {
                 historyWindowController = nil
             } else if closingWindow === onboardingWindowController?.window {
@@ -321,6 +386,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         let hasOpenWindows =
             settingsWindowController != nil ||
             aiStudioWindowController != nil ||
+            assistantWindowController != nil ||
             historyWindowController != nil ||
             onboardingWindowController != nil
         NSApp.setActivationPolicy(hasOpenWindows ? .regular : .accessory)
