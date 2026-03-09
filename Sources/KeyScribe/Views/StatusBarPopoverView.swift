@@ -8,11 +8,17 @@ final class StatusBarViewModel: ObservableObject {
     @Published var currentAudioLevel: Float = 0
     @Published var isContinuousMode: Bool = false
     @Published var permissionsReady: Bool = false
+    @Published var assistantEnabled: Bool = false
+    @Published var assistantCanStopCurrentAction: Bool = false
+    @Published var assistantStopActionLabel: String = "Stop Assistant"
 
     var onToggleDictation: (() -> Void)?
     var onPasteLastTranscript: (() -> Void)?
     var onOpenHistory: (() -> Void)?
     var onOpenAIMemoryStudio: (() -> Void)?
+    var onOpenAssistant: (() -> Void)?
+    var onSpeakAssistantTask: (() -> Void)?
+    var onStopAssistant: (() -> Void)?
     var onOpenSettings: (() -> Void)?
     var onQuit: (() -> Void)?
 }
@@ -68,6 +74,38 @@ struct StatusBarPopoverView: View {
                     .padding(.bottom, 8)
 
                 VStack(alignment: .leading, spacing: 5) {
+                    if viewModel.assistantEnabled {
+                        sectionTitle("Assistant")
+                        PopoverMenuRow(
+                            icon: "sparkles.rectangle.stack.fill",
+                            label: "Open Assistant",
+                            iconTint: AppVisualTheme.aiStudioTint
+                        ) {
+                            viewModel.onOpenAssistant?()
+                        }
+
+                        PopoverMenuRow(
+                            icon: "waveform",
+                            label: "Speak Assistant Task",
+                            iconTint: AppVisualTheme.baseTint
+                        ) {
+                            viewModel.onSpeakAssistantTask?()
+                        }
+
+                        if viewModel.assistantCanStopCurrentAction {
+                            PopoverMenuRow(
+                                icon: "stop.circle.fill",
+                                label: viewModel.assistantStopActionLabel,
+                                iconTint: .orange
+                            ) {
+                                viewModel.onStopAssistant?()
+                            }
+                        }
+
+                        Divider().overlay(Color.white.opacity(0.08))
+                            .padding(.vertical, 8)
+                    }
+
                     sectionTitle("Open")
                     PopoverMenuRow(
                         icon: "clock.arrow.circlepath",

@@ -796,7 +796,7 @@ final class CloudTranscriber: NSObject {
         var pcmData = Data(capacity: samples.count * 2)
         for sample in samples {
             let clamped = max(-1.0, min(1.0, sample))
-            var intSample = Int16(clamped * Float(Int16.max))
+            let intSample = Int16(clamped * Float(Int16.max))
             var intSampleLE = intSample.littleEndian
             pcmData.append(Data(bytes: &intSampleLE, count: MemoryLayout<Int16>.size))
         }

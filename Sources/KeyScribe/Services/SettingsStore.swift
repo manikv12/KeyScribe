@@ -553,6 +553,20 @@ final class SettingsStore: ObservableObject {
         static let localAIManagedRuntimeEnabled = "KeyScribe.localAIManagedRuntimeEnabled"
         static let localAIRuntimeVersion = "KeyScribe.localAIRuntimeVersion"
         static let localAILastHealthCheckEpoch = "KeyScribe.localAILastHealthCheckEpoch"
+        static let assistantBetaEnabled = "KeyScribe.assistantBetaEnabled"
+        static let assistantVoiceTaskEntryEnabled = "KeyScribe.assistantVoiceTaskEntryEnabled"
+        static let assistantFloatingHUDEnabled = "KeyScribe.assistantFloatingHUDEnabled"
+        static let assistantBetaWarningAcknowledged = "KeyScribe.assistantBetaWarningAcknowledged"
+        static let assistantPreferredModelID = "KeyScribe.assistantPreferredModelID"
+        static let assistantOwnedThreadIDs = "KeyScribe.assistantOwnedThreadIDs"
+        static let browserAutomationEnabled = "KeyScribe.browserAutomationEnabled"
+        static let browserSelectedProfileID = "KeyScribe.browserSelectedProfileID"
+        static let assistantAlwaysApprovedToolKinds = "KeyScribe.assistantAlwaysApprovedToolKinds"
+        static let assistantCustomInstructions = "KeyScribe.assistantCustomInstructions"
+        static let assistantMaxToolCallsPerTurn = "KeyScribe.assistantMaxToolCallsPerTurn"
+        static let assistantMemoryEnabled = "KeyScribe.assistantMemoryEnabled"
+        static let assistantMemoryReviewEnabled = "KeyScribe.assistantMemoryReviewEnabled"
+        static let assistantMemorySummaryMaxChars = "KeyScribe.assistantMemorySummaryMaxChars"
     }
 
     private enum ContinuousToggleDefaults {
@@ -1159,6 +1173,101 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var assistantBetaEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantVoiceTaskEntryEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantFloatingHUDEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantBetaWarningAcknowledged: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantPreferredModelID: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantOwnedThreadIDs: [String] {
+        didSet {
+            let normalized = Self.normalizedStringList(assistantOwnedThreadIDs)
+            guard normalized == assistantOwnedThreadIDs else {
+                assistantOwnedThreadIDs = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var assistantAlwaysApprovedToolKinds: Set<String> {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var browserAutomationEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var browserSelectedProfileID: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantCustomInstructions: String {
+        didSet {
+            save()
+        }
+    }
+
+    /// Maximum number of tool calls allowed per agent turn before auto-cancelling. 0 = unlimited.
+    @Published var assistantMaxToolCallsPerTurn: Int {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantMemoryEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantMemoryReviewEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantMemorySummaryMaxChars: Int {
+        didSet {
+            let clamped = min(max(assistantMemorySummaryMaxChars, 400), 6_000)
+            guard clamped == assistantMemorySummaryMaxChars else {
+                assistantMemorySummaryMaxChars = clamped
+                return
+            }
+            save()
+        }
+    }
+
     @Published var availableMicrophones: [MicrophoneOption] = []
     @Published var accessibilityTrusted: Bool = AXIsProcessTrusted()
 
@@ -1685,6 +1794,65 @@ final class SettingsStore: ObservableObject {
             ? 0
             : defaults.double(forKey: Keys.localAILastHealthCheckEpoch)
 
+        if defaults.object(forKey: Keys.assistantBetaEnabled) == nil {
+            assistantBetaEnabled = false
+        } else {
+            assistantBetaEnabled = defaults.bool(forKey: Keys.assistantBetaEnabled)
+        }
+
+        if defaults.object(forKey: Keys.assistantVoiceTaskEntryEnabled) == nil {
+            assistantVoiceTaskEntryEnabled = true
+        } else {
+            assistantVoiceTaskEntryEnabled = defaults.bool(forKey: Keys.assistantVoiceTaskEntryEnabled)
+        }
+
+        if defaults.object(forKey: Keys.assistantFloatingHUDEnabled) == nil {
+            assistantFloatingHUDEnabled = true
+        } else {
+            assistantFloatingHUDEnabled = defaults.bool(forKey: Keys.assistantFloatingHUDEnabled)
+        }
+
+        if defaults.object(forKey: Keys.assistantBetaWarningAcknowledged) == nil {
+            assistantBetaWarningAcknowledged = false
+        } else {
+            assistantBetaWarningAcknowledged = defaults.bool(forKey: Keys.assistantBetaWarningAcknowledged)
+        }
+
+        assistantPreferredModelID = defaults
+            .string(forKey: Keys.assistantPreferredModelID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        assistantOwnedThreadIDs = Self.normalizedStringList(
+            defaults.stringArray(forKey: Keys.assistantOwnedThreadIDs) ?? []
+        )
+        assistantAlwaysApprovedToolKinds = Set(
+            defaults.stringArray(forKey: Keys.assistantAlwaysApprovedToolKinds) ?? []
+        )
+
+        if defaults.object(forKey: Keys.browserAutomationEnabled) == nil {
+            browserAutomationEnabled = false
+        } else {
+            browserAutomationEnabled = defaults.bool(forKey: Keys.browserAutomationEnabled)
+        }
+        browserSelectedProfileID = defaults.string(forKey: Keys.browserSelectedProfileID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        assistantCustomInstructions = defaults.string(forKey: Keys.assistantCustomInstructions) ?? ""
+        let storedMaxCalls = defaults.integer(forKey: Keys.assistantMaxToolCallsPerTurn)
+        assistantMaxToolCallsPerTurn = storedMaxCalls > 0 ? storedMaxCalls : 75
+        if defaults.object(forKey: Keys.assistantMemoryEnabled) == nil {
+            assistantMemoryEnabled = true
+        } else {
+            assistantMemoryEnabled = defaults.bool(forKey: Keys.assistantMemoryEnabled)
+        }
+        if defaults.object(forKey: Keys.assistantMemoryReviewEnabled) == nil {
+            assistantMemoryReviewEnabled = true
+        } else {
+            assistantMemoryReviewEnabled = defaults.bool(forKey: Keys.assistantMemoryReviewEnabled)
+        }
+        let storedMemorySummaryMaxChars = defaults.integer(forKey: Keys.assistantMemorySummaryMaxChars)
+        assistantMemorySummaryMaxChars = storedMemorySummaryMaxChars > 0
+            ? min(max(storedMemorySummaryMaxChars, 400), 6_000)
+            : 1_800
+
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
         refreshMicrophones(notifyChange: false)
@@ -1824,6 +1992,20 @@ final class SettingsStore: ObservableObject {
         defaults.set(localAIManagedRuntimeEnabled, forKey: Keys.localAIManagedRuntimeEnabled)
         defaults.set(localAIRuntimeVersion.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.localAIRuntimeVersion)
         defaults.set(localAILastHealthCheckEpoch, forKey: Keys.localAILastHealthCheckEpoch)
+        defaults.set(assistantBetaEnabled, forKey: Keys.assistantBetaEnabled)
+        defaults.set(assistantVoiceTaskEntryEnabled, forKey: Keys.assistantVoiceTaskEntryEnabled)
+        defaults.set(assistantFloatingHUDEnabled, forKey: Keys.assistantFloatingHUDEnabled)
+        defaults.set(assistantBetaWarningAcknowledged, forKey: Keys.assistantBetaWarningAcknowledged)
+        defaults.set(assistantPreferredModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantPreferredModelID)
+        defaults.set(Self.normalizedStringList(assistantOwnedThreadIDs), forKey: Keys.assistantOwnedThreadIDs)
+        defaults.set(Array(assistantAlwaysApprovedToolKinds), forKey: Keys.assistantAlwaysApprovedToolKinds)
+        defaults.set(browserAutomationEnabled, forKey: Keys.browserAutomationEnabled)
+        defaults.set(browserSelectedProfileID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.browserSelectedProfileID)
+        defaults.set(assistantCustomInstructions, forKey: Keys.assistantCustomInstructions)
+        defaults.set(assistantMaxToolCallsPerTurn, forKey: Keys.assistantMaxToolCallsPerTurn)
+        defaults.set(assistantMemoryEnabled, forKey: Keys.assistantMemoryEnabled)
+        defaults.set(assistantMemoryReviewEnabled, forKey: Keys.assistantMemoryReviewEnabled)
+        defaults.set(assistantMemorySummaryMaxChars, forKey: Keys.assistantMemorySummaryMaxChars)
 
         scheduleOnChangeNotificationIfNeeded()
     }

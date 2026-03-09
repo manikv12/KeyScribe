@@ -30,7 +30,7 @@ enum MemorySQLiteStoreError: LocalizedError {
 }
 
 final class MemorySQLiteStore {
-    private static let schemaVersion = 7
+    private static let schemaVersion = 8
     private static let cleanupUnknownIssueKey = "issue-unassigned"
     private static let cleanupNoiseIssueKey = "issue-noise"
     private static let expiredContextDefaultRetentionDays = 30
@@ -63,6 +63,15 @@ final class MemorySQLiteStore {
 
     deinit {
         close()
+    }
+
+    /// Creates a best-effort in-memory store for degraded operation when the
+    /// primary database cannot be opened (disk full, permissions, corruption).
+    static func fallback() -> MemorySQLiteStore {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KeyScribe-memory-fallback-\(UUID().uuidString).sqlite3")
+        // swiftlint:disable:next force_try
+        return try! MemorySQLiteStore(databaseURL: tempURL)
     }
 
     static func defaultDatabaseURL(fileManager: FileManager = .default) throws -> URL {
@@ -467,6 +476,43 @@ final class MemorySQLiteStore {
         try execute(sql: """
         CREATE INDEX IF NOT EXISTS idx_conversation_agent_preferences_expires
             ON conversation_agent_preferences(expires_at);
+        """)
+
+        try execute(sql: """
+        CREATE TABLE IF NOT EXISTS assistant_memory_entries (
+            id TEXT PRIMARY KEY NOT NULL,
+            provider TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            bundle_id TEXT NOT NULL,
+            project_key TEXT,
+            identity_key TEXT,
+            thread_id TEXT,
+            memory_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            keywords_json TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'active',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_assistant_memory_provider_scope
+            ON assistant_memory_entries(provider, scope_key, state, updated_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_assistant_memory_provider_project
+            ON assistant_memory_entries(provider, project_key, state, updated_at DESC);
+        """)
+
+        try execute(sql: """
+        CREATE INDEX IF NOT EXISTS idx_assistant_memory_provider_thread
+            ON assistant_memory_entries(provider, thread_id, state, updated_at DESC);
         """)
 
         try execute(sql: """
@@ -1373,6 +1419,170 @@ final class MemorySQLiteStore {
         let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedThreadID.isEmpty else { return }
         try execute(sql: "DELETE FROM conversation_agent_preferences WHERE thread_id = ?;", bind: { statement in
+            self.bind(normalizedThreadID, at: 1, in: statement)
+        })
+    }
+
+    func upsertAssistantMemoryEntry(_ entry: AssistantMemoryEntry) throws {
+        let sql = """
+        INSERT INTO assistant_memory_entries (
+            id, provider, scope_key, bundle_id, project_key, identity_key, thread_id, memory_type,
+            title, summary, detail, keywords_json, confidence, state, metadata_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            provider = excluded.provider,
+            scope_key = excluded.scope_key,
+            bundle_id = excluded.bundle_id,
+            project_key = excluded.project_key,
+            identity_key = excluded.identity_key,
+            thread_id = excluded.thread_id,
+            memory_type = excluded.memory_type,
+            title = excluded.title,
+            summary = excluded.summary,
+            detail = excluded.detail,
+            keywords_json = excluded.keywords_json,
+            confidence = excluded.confidence,
+            state = excluded.state,
+            metadata_json = excluded.metadata_json,
+            updated_at = excluded.updated_at;
+        """
+
+        try execute(sql: sql, bind: { statement in
+            self.bind(entry.id.uuidString, at: 1, in: statement)
+            self.bind(entry.provider.rawValue, at: 2, in: statement)
+            self.bind(entry.scopeKey, at: 3, in: statement)
+            self.bind(entry.bundleID, at: 4, in: statement)
+            self.bind(entry.projectKey, at: 5, in: statement)
+            self.bind(entry.identityKey, at: 6, in: statement)
+            self.bind(entry.threadID, at: 7, in: statement)
+            self.bind(entry.memoryType.rawValue, at: 8, in: statement)
+            self.bind(entry.title, at: 9, in: statement)
+            self.bind(entry.summary, at: 10, in: statement)
+            self.bind(entry.detail, at: 11, in: statement)
+            self.bind(self.encodeJSON(entry.keywords, fallback: "[]"), at: 12, in: statement)
+            self.bind(entry.confidence, at: 13, in: statement)
+            self.bind(entry.state.rawValue, at: 14, in: statement)
+            self.bind(self.encodeJSON(entry.metadata, fallback: "{}"), at: 15, in: statement)
+            self.bind(entry.createdAt.timeIntervalSince1970, at: 16, in: statement)
+            self.bind(entry.updatedAt.timeIntervalSince1970, at: 17, in: statement)
+        })
+    }
+
+    func fetchAssistantMemoryEntries(
+        query searchQuery: String = "",
+        provider: MemoryProviderKind = .codex,
+        scopeKey: String? = nil,
+        projectKey: String? = nil,
+        identityKey: String? = nil,
+        threadID: String? = nil,
+        state: AssistantMemoryEntryState = .active,
+        limit: Int = 24
+    ) throws -> [AssistantMemoryEntry] {
+        let normalizedQuery = MemoryTextNormalizer.collapsedWhitespace(searchQuery)
+        let hasSearchTerm = !normalizedQuery.isEmpty
+        let likeValue = "%\(escapedLike(normalizedQuery))%"
+        let normalizedLimit = max(1, min(limit, 200))
+
+        let sql = """
+        SELECT
+            id, provider, scope_key, bundle_id, project_key, identity_key, thread_id, memory_type,
+            title, summary, detail, keywords_json, confidence, state, metadata_json, created_at, updated_at
+        FROM assistant_memory_entries
+        WHERE provider = ?
+            AND state = ?
+            AND (? IS NULL OR scope_key = ?)
+            AND (? IS NULL OR project_key = ?)
+            AND (? IS NULL OR identity_key = ?)
+            AND (? IS NULL OR thread_id = ?)
+            AND (
+                ? = 0
+                OR title LIKE ? ESCAPE '\\'
+                OR summary LIKE ? ESCAPE '\\'
+                OR detail LIKE ? ESCAPE '\\'
+            )
+        ORDER BY confidence DESC, updated_at DESC
+        LIMIT ?;
+        """
+
+        return try query(sql: sql, bind: { statement in
+            self.bind(provider.rawValue, at: 1, in: statement)
+            self.bind(state.rawValue, at: 2, in: statement)
+            self.bind(scopeKey, at: 3, in: statement)
+            self.bind(scopeKey, at: 4, in: statement)
+            self.bind(projectKey, at: 5, in: statement)
+            self.bind(projectKey, at: 6, in: statement)
+            self.bind(identityKey, at: 7, in: statement)
+            self.bind(identityKey, at: 8, in: statement)
+            self.bind(threadID, at: 9, in: statement)
+            self.bind(threadID, at: 10, in: statement)
+            self.bind(hasSearchTerm ? 1 : 0, at: 11, in: statement)
+            self.bind(likeValue, at: 12, in: statement)
+            self.bind(likeValue, at: 13, in: statement)
+            self.bind(likeValue, at: 14, in: statement)
+            self.bind(Int64(normalizedLimit), at: 15, in: statement)
+        }, mapRow: { statement in
+            AssistantMemoryEntry(
+                id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),
+                provider: MemoryProviderKind(rawValue: self.readString(at: 1, in: statement) ?? "") ?? .unknown,
+                scopeKey: self.readString(at: 2, in: statement) ?? "",
+                bundleID: self.readString(at: 3, in: statement) ?? "",
+                projectKey: self.readString(at: 4, in: statement),
+                identityKey: self.readString(at: 5, in: statement),
+                threadID: self.readString(at: 6, in: statement),
+                memoryType: AssistantMemoryEntryType(rawValue: self.readString(at: 7, in: statement) ?? "") ?? .lesson,
+                title: self.readString(at: 8, in: statement) ?? "",
+                summary: self.readString(at: 9, in: statement) ?? "",
+                detail: self.readString(at: 10, in: statement) ?? "",
+                keywords: self.decodeStringArray(from: self.readString(at: 11, in: statement) ?? "[]"),
+                confidence: sqlite3_column_double(statement, 12),
+                state: AssistantMemoryEntryState(rawValue: self.readString(at: 13, in: statement) ?? "") ?? .active,
+                metadata: self.decodeStringDictionary(from: self.readString(at: 14, in: statement) ?? "{}"),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 15)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 16))
+            )
+        })
+    }
+
+    func invalidateAssistantMemoryEntry(
+        id: UUID,
+        reason: String,
+        updatedAt: Date = Date()
+    ) throws {
+        let existing = try fetchAssistantMemoryEntries(query: "", state: .active, limit: 500)
+            .first(where: { $0.id == id })
+        guard let existing else { return }
+
+        var metadata = existing.metadata
+        metadata["memory_domain"] = "assistant"
+        metadata["invalidation_reason"] = MemoryTextNormalizer.normalizedSummary(reason, limit: 240)
+        metadata["invalidated_at"] = iso8601Timestamp(updatedAt)
+
+        let invalidated = AssistantMemoryEntry(
+            id: existing.id,
+            provider: existing.provider,
+            scopeKey: existing.scopeKey,
+            bundleID: existing.bundleID,
+            projectKey: existing.projectKey,
+            identityKey: existing.identityKey,
+            threadID: existing.threadID,
+            memoryType: existing.memoryType,
+            title: existing.title,
+            summary: existing.summary,
+            detail: existing.detail,
+            keywords: existing.keywords,
+            confidence: existing.confidence,
+            state: .invalidated,
+            metadata: metadata,
+            createdAt: existing.createdAt,
+            updatedAt: updatedAt
+        )
+        try upsertAssistantMemoryEntry(invalidated)
+    }
+
+    func deleteAssistantMemoryEntries(threadID: String) throws {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return }
+        try execute(sql: "DELETE FROM assistant_memory_entries WHERE thread_id = ?;", bind: { statement in
             self.bind(normalizedThreadID, at: 1, in: statement)
         })
     }

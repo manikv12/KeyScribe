@@ -209,7 +209,13 @@ final class WaveformHUDManager {
         let x = screen.frame.midX - (waveformPanel.frame.width * 0.5)
         let y = screen.frame.minY + HUDLayout.dockReserve
 
-        waveformPanel.setFrameOrigin(NSPoint(x: x, y: y))
+        let newOrigin = NSPoint(x: x, y: y)
+        if waveformPanel.frame.origin != newOrigin {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            waveformPanel.setFrameOrigin(newOrigin)
+            CATransaction.commit()
+        }
     }
 
     private func repositionToastPanel() {
@@ -219,7 +225,14 @@ final class WaveformHUDManager {
 
         let x = screen.frame.midX - (toastPanel.frame.width * 0.5)
         let y = screen.frame.minY + HUDLayout.dockReserve + HUDLayout.waveformHeight + HUDLayout.toastVerticalGap
-        toastPanel.setFrameOrigin(NSPoint(x: x, y: y))
+        let newOrigin = NSPoint(x: x, y: y)
+        
+        if toastPanel.frame.origin != newOrigin {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            toastPanel.setFrameOrigin(newOrigin)
+            CATransaction.commit()
+        }
     }
 
     private func repositionCorrectionPanel() {
@@ -229,7 +242,14 @@ final class WaveformHUDManager {
 
         let x = screen.frame.midX - (correctionPanel.frame.width * 0.5)
         let y = screen.frame.minY + HUDLayout.dockReserve + HUDLayout.waveformHeight + HUDLayout.toastVerticalGap
-        correctionPanel.setFrameOrigin(NSPoint(x: x, y: y))
+        let newOrigin = NSPoint(x: x, y: y)
+        
+        if correctionPanel.frame.origin != newOrigin {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            correctionPanel.setFrameOrigin(newOrigin)
+            CATransaction.commit()
+        }
     }
 
     private func completeCorrectionDecision(token: UUID, decision: HUDCorrectionDecision) {
@@ -452,7 +472,7 @@ struct HUDCorrectionDecisionView: View {
     }
 }
 
-private struct HUDCapsuleBackground: View {
+struct HUDCapsuleBackground: View {
     let tint: Color
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 

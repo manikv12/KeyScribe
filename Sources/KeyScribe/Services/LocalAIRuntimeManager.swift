@@ -205,6 +205,11 @@ actor LocalAIRuntimeManager: LocalAIRuntimeManaging {
     }
 
     func stop() async {
+        // Fast path: if we never started a runtime process, skip expensive process-table scans
+        guard runtimeProcess != nil || runtimeExecutablePath != nil else {
+            return
+        }
+
         if runtimeExecutablePath == nil,
            let appURL = findRuntimeAppURL(),
            let executableURL = executableURL(for: appURL) {
