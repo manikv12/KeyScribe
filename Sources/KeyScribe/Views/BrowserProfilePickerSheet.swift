@@ -79,10 +79,13 @@ struct BrowserProfilePickerSheet: View {
         }
         .padding(20)
         .frame(width: 360)
-        .onAppear {
-            profiles = BrowserProfileManager.shared.allProfiles()
-            if profiles.count == 1 {
-                selectedID = profiles[0].id
+        .task {
+            let loaded = await Task.detached {
+                BrowserProfileManager.shared.allProfiles()
+            }.value
+            profiles = loaded
+            if loaded.count == 1 {
+                selectedID = loaded[0].id
             }
         }
     }

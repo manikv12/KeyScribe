@@ -287,12 +287,14 @@ struct AssistantThreadMemoryDocument: Equatable, Sendable {
             }
             let bodyStart = headingRange.upperBound
             let sectionSlice = normalizedText[bodyStart...]
-            let bodyEnd: String.Index
-            if index + 1 < headings.count,
-               let nextRange = sectionSlice.range(of: "\n# \(headings[index + 1].rawValue)") {
-                bodyEnd = nextRange.lowerBound
-            } else {
-                bodyEnd = normalizedText.endIndex
+            // Find the nearest subsequent heading that is actually present,
+            // not just the immediately next enum case.
+            var bodyEnd = normalizedText.endIndex
+            for laterIndex in (index + 1)..<headings.count {
+                if let nextRange = sectionSlice.range(of: "\n# \(headings[laterIndex].rawValue)") {
+                    bodyEnd = nextRange.lowerBound
+                    break
+                }
             }
             let body = normalizedText[bodyStart..<bodyEnd]
                 .trimmingCharacters(in: .whitespacesAndNewlines)

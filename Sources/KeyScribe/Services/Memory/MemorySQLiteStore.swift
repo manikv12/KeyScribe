@@ -65,6 +65,15 @@ final class MemorySQLiteStore {
         close()
     }
 
+    /// Creates a best-effort in-memory store for degraded operation when the
+    /// primary database cannot be opened (disk full, permissions, corruption).
+    static func fallback() -> MemorySQLiteStore {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KeyScribe-memory-fallback-\(UUID().uuidString).sqlite3")
+        // swiftlint:disable:next force_try
+        return try! MemorySQLiteStore(databaseURL: tempURL)
+    }
+
     static func defaultDatabaseURL(fileManager: FileManager = .default) throws -> URL {
         guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             throw MemorySQLiteStoreError.failedToCreateDirectory(path: "\(NSHomeDirectory())/Library/Application Support")
@@ -1481,7 +1490,10 @@ final class MemorySQLiteStore {
         FROM assistant_memory_entries
         WHERE provider = ?
             AND state = ?
-            AND (? IS NULL OR scope_key = ? OR project_key = ? OR identity_key = ? OR thread_id = ?)
+            AND (? IS NULL OR scope_key = ?)
+            AND (? IS NULL OR project_key = ?)
+            AND (? IS NULL OR identity_key = ?)
+            AND (? IS NULL OR thread_id = ?)
             AND (
                 ? = 0
                 OR title LIKE ? ESCAPE '\\'
@@ -1498,13 +1510,16 @@ final class MemorySQLiteStore {
             self.bind(scopeKey, at: 3, in: statement)
             self.bind(scopeKey, at: 4, in: statement)
             self.bind(projectKey, at: 5, in: statement)
-            self.bind(identityKey, at: 6, in: statement)
-            self.bind(threadID, at: 7, in: statement)
-            self.bind(hasSearchTerm ? 1 : 0, at: 8, in: statement)
-            self.bind(likeValue, at: 9, in: statement)
-            self.bind(likeValue, at: 10, in: statement)
-            self.bind(likeValue, at: 11, in: statement)
-            self.bind(Int64(normalizedLimit), at: 12, in: statement)
+            self.bind(projectKey, at: 6, in: statement)
+            self.bind(identityKey, at: 7, in: statement)
+            self.bind(identityKey, at: 8, in: statement)
+            self.bind(threadID, at: 9, in: statement)
+            self.bind(threadID, at: 10, in: statement)
+            self.bind(hasSearchTerm ? 1 : 0, at: 11, in: statement)
+            self.bind(likeValue, at: 12, in: statement)
+            self.bind(likeValue, at: 13, in: statement)
+            self.bind(likeValue, at: 14, in: statement)
+            self.bind(Int64(normalizedLimit), at: 15, in: statement)
         }, mapRow: { statement in
             AssistantMemoryEntry(
                 id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),

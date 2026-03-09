@@ -10,11 +10,11 @@ final class AssistantMemorySuggestionService {
     init(
         fileManager: FileManager = .default,
         threadMemoryService: AssistantThreadMemoryService = AssistantThreadMemoryService(),
-        store: MemorySQLiteStore = try! MemorySQLiteStore()
+        store: MemorySQLiteStore? = nil
     ) {
         self.fileManager = fileManager
         self.threadMemoryService = threadMemoryService
-        self.store = store
+        self.store = store ?? (try? MemorySQLiteStore()) ?? MemorySQLiteStore.fallback()
         self.suggestionsFileURL = threadMemoryService.rootDirectoryURL
             .appendingPathComponent("pending-suggestions.json", isDirectory: false)
     }

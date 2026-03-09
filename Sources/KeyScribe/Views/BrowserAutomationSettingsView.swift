@@ -117,6 +117,9 @@ struct BrowserAutomationSettingsView: View {
     }
 
     private func refreshProfiles() {
-        profiles = BrowserProfileManager.shared.allProfiles()
+        Task.detached {
+            let loaded = BrowserProfileManager.shared.allProfiles()
+            await MainActor.run { profiles = loaded }
+        }
     }
 }

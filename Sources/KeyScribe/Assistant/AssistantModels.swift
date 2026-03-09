@@ -744,7 +744,7 @@ final class AssistantStore: ObservableObject {
         self.settings = settings ?? .shared
         self.selectedModelID = self.settings.assistantPreferredModelID.nonEmpty
         self.runtime = runtime ?? CodexAssistantRuntime(preferredModelID: self.settings.assistantPreferredModelID.nonEmpty)
-        let resolvedMemoryStore = memoryStore ?? (try? MemorySQLiteStore()) ?? (try! MemorySQLiteStore())
+        let resolvedMemoryStore = memoryStore ?? (try? MemorySQLiteStore()) ?? MemorySQLiteStore.fallback()
         let resolvedThreadMemoryService = threadMemoryService ?? AssistantThreadMemoryService()
         self.threadMemoryService = resolvedThreadMemoryService
         self.memoryRetrievalService = memoryRetrievalService ?? AssistantMemoryRetrievalService(

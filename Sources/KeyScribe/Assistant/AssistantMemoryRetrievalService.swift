@@ -5,10 +5,10 @@ final class AssistantMemoryRetrievalService {
     private let threadMemoryService: AssistantThreadMemoryService
 
     init(
-        store: MemorySQLiteStore = try! MemorySQLiteStore(),
+        store: MemorySQLiteStore? = nil,
         threadMemoryService: AssistantThreadMemoryService = AssistantThreadMemoryService()
     ) {
-        self.store = store
+        self.store = store ?? (try? MemorySQLiteStore()) ?? MemorySQLiteStore.fallback()
         self.threadMemoryService = threadMemoryService
     }
 
