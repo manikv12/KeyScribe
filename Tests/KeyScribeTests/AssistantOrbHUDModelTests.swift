@@ -144,6 +144,30 @@ final class AssistantOrbHUDModelTests: XCTestCase {
     }
 
     @MainActor
+    func testOpenSelectedSessionInMainWindowUsesActiveSessionSummary() {
+        let model = AssistantOrbHUDModel()
+        let session = AssistantSessionSummary(
+            id: "session-5",
+            title: "Orb follow-up",
+            source: .appServer,
+            status: .completed,
+            latestAssistantMessage: "Reply ready."
+        )
+        var openedSession: AssistantSessionSummary?
+
+        model.activeSessionSummary = session
+        model.showWorkingDetail = true
+        model.onOpenSession = { selected in
+            openedSession = selected
+        }
+
+        model.openSelectedSessionInMainWindow()
+
+        XCTAssertEqual(openedSession?.id, "session-5")
+        XCTAssertFalse(model.showWorkingDetail)
+    }
+
+    @MainActor
     func testLevelUpdatesAreSmoothedAndStayWithinBounds() {
         let model = AssistantOrbHUDModel()
 

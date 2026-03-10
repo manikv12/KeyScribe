@@ -3,6 +3,7 @@ import SwiftUI
 
 struct AIMemoryStudioView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @ObservedObject private var assistant = AssistantStore.shared
     @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
     @StateObject private var localAISetupService = LocalAISetupService.shared
 
@@ -97,6 +98,11 @@ struct AIMemoryStudioView: View {
         case sourceFolders
         case browser
         case actions
+        case assistantSetup
+        case assistantMemory
+        case assistantInstructions
+        case assistantLimits
+        case assistantSessions
 
         var id: Self { self }
 
@@ -116,6 +122,16 @@ struct AIMemoryStudioView: View {
                 return "Memory Browser"
             case .actions:
                 return "Maintenance"
+            case .assistantSetup:
+                return "Setup"
+            case .assistantMemory:
+                return "Memory"
+            case .assistantInstructions:
+                return "Custom Instructions"
+            case .assistantLimits:
+                return "Limits"
+            case .assistantSessions:
+                return "Recent Sessions"
             }
         }
 
@@ -135,6 +151,16 @@ struct AIMemoryStudioView: View {
                 return "Browse indexed memories by filters."
             case .actions:
                 return "Rescan, rebuild, and cleanup controls."
+            case .assistantSetup:
+                return "Enable, model, account, and browser automation."
+            case .assistantMemory:
+                return "Thread memory, long-term lessons, and review controls."
+            case .assistantInstructions:
+                return "Persistent instructions sent to every assistant session."
+            case .assistantLimits:
+                return "Tool call and repeated command safety limits."
+            case .assistantSessions:
+                return "Saved Codex sessions in KeyScribe."
             }
         }
 
@@ -154,6 +180,16 @@ struct AIMemoryStudioView: View {
                 return "magnifyingglass.circle"
             case .actions:
                 return "hammer"
+            case .assistantSetup:
+                return "sparkles.rectangle.stack.fill"
+            case .assistantMemory:
+                return "brain.head.profile"
+            case .assistantInstructions:
+                return "text.quote"
+            case .assistantLimits:
+                return "gauge.with.dots.needle.33percent"
+            case .assistantSessions:
+                return "clock.arrow.circlepath"
             }
         }
 
@@ -173,6 +209,25 @@ struct AIMemoryStudioView: View {
                 return Color(red: 0.92, green: 0.49, blue: 0.34)
             case .actions:
                 return Color(red: 0.90, green: 0.70, blue: 0.26)
+            case .assistantSetup:
+                return Color(red: 0.22, green: 0.70, blue: 1.00)
+            case .assistantMemory:
+                return Color(red: 0.46, green: 0.79, blue: 0.66)
+            case .assistantInstructions:
+                return Color(red: 0.72, green: 0.56, blue: 0.88)
+            case .assistantLimits:
+                return Color(red: 0.90, green: 0.70, blue: 0.26)
+            case .assistantSessions:
+                return Color(red: 0.84, green: 0.52, blue: 0.28)
+            }
+        }
+
+        var isAssistantPage: Bool {
+            switch self {
+            case .assistantSetup, .assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions:
+                return true
+            default:
+                return false
             }
         }
     }
@@ -539,6 +594,25 @@ struct AIMemoryStudioView: View {
                 }
             }
 
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+
+            Text("Assistant")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 2)
+
+            VStack(spacing: 3) {
+                ForEach(assistantStudioPages) { page in
+                    Button {
+                        selectedStudioPage = page
+                    } label: {
+                        studioPageRow(for: page)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
             Spacer(minLength: 0)
         }
         .padding(12)
@@ -622,6 +696,16 @@ struct AIMemoryStudioView: View {
             if isMemoryFeatureEnabled { studioBrowserPage } else { studioOverviewPage }
         case .actions:
             if isMemoryFeatureEnabled { studioActionsPage } else { studioOverviewPage }
+        case .assistantSetup:
+            studioAssistantSetupPage
+        case .assistantMemory:
+            studioAssistantMemoryPage
+        case .assistantInstructions:
+            studioAssistantInstructionsPage
+        case .assistantLimits:
+            studioAssistantLimitsPage
+        case .assistantSessions:
+            studioAssistantSessionsPage
         }
     }
 
@@ -2281,7 +2365,12 @@ struct AIMemoryStudioView: View {
     }
 
     private var availableStudioPages: [StudioPage] {
-        isMemoryFeatureEnabled ? StudioPage.allCases : aiCorePages
+        let base = isMemoryFeatureEnabled ? StudioPage.allCases : aiCorePages
+        return base.filter { !$0.isAssistantPage }
+    }
+
+    private var assistantStudioPages: [StudioPage] {
+        [.assistantSetup, .assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions]
     }
 
     private var enabledSourceProviderCount: Int {
@@ -4411,7 +4500,8 @@ struct AIMemoryStudioView: View {
     }
 
     private func sanitizeSelectedStudioPage() {
-        if !availableStudioPages.contains(selectedStudioPage) {
+        let allValid = availableStudioPages + assistantStudioPages
+        if !allValid.contains(selectedStudioPage) {
             selectedStudioPage = .dashboard
         }
     }
@@ -5268,6 +5358,375 @@ struct AIMemoryStudioView: View {
         memoryActionMessage = "\(actionLabel) finished. Indexed \(indexedFiles) files, skipped \(skippedFiles), produced \(indexedCards) cards, and generated \(indexedRewrites) rewrite suggestion(s)."
         refreshMemoryBrowser()
         refreshMemoryAnalytics()
+    }
+
+    // MARK: - Assistant Memory Page
+
+    private var studioAssistantMemoryPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsCard(
+                title: "Assistant Memory",
+                subtitle: "Short-term file memory for the current Codex thread, plus reviewed long-term lessons.",
+                symbol: "brain.head.profile",
+                tint: Color(red: 0.46, green: 0.79, blue: 0.66)
+            ) {
+                Toggle("Enable assistant memory", isOn: $settings.assistantMemoryEnabled)
+                    .disabled(!settings.assistantBetaEnabled)
+
+                Toggle("Review before saving long-term memory", isOn: $settings.assistantMemoryReviewEnabled)
+                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
+
+                Stepper(value: $settings.assistantMemorySummaryMaxChars, in: 400...4000, step: 200) {
+                    HStack {
+                        Text("Memory summary size")
+                        Spacer()
+                        Text("\(settings.assistantMemorySummaryMaxChars) chars")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
+
+                if let memoryStatusMessage = assistant.memoryStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !memoryStatusMessage.isEmpty {
+                    Text(memoryStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("Assistant memory stays separate from voice-to-text memory.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack(spacing: 8) {
+                    Button("Open Current Memory File") {
+                        assistant.openCurrentMemoryFile()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
+
+                    Button("Reset Current Task Memory") {
+                        assistant.resetCurrentTaskMemory()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
+                }
+
+                HStack(spacing: 8) {
+                    Button("Review Memory Suggestions") {
+                        assistant.openMemorySuggestionReview()
+                        NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
+
+                    Button("Clear This Thread Memory", role: .destructive) {
+                        assistant.clearCurrentThreadMemory()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
+                }
+            }
+        }
+    }
+
+    // MARK: - Assistant Instructions Page
+
+    private var studioAssistantInstructionsPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsCard(
+                title: "Custom Instructions",
+                subtitle: "These instructions are sent to every new assistant session. Use them to set coding style, preferred tools, personality, or any rules.",
+                symbol: "text.quote",
+                tint: Color(red: 0.72, green: 0.56, blue: 0.88)
+            ) {
+                TextEditor(text: $settings.assistantCustomInstructions)
+                    .font(.system(size: 12, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .frame(minHeight: 120, maxHeight: 240)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.white.opacity(0.05))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.white.opacity(0.10), lineWidth: 0.8)
+                            )
+                    )
+
+                if !settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle")
+                            .foregroundStyle(.green)
+                            .font(.system(size: 11))
+                        Text("Instructions will be applied to the next new session.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Assistant Setup Page
+
+    private var studioAssistantSetupPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsCard(
+                title: "Assistant",
+                subtitle: "Codex-powered personal assistant with voice task entry.",
+                symbol: "sparkles.rectangle.stack.fill",
+                tint: Color(red: 0.22, green: 0.70, blue: 1.00)
+            ) {
+                Toggle("Enable assistant", isOn: $settings.assistantBetaEnabled)
+
+                if !settings.assistantBetaWarningAcknowledged {
+                    Text("This assistant can read files, continue Codex threads, and guide bigger tasks. Review the assistant window before using it for important work.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("I understand") {
+                        settings.assistantBetaWarningAcknowledged = true
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Toggle("Enable voice task entry", isOn: $settings.assistantVoiceTaskEntryEnabled)
+                    .disabled(!settings.assistantBetaEnabled)
+
+                Toggle("Show floating activity bubble", isOn: $settings.assistantFloatingHUDEnabled)
+                    .disabled(!settings.assistantBetaEnabled)
+
+                if assistant.accountSnapshot.isLoggedIn {
+                    HStack(spacing: 6) {
+                        Image(systemName: "person.crop.circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(assistant.accountSnapshot.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if assistant.accountSnapshot.isLoggedIn && assistant.visibleModels.isEmpty {
+                    Text(
+                        assistant.isLoadingModels
+                            ? "Loading assistant models..."
+                            : "No assistant models are available yet."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                if !assistant.visibleModels.isEmpty {
+                    Picker(
+                        "Model",
+                        selection: Binding(
+                            get: { assistant.selectedModelID ?? "" },
+                            set: { assistant.chooseModel($0) }
+                        )
+                    ) {
+                        Text("Select a model").tag("")
+                        ForEach(assistant.visibleModels) { model in
+                            Text(model.displayName).tag(model.id)
+                        }
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button("Open Assistant") {
+                        NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!settings.assistantBetaEnabled)
+
+                    switch assistant.environment.state {
+                    case .missingCodex:
+                        Button("Install Codex") {
+                            assistant.runPreferredInstallCommand()
+                        }
+                        .buttonStyle(.bordered)
+                    case .needsLogin:
+                        Button("Sign In with ChatGPT") {
+                            assistant.runLoginCommand()
+                        }
+                        .buttonStyle(.bordered)
+                    case .ready:
+                        EmptyView()
+                    case .failed:
+                        Button("Codex Docs") {
+                            assistant.openInstallDocs()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                if assistant.environment.state != .ready {
+                    Text(assistant.environment.installHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            BrowserAutomationSettingsView(settings: settings)
+        }
+        .onAppear {
+            assistant.refreshAll()
+        }
+    }
+
+    // MARK: - Assistant Limits Page
+
+    private var studioAssistantLimitsPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsCard(
+                title: "Agent Turn Limit",
+                subtitle: "Maximum number of tool calls the agent can make in a single turn before it is automatically stopped. Set to 0 for unlimited.",
+                symbol: "gauge.with.dots.needle.33percent",
+                tint: Color(red: 0.90, green: 0.70, blue: 0.26)
+            ) {
+                HStack(spacing: 12) {
+                    TextField(
+                        "Max tool calls",
+                        value: $settings.assistantMaxToolCallsPerTurn,
+                        format: .number
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 80)
+
+                    Text("\(settings.assistantMaxToolCallsPerTurn == 0 ? "Unlimited" : "\(settings.assistantMaxToolCallsPerTurn) tool calls")")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button("Reset") {
+                        settings.assistantMaxToolCallsPerTurn = 75
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            settingsCard(
+                title: "Repeated Command Limit",
+                subtitle: "Maximum number of times the same terminal command can repeat back-to-back in a single turn before it is automatically stopped. Set to 0 for unlimited.",
+                symbol: "arrow.trianglehead.2.clockwise",
+                tint: Color(red: 0.90, green: 0.70, blue: 0.26)
+            ) {
+                HStack(spacing: 12) {
+                    TextField(
+                        "Max repeats",
+                        value: $settings.assistantMaxRepeatedCommandAttemptsPerTurn,
+                        format: .number
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 80)
+
+                    Text(
+                        settings.assistantMaxRepeatedCommandAttemptsPerTurn == 0
+                            ? "Unlimited"
+                            : "\(settings.assistantMaxRepeatedCommandAttemptsPerTurn) attempts"
+                    )
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button("Reset") {
+                        settings.assistantMaxRepeatedCommandAttemptsPerTurn = 3
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    // MARK: - Assistant Sessions Page
+
+    private var studioAssistantSessionsPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if assistant.sessions.isEmpty {
+                settingsCard(
+                    title: "Recent Sessions",
+                    subtitle: "No sessions saved yet.",
+                    symbol: "clock.arrow.circlepath",
+                    tint: Color(red: 0.84, green: 0.52, blue: 0.28)
+                ) {
+                    Text("Sessions will appear here once you start using the assistant.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                settingsCard(
+                    title: "Recent Sessions",
+                    subtitle: "\(assistant.sessions.count) session\(assistant.sessions.count == 1 ? "" : "s") saved in KeyScribe.",
+                    symbol: "clock.arrow.circlepath",
+                    tint: Color(red: 0.84, green: 0.52, blue: 0.28)
+                ) {
+                    ForEach(assistant.sessions) { session in
+                        HStack(alignment: .top, spacing: 10) {
+                            AppIconBadge(
+                                symbol: assistantSessionBadgeSymbol(for: session.source),
+                                tint: assistantSessionBadgeTint(for: session.source),
+                                size: 22,
+                                symbolSize: 10,
+                                isEmphasized: assistant.selectedSessionID == session.id
+                            )
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.title)
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(.white.opacity(0.94))
+                                    .lineLimit(1)
+                                Text(session.detail.isEmpty ? (session.cwd ?? "") : session.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 2)
+                    }
+
+                    Button("Open Assistant Window") {
+                        NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                    .disabled(!settings.assistantBetaEnabled)
+                }
+            }
+        }
+    }
+
+    private func assistantSessionBadgeSymbol(for source: AssistantSessionSource) -> String {
+        switch source {
+        case .cli:
+            return "terminal.fill"
+        case .vscode:
+            return "chevron.left.forwardslash.chevron.right"
+        case .appServer:
+            return "sparkles"
+        case .other:
+            return "tray.full.fill"
+        }
+    }
+
+    private func assistantSessionBadgeTint(for source: AssistantSessionSource) -> Color {
+        switch source {
+        case .cli:
+            return AppVisualTheme.baseTint
+        case .vscode:
+            return AppVisualTheme.accentTint
+        case .appServer:
+            return .green
+        case .other:
+            return .orange
+        }
     }
 
     @ViewBuilder

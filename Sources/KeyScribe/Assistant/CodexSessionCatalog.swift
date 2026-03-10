@@ -2088,7 +2088,7 @@ struct CodexSessionCatalog {
                 options: .regularExpression
             )
             .replacingOccurrences(
-                of: #"\s+"#,
+                of: #"[^\S\n]+"#,
                 with: " ",
                 options: .regularExpression
             )

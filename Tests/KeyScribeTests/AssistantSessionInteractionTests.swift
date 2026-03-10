@@ -80,6 +80,20 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 command: "rg --files Sources"
             )
         )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "commandExecution",
+                command: "rg TODO Sources | head"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "commandExecution",
+                command: "python3 /Users/manikvashith/.codex/skills/obsidian-cli/scripts/obsidian_cli_tool.py summarize --file KeyScribe"
+            )
+        )
         XCTAssertFalse(
             runtime.isToolActivityAllowedForTesting(
                 mode: .conversational,
@@ -94,23 +108,29 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 command: "swift test"
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
                 rawType: "fileChange"
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
                 rawType: "browserAutomation"
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
                 rawType: "dynamicToolCall",
                 toolName: "computer_use"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "mcpToolCall"
             )
         )
         XCTAssertFalse(
@@ -213,17 +233,18 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         let conversational = runtime.blockedToolUseMessage(
             for: .conversational,
-            activityTitle: "Command",
+            activityTitle: "swift test",
             commandClass: .validation
         )
         XCTAssertTrue(conversational.contains("cannot run build or test checks"))
         XCTAssertTrue(conversational.contains("Plan or Agentic mode"))
+        XCTAssertTrue(conversational.contains("swift test"))
 
         let plan = runtime.blockedToolUseMessage(
             for: .plan,
             activityTitle: "Command"
         )
-        XCTAssertEqual(plan, "Tool use is allowed in Plan mode.")
+        XCTAssertTrue(plan.contains("Plan mode focuses on exploration and planning"))
 
         let computerUse = runtime.blockedToolUseMessage(
             for: .conversational,
@@ -345,8 +366,8 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         let item = attachment.toInputItem()
 
-        XCTAssertEqual(item["type"] as? String, "input_image")
-        XCTAssertTrue((item["image_url"] as? String)?.hasPrefix("data:image/png;base64,") == true)
+        XCTAssertEqual(item["type"] as? String, "image")
+        XCTAssertTrue((item["url"] as? String)?.hasPrefix("data:image/png;base64,") == true)
     }
 
     @MainActor
@@ -399,8 +420,28 @@ final class AssistantSessionInteractionTests: XCTestCase {
         let runtime = CodexAssistantRuntime()
 
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), [])
-        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["computer_use"])
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), [])
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .agentic), ["computer_use"])
+    }
+
+    @MainActor
+    func testChatTurnStartParamsUseReadOnlySandboxAndUnlessTrustedApproval() {
+        let runtime = CodexAssistantRuntime()
+
+        let chatParams = runtime.turnStartParamsForTesting(mode: .conversational)
+        XCTAssertEqual(chatParams["approvalPolicy"] as? String, "untrusted")
+        XCTAssertEqual(
+            (chatParams["sandboxPolicy"] as? [String: Any])?["type"] as? String,
+            "readOnly"
+        )
+        XCTAssertEqual(
+            (chatParams["sandboxPolicy"] as? [String: Any])?["networkAccess"] as? Bool,
+            true
+        )
+
+        let planParams = runtime.turnStartParamsForTesting(mode: .plan)
+        XCTAssertEqual(planParams["approvalPolicy"] as? String, "on-request")
+        XCTAssertNil(planParams["sandboxPolicy"])
     }
 
     @MainActor

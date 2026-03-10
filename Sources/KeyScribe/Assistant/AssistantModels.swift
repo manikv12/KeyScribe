@@ -321,8 +321,8 @@ struct AssistantAttachment: Identifiable, Equatable {
         if isImage {
             let base64 = data.base64EncodedString()
             return [
-                "type": "input_image",
-                "image_url": "data:\(mimeType);base64,\(base64)"
+                "type": "image",
+                "url": "data:\(mimeType);base64,\(base64)"
             ]
         } else {
             let text = String(data: data, encoding: .utf8) ?? data.base64EncodedString()
@@ -785,6 +785,15 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var subagents: [SubagentState] = []
     @Published private(set) var voiceCaptureLevel: Float = 0
     @Published var reasoningEffort: AssistantReasoningEffort = .high
+    @Published var fastModeEnabled = false {
+        didSet {
+            guard oldValue != fastModeEnabled else { return }
+            runtime.serviceTier = fastModeEnabled ? "fast" : nil
+            Task { @MainActor [weak self] in
+                await self?.refreshCurrentSessionConfigurationForModeChange()
+            }
+        }
+    }
     @Published var interactionMode: AssistantInteractionMode = .conversational {
         didSet {
             refreshModeSwitchSuggestion()
@@ -2178,6 +2187,7 @@ final class AssistantStore: ObservableObject {
             oneShot: oneShot
         )
         runtime.reasoningEffort = reasoningEffort.wireValue
+        runtime.serviceTier = fastModeEnabled ? "fast" : nil
         runtime.interactionMode = interactionMode
         runtime.maxToolCallsPerTurn = settings.assistantMaxToolCallsPerTurn
         runtime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn

@@ -7,6 +7,31 @@ enum AssistantCommandSafetyClass: Equatable, Sendable {
 }
 
 enum AssistantModePolicy {
+    private static let simpleReadOnlyExecutables: Set<String> = [
+        "pwd", "ls", "rg", "find", "cat", "head", "tail", "grep",
+        "sort", "uniq", "cut", "wc", "which", "mdfind", "stat",
+        "file", "plutil"
+    ]
+
+    private static let gitReadOnlyCommands: Set<String> = [
+        "git status", "git diff", "git show", "git log", "git grep",
+        "git ls-files", "git rev-parse", "git branch --show-current"
+    ]
+
+    private static let directObsidianReadOnlyCommands: Set<String> = [
+        "read", "search", "links", "backlinks", "tasks", "tags",
+        "aliases", "properties", "property:get", "property:list",
+        "daily:read", "history:list", "history:read"
+    ]
+
+    private static let trustedReadOnlyPythonWrappers: Set<String> = [
+        "obsidian_cli_tool.py"
+    ]
+
+    private static let trustedReadOnlyWrapperCommands: Set<String> = [
+        "read", "summarize"
+    ]
+
     private static func normalizedToolName(_ toolName: String?) -> String? {
         toolName?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -18,29 +43,58 @@ enum AssistantModePolicy {
         let normalized = normalize(command)
         guard !normalized.isEmpty else { return .mutatingOrUnknown }
 
-        if containsCompoundOrRedirectedShell(normalized) {
+        if containsDisallowedShellSyntax(normalized) {
             return .mutatingOrUnknown
         }
 
-        let tokens = executableTokens(from: normalized)
+        if let stages = pipelineStages(from: normalized) {
+            guard !stages.isEmpty else { return .mutatingOrUnknown }
+            return stages.allSatisfy({ classifySimpleCommand($0) == .readOnly })
+                ? .readOnly
+                : .mutatingOrUnknown
+        }
+
+        return classifySimpleCommand(normalized)
+    }
+
+    static func shouldAutoApproveCommandRequest(
+        mode: AssistantInteractionMode,
+        command: String
+    ) -> Bool {
+        (mode == .conversational || mode == .plan) && commandSafetyClass(for: command) == .readOnly
+    }
+
+    static func activityTitle(forBlockedCommand command: String?) -> String {
+        let collapsed = command?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: #"\s+"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .nonEmpty
+        return collapsed ?? "Command"
+    }
+
+    private static func classifySimpleCommand(_ normalizedCommand: String) -> AssistantCommandSafetyClass {
+        let tokens = executableTokens(from: normalizedCommand)
         guard let executable = tokens.first else {
             return .mutatingOrUnknown
         }
 
         let firstTwo = tokens.prefix(2).joined(separator: " ")
+        let firstThree = tokens.prefix(3).joined(separator: " ")
 
         switch executable {
-        case "pwd", "ls", "rg", "find", "cat", "head", "tail":
+        case let executable where simpleReadOnlyExecutables.contains(executable):
             return .readOnly
         case "sed":
             return firstTwo == "sed -n" ? .readOnly : .mutatingOrUnknown
         case "git":
-            switch firstTwo {
-            case "git status", "git diff", "git show":
-                return .readOnly
-            default:
-                return .mutatingOrUnknown
-            }
+            return gitReadOnlyCommands.contains(firstThree)
+                || gitReadOnlyCommands.contains(firstTwo)
+                ? .readOnly
+                : .mutatingOrUnknown
         case "swift":
             switch firstTwo {
             case "swift build", "swift test":
@@ -53,6 +107,10 @@ enum AssistantModePolicy {
                 return .mutatingOrUnknown
             }
             return action == "build" || action == "test" ? .validation : .mutatingOrUnknown
+        case "obsidian":
+            return isTrustedDirectObsidianReadOnlyCommand(tokens) ? .readOnly : .mutatingOrUnknown
+        case "python", "python3":
+            return isTrustedReadOnlyPythonWrapper(tokens) ? .readOnly : .mutatingOrUnknown
         default:
             return .mutatingOrUnknown
         }
@@ -64,7 +122,7 @@ enum AssistantModePolicy {
         command: String? = nil,
         toolName: String? = nil
     ) -> Bool {
-        if mode == .agentic || mode == .plan {
+        if mode == .agentic {
             return true
         }
 
@@ -75,7 +133,9 @@ enum AssistantModePolicy {
             case .conversational:
                 return commandClass == .readOnly
             case .plan:
-                return true
+                // Plan mode allows read-only and validation (build/test) commands
+                // but blocks mutating commands to keep the focus on planning.
+                return commandClass == .readOnly || commandClass == .validation
             case .agentic:
                 return true
             }
@@ -83,12 +143,17 @@ enum AssistantModePolicy {
             return true
         case .dynamicToolCall:
             switch mode {
-            case .conversational:
+            case .conversational, .plan:
                 return normalizedToolName(toolName) != "computer_use"
-            case .plan, .agentic:
+            case .agentic:
                 return true
             }
-        case .fileChange, .browserAutomation, .mcpToolCall, .subagent:
+        case .fileChange, .browserAutomation:
+            return false
+        case .mcpToolCall:
+            // Plan mode allows MCP tool calls for exploration (e.g. reading docs)
+            return mode == .plan
+        case .subagent:
             return false
         case .reasoning:
             return true
@@ -120,7 +185,10 @@ enum AssistantModePolicy {
             }
             return "I stopped\(activityPhrase) because Chat mode can inspect files, search the web, and read attached images when the selected model supports them, but it cannot make changes or use higher-risk tools. Switch to Agentic mode for execution."
         case .plan:
-            return "Tool use is allowed in Plan mode."
+            if commandClass == .mutatingOrUnknown {
+                return "I stopped\(activityPhrase) because Plan mode can explore, search, and run read-only or validation commands, but it cannot make changes. Switch to Agentic mode to execute."
+            }
+            return "I stopped\(activityPhrase) because Plan mode focuses on exploration and planning. Switch to Agentic mode to execute changes."
         case .agentic:
             return "Tool use is allowed in Agentic mode."
         }
@@ -133,14 +201,29 @@ enum AssistantModePolicy {
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     }
 
-    private static func containsCompoundOrRedirectedShell(_ command: String) -> Bool {
-        if command.contains("&&") || command.contains(";") {
+    private static func containsDisallowedShellSyntax(_ command: String) -> Bool {
+        if command.contains("&&") || command.contains("||") || command.contains(";") {
             return true
         }
-        if command.contains("|") || command.contains(">") || command.contains("<") {
+        if command.contains("|&") || command.hasSuffix("&") || command.contains(" & ") {
             return true
         }
-        return command.contains(" tee ")
+        if command.contains(">") || command.contains("<") {
+            return true
+        }
+        if command.contains(" tee ") || command.contains("$(") {
+            return true
+        }
+        return command.contains("`")
+    }
+
+    private static func pipelineStages(from command: String) -> [String]? {
+        guard command.contains("|") else { return nil }
+        let stages = command
+            .split(separator: "|")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return stages.isEmpty ? nil : stages
     }
 
     private static func executableTokens(from command: String) -> [String] {
@@ -164,5 +247,23 @@ enum AssistantModePolicy {
             of: #"^[a-z_][a-z0-9_]*=.*$"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
+    }
+
+    private static func isTrustedDirectObsidianReadOnlyCommand(_ tokens: [String]) -> Bool {
+        guard let command = tokens.dropFirst().first else {
+            return false
+        }
+        return directObsidianReadOnlyCommands.contains(command)
+    }
+
+    private static func isTrustedReadOnlyPythonWrapper(_ tokens: [String]) -> Bool {
+        guard tokens.count >= 3 else { return false }
+        guard trustedReadOnlyPythonWrappers.contains(where: { tokens[1].hasSuffix($0) }) else {
+            return false
+        }
+
+        let subcommand = tokens.dropFirst(2).first { !$0.hasPrefix("-") }
+        guard let subcommand else { return false }
+        return trustedReadOnlyWrapperCommands.contains(subcommand)
     }
 }

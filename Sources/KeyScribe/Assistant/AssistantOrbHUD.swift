@@ -264,6 +264,14 @@ final class AssistantOrbHUDModel: ObservableObject {
         messageText = ""
     }
 
+    func openSelectedSessionInMainWindow() {
+        dismissWorkingDetail()
+        guard let session = activeSessionSummary ?? sessions.first(where: { $0.id == selectedSessionID }) else {
+            return
+        }
+        onOpenSession?(session)
+    }
+
     func toggleExpanded() {
         if isExpanded { collapse() } else { expand() }
     }
@@ -300,6 +308,20 @@ final class AssistantOrbHUDManager {
         didSet {
             if !isEnabled { hide() }
         }
+    }
+
+    func showFollowUp(for session: AssistantSessionSummary) {
+        guard isEnabled else { return }
+        if panel == nil { createPanel() }
+
+        controller.selectedSessionID = session.id
+        syncModelFromController()
+        model.showFollowUpPreview(for: session)
+
+        if !model.isExpanded {
+            reposition()
+        }
+        panel?.orderFrontRegardless()
     }
 
     private var autoDismissItem: DispatchWorkItem?
@@ -378,16 +400,17 @@ final class AssistantOrbHUDManager {
             }
             .store(in: &cancellables)
 
-        // Resize panel when done detail popup toggles
+        // Resize panel when done detail popup toggles.
+        // Must fire synchronously (no `.receive(on:)`) so the panel
+        // frame updates in the same run-loop tick as the SwiftUI view,
+        // preventing the orb from jumping during dismiss.
         model.$showDoneDetail
-            .receive(on: RunLoop.main)
             .sink { [weak self] showing in
                 self?.handleDoneDetailChange(showing)
             }
             .store(in: &cancellables)
 
         model.$showWorkingDetail
-            .receive(on: RunLoop.main)
             .sink { [weak self] showing in
                 self?.handleWorkingDetailChange(showing)
             }
@@ -1080,6 +1103,8 @@ private struct AssistantOrbHUDView: View {
         static let content = Animation.easeOut(duration: 0.18)
     }
 
+    private let overlayBottomDock: CGFloat = 108
+
     private var showingPopup: Bool {
         (
             model.showDoneDetail
@@ -1096,6 +1121,13 @@ private struct AssistantOrbHUDView: View {
 
     private var expandedSessionListMaxHeight: CGFloat {
         216
+    }
+
+    private var overlayContentMaxHeight: CGFloat {
+        let totalHeight = model.isExpanded
+            ? AssistantOrbHUDModel.Layout.expandedSize.height
+            : model.popupSize.height
+        return max(180, totalHeight - overlayBottomDock)
     }
 
     private var resizeHandle: some View {
@@ -1127,44 +1159,15 @@ private struct AssistantOrbHUDView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if model.isExpanded {
-                sessionPopoverSection
-                    .transition(.opacity)
-            } else {
-                if model.showDoneDetail {
-                    resizeHandle
-                    doneDetailPopup(maxHeight: popupContentMaxHeight, showsFollowUpComposer: true)
-                        .transition(.opacity)
-                }
-
-                if model.showWorkingDetail && !model.showDoneDetail && model.pendingPermissionRequest == nil {
-                    resizeHandle
-                    workingDetailPopup(maxHeight: popupContentMaxHeight)
-                        .transition(.opacity)
-                }
-
-                if model.pendingPermissionRequest != nil && !model.showDoneDetail && !model.showWorkingDetail {
-                    resizeHandle
-                    permissionPopup(maxHeight: popupContentMaxHeight)
-                        .transition(.opacity)
-                }
-
-                if model.modeSwitchSuggestion != nil
-                    && !model.showDoneDetail
-                    && !model.showWorkingDetail
-                    && model.pendingPermissionRequest == nil {
-                    resizeHandle
-                    modeSwitchPopup(maxHeight: popupContentMaxHeight)
-                        .transition(.opacity)
-                }
-            }
-
+        ZStack(alignment: .bottom) {
+            overlayContent
             orbSection
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .frame(
             width: model.isExpanded ? AssistantOrbHUDModel.Layout.expandedSize.width : (showingPopup ? model.popupSize.width : 140),
-            height: model.isExpanded ? AssistantOrbHUDModel.Layout.expandedSize.height : (showingPopup ? model.popupSize.height : 156)
+            height: model.isExpanded ? AssistantOrbHUDModel.Layout.expandedSize.height : (showingPopup ? model.popupSize.height : 156),
+            alignment: .bottom
         )
         .popover(item: $previewAttachment, attachmentAnchor: .point(.center)) { attachment in
             if let nsImage = NSImage(data: attachment.data) {
@@ -1189,6 +1192,47 @@ private struct AssistantOrbHUDView: View {
                 }
                 .frame(minWidth: 360, minHeight: 260)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var overlayContent: some View {
+        if model.isExpanded {
+            sessionPopoverSection
+                .frame(maxHeight: overlayContentMaxHeight)
+                .padding(.bottom, overlayBottomDock)
+                .transition(.opacity)
+        } else if model.showDoneDetail {
+            VStack(spacing: 0) {
+                resizeHandle
+                doneDetailPopup(maxHeight: overlayContentMaxHeight, showsFollowUpComposer: true)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
+        } else if model.showWorkingDetail && !model.showDoneDetail && model.pendingPermissionRequest == nil {
+            VStack(spacing: 0) {
+                resizeHandle
+                workingDetailPopup(maxHeight: overlayContentMaxHeight)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
+        } else if model.pendingPermissionRequest != nil && !model.showDoneDetail && !model.showWorkingDetail {
+            VStack(spacing: 0) {
+                resizeHandle
+                permissionPopup(maxHeight: overlayContentMaxHeight)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
+        } else if model.modeSwitchSuggestion != nil
+            && !model.showDoneDetail
+            && !model.showWorkingDetail
+            && model.pendingPermissionRequest == nil {
+            VStack(spacing: 0) {
+                resizeHandle
+                modeSwitchPopup(maxHeight: overlayContentMaxHeight)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
         }
     }
 
@@ -1261,11 +1305,14 @@ private struct AssistantOrbHUDView: View {
             .animation(OrbHUDAnimations.content, value: model.state.detail)
             .animation(OrbHUDAnimations.state, value: model.state.phase)
         }
-        .padding(.top, showingPopup ? 10 : 12)
+        .padding(.top, 12)
+        .frame(maxWidth: .infinity)
+        .frame(height: 156, alignment: .top)
     }
 
     private var orbSphereView: some View {
-        TimelineView(.animation(minimumInterval: orbRefreshInterval, paused: false)) { context in
+        let paused = model.state.phase == .idle
+        return TimelineView(.animation(minimumInterval: orbRefreshInterval, paused: paused)) { context in
             OrbSphere(
                 phase: model.state.phase,
                 level: CGFloat(model.level),
@@ -1296,11 +1343,10 @@ private struct AssistantOrbHUDView: View {
                 title: "Done",
                 subtitle: "Latest assistant result",
                 symbol: "checkmark.circle.fill",
-                tint: tint
+                tint: tint,
+                onOpenMainWindow: { model.openSelectedSessionInMainWindow() }
             ) {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                    model.dismissDoneDetail()
-                }
+                model.dismissDoneDetail()
             }
 
             OrbPopupDivider(tint: tint)
@@ -1319,47 +1365,12 @@ private struct AssistantOrbHUDView: View {
                 OrbPopupDivider(tint: tint)
                     .padding(.horizontal, 2)
 
-                VStack(spacing: 10) {
-                    if let suggestion = model.modeSwitchSuggestion {
-                        modeSwitchInlineCard(suggestion, tint: tint)
-                    }
-
-                    HStack(spacing: 8) {
-                        orbAttachmentButton(tint: tint)
-                        AssistantModePicker(selection: model.interactionMode, style: .compact) { mode in
-                            model.setInteractionMode(mode)
-                        }
-                        Spacer(minLength: 8)
-                        OrbInlinePill(text: "Enter sends", symbol: "arrow.turn.down.left", tint: tint)
-                    }
-
-                    if !model.attachments.isEmpty {
-                        orbAttachmentStrip(tint: tint)
-                    }
-
-                    HStack(alignment: .bottom, spacing: 10) {
-                        orbComposerField(
-                            tint: tint,
-                            placeholder: model.isVoiceRecording ? "Listening..." : "Follow up...",
-                            minHeight: 66,
-                            maxHeight: 108,
-                            submit: sendDoneFollowUp
-                        )
-
-                        VStack(spacing: 8) {
-                            orbVoiceToggleButton()
-
-                            OrbFloatingActionButton(
-                                symbol: "arrow.up",
-                                tint: tint,
-                                isEnabled: canSend && !model.isVoiceRecording
-                            ) {
-                                sendDoneFollowUp()
-                            }
-                        }
-                        .padding(.bottom, 6)
-                    }
-                }
+                popupFollowUpComposerSection(
+                    tint: tint,
+                    placeholder: model.isVoiceRecording ? "Listening..." : "Follow up...",
+                    enterHint: "Enter sends",
+                    submit: sendDoneFollowUp
+                )
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
             } else {
@@ -1374,10 +1385,16 @@ private struct AssistantOrbHUDView: View {
 
                     Spacer(minLength: 8)
 
+                    OrbSecondaryActionButton(
+                        title: "Open Main Window",
+                        symbol: "arrow.up.right.square",
+                        tint: tint
+                    ) {
+                        model.openSelectedSessionInMainWindow()
+                    }
+
                     OrbSecondaryActionButton(title: "Ready", symbol: "sparkles", tint: tint) {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                            model.dismissDoneDetail()
-                        }
+                        model.dismissDoneDetail()
                     }
                 }
                 .padding(.horizontal, 14)
@@ -1459,9 +1476,7 @@ private struct AssistantOrbHUDView: View {
                 symbol: "waveform.path.ecg",
                 tint: tint
             ) {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                    model.dismissWorkingDetail()
-                }
+                model.dismissWorkingDetail()
             }
 
             OrbPopupDivider(tint: tint)
@@ -1528,48 +1543,14 @@ private struct AssistantOrbHUDView: View {
                 .padding(.horizontal, 2)
 
             VStack(spacing: 10) {
-                if let suggestion = model.modeSwitchSuggestion {
-                    modeSwitchInlineCard(suggestion, tint: tint)
-                }
-
-                HStack(spacing: 8) {
-                    orbAttachmentButton(tint: tint)
-                    AssistantModePicker(selection: model.interactionMode, style: .compact) { mode in
-                        model.setInteractionMode(mode)
-                    }
-                    Spacer(minLength: 8)
-                    OrbInlinePill(text: "Enter steers now", symbol: "arrow.turn.down.left", tint: tint)
-                }
-
-                if !model.attachments.isEmpty {
-                    orbAttachmentStrip(tint: tint)
-                }
-
-                HStack(alignment: .bottom, spacing: 10) {
-                    orbComposerField(
-                        tint: tint,
-                        placeholder: model.isVoiceRecording
-                            ? "Listening..."
-                            : "Steer it or prepare the next follow-up...",
-                        minHeight: 66,
-                        maxHeight: 108,
-                        submit: sendWorkingFollowUp
-                    )
-
-                    VStack(spacing: 8) {
-                        orbVoiceToggleButton()
-
-                        OrbFloatingActionButton(
-                            symbol: "paperplane.fill",
-                            tint: tint,
-                            isEnabled: canSend && !model.isVoiceRecording
-                        ) {
-                            sendWorkingFollowUp()
-                        }
-
-                    }
-                    .padding(.bottom, 6)
-                }
+                popupFollowUpComposerSection(
+                    tint: tint,
+                    placeholder: model.isVoiceRecording
+                        ? "Listening..."
+                        : "Steer it or prepare the next follow-up...",
+                    enterHint: "Enter steers now",
+                    submit: sendWorkingFollowUp
+                )
 
                 HStack(spacing: 6) {
                     Image(systemName: "sparkles")
@@ -1688,13 +1669,12 @@ private struct AssistantOrbHUDView: View {
             sessionListSection
         }
         .orbPopupSurface(tint: AppVisualTheme.baseTint, cornerRadius: 18)
-        .padding(.bottom, 8)
     }
 
     // MARK: Session List
 
     private var sessionListSection: some View {
-        Group {
+        VStack(spacing: 0) {
             // New session button
             Button(action: {
                 Task { await model.onNewSession?() }
@@ -1816,7 +1796,7 @@ private struct AssistantOrbHUDView: View {
 
                     Spacer(minLength: 0)
 
-                    orbModelPicker
+                    orbModelPicker()
                 }
 
                 HStack(alignment: .center, spacing: 6) {
@@ -1866,8 +1846,45 @@ private struct AssistantOrbHUDView: View {
 
     // MARK: Helpers
 
-    private var orbModelPicker: some View {
-        Menu {
+    private func popupFollowUpComposerSection(
+        tint: Color,
+        placeholder: String,
+        enterHint: String,
+        submit: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 10) {
+            if let suggestion = model.modeSwitchSuggestion {
+                modeSwitchInlineCard(suggestion, tint: tint)
+            }
+
+            HStack(alignment: .center, spacing: 8) {
+                orbAttachmentButton(tint: tint, size: 28)
+                AssistantModePicker(selection: model.interactionMode, style: .compact) { mode in
+                    model.setInteractionMode(mode)
+                }
+                orbModelPicker(maxWidth: 138, showsLabel: true, tint: tint)
+                Spacer(minLength: 0)
+            }
+
+            if !model.attachments.isEmpty {
+                orbAttachmentStrip(tint: tint)
+            }
+
+            popupComposerCard(
+                tint: tint,
+                placeholder: placeholder,
+                submit: submit
+            )
+        }
+    }
+
+    private func orbModelPicker(
+        maxWidth: CGFloat = 74,
+        showsLabel: Bool = false,
+        tint: Color? = nil
+    ) -> some View {
+        let effectiveTint = tint ?? AppVisualTheme.accentTint
+        return Menu {
             ForEach(model.availableModels) { m in
                 Button {
                     model.onChooseModel?(m.id)
@@ -1879,10 +1896,15 @@ private struct AssistantOrbHUDView: View {
             HStack(spacing: 3) {
                 Image(systemName: "bolt.fill")
                     .font(.system(size: 7, weight: .semibold))
-                    .foregroundStyle(AppVisualTheme.accentTint.opacity(0.9))
+                    .foregroundStyle(effectiveTint.opacity(0.9))
+                if showsLabel {
+                    Text("Model")
+                        .font(.system(size: 8.8, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.62))
+                }
                 Text(model.selectedModelSummary)
-                    .font(.system(size: 8.6, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.50))
+                    .font(.system(size: showsLabel ? 9.2 : 8.6, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(showsLabel ? 0.68 : 0.50))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Image(systemName: "chevron.down")
@@ -1901,7 +1923,7 @@ private struct AssistantOrbHUDView: View {
             )
         }
         .menuStyle(.borderlessButton)
-        .frame(maxWidth: 74)
+        .frame(maxWidth: maxWidth)
         .disabled(model.availableModels.isEmpty)
     }
 
@@ -1954,20 +1976,18 @@ private struct AssistantOrbHUDView: View {
             return
         }
 
-        if model.showDoneDetail || model.pendingPermissionRequest != nil || model.modeSwitchSuggestion != nil {
+        // If a popup is already showing (done/permission/working), expand inline
+        if model.showDoneDetail || model.showWorkingDetail || model.pendingPermissionRequest != nil {
             model.expand()
             return
         }
 
-        if model.showWorkingDetail {
-            model.expand()
-            return
-        }
-
+        // If the agent is actively working, show the working detail popup
         if model.presentWorkingDetailIfAvailable() {
             return
         }
 
+        // Default: expand inline popup (composer + session list)
         model.expand()
     }
 
@@ -1976,9 +1996,7 @@ private struct AssistantOrbHUDView: View {
         guard canSend else { return }
         model.onSendMessage?(trimmed, model.selectedSessionID)
         model.messageText = ""
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-            model.dismissDoneDetail()
-        }
+        model.dismissDoneDetail()
     }
 
     private func sendWorkingFollowUp() {
@@ -1986,9 +2004,7 @@ private struct AssistantOrbHUDView: View {
         guard canSend else { return }
         model.onSendMessage?(trimmed, model.selectedSessionID)
         model.messageText = ""
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-            model.dismissWorkingDetail()
-        }
+        model.dismissWorkingDetail()
     }
 
     private func sendMessage() {
@@ -2004,6 +2020,7 @@ private struct AssistantOrbHUDView: View {
         model.collapse()
     }
 
+    @ViewBuilder
     private func orbComposerField(
         tint: Color,
         placeholder: String,
@@ -2011,9 +2028,10 @@ private struct AssistantOrbHUDView: View {
         maxHeight: CGFloat,
         cornerRadius: CGFloat = 18,
         fillOpacity: Double = 0.11,
+        showsSurface: Bool = true,
         submit: @escaping () -> Void
     ) -> some View {
-        OrbComposerTextView(
+        let textView = OrbComposerTextView(
             text: $model.messageText,
             placeholder: placeholder,
             isEnabled: !model.isVoiceRecording,
@@ -2025,11 +2043,60 @@ private struct AssistantOrbHUDView: View {
             }
         )
         .frame(minHeight: minHeight, maxHeight: maxHeight)
-        .orbInsetSurface(tint: tint, cornerRadius: cornerRadius, fillOpacity: fillOpacity)
         .onDrop(of: orbDropTypes, isTargeted: nil) { providers in
             handleAttachmentDrop(providers)
             return true
         }
+
+        if showsSurface {
+            textView
+                .orbInsetSurface(tint: tint, cornerRadius: cornerRadius, fillOpacity: fillOpacity)
+        } else {
+            textView
+        }
+    }
+
+    private func popupComposerCard(
+        tint: Color,
+        placeholder: String,
+        submit: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 0) {
+            orbComposerField(
+                tint: tint,
+                placeholder: placeholder,
+                minHeight: 36,
+                maxHeight: 72,
+                cornerRadius: 18,
+                fillOpacity: 0.0,
+                showsSurface: false,
+                submit: submit
+            )
+            .padding(.horizontal, 2)
+            .padding(.top, 2)
+
+            OrbPopupDivider(tint: tint)
+                .padding(.horizontal, 10)
+
+            HStack(spacing: 8) {
+                Text(model.isVoiceRecording ? "Release to stop" : "Enter sends")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.52))
+                Spacer(minLength: 0)
+                orbVoiceToggleButton(size: 22)
+                OrbFloatingActionButton(
+                    symbol: "arrow.up",
+                    tint: tint,
+                    isEnabled: canSend && !model.isVoiceRecording,
+                    size: 26
+                ) {
+                    submit()
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .orbInsetSurface(tint: tint, cornerRadius: 20, fillOpacity: 0.08)
     }
 
     private func orbAttachmentStrip(tint: Color) -> some View {
@@ -2122,12 +2189,18 @@ private struct AssistantOrbHUDView: View {
         switch model.state.phase {
         case .idle: return "Ready"
         case .listening: return "Listening"
-        case .thinking: return "Thinking"
-        case .acting: return "Working"
-        case .waitingForPermission: return "Waiting"
-        case .streaming: return "Streaming"
         case .success: return "Done"
         case .failed: return "Error"
+        case .thinking, .acting, .waitingForPermission, .streaming:
+            let title = model.state.title
+            if !title.isEmpty { return title }
+            switch model.state.phase {
+            case .thinking: return "Thinking"
+            case .acting: return "Working"
+            case .waitingForPermission: return "Needs Approval"
+            case .streaming: return "Responding"
+            default: return "Working"
+            }
         }
     }
 
@@ -2149,6 +2222,7 @@ private struct OrbPopupHeader: View {
     let subtitle: String
     let symbol: String
     let tint: Color
+    var onOpenMainWindow: (() -> Void)?
     let onClose: () -> Void
 
     var body: some View {
@@ -2178,6 +2252,24 @@ private struct OrbPopupHeader: View {
             }
 
             Spacer()
+
+            if let onOpenMainWindow {
+                Button(action: onOpenMainWindow) {
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.06))
+                                .overlay(
+                                    Circle()
+                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
+            }
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -2936,7 +3028,7 @@ private struct OrbSphere: View {
                 )
                 .frame(width: containerSize, height: containerSize)
                 .blur(radius: 10)
-                .scaleEffect(1.02 + ((pulse - 1.0) * 0.65))
+                .scaleEffect((1.02 + ((pulse - 1.0) * 0.65)) * glowBreathingScale)
 
             ZStack {
                 Circle()
@@ -3086,6 +3178,7 @@ private struct OrbSphere: View {
                     lineWidth: 1.0
                 )
                 .frame(width: sphereSize, height: sphereSize)
+                .rotationEffect(rimRotation)
 
             Circle()
                 .strokeBorder(
@@ -3103,25 +3196,36 @@ private struct OrbSphere: View {
                 .frame(width: sphereSize, height: sphereSize)
         }
         .frame(width: containerSize, height: containerSize)
+        .offset(y: floatOffset)
         .scaleEffect(pulse)
     }
 
     // MARK: Animation
 
+    private var floatOffset: CGFloat {
+        switch phase {
+        case .thinking: return CGFloat(sin(time * 2.4)) * 1.2
+        case .acting: return CGFloat(sin(time * 2.8)) * 1.0
+        case .streaming: return CGFloat(sin(time * 2.6)) * 1.1
+        case .listening: return CGFloat(sin(time * 2.0)) * 0.8
+        default: return 0
+        }
+    }
+
     private var pulseScale: CGFloat {
         switch phase {
         case .idle:
-            return 1.0 + CGFloat(sin(time * 0.9)) * 0.004
+            return 1.0
         case .listening:
             return 1.0 + min(level * 0.055, 0.055) + CGFloat(sin(time * 1.6)) * 0.008
         case .thinking:
-            return 1.0 + CGFloat(sin(time * 1.25)) * 0.010
+            return 1.0 + CGFloat(sin(time * 2.5)) * 0.018
         case .acting:
-            return 1.002 + CGFloat(sin(time * 1.65)) * 0.012
+            return 1.002 + CGFloat(sin(time * 3.0)) * 0.020
         case .waitingForPermission:
             return 1.0 + CGFloat(sin(time * 0.8)) * 0.006
         case .streaming:
-            return 1.002 + CGFloat(sin(time * 1.35)) * 0.010
+            return 1.002 + CGFloat(sin(time * 2.7)) * 0.016
         case .success:
             return 1.008 + CGFloat(sin(time * 0.7)) * 0.003
         case .failed:
@@ -3132,7 +3236,7 @@ private struct OrbSphere: View {
     /// Controls how fast the internal blobs drift.
     private var animSpeed: Double {
         switch phase {
-        case .idle: return 0.75
+        case .idle: return 0.0
         case .listening: return 1.35 + Double(min(level, 1)) * 0.55
         case .thinking: return 1.05
         case .acting: return 1.45
@@ -3146,7 +3250,7 @@ private struct OrbSphere: View {
     private var motionAmplitude: CGFloat {
         switch phase {
         case .idle:
-            return 2.2
+            return 0.0
         case .listening:
             return 3.2 + min(level * 1.4, 1.4)
         case .thinking:
@@ -3166,12 +3270,32 @@ private struct OrbSphere: View {
 
     private var highlightTravelDistance: CGFloat {
         switch phase {
-        case .idle, .success:
+        case .idle:
+            return 0.0
+        case .success:
             return 0.04
         case .listening, .acting, .streaming:
             return 0.06
         case .thinking, .waitingForPermission, .failed:
             return 0.05
+        }
+    }
+
+    private var glowBreathingScale: CGFloat {
+        switch phase {
+        case .thinking: return 1.0 + CGFloat(sin(time * 2.8)) * 0.05
+        case .acting: return 1.0 + CGFloat(sin(time * 3.2)) * 0.05
+        case .streaming: return 1.0 + CGFloat(sin(time * 3.0)) * 0.04
+        default: return 1.0
+        }
+    }
+
+    private var rimRotation: Angle {
+        switch phase {
+        case .thinking: return .degrees(time * 30)
+        case .acting: return .degrees(time * 40)
+        case .streaming: return .degrees(time * 35)
+        default: return .zero
         }
     }
 

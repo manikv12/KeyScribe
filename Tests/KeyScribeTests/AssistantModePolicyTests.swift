@@ -15,6 +15,20 @@ final class AssistantModePolicyTests: XCTestCase {
             AssistantModePolicy.commandSafetyClass(for: "git diff --stat"),
             .readOnly
         )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "rg TODO Sources | head"),
+            .readOnly
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(
+                for: "python3 /Users/manikvashith/.codex/skills/obsidian-cli/scripts/obsidian_cli_tool.py summarize --file KeyScribe"
+            ),
+            .readOnly
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "obsidian search query=KeyScribe"),
+            .readOnly
+        )
     }
 
     func testCommandSafetyClassifiesValidationCommands() {
@@ -38,16 +52,33 @@ final class AssistantModePolicyTests: XCTestCase {
             .mutatingOrUnknown
         )
         XCTAssertEqual(
-            AssistantModePolicy.commandSafetyClass(for: "rg TODO Sources | head"),
-            .mutatingOrUnknown
-        )
-        XCTAssertEqual(
             AssistantModePolicy.commandSafetyClass(for: "swift package update"),
             .mutatingOrUnknown
         )
         XCTAssertEqual(
             AssistantModePolicy.commandSafetyClass(for: "custom-tool --flag"),
             .mutatingOrUnknown
+        )
+    }
+
+    func testChatAutoApprovesTrustedReadOnlyCommandRequests() {
+        XCTAssertTrue(
+            AssistantModePolicy.shouldAutoApproveCommandRequest(
+                mode: .conversational,
+                command: "python3 /Users/manikvashith/.codex/skills/obsidian-cli/scripts/obsidian_cli_tool.py read --file KeyScribe"
+            )
+        )
+        XCTAssertFalse(
+            AssistantModePolicy.shouldAutoApproveCommandRequest(
+                mode: .conversational,
+                command: "swift test"
+            )
+        )
+        XCTAssertFalse(
+            AssistantModePolicy.shouldAutoApproveCommandRequest(
+                mode: .agentic,
+                command: "rg --files Sources"
+            )
         )
     }
 
@@ -79,23 +110,29 @@ final class AssistantModePolicyTests: XCTestCase {
                 command: "swift test"
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
                 activityKind: .fileChange
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
                 activityKind: .browserAutomation
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
                 activityKind: .dynamicToolCall,
                 toolName: "computer_use"
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
+                activityKind: .mcpToolCall
             )
         )
         XCTAssertFalse(
@@ -141,6 +178,17 @@ final class AssistantModePolicyTests: XCTestCase {
                 mode: .agentic,
                 activityKind: .fileChange
             )
+        )
+    }
+
+    func testBlockedCommandTitleUsesTheRealCommandText() {
+        XCTAssertEqual(
+            AssistantModePolicy.activityTitle(forBlockedCommand: "  swift test  "),
+            "swift test"
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.activityTitle(forBlockedCommand: nil),
+            "Command"
         )
     }
 }

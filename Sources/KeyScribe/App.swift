@@ -14,6 +14,10 @@ extension Notification.Name {
     static let keyScribeStopAssistantVoiceCapture = Notification.Name("KeyScribe.stopAssistantVoiceCapture")
     static let keyScribeStartOrbVoiceCapture = Notification.Name("KeyScribe.startOrbVoiceCapture")
     static let keyScribeStopOrbVoiceCapture = Notification.Name("KeyScribe.stopOrbVoiceCapture")
+    static let keyScribeAssistantZoomIn = Notification.Name("KeyScribe.assistantZoomIn")
+    static let keyScribeAssistantZoomOut = Notification.Name("KeyScribe.assistantZoomOut")
+    static let keyScribeAssistantZoomReset = Notification.Name("KeyScribe.assistantZoomReset")
+    static let keyScribeMinimizeAssistantToOrb = Notification.Name("KeyScribe.minimizeAssistantToOrb")
 }
 
 @MainActor
@@ -666,6 +670,24 @@ struct KeyScribeApp: App {
             SettingsView()
                 .environmentObject(settings)
         }
+        .commands {
+            CommandGroup(after: .toolbar) {
+                Button("Zoom In") {
+                    NotificationCenter.default.post(name: .keyScribeAssistantZoomIn, object: nil)
+                }
+                .keyboardShortcut("+", modifiers: .command)
+
+                Button("Zoom Out") {
+                    NotificationCenter.default.post(name: .keyScribeAssistantZoomOut, object: nil)
+                }
+                .keyboardShortcut("-", modifiers: .command)
+
+                Button("Actual Size") {
+                    NotificationCenter.default.post(name: .keyScribeAssistantZoomReset, object: nil)
+                }
+                .keyboardShortcut("0", modifiers: .command)
+            }
+        }
     }
 }
 
@@ -722,6 +744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var assistantSetupRequestObserver: NSObjectProtocol?
     private var assistantStartVoiceCaptureObserver: NSObjectProtocol?
     private var assistantStopVoiceCaptureObserver: NSObjectProtocol?
+    private var assistantMinimizeToOrbObserver: NSObjectProtocol?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var assistantHUDObserver: AnyCancellable?
@@ -1267,6 +1290,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             }
         }
 
+        assistantMinimizeToOrbObserver = NotificationCenter.default.addObserver(
+            forName: .keyScribeMinimizeAssistantToOrb,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.minimizeAssistantToOrb()
+            }
+        }
+
         NotificationCenter.default.addObserver(
             forName: .keyScribeStartOrbVoiceCapture,
             object: nil,
@@ -1789,6 +1822,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             rootView: AssistantWindowView(assistant: assistantController)
             .environmentObject(settings)
         )
+    }
+
+    private func minimizeAssistantToOrb() {
+        guard settings.assistantFloatingHUDEnabled else { return }
+        windowCoordinator?.closeAssistantWindow()
+        // The orb becomes visible via syncAssistantOrbVisibility (triggered by
+        // onAssistantWindowVisibilityChanged). If there's a selected session,
+        // show its follow-up preview on the orb.
+        if let sessionID = assistantController.selectedSessionID,
+           let session = assistantController.sessions.first(where: { $0.id == sessionID }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.assistantOrbHUD?.showFollowUp(for: session)
+            }
+        }
     }
 
     private func syncAssistantOrbVisibility() {
@@ -3854,7 +3901,6 @@ struct SettingsView: View {
         case speech
         case aiModels
         case integrations
-        case assistant
         case corrections
         case about
 
@@ -3867,7 +3913,6 @@ struct SettingsView: View {
             case .speech: return "Speech & Input"
             case .aiModels: return "AI & Models"
             case .integrations: return "Integrations"
-            case .assistant: return "Assistant"
             case .corrections: return "Corrections"
             case .about: return "About & Permissions"
             }
@@ -3880,7 +3925,6 @@ struct SettingsView: View {
             case .speech: return "Microphone, engine, whisper models, timing, and text quality"
             case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
             case .integrations: return "Local automation and agent notifications"
-            case .assistant: return "Codex assistant, saved threads, and live workflow"
             case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
@@ -3893,7 +3937,6 @@ struct SettingsView: View {
             case .speech: return "waveform.and.mic"
             case .aiModels: return "shippingbox.fill"
             case .integrations: return "point.3.connected.trianglepath.dotted"
-            case .assistant: return "sparkles.rectangle.stack.fill"
             case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"
             }
@@ -3911,8 +3954,6 @@ struct SettingsView: View {
                 return Color(red: 0.45, green: 0.56, blue: 0.92)
             case .integrations:
                 return Color(red: 0.84, green: 0.52, blue: 0.28)
-            case .assistant:
-                return Color(red: 0.22, green: 0.70, blue: 1.00)
             case .corrections:
                 return Color(red: 0.21, green: 0.70, blue: 0.73)
             case .about:
@@ -3932,8 +3973,6 @@ struct SettingsView: View {
                 return ["ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "style", "conversation", "history"]
             case .integrations:
                 return ["integrations", "automation", "api", "localhost", "claude", "codex", "cloud", "hooks", "notification", "speech", "sound", "token", "port"]
-            case .assistant:
-                return ["assistant", "codex", "threads", "voice task", "resume", "top bar", "hud", "install", "chatgpt", "model"]
             case .corrections:
                 return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
             case .about:
@@ -4017,7 +4056,6 @@ struct SettingsView: View {
     @StateObject private var adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
     @StateObject private var localAISetupService = LocalAISetupService.shared
-    @StateObject private var assistantController = AssistantFeatureController.shared
     @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
     @StateObject private var automationAPICoordinator = AutomationAPICoordinator.shared
     @State private var selectedSection: SettingsSection = .essentials
@@ -4209,7 +4247,7 @@ struct SettingsView: View {
             sanitizePinnedConversationContextSelection()
         }
         .onReceive(NotificationCenter.default.publisher(for: .keyScribeOpenAssistantSetup)) { _ in
-            selectedSection = .assistant
+            NotificationCenter.default.post(name: .keyScribeOpenAIMemoryStudio, object: nil)
         }
         .sheet(isPresented: $isCorrectionEditorPresented) {
             correctionEditorSheet
@@ -4512,8 +4550,6 @@ struct SettingsView: View {
             aiModelsSection
         case .integrations:
             integrationsSection
-        case .assistant:
-            assistantSection
         case .corrections:
             correctionsSection
         case .about:
@@ -5339,375 +5375,6 @@ struct SettingsView: View {
         }
         .onAppear {
             localAISetupService.refreshStatus()
-        }
-    }
-
-    @ViewBuilder
-    private var assistantSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .assistant)
-
-            settingsCard(
-                title: "Assistant",
-                subtitle: "Codex-powered personal assistant with voice task entry.",
-                symbol: "sparkles.rectangle.stack.fill",
-                tint: Color(red: 0.22, green: 0.70, blue: 1.00)
-            ) {
-                Toggle("Enable assistant", isOn: $settings.assistantBetaEnabled)
-
-                if !settings.assistantBetaWarningAcknowledged {
-                    Text("This assistant can read files, continue Codex threads, and guide bigger tasks. Review the assistant window before using it for important work.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Button("I understand") {
-                        settings.assistantBetaWarningAcknowledged = true
-                    }
-                    .buttonStyle(.bordered)
-                }
-
-                Toggle("Enable voice task entry", isOn: $settings.assistantVoiceTaskEntryEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                Toggle("Show floating activity bubble", isOn: $settings.assistantFloatingHUDEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                if assistantController.accountSnapshot.isLoggedIn {
-                    HStack(spacing: 6) {
-                        Image(systemName: "person.crop.circle.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text(assistantController.accountSnapshot.summary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                if assistantController.accountSnapshot.isLoggedIn && assistantController.visibleModels.isEmpty {
-                    Text(
-                        assistantController.isLoadingModels
-                            ? "Loading assistant models..."
-                            : "No assistant models are available yet."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-
-                if !assistantController.visibleModels.isEmpty {
-                    Picker(
-                        "Model",
-                        selection: Binding(
-                            get: { assistantController.selectedModelID ?? "" },
-                            set: { assistantController.chooseModel($0) }
-                        )
-                    ) {
-                        Text("Select a model").tag("")
-                        ForEach(assistantController.visibleModels) { model in
-                            Text(model.displayName).tag(model.id)
-                        }
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open Assistant") {
-                        NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                    switch assistantController.environment.state {
-                    case .missingCodex:
-                        Button("Install Codex") {
-                            assistantController.runPreferredInstallCommand()
-                        }
-                        .buttonStyle(.bordered)
-                    case .needsLogin:
-                        Button("Sign In with ChatGPT") {
-                            assistantController.runLoginCommand()
-                        }
-                        .buttonStyle(.bordered)
-                    case .ready:
-                        EmptyView()
-                    case .failed:
-                        Button("Codex Docs") {
-                            assistantController.openInstallDocs()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-
-                if assistantController.environment.state != .ready {
-                    Text(assistantController.environment.installHelpText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            settingsCard(
-                title: "Memory",
-                subtitle: "Short-term file memory for the current Codex thread, plus reviewed long-term lessons.",
-                symbol: "brain.head.profile",
-                tint: Color(red: 0.46, green: 0.79, blue: 0.66)
-            ) {
-                Toggle("Enable assistant memory", isOn: $settings.assistantMemoryEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                Toggle("Review before saving long-term memory", isOn: $settings.assistantMemoryReviewEnabled)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                Stepper(value: $settings.assistantMemorySummaryMaxChars, in: 400...4000, step: 200) {
-                    HStack {
-                        Text("Memory summary size")
-                        Spacer()
-                        Text("\(settings.assistantMemorySummaryMaxChars) chars")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                if let memoryStatusMessage = assistantController.memoryStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !memoryStatusMessage.isEmpty {
-                    Text(memoryStatusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    Text("Assistant memory stays separate from voice-to-text memory.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open Current Memory File") {
-                        assistantController.openCurrentMemoryFile()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                    Button("Reset Current Task Memory") {
-                        assistantController.resetCurrentTaskMemory()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Review Memory Suggestions") {
-                        assistantController.openMemorySuggestionReview()
-                        NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                    Button("Clear This Thread Memory", role: .destructive) {
-                        assistantController.clearCurrentThreadMemory()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-                }
-            }
-
-            BrowserAutomationSettingsView(settings: settings)
-
-            // Custom instructions
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "text.quote")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text("Custom Instructions")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-
-                Text("These instructions are sent to every new assistant session. Use them to set coding style, preferred tools, personality, or any rules.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                TextEditor(text: $settings.assistantCustomInstructions)
-                    .font(.system(size: 12, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                    .frame(minHeight: 80, maxHeight: 160)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.white.opacity(0.05))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(Color.white.opacity(0.10), lineWidth: 0.8)
-                            )
-                    )
-
-                if !settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle")
-                            .foregroundStyle(.green)
-                            .font(.system(size: 11))
-                        Text("Instructions will be applied to the next new session.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
-
-            // Agent turn limit
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "gauge.with.dots.needle.33percent")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text("Agent Turn Limit")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-
-                Text("Maximum number of tool calls the agent can make in a single turn before it is automatically stopped. Set to 0 for unlimited.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 12) {
-                    TextField(
-                        "Max tool calls",
-                        value: $settings.assistantMaxToolCallsPerTurn,
-                        format: .number
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 80)
-
-                    Text("\(settings.assistantMaxToolCallsPerTurn == 0 ? "Unlimited" : "\(settings.assistantMaxToolCallsPerTurn) tool calls")")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-
-                    Spacer()
-
-                    Button("Reset") {
-                        settings.assistantMaxToolCallsPerTurn = 75
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
-
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "arrow.trianglehead.2.clockwise")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text("Repeated Command Limit")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-
-                Text("Maximum number of times the same terminal command can repeat back-to-back in a single turn before it is automatically stopped. Set to 0 for unlimited.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 12) {
-                    TextField(
-                        "Max repeats",
-                        value: $settings.assistantMaxRepeatedCommandAttemptsPerTurn,
-                        format: .number
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 80)
-
-                    Text(
-                        settings.assistantMaxRepeatedCommandAttemptsPerTurn == 0
-                            ? "Unlimited"
-                            : "\(settings.assistantMaxRepeatedCommandAttemptsPerTurn) attempts"
-                    )
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-
-                    Spacer()
-
-                    Button("Reset") {
-                        settings.assistantMaxRepeatedCommandAttemptsPerTurn = 3
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
-
-            if !assistantController.sessions.isEmpty {
-                settingsCard(
-                    title: "Recent Sessions",
-                    subtitle: "\(assistantController.sessions.count) session\(assistantController.sessions.count == 1 ? "" : "s") saved in KeyScribe.",
-                    symbol: "clock.arrow.circlepath",
-                    tint: AppVisualTheme.baseTint
-                ) {
-                    ForEach(Array(assistantController.sessions.prefix(4))) { session in
-                        HStack(alignment: .top, spacing: 10) {
-                            AppIconBadge(
-                                symbol: assistantSessionBadgeSymbol(for: session.source),
-                                tint: assistantSessionBadgeTint(for: session.source),
-                                size: 22,
-                                symbolSize: 10,
-                                isEmphasized: assistantController.selectedSessionID == session.id
-                            )
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(session.title)
-                                    .font(.callout.weight(.semibold))
-                                    .foregroundStyle(.white.opacity(0.94))
-                                    .lineLimit(1)
-                                Text(session.detail.isEmpty ? (session.cwd ?? "") : session.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                            Spacer()
-                        }
-                        .padding(.vertical, 2)
-                    }
-
-                    if assistantController.sessions.count > 4 {
-                        Button("View All in Assistant Window") {
-                            NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
-                        }
-                        .font(.caption)
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.assistantBetaEnabled)
-                    }
-                }
-            }
-        }
-        .onAppear {
-            assistantController.refreshAll()
-        }
-    }
-
-    private func assistantSessionBadgeSymbol(for source: AssistantSessionSource) -> String {
-        switch source {
-        case .cli:
-            return "terminal.fill"
-        case .vscode:
-            return "chevron.left.forwardslash.chevron.right"
-        case .appServer:
-            return "sparkles"
-        case .other:
-            return "tray.full.fill"
-        }
-    }
-
-    private func assistantSessionBadgeTint(for source: AssistantSessionSource) -> Color {
-        switch source {
-        case .cli:
-            return AppVisualTheme.baseTint
-        case .vscode:
-            return AppVisualTheme.accentTint
-        case .appServer:
-            return .green
-        case .other:
-            return .orange
         }
     }
 
@@ -7487,10 +7154,6 @@ struct SettingsView: View {
             .init(section: .integrations, title: "Codex CLI notify config", detail: "Copy the Codex CLI notify snippet for ~/.codex/config.toml", keywords: ["codex", "notify", "config", "toml", "cloud"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Codex Cloud beta", detail: "Watch local codex cloud tasks and alert when they are ready or fail", keywords: ["codex", "cloud", "beta", "polling", "ready", "failed"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Automation notification permission", detail: "Allow desktop notifications for local API alerts", keywords: ["notification", "permission", "desktop", "grant"], integrationsPage: .automationNotifications),
-            .init(section: .assistant, title: "Enable assistant", detail: "Turn on the personal assistant experience", keywords: ["assistant", "codex"]),
-            .init(section: .assistant, title: "Codex status", detail: "See whether Codex is installed and ready", keywords: ["codex", "install", "login", "cli", "chatgpt"]),
-            .init(section: .assistant, title: "Voice task entry", detail: "Use your voice to draft assistant tasks", keywords: ["voice", "assistant", "task", "speak"]),
-            .init(section: .assistant, title: "Open assistant window", detail: "Launch the live assistant workspace", keywords: ["assistant window", "sessions", "resume"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall KeyScribe", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
@@ -7513,12 +7176,7 @@ struct SettingsView: View {
     }
 
     private var filteredSections: [SettingsSection] {
-        let availableSections = SettingsSection.allCases.filter { section in
-            if section == .assistant {
-                return FeatureFlags.personalAssistantEnabled
-            }
-            return true
-        }
+        let availableSections = SettingsSection.allCases
 
         guard !trimmedSearchQuery.isEmpty else {
             return availableSections

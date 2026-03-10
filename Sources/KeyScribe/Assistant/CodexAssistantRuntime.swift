@@ -363,7 +363,7 @@ final class CodexAssistantRuntime {
 
         turnToolCallCount = 0
         repeatedCommandTracker.reset()
-        updateHUD(phase: .streaming, title: "Codex is working", detail: nil)
+        updateHUD(phase: .streaming, title: "Starting", detail: nil)
         let requestedModelID = preferredModelID ?? self.preferredModelID
         CrashReporter.logInfo("Assistant runtime requesting turn/start threadID=\(activeSessionID) model=\(requestedModelID ?? "server-default") promptChars=\(trimmed.count) attachments=\(attachments.count)")
 
@@ -785,7 +785,6 @@ final class CodexAssistantRuntime {
                 let channel = (params["channel"] as? String)?.lowercased()
                 if channel == "commentary" {
                     appendCommentaryDelta(delta)
-                    updateHUD(phase: .acting, title: "Working", detail: delta)
                 } else {
                     // Accumulate deltas into a single growing entry
                     if streamingEntryID == nil {
@@ -799,7 +798,7 @@ final class CodexAssistantRuntime {
                         isStreaming: true
                     ))
                     appendAssistantDelta(delta)
-                    updateHUD(phase: .streaming, title: "Codex is responding", detail: nil)
+                    updateHUD(phase: .streaming, title: "Responding", detail: nil)
                 }
             }
         case "item/plan/delta":
@@ -809,13 +808,13 @@ final class CodexAssistantRuntime {
                 proposedPlanBuffer += delta
                 onProposedPlan?(proposedPlanBuffer)
                 emitPlanTimeline(text: proposedPlanBuffer, isStreaming: true)
-                updateHUD(phase: .streaming, title: "Building plan", detail: nil)
+                updateHUD(phase: .streaming, title: "Planning", detail: nil)
             }
         case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
             if let delta = params["delta"] as? String, delta.nonEmpty != nil {
                 onTranscript?(AssistantTranscriptEntry(role: .status, text: delta))
                 appendCommentaryDelta(delta)
-                updateHUD(phase: .thinking, title: "Thinking", detail: delta)
+                updateHUD(phase: .thinking, title: "Reasoning", detail: nil)
             }
         case "item/started":
             handleItemStartedOrCompleted(params, isCompleted: false)
@@ -1109,6 +1108,10 @@ final class CodexAssistantRuntime {
             return
         }
 
+        if await autoApproveServerRequestIfPossible(id: id, method: method, params: params) {
+            return
+        }
+
         switch method {
         case "item/commandExecution/requestApproval":
             await presentCommandApprovalRequest(id: id, params: params)
@@ -1149,6 +1152,31 @@ final class CodexAssistantRuntime {
             onStatusMessage?(message)
         default:
             onStatusMessage?("Codex requested an unsupported action: \(method)")
+        }
+    }
+
+    private func autoApproveServerRequestIfPossible(
+        id: JSONRPCRequestID,
+        method: String,
+        params: [String: Any]
+    ) async -> Bool {
+        guard method == "item/commandExecution/requestApproval",
+              let command = params["command"] as? String,
+              AssistantModePolicy.shouldAutoApproveCommandRequest(
+                mode: interactionMode,
+                command: command
+              ) else {
+            return false
+        }
+
+        do {
+            try await transport?.sendResponse(id: id, result: ["decision": "accept"])
+            return true
+        } catch {
+            await MainActor.run {
+                onStatusMessage?(error.localizedDescription)
+            }
+            return false
         }
     }
 
@@ -1209,7 +1237,7 @@ final class CodexAssistantRuntime {
                 )
             )
         )
-        updateHUD(phase: .waitingForPermission, title: "Approval needed", detail: command)
+        updateHUD(phase: .waitingForPermission, title: "Approve Command", detail: friendlyCommandSummary(command))
     }
 
     private func presentFileChangeApprovalRequest(id: JSONRPCRequestID, params: [String: Any]) async {
@@ -1269,7 +1297,7 @@ final class CodexAssistantRuntime {
                 )
             )
         )
-        updateHUD(phase: .waitingForPermission, title: "Approval needed", detail: "File changes")
+        updateHUD(phase: .waitingForPermission, title: "Approve Edit", detail: "File changes")
     }
 
     private func presentToolUserInputRequest(id: JSONRPCRequestID, params: [String: Any]) async {
@@ -1350,7 +1378,7 @@ final class CodexAssistantRuntime {
                 )
             )
         )
-        updateHUD(phase: .waitingForPermission, title: "Need input", detail: request.toolTitle)
+        updateHUD(phase: .waitingForPermission, title: "Input Needed", detail: request.toolTitle)
     }
 
     private func handleDynamicToolCall(id: JSONRPCRequestID, params: [String: Any]) async {
@@ -1494,7 +1522,7 @@ final class CodexAssistantRuntime {
                 )
             )
         )
-        updateHUD(phase: .waitingForPermission, title: "Computer Use needs approval", detail: taskSummary)
+        updateHUD(phase: .waitingForPermission, title: "Approve Action", detail: taskSummary)
     }
 
     private func executeComputerUseCall(
@@ -1687,7 +1715,18 @@ final class CodexAssistantRuntime {
                 Task { [weak self] in await self?.cancelActiveTurn() }
                 return
             }
-            updateHUD(phase: .acting, title: state.title, detail: state.hudDetail ?? state.detail)
+            updateHUD(phase: .acting, title: hudLabelForToolKind(state.kind, fallback: state.title), detail: state.hudDetail ?? state.detail)
+        }
+    }
+
+    private func hudLabelForToolKind(_ kind: String?, fallback: String) -> String {
+        switch kind {
+        case "commandExecution": return "Running"
+        case "fileChange": return "Editing"
+        case "webSearch": return "Searching"
+        case "browserAutomation": return "Browsing"
+        case "collabAgentToolCall": return "Delegating"
+        default: return fallback
         }
     }
 
@@ -2168,6 +2207,23 @@ final class CodexAssistantRuntime {
         }
     }
 
+    func turnStartParamsForTesting(
+        mode: AssistantInteractionMode,
+        threadID: String = "thread-1",
+        prompt: String = "Hello",
+        modelID: String? = "gpt-5.4"
+    ) -> [String: Any] {
+        let previousMode = interactionMode
+        interactionMode = mode
+        defer { interactionMode = previousMode }
+        return turnStartParams(
+            threadID: threadID,
+            prompt: prompt,
+            attachments: [],
+            modelID: modelID
+        )
+    }
+
     func blockedToolUseMessage(
         for mode: AssistantInteractionMode,
         activityTitle: String? = nil,
@@ -2267,7 +2323,7 @@ final class CodexAssistantRuntime {
             ) else {
                 return nil
             }
-            return ("Command", commandClass)
+            return (AssistantModePolicy.activityTitle(forBlockedCommand: command), commandClass)
         case "item/fileChange/requestApproval":
             guard !AssistantModePolicy.isAllowed(
                 mode: interactionMode,
@@ -2322,7 +2378,7 @@ final class CodexAssistantRuntime {
     ) -> String {
         switch kind {
         case .commandExecution:
-            return "Command"
+            return AssistantModePolicy.activityTitle(forBlockedCommand: item["command"] as? String)
         case .fileChange:
             return "File Changes"
         case .webSearch:
@@ -2334,7 +2390,7 @@ final class CodexAssistantRuntime {
             let tool = item["tool"] as? String ?? "tool"
             return "\(server): \(tool)"
         case .dynamicToolCall:
-            return dynamicToolDisplayName(item["tool"] as? String)
+            return dynamicToolDisplayName(dynamicToolName(from: item))
         case .subagent:
             return "Subagent"
         case .reasoning:
@@ -2347,6 +2403,45 @@ final class CodexAssistantRuntime {
     private func dynamicToolDisplayName(_ rawTool: String?) -> String {
         let tool = rawTool ?? "Tool"
         return tool == AssistantComputerUseToolDefinition.name ? "Computer Use" : tool
+    }
+
+    private func threadApprovalPolicy(for mode: AssistantInteractionMode) -> String {
+        switch mode {
+        case .conversational:
+            return "untrusted"
+        case .plan, .agentic:
+            return "on-request"
+        }
+    }
+
+    private func threadSandboxMode(for mode: AssistantInteractionMode) -> String {
+        switch mode {
+        case .conversational:
+            return "read-only"
+        case .plan, .agentic:
+            return "danger-full-access"
+        }
+    }
+
+    private func turnApprovalPolicy(for mode: AssistantInteractionMode) -> String {
+        switch mode {
+        case .conversational:
+            return "untrusted"
+        case .plan, .agentic:
+            return "on-request"
+        }
+    }
+
+    private func turnSandboxPolicy(for mode: AssistantInteractionMode) -> [String: Any]? {
+        switch mode {
+        case .conversational:
+            return [
+                "type": "readOnly",
+                "networkAccess": true
+            ]
+        case .plan, .agentic:
+            return nil
+        }
     }
 
     private func declineBlockedServerRequest(
@@ -2433,7 +2528,8 @@ final class CodexAssistantRuntime {
                 title: "\(server): \(tool)",
                 kind: type,
                 status: status,
-                detail: compactDetail(extractString(item["arguments"]))
+                detail: compactDetail(extractString(item["arguments"])),
+                hudDetail: "Using \(tool)"
             )
         case "dynamicToolCall":
             let rawTool = dynamicToolName(from: item) ?? "Tool"
@@ -2443,17 +2539,20 @@ final class CodexAssistantRuntime {
                 title: tool,
                 kind: type,
                 status: status,
-                detail: compactDetail(extractString(item["arguments"]))
+                detail: compactDetail(extractString(item["arguments"])),
+                hudDetail: "Using \(tool)"
             )
         case "webSearch":
             let query = firstNonEmptyString(
                 item["query"] as? String,
                 ((item["action"] as? [String: Any])?["query"] as? String)
             )
-            return AssistantToolCallState(id: id, title: "Web Search", kind: type, status: status, detail: compactDetail(query))
+            let truncatedQuery = query.map { String($0.prefix(40)) }
+            let searchHudDetail = truncatedQuery.map { "Searching: \($0)" } ?? "Searching the web"
+            return AssistantToolCallState(id: id, title: "Web Search", kind: type, status: status, detail: compactDetail(query), hudDetail: searchHudDetail)
         case "browserAutomation":
             let action = item["action"] as? String ?? "Browser action"
-            return AssistantToolCallState(id: id, title: "Browser", kind: type, status: status, detail: compactDetail(action))
+            return AssistantToolCallState(id: id, title: "Browser", kind: type, status: status, detail: compactDetail(action), hudDetail: "Browsing")
         case "collabAgentToolCall":
             handleCollabToolCall(item: item, status: status)
             let tool = item["tool"] as? String ?? "collab"
@@ -2547,6 +2646,7 @@ final class CodexAssistantRuntime {
     var browserProfileContext: [String: String]?
     var customInstructions: String?
     var reasoningEffort: String?
+    var serviceTier: String?
     var interactionMode: AssistantInteractionMode = .agentic
     private var currentTurnIncludesImageAttachments = false
     private var currentTurnModelSupportsImageInput = false
@@ -2563,9 +2663,9 @@ final class CodexAssistantRuntime {
 
     private func dynamicToolSpecs(for mode: AssistantInteractionMode) -> [[String: Any]] {
         switch mode {
-        case .conversational:
+        case .conversational, .plan:
             return []
-        case .plan, .agentic:
+        case .agentic:
             return [AssistantComputerUseToolDefinition.dynamicToolSpec()]
         }
     }
@@ -2613,8 +2713,8 @@ final class CodexAssistantRuntime {
 
     private func threadStartParams(cwd: String?, modelID: String?) -> [String: Any] {
         var params: [String: Any] = [
-            "approvalPolicy": "on-request",
-            "sandbox": "danger-full-access",
+            "approvalPolicy": threadApprovalPolicy(for: interactionMode),
+            "sandbox": threadSandboxMode(for: interactionMode),
             "personality": "friendly",
             "serviceName": "KeyScribe",
             "ephemeral": false
@@ -2623,6 +2723,9 @@ final class CodexAssistantRuntime {
         params["cwd"] = cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
         if let modelID = modelID?.nonEmpty {
             params["model"] = modelID
+        }
+        if let tier = serviceTier?.nonEmpty {
+            params["serviceTier"] = tier
         }
         let instructions = buildInstructions()
         if !instructions.isEmpty {
@@ -2656,7 +2759,7 @@ final class CodexAssistantRuntime {
 
             You are in Chat mode. Reply with normal helpful text.
             Do NOT propose or output a structured plan, checklist, outline, or step-by-step implementation plan in this mode.
-            You may inspect the workspace, search the web, and run read-only commands when needed to answer accurately.
+            You may inspect the workspace, search the web, and run safe read-only commands when needed to answer accurately.
             If the user attaches images and the selected model supports image input, read those attached images directly and answer from them.
             Do NOT edit files, run validation checks like builds or tests, use browser automation, use computer-control tools, or use unsafe commands.
             If the task requires changes or higher-risk execution, explain that Chat mode can inspect and search but cannot make changes, and tell the user to switch to Agentic mode.
@@ -2762,8 +2865,11 @@ final class CodexAssistantRuntime {
         var params: [String: Any] = [
             "threadId": threadID,
             "input": inputItems,
-            "approvalPolicy": "on-request"
+            "approvalPolicy": turnApprovalPolicy(for: interactionMode)
         ]
+        if let sandboxPolicy = turnSandboxPolicy(for: interactionMode) {
+            params["sandboxPolicy"] = sandboxPolicy
+        }
         if let modelID = modelID?.nonEmpty {
             params["model"] = modelID
         }
@@ -2858,71 +2964,146 @@ final class CodexAssistantRuntime {
         let firstLine = cmd.components(separatedBy: .newlines).first ?? cmd
         let tokens = firstLine.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
         let base = tokens.first ?? cmd
+        let baseName = (base as NSString).lastPathComponent
+        let sub = tokens.count > 1 ? tokens[1] : nil
 
-        // Map well-known commands to friendly labels
-        let labels: [String: String] = [
-            "npm": "Running npm",
-            "npx": "Running npx",
-            "yarn": "Running yarn",
-            "pnpm": "Running pnpm",
-            "bun": "Running bun",
-            "node": "Running Node.js",
-            "python": "Running Python",
-            "python3": "Running Python",
-            "pip": "Installing packages",
-            "pip3": "Installing packages",
-            "swift": "Running Swift",
-            "swiftc": "Compiling Swift",
-            "xcodebuild": "Building with Xcode",
-            "xcrun": "Running Xcode tool",
-            "git": "Running git",
-            "cargo": "Running Cargo",
-            "rustc": "Compiling Rust",
-            "go": "Running Go",
-            "make": "Running make",
-            "cmake": "Running CMake",
-            "docker": "Running Docker",
-            "kubectl": "Running kubectl",
-            "curl": "Fetching URL",
-            "wget": "Fetching URL",
-            "cat": "Reading file",
-            "ls": "Listing files",
-            "find": "Searching files",
-            "grep": "Searching content",
-            "rg": "Searching content",
-            "sed": "Editing text",
-            "awk": "Processing text",
-            "mkdir": "Creating directory",
-            "rm": "Removing files",
-            "cp": "Copying files",
-            "mv": "Moving files",
-            "chmod": "Changing permissions",
-            "brew": "Running Homebrew",
-            "apt": "Installing packages",
-            "apt-get": "Installing packages",
-            "cd": "Changing directory",
-            "echo": "Running shell command",
-            "env": "Running command",
-            "which": "Locating command",
-            "ruby": "Running Ruby",
-            "gem": "Running gem",
-            "java": "Running Java",
-            "javac": "Compiling Java",
-            "gradle": "Running Gradle",
-            "mvn": "Running Maven",
-            "pytest": "Running tests",
-            "jest": "Running tests",
-            "vitest": "Running tests",
+        // Subcommand-specific descriptions for multi-verb CLIs
+        let subcommandDescriptions: [String: [String: String]] = [
+            "git": [
+                "status": "Checking repo status", "diff": "Reviewing changes",
+                "add": "Staging changes", "commit": "Committing changes",
+                "push": "Pushing to remote", "pull": "Pulling latest",
+                "clone": "Cloning repository", "checkout": "Switching branch",
+                "switch": "Switching branch", "branch": "Managing branches",
+                "log": "Viewing history", "stash": "Stashing changes",
+                "merge": "Merging branches", "rebase": "Rebasing",
+                "fetch": "Fetching remote", "reset": "Resetting changes",
+                "tag": "Managing tags", "init": "Initializing repository",
+                "remote": "Managing remotes", "cherry-pick": "Cherry-picking",
+                "restore": "Restoring files", "clean": "Cleaning repo",
+            ],
+            "npm": [
+                "install": "Installing dependencies", "i": "Installing dependencies",
+                "ci": "Installing dependencies", "test": "Running tests",
+                "t": "Running tests", "start": "Starting application",
+                "build": "Building project", "publish": "Publishing package",
+                "init": "Initializing project", "uninstall": "Removing package",
+                "update": "Updating dependencies", "audit": "Auditing dependencies",
+                "link": "Linking package", "pack": "Packing module",
+            ],
+            "yarn": [
+                "install": "Installing dependencies", "add": "Installing dependencies",
+                "test": "Running tests", "build": "Building project",
+                "start": "Starting application", "remove": "Removing package",
+            ],
+            "pnpm": [
+                "install": "Installing dependencies", "i": "Installing dependencies",
+                "add": "Installing dependencies", "test": "Running tests",
+                "build": "Building project", "start": "Starting application",
+                "remove": "Removing package",
+            ],
+            "bun": [
+                "install": "Installing dependencies", "i": "Installing dependencies",
+                "add": "Installing dependencies", "test": "Running tests",
+                "build": "Building project", "run": "Running script",
+                "remove": "Removing package",
+            ],
+            "swift": [
+                "build": "Building project", "test": "Running tests",
+                "run": "Running application", "package": "Managing package",
+            ],
+            "cargo": [
+                "build": "Building project", "test": "Running tests",
+                "run": "Running application", "check": "Checking code",
+                "clippy": "Linting code", "fmt": "Formatting code",
+                "doc": "Building docs", "publish": "Publishing crate",
+                "install": "Installing crate", "update": "Updating dependencies",
+                "bench": "Running benchmarks", "clean": "Cleaning build",
+            ],
+            "go": [
+                "build": "Building project", "test": "Running tests",
+                "run": "Running application", "mod": "Managing modules",
+                "fmt": "Formatting code", "vet": "Checking code",
+                "get": "Installing dependencies", "install": "Installing package",
+                "generate": "Generating code",
+            ],
+            "docker": [
+                "build": "Building image", "run": "Running container",
+                "compose": "Managing services", "push": "Pushing image",
+                "pull": "Pulling image", "stop": "Stopping container",
+                "exec": "Running in container",
+            ],
+            "kubectl": [
+                "apply": "Applying config", "get": "Fetching resources",
+                "describe": "Inspecting resource", "delete": "Deleting resource",
+                "logs": "Viewing logs", "exec": "Running in pod",
+            ],
+            "brew": [
+                "install": "Installing package", "uninstall": "Removing package",
+                "update": "Updating Homebrew", "upgrade": "Upgrading packages",
+                "search": "Searching packages", "info": "Package info",
+            ],
         ]
 
-        // Check for a known command
-        let baseName = (base as NSString).lastPathComponent
-        if let label = labels[baseName] {
-            // Append subcommand for multi-verb CLIs where it adds clarity
-            let multiVerb: Set<String> = ["git", "npm", "npx", "yarn", "pnpm", "bun", "swift", "cargo", "go", "docker", "kubectl", "brew", "apt", "apt-get"]
-            if multiVerb.contains(baseName), tokens.count > 1 {
-                return "\(label) \(tokens[1])"
+        // Check for subcommand-specific descriptions first
+        if let sub, let subMap = subcommandDescriptions[baseName], let desc = subMap[sub] {
+            return desc
+        }
+
+        // Handle "npm/yarn/pnpm run <script>" — look up the script name
+        let runScriptDescriptions: [String: String] = [
+            "test": "Running tests", "build": "Building project",
+            "start": "Starting application", "dev": "Starting dev server",
+            "lint": "Linting code", "format": "Formatting code",
+            "serve": "Starting server", "watch": "Watching for changes",
+            "clean": "Cleaning build", "deploy": "Deploying",
+            "typecheck": "Type-checking", "check": "Checking code",
+            "preview": "Previewing",
+        ]
+        let npmLike: Set<String> = ["npm", "yarn", "pnpm", "bun", "npx"]
+        if npmLike.contains(baseName), sub == "run", tokens.count > 2 {
+            if let desc = runScriptDescriptions[tokens[2]] {
+                return desc
             }
+            return "Running \(tokens[2])"
+        }
+
+        // Semantic labels for single commands (no subcommand needed)
+        let labels: [String: String] = [
+            "node": "Executing script",
+            "python": "Executing script", "python3": "Executing script",
+            "pip": "Installing packages", "pip3": "Installing packages",
+            "swiftc": "Compiling Swift",
+            "xcodebuild": "Building with Xcode", "xcrun": "Running Xcode tool",
+            "rustc": "Compiling Rust",
+            "make": "Building", "cmake": "Configuring build",
+            "curl": "Downloading", "wget": "Downloading",
+            "cat": "Reading file", "less": "Reading file", "more": "Reading file",
+            "ls": "Listing directory", "tree": "Listing directory",
+            "find": "Searching filesystem",
+            "grep": "Searching code", "rg": "Searching code", "ag": "Searching code",
+            "sed": "Editing text", "awk": "Processing text",
+            "mkdir": "Creating directory",
+            "rm": "Removing files", "rmdir": "Removing directory",
+            "cp": "Copying files", "mv": "Moving files",
+            "chmod": "Changing permissions", "chown": "Changing ownership",
+            "apt": "Installing packages", "apt-get": "Installing packages",
+            "cd": "Changing directory",
+            "echo": "Running shell", "env": "Running command",
+            "which": "Locating command", "where": "Locating command",
+            "ruby": "Executing script", "gem": "Managing gems",
+            "java": "Running Java", "javac": "Compiling Java",
+            "gradle": "Building project", "mvn": "Building project",
+            "pytest": "Running tests", "jest": "Running tests",
+            "vitest": "Running tests", "mocha": "Running tests",
+            "tsc": "Type-checking", "eslint": "Linting code",
+            "prettier": "Formatting code", "black": "Formatting code",
+            "flake8": "Linting code", "mypy": "Type-checking",
+            "tar": "Archiving files", "zip": "Compressing files",
+            "unzip": "Extracting files",
+        ]
+
+        if let label = labels[baseName] {
             return label
         }
 

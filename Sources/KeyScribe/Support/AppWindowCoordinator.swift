@@ -23,6 +23,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private var settingsWindowController: NSWindowController?
     private var aiStudioWindowController: NSWindowController?
     private var assistantWindowController: NSWindowController?
+    private var assistantHostingController: NSHostingController<AnyView>?
     private var historyWindowController: NSWindowController?
     private var onboardingWindowController: NSWindowController?
     private var historyTargetApplication: NSRunningApplication?
@@ -201,9 +202,13 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         onStatusUpdate(.openingSettings)
         requestDockActivation()
 
-        let hostingController = NSHostingController(rootView: rootView)
-
         if assistantWindowController == nil {
+            let hostingController = NSHostingController(rootView: AnyView(rootView))
+            // Prevent the hosting controller from resizing the window when
+            // SwiftUI content changes (e.g. mode switch, agent stop).
+            hostingController.sizingOptions = []
+            assistantHostingController = hostingController
+
             let window = NSWindow(
                 contentRect: NSRect(origin: .zero, size: assistantDefaultSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -215,8 +220,11 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.titlebarAppearsTransparent = true
             window.isOpaque = false
             window.backgroundColor = .clear
+            let toolbar = NSToolbar(identifier: "assistantToolbar")
+            toolbar.showsBaselineSeparator = false
+            window.toolbar = toolbar
             window.toolbarStyle = .unifiedCompact
-            window.isMovableByWindowBackground = false
+            window.isMovableByWindowBackground = true
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
             window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
@@ -226,9 +234,10 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.delegate = self
 
             assistantWindowController = NSWindowController(window: window)
-        } else {
-            assistantWindowController?.window?.contentViewController = hostingController
         }
+        // Do NOT replace rootView or contentViewController when the window
+        // already exists — the SwiftUI view observes the same store, so
+        // rebuilding the hierarchy is unnecessary and causes layout jumps.
 
         guard let window = assistantWindowController?.window else {
             onStatusUpdate(.message("Could not open assistant"))
@@ -240,10 +249,13 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
-        if window.frame.width < assistantMinimumSize.width || window.frame.height < assistantMinimumSize.height {
-            window.setContentSize(assistantDefaultSize)
+        // Only center when the window hasn't been shown yet.
+        if !window.isVisible {
+            if window.frame.width < assistantMinimumSize.width || window.frame.height < assistantMinimumSize.height {
+                window.setContentSize(assistantDefaultSize)
+            }
+            centerWindowOnActiveScreen(window)
         }
-        centerWindowOnActiveScreen(window)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         onStatusUpdate(.ready)
@@ -258,6 +270,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     func closeAssistantWindow() {
         assistantWindowController?.close()
         assistantWindowController = nil
+        assistantHostingController = nil
         setActivationPolicyForOpenWindows()
         onAssistantWindowVisibilityChanged?(false)
     }
@@ -332,6 +345,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         aiStudioWindowController = nil
         assistantWindowController?.close()
         assistantWindowController = nil
+        assistantHostingController = nil
         historyWindowController?.close()
         historyWindowController = nil
         setActivationPolicyForOpenWindows()
@@ -346,6 +360,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
                 aiStudioWindowController = nil
             } else if closingWindow === assistantWindowController?.window {
                 assistantWindowController = nil
+                assistantHostingController = nil
                 onAssistantWindowVisibilityChanged?(false)
             } else if closingWindow === historyWindowController?.window {
                 historyWindowController = nil
