@@ -88,4 +88,31 @@ final class SettingsStoreCrossIDEBootstrapTests: XCTestCase {
         XCTAssertEqual(result.source, "user-default")
         XCTAssertFalse(result.migrationApplied)
     }
+
+    func testRestoredIntegerReturnsDefaultWhenValueIsMissing() {
+        let defaults = makeIsolatedDefaults()
+
+        XCTAssertEqual(
+            SettingsStore.restoredInteger(
+                defaults: defaults,
+                key: "KeyScribe.testMissingInt",
+                defaultValue: 75
+            ),
+            75
+        )
+    }
+
+    func testRestoredIntegerPreservesZeroForUnlimitedSettings() {
+        let defaults = makeIsolatedDefaults()
+        defaults.set(0, forKey: "KeyScribe.testUnlimitedInt")
+
+        XCTAssertEqual(
+            SettingsStore.restoredInteger(
+                defaults: defaults,
+                key: "KeyScribe.testUnlimitedInt",
+                defaultValue: 75
+            ),
+            0
+        )
+    }
 }

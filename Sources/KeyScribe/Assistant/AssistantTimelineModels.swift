@@ -52,6 +52,285 @@ struct AssistantActivityItem: Identifiable, Equatable, Codable, Sendable {
     var isActive: Bool { status.isActive }
 }
 
+enum AssistantActivityOpenTargetKind: String, Equatable, Sendable {
+    case file
+    case webSearch
+    case url
+}
+
+struct AssistantActivityOpenTarget: Identifiable, Equatable, Sendable {
+    let kind: AssistantActivityOpenTargetKind
+    let label: String
+    let url: URL
+    let detail: String?
+
+    var id: String {
+        "\(kind.rawValue)-\(url.absoluteString)"
+    }
+}
+
+func assistantActivityOpenTargets(
+    for activity: AssistantActivityItem,
+    sessionCWD: String? = nil
+) -> [AssistantActivityOpenTarget] {
+    let rawDetails = activity.rawDetails?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nonEmpty
+
+    switch activity.kind {
+    case .webSearch:
+        guard let query = rawDetails,
+              let url = assistantSearchURL(for: query) else {
+            return []
+        }
+        return [
+            AssistantActivityOpenTarget(
+                kind: .webSearch,
+                label: query,
+                url: url,
+                detail: "Open search"
+            )
+        ]
+
+    default:
+        guard let rawDetails else { return [] }
+
+        let fileTargets = assistantResolvedFileTargets(
+            from: rawDetails,
+            sessionCWD: sessionCWD
+        )
+        if !fileTargets.isEmpty {
+            return fileTargets
+        }
+
+        if let url = assistantFirstURL(in: rawDetails) {
+            return [
+                AssistantActivityOpenTarget(
+                    kind: .url,
+                    label: assistantURLDisplayLabel(url),
+                    url: url,
+                    detail: url.absoluteString
+                )
+            ]
+        }
+
+        return []
+    }
+}
+
+private func assistantResolvedFileTargets(
+    from rawDetails: String,
+    sessionCWD: String?
+) -> [AssistantActivityOpenTarget] {
+    var results: [AssistantActivityOpenTarget] = []
+    var seen = Set<String>()
+
+    for candidate in assistantExtractFilePathCandidates(from: rawDetails) {
+        guard let fileURL = assistantResolvedFileURL(
+            from: candidate,
+            sessionCWD: sessionCWD
+        ) else {
+            continue
+        }
+
+        let key = fileURL.standardizedFileURL.path
+        guard seen.insert(key).inserted else { continue }
+
+        let basePath = sessionCWD?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let detail: String?
+        if let basePath,
+           key.hasPrefix(basePath + "/") {
+            detail = String(key.dropFirst(basePath.count + 1))
+        } else {
+            detail = key
+        }
+
+        results.append(
+            AssistantActivityOpenTarget(
+                kind: .file,
+                label: fileURL.lastPathComponent,
+                url: fileURL,
+                detail: detail
+            )
+        )
+    }
+
+    return results
+}
+
+private func assistantExtractFilePathCandidates(from rawDetails: String) -> [String] {
+    let normalized = rawDetails.replacingOccurrences(of: "\r\n", with: "\n")
+    let lines = normalized.split(whereSeparator: \.isNewline)
+    var candidates: [String] = []
+    var seen = Set<String>()
+
+    func append(_ candidate: String) {
+        let normalizedCandidate = assistantNormalizedPathCandidate(candidate)
+        guard let normalizedCandidate, seen.insert(normalizedCandidate).inserted else { return }
+        candidates.append(normalizedCandidate)
+    }
+
+    for rawLine in lines {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { continue }
+
+        if let gitStylePath = assistantFirstRegexCapture(
+            in: line,
+            pattern: #"^(?:[MADRCU?]{1,2}|\+\+\+\s+[ab]/|---\s+[ab]/)\s+(.+)$"#
+        ) {
+            append(gitStylePath)
+        }
+
+        if let patchPath = assistantFirstRegexCapture(
+            in: line,
+            pattern: #"^\*\*\* (?:Update|Add|Delete) File: (.+)$"#
+        ) {
+            append(patchPath)
+        }
+
+        if assistantLooksLikeStandalonePath(line) {
+            append(line)
+        }
+
+        for match in assistantRegexMatches(
+            in: line,
+            pattern: #"(?:/|(?:[A-Za-z0-9._-]+/)+)[A-Za-z0-9._-]+\.[A-Za-z][A-Za-z0-9]{0,7}"#
+        ) {
+            append(match)
+        }
+
+        for match in assistantRegexMatches(
+            in: line,
+            pattern: #"(?<![\w/])(?:[A-Za-z0-9._-]+\.)[A-Za-z][A-Za-z0-9]{0,7}(?![\w])"#
+        ) {
+            append(match)
+        }
+    }
+
+    return candidates
+}
+
+private func assistantLooksLikeStandalonePath(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.nonEmpty != nil else { return false }
+    guard !trimmed.contains(" ") else { return false }
+    guard trimmed.contains("/") || trimmed.contains(".") else { return false }
+    return !trimmed.lowercased().hasPrefix("http://") && !trimmed.lowercased().hasPrefix("https://")
+}
+
+private func assistantResolvedFileURL(
+    from candidate: String,
+    sessionCWD: String?
+) -> URL? {
+    let normalized = assistantNormalizedPathCandidate(candidate)
+    guard let normalized else { return nil }
+
+    if normalized.lowercased().hasPrefix("file://"),
+       let fileURL = URL(string: normalized),
+       fileURL.isFileURL,
+       FileManager.default.fileExists(atPath: fileURL.path) {
+        return fileURL.standardizedFileURL
+    }
+
+    if normalized.hasPrefix("/") {
+        let absoluteURL = URL(fileURLWithPath: normalized)
+        guard FileManager.default.fileExists(atPath: absoluteURL.path) else { return nil }
+        return absoluteURL.standardizedFileURL
+    }
+
+    let candidateRoots = [
+        sessionCWD?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+        FileManager.default.currentDirectoryPath
+    ].compactMap { $0 }
+
+    for root in candidateRoots {
+        let resolved = URL(fileURLWithPath: root)
+            .appendingPathComponent(normalized)
+            .standardizedFileURL
+        if FileManager.default.fileExists(atPath: resolved.path) {
+            return resolved
+        }
+    }
+
+    return nil
+}
+
+private func assistantNormalizedPathCandidate(_ candidate: String) -> String? {
+    var value = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else { return nil }
+
+    value = value
+        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`()[]{}<>"))
+        .replacingOccurrences(
+            of: #"^(?:[MADRCU?]{1,2}|\+\+\+\s+[ab]/|---\s+[ab]/)\s+"#,
+            with: "",
+            options: .regularExpression
+        )
+        .replacingOccurrences(
+            of: #"^\*\*\* (?:Update|Add|Delete) File: "#,
+            with: "",
+            options: .regularExpression
+        )
+        .replacingOccurrences(
+            of: #"(#L\d+(?:C\d+)?|:\d+(?::\d+)?)$"#,
+            with: "",
+            options: .regularExpression
+        )
+        .trimmingCharacters(in: CharacterSet(charactersIn: ".,:;"))
+
+    if value.hasPrefix("a/") || value.hasPrefix("b/") {
+        value.removeFirst(2)
+    }
+
+    return value.nonEmpty
+}
+
+private func assistantSearchURL(for query: String) -> URL? {
+    var components = URLComponents(string: "https://www.google.com/search")
+    components?.queryItems = [URLQueryItem(name: "q", value: query)]
+    return components?.url
+}
+
+private func assistantFirstURL(in text: String) -> URL? {
+    guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+        return nil
+    }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    return detector
+        .matches(in: text, options: [], range: range)
+        .compactMap(\.url)
+        .first
+}
+
+private func assistantURLDisplayLabel(_ url: URL) -> String {
+    if let host = url.host?.nonEmpty {
+        return host
+    }
+    return url.absoluteString
+}
+
+private func assistantRegexMatches(in text: String, pattern: String) -> [String] {
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    return regex.matches(in: text, options: [], range: range).compactMap {
+        guard let matchRange = Range($0.range, in: text) else { return nil }
+        return String(text[matchRange])
+    }
+}
+
+private func assistantFirstRegexCapture(in text: String, pattern: String) -> String? {
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = regex.firstMatch(in: text, options: [], range: range),
+          match.numberOfRanges > 1,
+          let captureRange = Range(match.range(at: 1), in: text) else {
+        return nil
+    }
+    return String(text[captureRange])
+}
+
 enum AssistantTimelineItemKind: String, Codable, Sendable {
     case userMessage
     case assistantProgress

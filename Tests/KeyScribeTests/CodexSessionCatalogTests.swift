@@ -273,6 +273,43 @@ final class CodexSessionCatalogTests: XCTestCase {
         XCTAssertEqual(sessions.first?.source, .appServer)
     }
 
+    func testLoadSessionsAndTranscriptStripInternalImagePlaceholders() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "image-session",
+            dayPath: "2026/03/09",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "image-session",
+                    timestamp: "2026-03-09T20:54:00Z",
+                    cwd: "/Users/test/Images",
+                    source: "vscode",
+                    originator: "KeyScribe"
+                ),
+                try responseMessageLine(
+                    timestamp: "2026-03-09T20:54:01Z",
+                    role: "user",
+                    text: "<image> </image> What does the dead letter mean here?"
+                ),
+                try responseMessageLine(
+                    timestamp: "2026-03-09T20:54:02Z",
+                    role: "assistant",
+                    text: "Dead-letter usually means messages were moved aside after repeated delivery failure."
+                )
+            ]
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let sessions = try await catalog.loadSessions(limit: 10)
+        let transcript = await catalog.loadTranscript(sessionID: "image-session")
+
+        XCTAssertEqual(sessions.first?.latestUserMessage, "What does the dead letter mean here?")
+        XCTAssertEqual(transcript.first(where: { $0.role == .user })?.text, "What does the dead letter mean here?")
+    }
+
     func testLoadSessionsReadsLargeSessionWithoutFullListParse() async throws {
         let homeDirectory = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: homeDirectory) }
@@ -418,6 +455,96 @@ final class CodexSessionCatalogTests: XCTestCase {
         )
         XCTAssertTrue(indexContents.contains("\"thread_name\":\"New Friendly Name\""))
         XCTAssertEqual(indexContents.split(whereSeparator: \.isNewline).count, 1)
+        XCTAssertTrue(indexContents.hasSuffix("\n"))
+    }
+
+    func testLoadSessionsRecoversThreadNameFromConcatenatedSessionIndexLines() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "named-session",
+            dayPath: "2026/03/07",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "named-session",
+                    timestamp: "2026-03-07T10:00:00Z",
+                    cwd: "/Users/test/NamedSession",
+                    source: "exec",
+                    originator: "KeyScribe"
+                ),
+                try responseMessageLine(
+                    timestamp: "2026-03-07T10:00:01Z",
+                    role: "user",
+                    text: "Latest follow-up that should not become the title"
+                )
+            ]
+        )
+
+        let codexDirectory = homeDirectory.appendingPathComponent(".codex", isDirectory: true)
+        try FileManager.default.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
+        let indexURL = codexDirectory.appendingPathComponent("session_index.jsonl")
+        let corruptedContents = """
+        {"id":"named-session","thread_name":"Pinned Friendly Name","updated_at":"2026-03-07T10:05:00Z"}{"id":"other-session","thread_name":"Other Name","updated_at":"2026-03-07T10:06:00Z"}
+        """
+        try corruptedContents.write(to: indexURL, atomically: true, encoding: .utf8)
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let sessions = try await catalog.loadSessions(limit: 10)
+
+        XCTAssertEqual(sessions.first?.id, "named-session")
+        XCTAssertEqual(sessions.first?.title, "Pinned Friendly Name")
+    }
+
+    func testRenameSessionPreservesIncompleteIndexEntries() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "rename-me",
+            dayPath: "2026/03/07",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "rename-me",
+                    timestamp: "2026-03-07T10:00:00Z",
+                    cwd: "/Users/test/RenameMe",
+                    source: "exec",
+                    originator: "KeyScribe"
+                )
+            ]
+        )
+        try writeSessionIndex(
+            entries: [
+                [
+                    "id": "rename-me",
+                    "thread_name": "Old Thread Name",
+                    "updated_at": "2026-03-07T10:01:00Z"
+                ],
+                [
+                    "id": "legacy-entry",
+                    "updated_at": "2026-03-07T10:02:00Z"
+                ],
+                [
+                    "thread_name": "Untitled Legacy Entry",
+                    "updated_at": "2026-03-07T10:03:00Z"
+                ]
+            ],
+            in: homeDirectory
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        try catalog.renameSession(sessionID: "rename-me", title: "New Friendly Name")
+
+        let indexContents = try String(
+            contentsOf: homeDirectory.appendingPathComponent(".codex/session_index.jsonl"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(indexContents.contains("\"thread_name\":\"New Friendly Name\""))
+        XCTAssertTrue(indexContents.contains("\"id\":\"legacy-entry\""))
+        XCTAssertTrue(indexContents.contains("\"thread_name\":\"Untitled Legacy Entry\""))
+        XCTAssertEqual(indexContents.split(whereSeparator: \.isNewline).count, 3)
     }
 
     func testLoadTranscriptFiltersSetupNoiseAndDeduplicatesAgentEchoes() async throws {
@@ -657,6 +784,48 @@ final class CodexSessionCatalogTests: XCTestCase {
         XCTAssertEqual(Set(loaded.map(\.kind)), Set([.assistantProgress, .activity]))
     }
 
+    func testLoadMergedTimelineDeduplicatesTaskCompleteEchoAfterLongRun() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        let sessionID = "timeline-task-complete-echo"
+        try writeSession(
+            id: sessionID,
+            dayPath: "2026/03/08",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: sessionID,
+                    timestamp: "2026-03-08T09:00:00Z",
+                    cwd: "/Users/test/KeyScribe",
+                    source: "exec",
+                    originator: "KeyScribe"
+                ),
+                try responseMessageLine(
+                    timestamp: "2026-03-08T09:00:01Z",
+                    role: "assistant",
+                    text: "I finished the cleanup and the session list now stays stable."
+                ),
+                try eventLine(
+                    timestamp: "2026-03-08T09:01:10Z",
+                    eventType: "task_complete",
+                    payload: [
+                        "last_agent_message": "I finished the cleanup and the session list now stays stable."
+                    ]
+                )
+            ]
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let timeline = await catalog.loadMergedTimeline(sessionID: sessionID)
+        let matchingFinals = timeline.filter {
+            $0.kind == .assistantFinal
+                && $0.text == "I finished the cleanup and the session list now stays stable."
+        }
+
+        XCTAssertEqual(matchingFinals.count, 1)
+    }
+
     func testDeleteSessionsRemovesOnlyRequestedKeyScribeFiles() async throws {
         let homeDirectory = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: homeDirectory) }
@@ -735,7 +904,7 @@ final class CodexSessionCatalogTests: XCTestCase {
         try FileManager.default.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
         let indexURL = codexDirectory.appendingPathComponent("session_index.jsonl")
         let lines = try entries.map(jsonLine)
-        try lines.joined(separator: "\n").write(to: indexURL, atomically: true, encoding: .utf8)
+        try (lines.joined(separator: "\n") + "\n").write(to: indexURL, atomically: true, encoding: .utf8)
     }
 
     private func sessionMetaLine(

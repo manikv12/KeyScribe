@@ -1399,12 +1399,6 @@ private struct PromptRewriteLoadingView: View {
                         .blur(radius: 0.3)
                 )
         }
-        .shadow(
-            color: tokens.cardShadowColor.opacity(0.86),
-            radius: max(14, tokens.cardShadowRadius),
-            x: 0,
-            y: max(7, tokens.cardShadowYOffset)
-        )
         .frame(
             width: PromptRewriteHUDLayout.loadingSize.width,
             height: PromptRewriteHUDLayout.loadingSize.height,
@@ -1484,7 +1478,6 @@ private struct PromptRewriteActivityBar: View {
                                 .fill(Color.white.opacity(0.94))
                                 .frame(width: 5, height: 5)
                                 .padding(.trailing, 2)
-                                .shadow(color: AppVisualTheme.accentTint.opacity(0.65), radius: 3, x: 0, y: 0.5)
                         }
                 }
         }
@@ -1508,7 +1501,6 @@ private struct PromptRewriteAccentDot: View {
                 Circle()
                     .stroke(Color.white.opacity(0.36), lineWidth: 0.7)
             )
-            .shadow(color: AppVisualTheme.accentTint.opacity(0.52), radius: 3.5, x: 0, y: 0.8)
     }
 }
 
@@ -1909,12 +1901,6 @@ private struct PromptRewriteHUDView: View {
             bubbleTail
                 .offset(x: bubbleOffsetX, y: bubbleEdge == .bottom ? 6 : -6)
         }
-        .shadow(
-            color: tokens.cardShadowColor,
-            radius: max(10, tokens.cardShadowRadius),
-            x: 0,
-            y: max(4, tokens.cardShadowYOffset)
-        )
         .onExitCommand {
             onChoice(.insertOriginal)
         }

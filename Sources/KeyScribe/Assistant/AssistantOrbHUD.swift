@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import MarkdownUI
 import SwiftUI
+import UniformTypeIdentifiers
 import UserNotifications
 
 // MARK: - Model
@@ -19,6 +20,7 @@ final class AssistantOrbHUDModel: ObservableObject {
     @Published var sessions: [AssistantSessionSummary] = []
     @Published var selectedSessionID: String?
     @Published var messageText = ""
+    @Published var attachments: [AssistantAttachment] = []
     @Published var shouldFocusTextField = false
 
     // Done detail popup
@@ -34,9 +36,20 @@ final class AssistantOrbHUDModel: ObservableObject {
     // Model selection
     @Published var availableModels: [AssistantModelOption] = []
     @Published var selectedModelSummary: String = ""
+    @Published var controllerModeSwitchSuggestion: AssistantModeSwitchSuggestion?
 
     // Voice recording
     @Published var isVoiceRecording = false
+
+    // Popup size (user-resizable, persisted)
+    @Published var popupSize: NSSize = Layout.defaultPopupSize
+
+    enum Layout {
+        static let defaultPopupSize = NSSize(width: 340, height: 456)
+        static let minPopupSize = NSSize(width: 280, height: 320)
+        static let maxPopupSize = NSSize(width: 500, height: 700)
+        static let expandedSize = NSSize(width: 300, height: 512)
+    }
 
     // Permission request popup
     @Published var pendingPermissionRequest: AssistantPermissionRequest?
@@ -48,26 +61,51 @@ final class AssistantOrbHUDModel: ObservableObject {
     var onOpenSession: ((AssistantSessionSummary) -> Void)?
     var onNewSession: (() async -> Void)?
     var onChooseModel: ((String) -> Void)?
+    var onOpenAttachmentPicker: (() -> Void)?
+    var onAddAttachment: ((AssistantAttachment) -> Void)?
+    var onRemoveAttachment: ((UUID) -> Void)?
     var onStartVoiceRecording: (() -> Void)?
     var onStopVoiceRecording: (() -> Void)?
     var onResolvePermission: ((String) -> Void)?
     var onCancelPermission: (() -> Void)?
     var onAlwaysAllowPermission: ((String) -> Void)?
+    var onModeChanged: ((AssistantInteractionMode) -> Void)?
+    var onApplyModeSwitchSuggestion: ((AssistantModeSwitchChoice) -> Void)?
+    var onDismissModeSwitchSuggestion: (() -> Void)?
+
+    init() {
+        if let dict = UserDefaults.standard.dictionary(forKey: kOrbPopupSizeKey),
+           let w = dict["width"] as? Double, let h = dict["height"] as? Double {
+            let clamped = NSSize(
+                width: min(max(w, Layout.minPopupSize.width), Layout.maxPopupSize.width),
+                height: min(max(h, Layout.minPopupSize.height), Layout.maxPopupSize.height)
+            )
+            popupSize = clamped
+        }
+    }
+
+    func persistPopupSize() {
+        let dict: [String: Double] = [
+            "width": Double(popupSize.width),
+            "height": Double(popupSize.height)
+        ]
+        UserDefaults.standard.set(dict, forKey: kOrbPopupSizeKey)
+    }
 
     func update(state: AssistantHUDState) {
         self.state = state
 
         switch state.phase {
-        case .success:
+        case .success, .failed:
             let trimmedDetail = state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
             storedDoneDetailText = trimmedDetail
             showDoneDetail = trimmedDetail != nil
             showWorkingDetail = false
         case .idle:
-            // Keep the completion popup visible until the user closes it.
+            // Keep the completion/error popup visible until the user closes it.
             showWorkingDetail = false
             break
-        case .waitingForPermission, .failed:
+        case .waitingForPermission:
             storedDoneDetailText = nil
             showDoneDetail = false
             showWorkingDetail = false
@@ -157,8 +195,56 @@ final class AssistantOrbHUDModel: ObservableObject {
         storedDoneDetailText = nil
     }
 
+    func showPreview(_ text: String) {
+        storedDoneDetailText = text
+        showDoneDetail = true
+    }
+
+    func selectSessionForReply(_ session: AssistantSessionSummary) {
+        selectedSessionID = session.id
+        dismissDoneDetail()
+    }
+
+    func setInteractionMode(_ mode: AssistantInteractionMode) {
+        guard interactionMode != mode else { return }
+        interactionMode = mode
+        onModeChanged?(mode)
+    }
+
+    var modeSwitchSuggestion: AssistantModeSwitchSuggestion? {
+        if let controllerModeSwitchSuggestion,
+           controllerModeSwitchSuggestion.originMode == interactionMode {
+            return controllerModeSwitchSuggestion
+        }
+
+        return AssistantStore.modeSwitchSuggestion(
+            forDraft: messageText,
+            currentMode: interactionMode
+        )
+    }
+
+    func cycleInteractionMode() {
+        setInteractionMode(interactionMode.nextMode)
+    }
+
+    func showFollowUpPreview(for session: AssistantSessionSummary) {
+        selectedSessionID = session.id
+        dismissDoneDetail()
+        guard let preview = session.latestAssistantMessage?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty else {
+            isExpanded = true
+            return
+        }
+        isExpanded = false
+        showPreview(preview)
+    }
+
     func updateLevel(_ level: Float) {
-        self.level = max(0, min(1, level))
+        let clamped = max(0, min(1, level))
+        let smoothing: Float = clamped > self.level ? 0.24 : 0.14
+        let next = self.level + ((clamped - self.level) * smoothing)
+        self.level = max(0, min(1, next))
     }
 
     func expand() {
@@ -178,8 +264,50 @@ final class AssistantOrbHUDModel: ObservableObject {
         messageText = ""
     }
 
+    func openSelectedSessionInMainWindow() {
+        dismissWorkingDetail()
+        guard let session = activeSessionSummary ?? sessions.first(where: { $0.id == selectedSessionID }) else {
+            return
+        }
+        onOpenSession?(session)
+    }
+
     func toggleExpanded() {
         if isExpanded { collapse() } else { expand() }
+    }
+
+    @discardableResult
+    func handleOrbTap() -> OrbTapResult {
+        if isExpanded {
+            collapse()
+            return .collapsedExpandedPanel
+        }
+
+        if showDoneDetail {
+            dismissDoneDetail()
+            return .dismissedDoneDetail
+        }
+
+        if showWorkingDetail {
+            dismissWorkingDetail()
+            return .dismissedWorkingDetail
+        }
+
+        if pendingPermissionRequest != nil {
+            return .keptPermissionCardVisible
+        }
+
+        if modeSwitchSuggestion != nil {
+            onDismissModeSwitchSuggestion?()
+            return .dismissedModeSwitchSuggestion
+        }
+
+        if presentWorkingDetailIfAvailable() {
+            return .presentedWorkingDetail
+        }
+
+        expand()
+        return .expandedInlinePanel
     }
 
     /// Display name for the session that will receive the message.
@@ -187,18 +315,28 @@ final class AssistantOrbHUDModel: ObservableObject {
         guard let sid = selectedSessionID else { return nil }
         return sessions.first(where: { $0.id == sid })?.title.nonEmpty ?? "Selected session"
     }
+
+    enum OrbTapResult: Equatable {
+        case collapsedExpandedPanel
+        case dismissedDoneDetail
+        case dismissedWorkingDetail
+        case keptPermissionCardVisible
+        case dismissedModeSwitchSuggestion
+        case presentedWorkingDetail
+        case expandedInlinePanel
+    }
 }
 
 // MARK: - Manager
 
 private let kOrbPositionKey = "assistantOrbHUDPosition"
+private let kOrbPopupSizeKey = "assistantOrbPopupSize"
 
 @MainActor
 final class AssistantOrbHUDManager {
     private enum Layout {
         static let collapsedSize = NSSize(width: 140, height: 156)
-        static let expandedSize = NSSize(width: 300, height: 480)
-        static let doneDetailSize = NSSize(width: 340, height: 456)
+        static let expandedSize = AssistantOrbHUDModel.Layout.expandedSize
     }
 
     private let model = AssistantOrbHUDModel()
@@ -214,6 +352,20 @@ final class AssistantOrbHUDManager {
         didSet {
             if !isEnabled { hide() }
         }
+    }
+
+    func showFollowUp(for session: AssistantSessionSummary) {
+        guard isEnabled else { return }
+        if panel == nil { createPanel() }
+
+        controller.selectedSessionID = session.id
+        syncModelFromController()
+        model.showFollowUpPreview(for: session)
+
+        if !model.isExpanded {
+            reposition()
+        }
+        panel?.orderFrontRegardless()
     }
 
     private var autoDismissItem: DispatchWorkItem?
@@ -259,6 +411,11 @@ final class AssistantOrbHUDManager {
             }
             .store(in: &cancellables)
 
+        controller.$attachments
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.syncModelFromController() }
+            .store(in: &cancellables)
+
         controller.$availableModels
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncModelFromController() }
@@ -287,18 +444,28 @@ final class AssistantOrbHUDManager {
             }
             .store(in: &cancellables)
 
-        // Resize panel when done detail popup toggles
+        // Resize panel when done detail popup toggles.
+        // Must fire synchronously (no `.receive(on:)`) so the panel
+        // frame updates in the same run-loop tick as the SwiftUI view,
+        // preventing the orb from jumping during dismiss.
         model.$showDoneDetail
-            .receive(on: RunLoop.main)
             .sink { [weak self] showing in
                 self?.handleDoneDetailChange(showing)
             }
             .store(in: &cancellables)
 
         model.$showWorkingDetail
-            .receive(on: RunLoop.main)
             .sink { [weak self] showing in
                 self?.handleWorkingDetailChange(showing)
+            }
+            .store(in: &cancellables)
+
+        // Reposition panel when popup is resized by the user
+        model.$popupSize
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, !self.model.isExpanded else { return }
+                self.reposition()
             }
             .store(in: &cancellables)
 
@@ -335,6 +502,44 @@ final class AssistantOrbHUDManager {
             self?.syncModelFromController()
         }
 
+        model.onOpenAttachmentPicker = { [weak self] in
+            AssistantAttachmentSupport.openFilePicker { attachments in
+                guard let self, !attachments.isEmpty else { return }
+                self.controller.attachments.append(contentsOf: attachments)
+                self.syncModelFromController()
+            }
+        }
+
+        model.onAddAttachment = { [weak self] attachment in
+            guard let self else { return }
+            self.controller.attachments.append(attachment)
+            self.syncModelFromController()
+        }
+
+        model.onRemoveAttachment = { [weak self] attachmentID in
+            guard let self else { return }
+            self.controller.attachments.removeAll { $0.id == attachmentID }
+            self.syncModelFromController()
+        }
+
+        model.onModeChanged = { [weak self] mode in
+            self?.controller.interactionMode = mode
+            self?.controller.syncRuntimeContext()
+        }
+
+        model.onApplyModeSwitchSuggestion = { [weak self] choice in
+            guard let self else { return }
+            Task { @MainActor in
+                await self.controller.applyModeSwitchSuggestion(choice)
+                self.syncModelFromController()
+            }
+        }
+
+        model.onDismissModeSwitchSuggestion = { [weak self] in
+            self?.controller.dismissModeSwitchSuggestion()
+            self?.syncModelFromController()
+        }
+
         model.onStartVoiceRecording = { [weak self] in
             self?.model.isVoiceRecording = true
             NotificationCenter.default.post(name: .keyScribeStartOrbVoiceCapture, object: nil)
@@ -368,6 +573,14 @@ final class AssistantOrbHUDManager {
             }
             .store(in: &cancellables)
 
+        controller.$modeSwitchSuggestion
+            .receive(on: RunLoop.main)
+            .sink { [weak self] suggestion in
+                self?.model.controllerModeSwitchSuggestion = suggestion
+                self?.handleModeSwitchSuggestionChange(suggestion)
+            }
+            .store(in: &cancellables)
+
         syncModelFromController()
 
         // Show the orb immediately on launch
@@ -397,28 +610,34 @@ final class AssistantOrbHUDManager {
             return
         }
 
-        if state.phase == .success, let detail = state.detail, !detail.isEmpty, model.state.phase != .success {
-            sendCompletionNotification(message: detail)
+        if let detail = state.detail, !detail.isEmpty {
+            if state.phase == .success, model.state.phase != .success {
+                sendCompletionNotification(message: detail)
+            } else if state.phase == .failed, model.state.phase != .failed {
+                sendCompletionNotification(message: detail)
+            }
         }
 
         show(state: state)
-
-        if state.phase == .failed && !model.isExpanded {
-            let item = DispatchWorkItem { [weak self] in
-                self?.resetToIdle()
-            }
-            autoDismissItem = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: item)
-        }
     }
 
     func updateLevel(_ level: Float) {
         model.updateLevel(level)
     }
 
+    func setVoiceRecording(_ isRecording: Bool) {
+        model.isVoiceRecording = isRecording
+        if !isRecording {
+            model.updateLevel(0)
+        }
+    }
+
     func receiveVoiceTranscript(_ text: String) {
         model.isVoiceRecording = false
-        model.messageText = text
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, !AssistantComposerBridge.shared.insert(trimmed) {
+            model.messageText = trimmed
+        }
         model.updateLevel(0)
     }
 
@@ -463,7 +682,7 @@ final class AssistantOrbHUDManager {
             guard let self, let panel = self.panel else { return }
             self.persistCollapsedOrigin(
                 from: panel.frame.origin,
-                isExpanded: self.model.isExpanded
+                panelSize: panel.frame.size
             )
         }
         panel.contentViewController = NSHostingController(rootView: AssistantOrbHUDView(model: model))
@@ -472,8 +691,11 @@ final class AssistantOrbHUDManager {
 
     private var targetSize: NSSize {
         if model.isExpanded { return Layout.expandedSize }
-        if model.showDoneDetail || model.showWorkingDetail || model.pendingPermissionRequest != nil {
-            return Layout.doneDetailSize
+        if model.showDoneDetail
+            || model.showWorkingDetail
+            || model.pendingPermissionRequest != nil
+            || model.modeSwitchSuggestion != nil {
+            return model.popupSize
         }
         return Layout.collapsedSize
     }
@@ -483,17 +705,25 @@ final class AssistantOrbHUDManager {
         let screen = screenForCurrentPlacement(panel: panel)
         guard let screen else { return }
 
-        let size = targetSize
         let availableFrame = screen.visibleFrame
+        let requestedSize = targetSize
+        let size = NSSize(
+            width: min(requestedSize.width, availableFrame.width),
+            height: min(requestedSize.height, availableFrame.height)
+        )
+
+        panel.isOrbAnchoredAtBottom = isOrbAnchoredAtBottom
 
         let origin: NSPoint
         if let saved = savedOrigin {
-            if model.isExpanded {
-                // Keep the orb itself at the same user-placed spot when expanding.
+            if requestedSize != Layout.collapsedSize {
+                // Keep the orb centered on the same user-placed x position.
                 let orbCenterX = saved.x + Layout.collapsedSize.width / 2
                 origin = NSPoint(
                     x: orbCenterX - size.width / 2,
-                    y: saved.y + Layout.collapsedSize.height - size.height
+                    y: isOrbAnchoredAtBottom
+                        ? saved.y
+                        : saved.y + Layout.collapsedSize.height - size.height
                 )
             } else {
                 origin = saved
@@ -511,11 +741,11 @@ final class AssistantOrbHUDManager {
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        panel.setFrame(frame, display: true)
+        panel.setFrame(frame, display: true, animate: false)
         CATransaction.commit()
 
         if savedOrigin == nil {
-            persistCollapsedOrigin(from: frame.origin, isExpanded: model.isExpanded)
+            persistCollapsedOrigin(from: frame.origin, panelSize: size)
         }
     }
 
@@ -525,15 +755,17 @@ final class AssistantOrbHUDManager {
         }
         if showing {
             if !model.isExpanded {
+                activatePopupTextEntry()
                 startClickOutsideMonitor()
             }
         } else {
             if !model.isExpanded {
+                deactivatePopupTextEntry()
                 stopClickOutsideMonitor()
             }
-            // When the user dismisses the done detail, reset the orb to idle
-            // so it doesn't stay stuck showing the "DONE" state.
-            if model.state.phase == .success {
+            // When the user dismisses the detail, reset the orb to idle
+            // so it doesn't stay stuck showing the "DONE" or error state.
+            if model.state.phase == .success || model.state.phase == .failed {
                 resetToIdle()
             }
         }
@@ -545,9 +777,11 @@ final class AssistantOrbHUDManager {
         }
         if showing {
             if !model.isExpanded {
+                activatePopupTextEntry()
                 startClickOutsideMonitor()
             }
         } else if !model.isExpanded {
+            deactivatePopupTextEntry()
             stopClickOutsideMonitor()
         }
     }
@@ -560,6 +794,18 @@ final class AssistantOrbHUDManager {
             panel?.orderFrontRegardless()
             startClickOutsideMonitor()
         } else {
+            stopClickOutsideMonitor()
+        }
+    }
+
+    private func handleModeSwitchSuggestionChange(_ suggestion: AssistantModeSwitchSuggestion?) {
+        guard !model.isExpanded else { return }
+        reposition()
+        if suggestion != nil {
+            if panel == nil { createPanel() }
+            panel?.orderFrontRegardless()
+            startClickOutsideMonitor()
+        } else if model.pendingPermissionRequest == nil && !model.showDoneDetail && !model.showWorkingDetail {
             stopClickOutsideMonitor()
         }
     }
@@ -607,6 +853,25 @@ final class AssistantOrbHUDManager {
         }
     }
 
+    private func activatePopupTextEntry() {
+        guard !model.isExpanded else { return }
+        if panel == nil { createPanel() }
+        panel?.allowsKeyStatus = true
+        panel?.makeKeyAndOrderFront(nil)
+        model.shouldFocusTextField = false
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.model.isExpanded else { return }
+            guard self.model.showDoneDetail || self.model.showWorkingDetail else { return }
+            self.model.shouldFocusTextField = true
+        }
+    }
+
+    private func deactivatePopupTextEntry() {
+        guard !model.isExpanded else { return }
+        model.shouldFocusTextField = false
+        panel?.allowsKeyStatus = false
+    }
+
     private func refreshSessionsForOrb() async {
         syncModelFromController()
 
@@ -647,6 +912,8 @@ final class AssistantOrbHUDManager {
         model.busySessionID = activeSessionIDForOrb()
         model.availableModels = controller.visibleModels
         model.selectedModelSummary = controller.selectedModelSummary
+        model.attachments = controller.attachments
+        model.controllerModeSwitchSuggestion = controller.modeSwitchSuggestion
         model.workingToolActivity = Array(controller.visibleToolActivity.prefix(6))
         model.activeSessionSummary = activeSessionSummaryForOrb()
         model.update(state: displayState(for: model.state))
@@ -713,13 +980,14 @@ final class AssistantOrbHUDManager {
         return lhs.caseInsensitiveCompare(rhs) == .orderedSame
     }
 
-    private func persistCollapsedOrigin(from panelOrigin: NSPoint, isExpanded: Bool) {
+    private func persistCollapsedOrigin(from panelOrigin: NSPoint, panelSize: NSSize) {
         let collapsedOrigin: NSPoint
-        if isExpanded {
-            collapsedOrigin = NSPoint(
-                x: panelOrigin.x + ((Layout.expandedSize.width - Layout.collapsedSize.width) / 2),
-                y: panelOrigin.y + (Layout.expandedSize.height - Layout.collapsedSize.height)
-            )
+        if panelSize.width > Layout.collapsedSize.width || panelSize.height > Layout.collapsedSize.height {
+            let collapsedX = panelOrigin.x + ((panelSize.width - Layout.collapsedSize.width) / 2)
+            let collapsedY = isOrbAnchoredAtBottom
+                ? panelOrigin.y
+                : panelOrigin.y + (panelSize.height - Layout.collapsedSize.height)
+            collapsedOrigin = NSPoint(x: collapsedX, y: collapsedY)
         } else {
             collapsedOrigin = panelOrigin
         }
@@ -730,6 +998,14 @@ final class AssistantOrbHUDManager {
             "y": Double(collapsedOrigin.y)
         ]
         UserDefaults.standard.set(dict, forKey: kOrbPositionKey)
+    }
+
+    private var isOrbAnchoredAtBottom: Bool {
+        model.isExpanded
+            || model.showDoneDetail
+            || model.showWorkingDetail
+            || model.pendingPermissionRequest != nil
+            || model.modeSwitchSuggestion != nil
     }
 
     private func screenForCurrentPlacement(panel: NSPanel) -> NSScreen? {
@@ -765,8 +1041,10 @@ final class AssistantOrbHUDManager {
 private class OrbHUDPanel: NSPanel {
     var allowsKeyStatus = false
     var onPositionPersist: (() -> Void)?
+    /// When true, the orb sits at the bottom of the panel. Drag zone moves to bottom.
+    var isOrbAnchoredAtBottom = false
 
-    /// Height of the orb area (top of window) that initiates dragging.
+    /// Height of the orb area that initiates dragging.
     private let orbAreaHeight: CGFloat = 120
     private let dragThreshold: CGFloat = 4
 
@@ -776,12 +1054,24 @@ private class OrbHUDPanel: NSPanel {
 
     override var canBecomeKey: Bool { allowsKeyStatus }
 
+    /// Check if click is in the orb drag zone.
+    /// When the orb is bottom-anchored, drag from the lower orb area.
+    /// Otherwise, drag from the upper orb area.
+    private func isInOrbDragZone(_ loc: NSPoint) -> Bool {
+        if isOrbAnchoredAtBottom {
+            // Orb is at the bottom — drag from the lower orbAreaHeight
+            return loc.y <= orbAreaHeight
+        } else {
+            // Orb is at the top — drag from the upper orbAreaHeight
+            return loc.y >= frame.height - orbAreaHeight
+        }
+    }
+
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown:
             let loc = event.locationInWindow
-            // Only track drag in the orb area (top portion of window)
-            if loc.y >= frame.height - orbAreaHeight {
+            if isInOrbDragZone(loc) {
                 dragStartScreenLocation = NSEvent.mouseLocation
                 dragStartOrigin = frame.origin
                 isWindowDragging = false
@@ -825,7 +1115,7 @@ private class OrbHUDPanel: NSPanel {
 
         case .rightMouseDown:
             let loc = event.locationInWindow
-            if loc.y >= frame.height - orbAreaHeight {
+            if isInOrbDragZone(loc) {
                 showOrbContextMenu(at: event)
                 return
             }
@@ -848,299 +1138,426 @@ private class OrbHUDPanel: NSPanel {
 
 private struct AssistantOrbHUDView: View {
     @ObservedObject var model: AssistantOrbHUDModel
-    @FocusState private var isTextFieldFocused: Bool
+    @State private var resizeStartSize: NSSize?
+    @State private var previewAttachment: AssistantAttachment?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private enum OrbHUDAnimations {
+        static let state = Animation.easeInOut(duration: 0.22)
+        static let content = Animation.easeOut(duration: 0.18)
+    }
+
+    private let overlayBottomDock: CGFloat = 108
 
     private var showingPopup: Bool {
-        (model.showDoneDetail || model.showWorkingDetail || model.pendingPermissionRequest != nil) && !model.isExpanded
+        (
+            model.showDoneDetail
+            || model.showWorkingDetail
+            || model.pendingPermissionRequest != nil
+            || model.modeSwitchSuggestion != nil
+        ) && !model.isExpanded
+    }
+
+    /// The popup content area height = total popup height minus the orb section (156pt).
+    private var popupContentMaxHeight: CGFloat {
+        model.popupSize.height - 156
+    }
+
+    private var expandedSessionListMaxHeight: CGFloat {
+        216
+    }
+
+    private var overlayContentMaxHeight: CGFloat {
+        let totalHeight = model.isExpanded
+            ? AssistantOrbHUDModel.Layout.expandedSize.height
+            : model.popupSize.height
+        return max(180, totalHeight - overlayBottomDock)
+    }
+
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(height: 6)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 2)
+                    .onChanged { value in
+                        if resizeStartSize == nil { resizeStartSize = model.popupSize }
+                        guard let start = resizeStartSize else { return }
+                        // Dragging up (negative y in SwiftUI) → increase height
+                        let newHeight = start.height - value.translation.height
+                        let clamped = min(
+                            max(newHeight, AssistantOrbHUDModel.Layout.minPopupSize.height),
+                            AssistantOrbHUDModel.Layout.maxPopupSize.height
+                        )
+                        model.popupSize.height = clamped
+                    }
+                    .onEnded { _ in
+                        resizeStartSize = nil
+                        model.persistPopupSize()
+                    }
+            )
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if model.showDoneDetail && !model.isExpanded {
-                doneDetailPopup(maxHeight: 280, showsFollowUpComposer: true)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            if model.showWorkingDetail && !model.showDoneDetail && model.pendingPermissionRequest == nil && !model.isExpanded {
-                workingDetailPopup(maxHeight: 280, showsOpenButton: true)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            if model.pendingPermissionRequest != nil && !model.showDoneDetail && !model.showWorkingDetail && !model.isExpanded {
-                permissionPopup(maxHeight: 280)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
+        ZStack(alignment: .bottom) {
+            overlayContent
             orbSection
-
-            if model.isExpanded {
-                sessionPopoverSection
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .frame(
+            width: model.isExpanded ? AssistantOrbHUDModel.Layout.expandedSize.width : (showingPopup ? model.popupSize.width : 140),
+            height: model.isExpanded ? AssistantOrbHUDModel.Layout.expandedSize.height : (showingPopup ? model.popupSize.height : 156),
+            alignment: .bottom
+        )
+        .popover(item: $previewAttachment, attachmentAnchor: .point(.center)) { attachment in
+            if let nsImage = NSImage(data: attachment.data) {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button {
+                            previewAttachment = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.6))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(8)
+                    }
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 720, maxHeight: 520)
+                        .padding([.bottom, .horizontal])
+                }
+                .frame(minWidth: 360, minHeight: 260)
             }
         }
-        .frame(
-            width: model.isExpanded ? 300 : (showingPopup ? 340 : 140),
-            height: model.isExpanded ? 480 : (showingPopup ? 456 : 156)
-        )
-        .animation(.spring(response: 0.35, dampingFraction: 0.82), value: model.isExpanded)
-        .animation(.spring(response: 0.35, dampingFraction: 0.82), value: model.showDoneDetail)
-        .animation(.spring(response: 0.35, dampingFraction: 0.82), value: model.showWorkingDetail)
-        .animation(.spring(response: 0.35, dampingFraction: 0.82), value: model.pendingPermissionRequest != nil)
-        .onChange(of: model.shouldFocusTextField) { focused in
-            if focused { isTextFieldFocused = true }
+    }
+
+    @ViewBuilder
+    private var overlayContent: some View {
+        if model.isExpanded {
+            sessionPopoverSection
+                .frame(maxHeight: overlayContentMaxHeight)
+                .padding(.bottom, overlayBottomDock)
+                .transition(.opacity)
+        } else if model.showDoneDetail {
+            VStack(spacing: 0) {
+                resizeHandle
+                doneDetailPopup(maxHeight: overlayContentMaxHeight, showsFollowUpComposer: true)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
+        } else if model.showWorkingDetail && !model.showDoneDetail && model.pendingPermissionRequest == nil {
+            VStack(spacing: 0) {
+                resizeHandle
+                workingDetailPopup(maxHeight: overlayContentMaxHeight)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
+        } else if model.pendingPermissionRequest != nil && !model.showDoneDetail && !model.showWorkingDetail {
+            VStack(spacing: 0) {
+                resizeHandle
+                permissionPopup(maxHeight: overlayContentMaxHeight)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
+        } else if model.modeSwitchSuggestion != nil
+            && !model.showDoneDetail
+            && !model.showWorkingDetail
+            && model.pendingPermissionRequest == nil {
+            VStack(spacing: 0) {
+                resizeHandle
+                modeSwitchPopup(maxHeight: overlayContentMaxHeight)
+            }
+            .padding(.bottom, overlayBottomDock)
+            .transition(.opacity)
         }
     }
 
     // MARK: Orb
 
     private var orbSection: some View {
-        VStack(spacing: 4) {
-            orbSphereView
-                .onTapGesture { handleOrbTap() }
-                .onHover { hovering in
-                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                }
+        VStack(spacing: 8) {
+            ZStack {
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                glowColor.opacity(0.20),
+                                glowColor.opacity(0.10),
+                                Color.clear
+                            ],
+                            center: .center,
+                            startRadius: 8,
+                            endRadius: 42
+                        )
+                    )
+                    .frame(width: 90, height: 90)
+                    .blur(radius: 12)
+                    .opacity(reduceMotion ? 0.85 : 1.0)
 
-            VStack(spacing: 1.5) {
-                Text(phaseLabel)
-                    .font(.system(size: 8.5, weight: .bold, design: .rounded))
-                    .tracking(1.0)
-                    .textCase(.uppercase)
-                    .foregroundStyle(.white.opacity(0.9))
-                    .shadow(color: glowColor.opacity(0.6), radius: 6, x: 0, y: 0)
-                    .contentTransition(.opacity)
+                orbSphereView
+            }
+            .frame(height: 72)
+            .onTapGesture { handleOrbTap() }
+            .onHover { hovering in
+                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+
+            VStack(spacing: 3.5) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(glowColor.opacity(0.92))
+                        .frame(width: 5, height: 5)
+
+                    Text(phaseLabel)
+                        .font(.system(size: 9, weight: .semibold, design: .rounded))
+                        .tracking(0.9)
+                        .textCase(.uppercase)
+                        .foregroundStyle(.white.opacity(0.94))
+                        .contentTransition(.opacity)
+                }
 
                 if let detail = model.state.detail, !detail.isEmpty, !model.showDoneDetail, !model.showWorkingDetail {
                     Text(detail)
-                        .font(.system(size: 9, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.75))
-                        .lineLimit(model.state.phase == .success ? 2 : 1)
+                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.72))
+                        .lineLimit(2)
                         .truncationMode(model.state.phase == .success ? .tail : .middle)
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 132)
-                        .shadow(color: Color.black.opacity(0.5), radius: 3, x: 0, y: 1)
+                        .frame(maxWidth: 136)
+                        .fixedSize(horizontal: false, vertical: true)
                         .contentTransition(.opacity)
-                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(HUDCapsuleBackground(tint: glowColor))
-            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.state.detail)
-            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.state.phase)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(OrbStatusCapsuleBackground(tint: glowColor))
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+            )
+            .animation(OrbHUDAnimations.content, value: model.state.detail)
+            .animation(OrbHUDAnimations.state, value: model.state.phase)
         }
+        .padding(.top, 12)
+        .frame(maxWidth: .infinity)
+        .frame(height: 156, alignment: .top)
     }
 
     private var orbSphereView: some View {
-        let isIdle = model.state.phase == .idle || model.state.phase == .success
-        return TimelineView(.animation(minimumInterval: isIdle ? 1.0 / 8.0 : 1.0 / 30.0, paused: false)) { context in
+        let paused = model.state.phase == .idle
+        return TimelineView(.animation(minimumInterval: orbRefreshInterval, paused: paused)) { context in
             OrbSphere(
                 phase: model.state.phase,
                 level: CGFloat(model.level),
                 time: context.date.timeIntervalSinceReferenceDate
             )
-            .frame(width: 56, height: 56)
+            .frame(width: 64, height: 64)
+        }
+    }
+
+    private var orbRefreshInterval: Double {
+        switch model.state.phase {
+        case .listening, .acting, .streaming:
+            return 1.0 / 24.0
+        case .thinking, .waitingForPermission, .failed:
+            return 1.0 / 18.0
+        case .idle, .success:
+            return 1.0 / 12.0
         }
     }
 
     // MARK: Done Detail Popup
 
     private func doneDetailPopup(maxHeight: CGFloat, showsFollowUpComposer: Bool) -> some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Text("DONE")
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .tracking(0.8)
-                    .foregroundStyle(.white.opacity(0.6))
+        let tint = Color(red: 0.20, green: 0.84, blue: 0.46)
 
-                Spacer()
-
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                        model.dismissDoneDetail()
-                    }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.5))
-                        .frame(width: 22, height: 22)
-                        .background(Circle().fill(Color.white.opacity(0.08)))
-                }
-                .buttonStyle(.plain)
+        return VStack(spacing: 0) {
+            OrbPopupHeader(
+                title: "Done",
+                subtitle: "Latest assistant result",
+                symbol: "checkmark.circle.fill",
+                tint: tint,
+                onOpenMainWindow: { model.openSelectedSessionInMainWindow() }
+            ) {
+                model.dismissDoneDetail()
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
 
-            Divider()
-                .overlay(Color.white.opacity(0.08))
+            OrbPopupDivider(tint: tint)
+                .padding(.horizontal, 2)
 
-            // Scrollable markdown content
             ScrollView(.vertical, showsIndicators: true) {
                 if let detail = model.doneDetailText, !detail.isEmpty {
                     OrbDoneMarkdownText(text: detail)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
                 }
             }
             .frame(maxHeight: .infinity)
 
             if showsFollowUpComposer {
-                Divider()
-                    .overlay(Color.white.opacity(0.08))
+                OrbPopupDivider(tint: tint)
+                    .padding(.horizontal, 2)
 
-                VStack(spacing: 8) {
-                    HStack(spacing: 4) {
-                        ForEach(AssistantInteractionMode.allCases, id: \.self) { mode in
-                            inlineModeButton(mode)
-                        }
-                        Spacer(minLength: 8)
-                        Text("Enter sends")
-                            .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.40))
-                    }
-
-                    HStack(alignment: .bottom, spacing: 8) {
-                        OrbComposerTextView(
-                            text: $model.messageText,
-                            placeholder: "Follow up...",
-                            onSubmit: { sendDoneFollowUp() }
-                        )
-                        .frame(minHeight: 58, maxHeight: 96)
-                        .appThemedSurface(
-                            cornerRadius: 10,
-                            tint: AppVisualTheme.baseTint,
-                            strokeOpacity: 0.12,
-                            tintOpacity: 0.028
-                        )
-
-                        Button {
-                            sendDoneFollowUp()
-                        } label: {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.system(size: 20))
-                                .foregroundStyle(
-                                    model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                        ? Color.white.opacity(0.25)
-                                        : Color(red: 0.15, green: 0.80, blue: 0.40)
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        .padding(.bottom, 4)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                popupFollowUpComposerSection(
+                    tint: tint,
+                    placeholder: model.isVoiceRecording ? "Listening..." : "Follow up...",
+                    enterHint: "Enter sends",
+                    submit: sendDoneFollowUp
+                )
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
             } else {
-                Divider()
-                    .overlay(Color.white.opacity(0.08))
+                OrbPopupDivider(tint: tint)
+                    .padding(.horizontal, 2)
 
                 HStack(spacing: 8) {
-                    Text("Keep chatting below or close this notice to return to ready.")
+                    Text("Close this card to return the orb to its ready state.")
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(.white.opacity(0.60))
                         .fixedSize(horizontal: false, vertical: true)
 
                     Spacer(minLength: 8)
 
-                    Button("Ready") {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                            model.dismissDoneDetail()
-                        }
+                    OrbSecondaryActionButton(
+                        title: "Open Main Window",
+                        symbol: "arrow.up.right.square",
+                        tint: tint
+                    ) {
+                        model.openSelectedSessionInMainWindow()
                     }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(Color(red: 0.15, green: 0.80, blue: 0.40))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(
-                        Capsule()
-                            .fill(Color(red: 0.15, green: 0.80, blue: 0.40).opacity(0.14))
-                    )
+
+                    OrbSecondaryActionButton(title: "Ready", symbol: "sparkles", tint: tint) {
+                        model.dismissDoneDetail()
+                    }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: maxHeight)
-        .appThemedSurface(
-            cornerRadius: 14,
-            tint: Color(red: 0.15, green: 0.80, blue: 0.40).opacity(0.96),
-            strokeOpacity: 0.18,
-            tintOpacity: 0.06
-        )
-        .shadow(color: Color(red: 0.15, green: 0.80, blue: 0.40).opacity(0.24), radius: 16, x: 0, y: 6)
+        .orbPopupSurface(tint: tint, cornerRadius: 20)
         .padding(.horizontal, 4)
         .padding(.bottom, 6)
     }
 
+    private func modeSwitchPopup(maxHeight: CGFloat) -> some View {
+        let tint = Color.orange
+
+        return VStack(spacing: 0) {
+            OrbPopupHeader(
+                title: "Mode switch",
+                subtitle: "Quick way to continue in the right mode",
+                symbol: "arrow.triangle.branch",
+                tint: tint
+            ) {
+                model.onDismissModeSwitchSuggestion?()
+            }
+
+            OrbPopupDivider(tint: tint)
+                .padding(.horizontal, 2)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                if let suggestion = model.modeSwitchSuggestion {
+                    modeSwitchInlineCard(suggestion, tint: tint)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                }
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: maxHeight)
+        .orbPopupSurface(tint: tint, cornerRadius: 20)
+        .padding(.horizontal, 4)
+        .padding(.bottom, 6)
+    }
+
+    @ViewBuilder
+    private func modeSwitchInlineCard(_ suggestion: AssistantModeSwitchSuggestion, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(suggestion.message)
+                .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                .foregroundStyle(.white.opacity(0.72))
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                ForEach(suggestion.choices) { choice in
+                    OrbSecondaryActionButton(
+                        title: choice.title,
+                        symbol: choice.mode.icon,
+                        tint: tint
+                    ) {
+                        model.interactionMode = choice.mode
+                        model.onApplyModeSwitchSuggestion?(choice)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .orbInsetSurface(tint: tint, cornerRadius: 16, fillOpacity: 0.10)
+    }
+
     // MARK: Working Detail Popup
 
-    private func workingDetailPopup(maxHeight: CGFloat, showsOpenButton: Bool) -> some View {
+    private func workingDetailPopup(maxHeight: CGFloat) -> some View {
         let tint = glowColor
 
         return VStack(spacing: 0) {
-            HStack {
-                Text(model.workingPopupTitle)
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .tracking(0.8)
-                    .foregroundStyle(.white.opacity(0.6))
-
-                Spacer()
-
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                        model.dismissWorkingDetail()
-                    }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.5))
-                        .frame(width: 22, height: 22)
-                        .background(Circle().fill(Color.white.opacity(0.08)))
-                }
-                .buttonStyle(.plain)
+            OrbPopupHeader(
+                title: model.workingPopupTitle.lowercased().capitalized,
+                subtitle: "Live progress and quick steering",
+                symbol: "waveform.path.ecg",
+                tint: tint
+            ) {
+                model.dismissWorkingDetail()
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
 
-            Divider()
-                .overlay(Color.white.opacity(0.08))
+            OrbPopupDivider(tint: tint)
+                .padding(.horizontal, 2)
 
             ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 12) {
                     Text(model.state.title)
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.92))
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.94))
 
                     if let summary = model.workingSummaryText, !summary.isEmpty {
                         Text(summary)
                             .font(.system(size: 11.5, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.70))
+                            .foregroundStyle(.white.opacity(0.72))
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if let session = model.activeSessionSummary {
-                        VStack(alignment: .leading, spacing: 4) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Active session")
+                                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                                .tracking(0.6)
+                                .textCase(.uppercase)
+                                .foregroundStyle(tint.opacity(0.92))
+
                             Text(session.title.isEmpty ? "Untitled Session" : session.title)
-                                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.88))
+                                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.90))
                             if let cwd = session.cwd?.nonEmpty {
                                 Text(cwd)
                                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.45))
+                                    .foregroundStyle(.white.opacity(0.50))
                                     .lineLimit(2)
                             }
                         }
-                        .padding(10)
+                        .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .fill(Color.white.opacity(0.04))
-                        )
+                        .orbInsetSurface(tint: tint, cornerRadius: 16, fillOpacity: 0.10)
                     }
 
                     if !model.workingToolActivity.isEmpty {
@@ -1150,7 +1567,7 @@ private struct AssistantOrbHUDView: View {
                                 .foregroundStyle(.white.opacity(0.52))
 
                             ForEach(Array(model.workingToolActivity.prefix(4))) { item in
-                                OrbWorkingActivityRow(item: item)
+                                OrbWorkingActivityRow(item: item, tint: tint)
                             }
                         }
                     } else {
@@ -1159,94 +1576,43 @@ private struct AssistantOrbHUDView: View {
                             .foregroundStyle(.white.opacity(0.48))
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
             }
             .frame(maxHeight: .infinity)
 
-            Divider()
-                .overlay(Color.white.opacity(0.08))
+            OrbPopupDivider(tint: tint)
+                .padding(.horizontal, 2)
 
-            VStack(spacing: 8) {
-                HStack(spacing: 4) {
-                    ForEach(AssistantInteractionMode.allCases, id: \.self) { mode in
-                        inlineModeButton(mode)
-                    }
-                    Spacer(minLength: 8)
-                    Text("Enter steers now")
-                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.40))
-                }
+            VStack(spacing: 10) {
+                popupFollowUpComposerSection(
+                    tint: tint,
+                    placeholder: model.isVoiceRecording
+                        ? "Listening..."
+                        : "Steer it or prepare the next follow-up...",
+                    enterHint: "Enter steers now",
+                    submit: sendWorkingFollowUp
+                )
 
-                HStack(alignment: .bottom, spacing: 8) {
-                    OrbComposerTextView(
-                        text: $model.messageText,
-                        placeholder: "Steer it or prepare the next follow-up...",
-                        onSubmit: { sendWorkingFollowUp() }
-                    )
-                    .frame(minHeight: 58, maxHeight: 96)
-                    .appThemedSurface(
-                        cornerRadius: 10,
-                        tint: AppVisualTheme.baseTint,
-                        strokeOpacity: 0.12,
-                        tintOpacity: 0.028
-                    )
-
-                    VStack(spacing: 6) {
-                        Button {
-                            sendWorkingFollowUp()
-                        } label: {
-                            Image(systemName: "paperplane.circle.fill")
-                                .font(.system(size: 20))
-                                .foregroundStyle(
-                                    model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                        ? Color.white.opacity(0.25)
-                                        : tint
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                        if showsOpenButton {
-                            Button("Open") {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                                    model.expand()
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 10, weight: .semibold, design: .rounded))
-                            .foregroundStyle(tint)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .fill(tint.opacity(0.14))
-                            )
-                        }
-                    }
-                    .padding(.bottom, 4)
-                }
-
-                HStack(spacing: 8) {
-                    Text("You can type while it works. Sending here interrupts the current turn and applies your new instruction.")
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(tint.opacity(0.85))
+                    Text("Typing here interrupts the current turn and applies your new instruction.")
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(.white.opacity(0.58))
                         .fixedSize(horizontal: false, vertical: true)
-
-                    Spacer(minLength: 8)
+                    Spacer(minLength: 0)
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .orbInsetSurface(tint: tint, cornerRadius: 14, fillOpacity: 0.07)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: maxHeight)
-        .appThemedSurface(
-            cornerRadius: 14,
-            tint: tint.opacity(0.96),
-            strokeOpacity: 0.18,
-            tintOpacity: 0.06
-        )
-        .shadow(color: tint.opacity(0.24), radius: 16, x: 0, y: 6)
+        .orbPopupSurface(tint: tint, cornerRadius: 20)
         .padding(.horizontal, 4)
         .padding(.bottom, 6)
     }
@@ -1257,145 +1623,83 @@ private struct AssistantOrbHUDView: View {
         let orangeTint = Color(red: 0.95, green: 0.60, blue: 0.10)
 
         return VStack(spacing: 0) {
-            // Header
-            HStack {
-                Text(permissionHeaderTitle)
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .tracking(0.8)
-                    .foregroundStyle(.white.opacity(0.6))
-
-                Spacer()
-
-                Button {
-                    model.onCancelPermission?()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.5))
-                        .frame(width: 22, height: 22)
-                        .background(Circle().fill(Color.white.opacity(0.08)))
-                }
-                .buttonStyle(.plain)
+            OrbPopupHeader(
+                title: permissionHeaderTitle.lowercased().capitalized,
+                subtitle: "Review before the assistant continues",
+                symbol: "hand.raised.fill",
+                tint: orangeTint
+            ) {
+                model.onCancelPermission?()
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
 
-            Divider()
-                .overlay(Color.white.opacity(0.08))
+            OrbPopupDivider(tint: orangeTint)
+                .padding(.horizontal, 2)
 
             if let request = model.pendingPermissionRequest {
                 ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         Text(request.toolTitle)
-                            .font(.system(size: 13, weight: .semibold, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.92))
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.94))
 
                         if let rationale = request.rationale, !rationale.isEmpty {
                             Text(rationale)
                                 .font(.system(size: 11.5, weight: .medium, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.65))
-                                .lineLimit(3)
+                                .foregroundStyle(.white.opacity(0.70))
+                                .fixedSize(horizontal: false, vertical: true)
                         }
 
                         if let summary = request.rawPayloadSummary, !summary.isEmpty {
                             Text(summary)
                                 .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                .foregroundStyle(.white.opacity(0.55))
+                                .foregroundStyle(.white.opacity(0.58))
                                 .lineLimit(4)
-                                .padding(8)
+                                .padding(10)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(Color.white.opacity(0.04))
-                                )
+                                .orbInsetSurface(tint: orangeTint, cornerRadius: 14, fillOpacity: 0.08)
                         }
 
-                        // Permission option buttons
-                        VStack(spacing: 6) {
+                        VStack(spacing: 8) {
                             ForEach(request.options) { option in
-                                Button {
+                                OrbPermissionChoiceButton(
+                                    title: option.title,
+                                    tint: orangeTint,
+                                    isProminent: option.isDefault
+                                ) {
                                     model.onResolvePermission?(option.id)
-                                } label: {
-                                    Text(option.title)
-                                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                        .foregroundStyle(.white)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 7)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(
-                                                    option.isDefault
-                                                        ? orangeTint.opacity(0.35)
-                                                        : Color.white.opacity(0.08)
-                                                )
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .stroke(
-                                                    option.isDefault
-                                                        ? orangeTint.opacity(0.5)
-                                                        : Color.white.opacity(0.08),
-                                                    lineWidth: 0.5
-                                                )
-                                        )
                                 }
-                                .buttonStyle(.plain)
                             }
 
-                            // Always Allow button
                             if let toolKind = request.toolKind, !toolKind.isEmpty {
-                                Button {
+                                OrbPermissionChoiceButton(
+                                    title: "Always Allow",
+                                    tint: orangeTint,
+                                    isProminent: false,
+                                    icon: "checkmark.shield.fill"
+                                ) {
                                     model.onAlwaysAllowPermission?(toolKind)
                                     let sessionOption = request.options.first(where: { $0.id == "acceptForSession" })
                                         ?? request.options.first(where: { $0.isDefault })
                                     if let optionID = sessionOption?.id {
                                         model.onResolvePermission?(optionID)
                                     }
-                                } label: {
-                                    Text("Always Allow")
-                                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                        .foregroundStyle(orangeTint)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 7)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(orangeTint.opacity(0.10))
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .stroke(orangeTint.opacity(0.25), lineWidth: 0.5)
-                                        )
                                 }
-                                .buttonStyle(.plain)
                             }
                         }
 
-                        // Cancel request
-                        Button {
+                        OrbSecondaryActionButton(title: "Cancel Request", symbol: "xmark", tint: Color.white.opacity(0.55)) {
                             model.onCancelPermission?()
-                        } label: {
-                            Text("Cancel Request")
-                                .font(.system(size: 11, weight: .medium, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.4))
                         }
-                        .buttonStyle(.plain)
                         .frame(maxWidth: .infinity, alignment: .center)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
                 }
                 .frame(maxHeight: .infinity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: maxHeight)
-        .appThemedSurface(
-            cornerRadius: 14,
-            tint: orangeTint.opacity(0.96),
-            strokeOpacity: 0.18,
-            tintOpacity: 0.06
-        )
-        .shadow(color: orangeTint.opacity(0.24), radius: 16, x: 0, y: 6)
+        .orbPopupSurface(tint: orangeTint, cornerRadius: 20)
         .padding(.horizontal, 4)
         .padding(.bottom, 6)
     }
@@ -1406,44 +1710,41 @@ private struct AssistantOrbHUDView: View {
         VStack(spacing: 0) {
             sessionListSection
         }
-        .appThemedSurface(
-            cornerRadius: 14,
-            tint: AppVisualTheme.baseTint,
-            strokeOpacity: 0.18,
-            tintOpacity: 0.05
-        )
-        .shadow(color: Color.black.opacity(0.42), radius: 24, x: 0, y: 10)
-        .padding(.top, 6)
+        .orbPopupSurface(tint: AppVisualTheme.baseTint, cornerRadius: 18)
     }
 
     // MARK: Session List
 
     private var sessionListSection: some View {
-        Group {
+        VStack(spacing: 0) {
             // New session button
             Button(action: {
                 Task { await model.onNewSession?() }
             }) {
-                HStack(spacing: 8) {
-                    Image(systemName: "plus.circle")
-                        .font(.system(size: 12, weight: .semibold))
+                HStack(spacing: 10) {
+                    ZStack {
+                        Circle()
+                            .fill(AppVisualTheme.accentTint.opacity(0.18))
+                            .frame(width: 24, height: 24)
+                        Image(systemName: "plus")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(AppVisualTheme.accentTint)
+                    }
                     Text("New Session")
                         .font(.system(size: 12, weight: .semibold, design: .rounded))
                     Spacer()
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.35))
                 }
-                .foregroundStyle(.white.opacity(0.85))
+                .foregroundStyle(.white.opacity(0.88))
                 .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .appThemedSurface(
-                    cornerRadius: 10,
-                    tint: AppVisualTheme.accentTint,
-                    strokeOpacity: 0.14,
-                    tintOpacity: 0.035
-                )
+                .padding(.vertical, 10)
+                .orbInsetSurface(tint: AppVisualTheme.accentTint, cornerRadius: 14, fillOpacity: 0.10)
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 12)
-            .padding(.top, 10)
+            .padding(.top, 12)
 
             if model.showDoneDetail {
                 doneDetailPopup(maxHeight: 180, showsFollowUpComposer: false)
@@ -1452,7 +1753,11 @@ private struct AssistantOrbHUDView: View {
                 permissionPopup(maxHeight: 240)
                     .padding(.top, 8)
             } else if model.showWorkingDetail {
-                workingDetailPopup(maxHeight: 200, showsOpenButton: false)
+                workingDetailPopup(maxHeight: 200)
+                    .padding(.top, 8)
+            } else if let suggestion = model.modeSwitchSuggestion {
+                modeSwitchInlineCard(suggestion, tint: AppVisualTheme.accentTint)
+                    .padding(.horizontal, 12)
                     .padding(.top, 8)
             }
 
@@ -1470,139 +1775,158 @@ private struct AssistantOrbHUDView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 20)
             } else {
-                VStack(spacing: 2) {
-                    ForEach(model.sessions.prefix(5)) { session in
-                        OrbSessionRow(
-                            session: session,
-                            isSelected: session.id == model.selectedSessionID,
-                            isBusy: sessionMatches(session.id, model.busySessionID)
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) {
-                            model.onOpenSession?(session)
-                        }
-                        .onTapGesture(count: 1) {
-                            model.selectedSessionID = session.id
-                            model.onSessionSelected?(session)
+                ScrollView(.vertical, showsIndicators: model.sessions.count > 4) {
+                    VStack(spacing: 6) {
+                        ForEach(model.sessions.prefix(5)) { session in
+                            Button {
+                                let clickCount = NSApp.currentEvent?.clickCount ?? 1
+                                if clickCount >= 2 {
+                                    model.showFollowUpPreview(for: session)
+                                } else {
+                                    model.selectSessionForReply(session)
+                                }
+                            } label: {
+                                OrbSessionRow(
+                                    session: session,
+                                    isSelected: session.id == model.selectedSessionID,
+                                    isBusy: sessionMatches(session.id, model.busySessionID)
+                                )
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button {
+                                    model.onOpenSession?(session)
+                                } label: {
+                                    Label("Open Conversation", systemImage: "arrow.up.right.square")
+                                }
+
+                                Button {
+                                    model.showFollowUpPreview(for: session)
+                                } label: {
+                                    Label("Show Follow-Up", systemImage: "bubble.left.and.text.bubble.right")
+                                }
+                            }
                         }
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.top, 6)
                 }
-                .padding(.horizontal, 8)
-                .padding(.top, 6)
+                .frame(maxHeight: expandedSessionListMaxHeight)
             }
 
             // Target indicator
             if let name = model.targetSessionName {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.turn.right.down")
-                        .font(.system(size: 8, weight: .semibold))
-                    Text("Sending to: \(name)")
-                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                }
-                .foregroundStyle(.white.opacity(0.40))
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14)
-                .padding(.top, 6)
+                compactTargetIndicator(name: name)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
             }
 
             // Message input with inline mode + model picker
-            VStack(spacing: 5) {
-                HStack(spacing: 4) {
-                    ForEach(AssistantInteractionMode.allCases, id: \.self) { mode in
-                        inlineModeButton(mode)
-                    }
-                    Spacer()
-                    orbModelPicker
+            VStack(spacing: 6) {
+                if !model.attachments.isEmpty {
+                    orbAttachmentStrip(tint: glowColor)
                 }
 
-                HStack(spacing: 8) {
-                    TextField(
-                        model.isVoiceRecording ? "Listening..." : "Send a message...",
-                        text: $model.messageText
+                HStack(alignment: .center, spacing: 6) {
+                    orbAttachmentButton(tint: glowColor, size: 24)
+
+                    AssistantModePicker(selection: model.interactionMode, style: .micro) { mode in
+                        model.setInteractionMode(mode)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    orbModelPicker()
+                }
+
+                HStack(alignment: .center, spacing: 6) {
+                    orbComposerField(
+                        tint: AppVisualTheme.baseTint,
+                        placeholder: model.isVoiceRecording ? "Listening..." : "Send a message...",
+                        minHeight: 30,
+                        maxHeight: 34,
+                        cornerRadius: 13,
+                        fillOpacity: 0.055,
+                        submit: sendMessage
                     )
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.92))
-                    .focused($isTextFieldFocused)
-                    .onSubmit { sendMessage() }
-                    .disabled(model.isVoiceRecording)
+                    .layoutPriority(1)
 
-                    Button {
-                        if model.isVoiceRecording {
-                            model.onStopVoiceRecording?()
-                        } else {
-                            model.onStartVoiceRecording?()
+                    HStack(spacing: 5) {
+                        orbVoiceToggleButton(size: 20)
+
+                        OrbFloatingActionButton(
+                            symbol: "arrow.up",
+                            tint: glowColor,
+                            isEnabled: canSend && !model.isVoiceRecording,
+                            size: 20
+                        ) {
+                            sendMessage()
                         }
-                    } label: {
-                        Image(systemName: model.isVoiceRecording ? "mic.fill" : "mic")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(
-                                model.isVoiceRecording
-                                    ? Color(red: 0.0, green: 0.75, blue: 0.95)
-                                    : Color.white.opacity(0.45)
-                            )
-                            .frame(width: 24, height: 24)
-                            .scaleEffect(model.isVoiceRecording ? 1.15 : 1.0)
-                            .animation(
-                                model.isVoiceRecording
-                                    ? .easeInOut(duration: 0.6).repeatForever(autoreverses: true)
-                                    : .default,
-                                value: model.isVoiceRecording
-                            )
                     }
-                    .buttonStyle(.plain)
-
-                    Button(action: { sendMessage() }) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 20))
-                            .foregroundStyle(
-                                canSend ? glowColor : Color.white.opacity(0.25)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(Color.white.opacity(0.035))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                    .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
                             )
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend || model.isVoiceRecording)
+                    )
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .appThemedSurface(
-                cornerRadius: 10,
-                tint: AppVisualTheme.baseTint,
-                strokeOpacity: 0.12,
-                tintOpacity: 0.028
-            )
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .orbInsetSurface(tint: AppVisualTheme.baseTint, cornerRadius: 13, fillOpacity: 0.042)
             .padding(.horizontal, 12)
-            .padding(.top, 8)
-            .padding(.bottom, 12)
+            .padding(.top, 6)
+            .padding(.bottom, 6)
         }
     }
 
     // MARK: Helpers
 
-    private func inlineModeButton(_ mode: AssistantInteractionMode) -> some View {
-        let isActive = model.interactionMode == mode
-        let fg: Color = isActive ? .white.opacity(0.92) : .white.opacity(0.45)
-        let bg: Color = isActive ? mode.tint.opacity(0.28) : Color.white.opacity(0.06)
-        let stroke: Color = isActive ? mode.tint.opacity(0.30) : Color.clear
+    private func popupFollowUpComposerSection(
+        tint: Color,
+        placeholder: String,
+        enterHint: String,
+        submit: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 10) {
+            if let suggestion = model.modeSwitchSuggestion {
+                modeSwitchInlineCard(suggestion, tint: tint)
+            }
 
-        return Button { model.interactionMode = mode } label: {
-            Text(mode.orbLabel)
-                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
-                .foregroundStyle(fg)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(
-                    Capsule()
-                        .fill(bg)
-                        .overlay(Capsule().stroke(stroke, lineWidth: 0.5))
-                )
+            HStack(alignment: .center, spacing: 8) {
+                orbAttachmentButton(tint: tint, size: 28)
+                AssistantModePicker(selection: model.interactionMode, style: .compact) { mode in
+                    model.setInteractionMode(mode)
+                }
+                orbModelPicker(maxWidth: 138, showsLabel: true, tint: tint)
+                Spacer(minLength: 0)
+            }
+
+            if !model.attachments.isEmpty {
+                orbAttachmentStrip(tint: tint)
+            }
+
+            popupComposerCard(
+                tint: tint,
+                placeholder: placeholder,
+                submit: submit
+            )
         }
-        .buttonStyle(.plain)
     }
 
-    private var orbModelPicker: some View {
-        Menu {
+    private func orbModelPicker(
+        maxWidth: CGFloat = 74,
+        showsLabel: Bool = false,
+        tint: Color? = nil
+    ) -> some View {
+        let effectiveTint = tint ?? AppVisualTheme.accentTint
+        return Menu {
             ForEach(model.availableModels) { m in
                 Button {
                     model.onChooseModel?(m.id)
@@ -1613,78 +1937,104 @@ private struct AssistantOrbHUDView: View {
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "bolt.fill")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(AppVisualTheme.accentTint)
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(effectiveTint.opacity(0.9))
+                if showsLabel {
+                    Text("Model")
+                        .font(.system(size: 8.8, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.62))
+                }
                 Text(model.selectedModelSummary)
-                    .font(.system(size: 9, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.50))
+                    .font(.system(size: showsLabel ? 9.2 : 8.6, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(showsLabel ? 0.68 : 0.50))
                     .lineLimit(1)
+                    .truncationMode(.tail)
                 Image(systemName: "chevron.down")
-                    .font(.system(size: 6, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.22))
+                    .font(.system(size: 5, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.18))
             }
             .padding(.horizontal, 6)
-            .padding(.vertical, 3)
+            .padding(.vertical, 2.5)
             .background(
-                Capsule()
-                    .fill(Color.white.opacity(0.07))
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.04))
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
+                    )
             )
         }
         .menuStyle(.borderlessButton)
-        .fixedSize()
+        .frame(maxWidth: maxWidth)
         .disabled(model.availableModels.isEmpty)
     }
 
     private var canSend: Bool {
-        !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments.isEmpty
+    }
+
+    private var orbDropTypes: [UTType] {
+        [.fileURL, .image, .png, .jpeg]
+    }
+
+    private func compactTargetIndicator(name: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "arrow.turn.right.down")
+                .font(.system(size: 7.5, weight: .bold))
+            Text("To: \(name)")
+                .lineLimit(1)
+        }
+        .font(.system(size: 8.8, weight: .medium, design: .rounded))
+        .foregroundStyle(.white.opacity(0.54))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AppVisualTheme.accentTint.opacity(0.06))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
+                )
+        )
+    }
+
+    private func orbVoiceToggleButton(size: CGFloat = 24) -> some View {
+        AssistantPushToTalkButton(
+            isListening: model.isVoiceRecording,
+            level: CGFloat(model.level),
+            size: size
+        ) { isPressed in
+            if isPressed {
+                model.onStartVoiceRecording?()
+            } else if model.isVoiceRecording {
+                model.onStopVoiceRecording?()
+            }
+        }
     }
 
     private func handleOrbTap() {
-        if model.isExpanded {
-            model.collapse()
-            return
-        }
-
-        if model.showDoneDetail || model.pendingPermissionRequest != nil {
-            model.expand()
-            return
-        }
-
-        if model.showWorkingDetail {
-            model.expand()
-            return
-        }
-
-        if model.presentWorkingDetailIfAvailable() {
-            return
-        }
-
-        model.expand()
+        model.handleOrbTap()
     }
 
     private func sendDoneFollowUp() {
         let trimmed = model.messageText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard canSend else { return }
         model.onSendMessage?(trimmed, model.selectedSessionID)
         model.messageText = ""
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-            model.dismissDoneDetail()
-        }
+        model.dismissDoneDetail()
     }
 
     private func sendWorkingFollowUp() {
         let trimmed = model.messageText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard canSend else { return }
         model.onSendMessage?(trimmed, model.selectedSessionID)
         model.messageText = ""
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-            model.dismissWorkingDetail()
-        }
+        model.dismissWorkingDetail()
     }
 
     private func sendMessage() {
         let trimmed = model.messageText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard canSend else { return }
         if model.showDoneDetail {
             model.dismissDoneDetail()
         }
@@ -1693,6 +2043,162 @@ private struct AssistantOrbHUDView: View {
         }
         model.onSendMessage?(trimmed, model.selectedSessionID)
         model.collapse()
+    }
+
+    @ViewBuilder
+    private func orbComposerField(
+        tint: Color,
+        placeholder: String,
+        minHeight: CGFloat,
+        maxHeight: CGFloat,
+        cornerRadius: CGFloat = 18,
+        fillOpacity: Double = 0.11,
+        showsSurface: Bool = true,
+        submit: @escaping () -> Void
+    ) -> some View {
+        let textView = OrbComposerTextView(
+            text: $model.messageText,
+            placeholder: placeholder,
+            isEnabled: !model.isVoiceRecording,
+            shouldFocus: model.shouldFocusTextField,
+            onSubmit: submit,
+            onToggleMode: { model.cycleInteractionMode() },
+            onPasteAttachment: { attachment in
+                addAttachment(attachment)
+            }
+        )
+        .frame(minHeight: minHeight, maxHeight: maxHeight)
+        .onDrop(of: orbDropTypes, isTargeted: nil) { providers in
+            handleAttachmentDrop(providers)
+            return true
+        }
+
+        if showsSurface {
+            textView
+                .orbInsetSurface(tint: tint, cornerRadius: cornerRadius, fillOpacity: fillOpacity)
+        } else {
+            textView
+        }
+    }
+
+    private func popupComposerCard(
+        tint: Color,
+        placeholder: String,
+        submit: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 0) {
+            orbComposerField(
+                tint: tint,
+                placeholder: placeholder,
+                minHeight: 36,
+                maxHeight: 72,
+                cornerRadius: 18,
+                fillOpacity: 0.0,
+                showsSurface: false,
+                submit: submit
+            )
+            .padding(.horizontal, 2)
+            .padding(.top, 2)
+
+            OrbPopupDivider(tint: tint)
+                .padding(.horizontal, 10)
+
+            HStack(spacing: 8) {
+                Text(model.isVoiceRecording ? "Release to stop" : "Enter sends")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.52))
+                Spacer(minLength: 0)
+                orbVoiceToggleButton(size: 22)
+                OrbFloatingActionButton(
+                    symbol: "arrow.up",
+                    tint: tint,
+                    isEnabled: canSend && !model.isVoiceRecording,
+                    size: 26
+                ) {
+                    submit()
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .orbInsetSurface(tint: tint, cornerRadius: 20, fillOpacity: 0.08)
+    }
+
+    private func orbAttachmentStrip(tint: Color) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(model.attachments) { attachment in
+                    orbAttachmentChip(attachment, tint: tint)
+                }
+            }
+            .padding(.horizontal, 2)
+            .padding(.vertical, 1)
+        }
+    }
+
+    private func orbAttachmentChip(_ attachment: AssistantAttachment, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            if attachment.isImage, let nsImage = NSImage(data: attachment.data) {
+                Button {
+                    previewAttachment = attachment
+                } label: {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 20, height: 20)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            } else {
+                Image(systemName: "doc.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(tint.opacity(0.92))
+            }
+
+            Text(attachment.filename)
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.white.opacity(0.70))
+                .lineLimit(1)
+
+            Button {
+                removeAttachment(attachment)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.42))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.08))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(tint.opacity(0.16), lineWidth: 0.6)
+                )
+        )
+    }
+
+    private func orbAttachmentButton(tint: Color, size: CGFloat = 34) -> some View {
+        OrbIconControlButton(symbol: "paperclip", tint: tint, size: size) {
+            model.onOpenAttachmentPicker?()
+        }
+    }
+
+    private func addAttachment(_ attachment: AssistantAttachment) {
+        model.onAddAttachment?(attachment)
+    }
+
+    private func removeAttachment(_ attachment: AssistantAttachment) {
+        model.onRemoveAttachment?(attachment.id)
+    }
+
+    private func handleAttachmentDrop(_ providers: [NSItemProvider]) {
+        AssistantAttachmentSupport.handleDrop(providers) { attachment in
+            addAttachment(attachment)
+        }
     }
 
     private var permissionHeaderTitle: String {
@@ -1708,12 +2214,18 @@ private struct AssistantOrbHUDView: View {
         switch model.state.phase {
         case .idle: return "Ready"
         case .listening: return "Listening"
-        case .thinking: return "Thinking"
-        case .acting: return "Working"
-        case .waitingForPermission: return "Waiting"
-        case .streaming: return "Streaming"
         case .success: return "Done"
         case .failed: return "Error"
+        case .thinking, .acting, .waitingForPermission, .streaming:
+            let title = model.state.title
+            if !title.isEmpty { return title }
+            switch model.state.phase {
+            case .thinking: return "Thinking"
+            case .acting: return "Working"
+            case .waitingForPermission: return "Needs Approval"
+            case .streaming: return "Responding"
+            default: return "Working"
+            }
         }
     }
 
@@ -1730,22 +2242,465 @@ private struct AssistantOrbHUDView: View {
     }
 }
 
-@MainActor
-private extension AssistantInteractionMode {
-    var orbLabel: String {
-        switch self {
-        case .conversational: return "Chat"
-        case .plan: return "Plan"
-        case .agentic: return "Agentic"
+private struct OrbPopupHeader: View {
+    let title: String
+    let subtitle: String
+    let symbol: String
+    let tint: Color
+    var onOpenMainWindow: (() -> Void)?
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(tint.opacity(0.16))
+                        .frame(width: 28, height: 28)
+                    Image(systemName: symbol)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(tint)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                        .tracking(0.8)
+                        .textCase(.uppercase)
+                        .foregroundStyle(.white.opacity(0.88))
+
+                    Text(subtitle)
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer()
+
+            if let onOpenMainWindow {
+                Button(action: onOpenMainWindow) {
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.06))
+                                .overlay(
+                                    Circle()
+                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.62))
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Circle()
+                            .fill(Color.white.opacity(0.06))
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                            )
+                    )
+            }
+            .buttonStyle(.plain)
         }
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+    }
+}
+
+private struct OrbPopupDivider: View {
+    let tint: Color
+
+    var body: some View {
+        Rectangle()
+            .fill(
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(0.04),
+                        tint.opacity(0.24),
+                        Color.white.opacity(0.04)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            )
+            .frame(height: 1)
+    }
+}
+
+private struct OrbInlinePill: View {
+    let text: String
+    var symbol: String? = nil
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let symbol {
+                Image(systemName: symbol)
+                    .font(.system(size: 8, weight: .bold))
+            }
+
+            Text(text)
+                .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                .lineLimit(1)
+        }
+        .foregroundStyle(.white.opacity(0.62))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(tint.opacity(0.10))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                )
+        )
+    }
+}
+
+private struct OrbFloatingActionButton: View {
+    let symbol: String
+    let tint: Color
+    let isEnabled: Bool
+    var size: CGFloat = 42
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: isEnabled
+                                ? [tint.opacity(0.96), tint.opacity(0.58)]
+                                : [Color.white.opacity(0.10), Color.white.opacity(0.06)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                Circle()
+                    .stroke(Color.white.opacity(isEnabled ? 0.18 : 0.08), lineWidth: 0.8)
+
+                Image(systemName: symbol)
+                    .font(.system(size: max(10, size * 0.33), weight: .bold))
+                    .foregroundStyle(isEnabled ? Color.black.opacity(0.78) : Color.white.opacity(0.32))
+            }
+            .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+    }
+}
+
+private struct OrbSecondaryActionButton: View {
+    let title: String
+    var symbol: String? = nil
+    let tint: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if let symbol {
+                    Image(systemName: symbol)
+                        .font(.system(size: 9, weight: .semibold))
+                }
+
+                Text(title)
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+            }
+            .foregroundStyle(tint)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(tint.opacity(0.12))
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(tint.opacity(0.18), lineWidth: 0.6)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct OrbIconControlButton: View {
+    let symbol: String
+    let tint: Color
+    var isActive = false
+    var size: CGFloat = 34
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: isActive
+                                ? [tint.opacity(0.26), tint.opacity(0.12)]
+                                : [Color.white.opacity(0.08), Color.white.opacity(0.04)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                Circle()
+                    .stroke(isActive ? tint.opacity(0.30) : Color.white.opacity(0.08), lineWidth: 0.6)
+
+                Image(systemName: symbol)
+                    .font(.system(size: max(10, size * 0.4), weight: .semibold))
+                    .foregroundStyle(isActive ? tint : Color.white.opacity(0.52))
+            }
+            .frame(width: size, height: size)
+            .scaleEffect(isActive ? 1.06 : 1.0)
+            .animation(
+                isActive
+                    ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true)
+                    : .default,
+                value: isActive
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct OrbPermissionChoiceButton: View {
+    let title: String
+    let tint: Color
+    let isProminent: Bool
+    var icon: String? = nil
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.system(size: 10, weight: .semibold))
+                }
+
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(isProminent ? Color.white : tint)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: isProminent
+                                ? [tint.opacity(0.38), tint.opacity(0.20)]
+                                : [tint.opacity(0.12), Color.white.opacity(0.05)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(isProminent ? tint.opacity(0.42) : Color.white.opacity(0.08), lineWidth: 0.6)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct OrbStatusCapsuleBackground: View {
+    let tint: Color
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+
+        Capsule(style: .continuous)
+            .fill(
+                LinearGradient(
+                    colors: [
+                        tokens.surfaceTop.opacity(0.54),
+                        tint.opacity(0.14),
+                        tokens.surfaceBottom.opacity(0.90)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+            .overlay {
+                if tokens.useMaterial {
+                    Capsule(style: .continuous)
+                        .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
+                        .opacity(0.36)
+                }
+            }
+            .overlay(
+                RadialGradient(
+                    colors: [
+                        tint.opacity(0.18),
+                        Color.clear
+                    ],
+                    center: .topLeading,
+                    startRadius: 6,
+                    endRadius: 100
+                )
+                .clipShape(Capsule(style: .continuous))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(tokens.strokeTop.opacity(0.18), lineWidth: 0.55)
+            )
+    }
+}
+
+private struct OrbPopupSurfaceModifier: ViewModifier {
+    let tint: Color
+    let cornerRadius: CGFloat
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+
+        return content
+            .background {
+                ZStack {
+                    shape
+                        .fill(tokens.surfaceBottom.opacity(reduceTransparency ? 0.96 : 0.80))
+
+                    if tokens.useMaterial {
+                        shape
+                            .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
+                            .opacity(0.74)
+                    }
+
+                    shape
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.10),
+                                    tint.opacity(0.12),
+                                    Color.black.opacity(0.18)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+
+                    shape
+                        .fill(
+                            RadialGradient(
+                                colors: [
+                                    tint.opacity(0.24),
+                                    Color.clear
+                                ],
+                                center: .topLeading,
+                                startRadius: 8,
+                                endRadius: 240
+                            )
+                        )
+
+                    shape
+                        .fill(
+                            RadialGradient(
+                                colors: [
+                                    AppVisualTheme.baseTint.opacity(0.18),
+                                    Color.clear
+                                ],
+                                center: .bottomTrailing,
+                                startRadius: 12,
+                                endRadius: 260
+                            )
+                        )
+                }
+            }
+            .clipShape(shape)
+            .overlay {
+                shape
+                    .stroke(tokens.strokeTop.opacity(0.34), lineWidth: 0.9)
+                    .overlay(
+                        shape
+                            .stroke(Color.black.opacity(0.24), lineWidth: 0.5)
+                            .blur(radius: 0.3)
+                    )
+            }
+    }
+}
+
+private struct OrbInsetSurfaceModifier: ViewModifier {
+    let tint: Color
+    let cornerRadius: CGFloat
+    let fillOpacity: Double
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+
+        return content
+            .background {
+                ZStack {
+                    shape
+                        .fill(Color.white.opacity(fillOpacity * 0.70))
+
+                    if !reduceTransparency {
+                        shape
+                            .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
+                            .opacity(0.18)
+                    }
+
+                    shape
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    tint.opacity(fillOpacity),
+                                    Color.clear,
+                                    Color.black.opacity(fillOpacity * 0.40)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                }
+            }
+            .clipShape(shape)
+            .overlay {
+                shape
+                    .stroke(Color.white.opacity(0.08), lineWidth: 0.6)
+                    .overlay(
+                        shape
+                            .stroke(tint.opacity(0.14), lineWidth: 0.5)
+                    )
+            }
+    }
+}
+
+private extension View {
+    func orbPopupSurface(tint: Color, cornerRadius: CGFloat = 18) -> some View {
+        modifier(OrbPopupSurfaceModifier(tint: tint, cornerRadius: cornerRadius))
     }
 
-    var tint: Color {
-        switch self {
-        case .conversational: return .blue
-        case .plan: return .orange
-        case .agentic: return AppVisualTheme.accentTint
-        }
+    func orbInsetSurface(tint: Color, cornerRadius: CGFloat = 14, fillOpacity: Double = 0.08) -> some View {
+        modifier(OrbInsetSurfaceModifier(tint: tint, cornerRadius: cornerRadius, fillOpacity: fillOpacity))
     }
 }
 
@@ -1757,19 +2712,19 @@ private struct OrbSessionRow: View {
     let isBusy: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             leadingIndicator
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(session.title.isEmpty ? "Untitled Session" : session.title)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.90))
+                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.92))
                     .lineLimit(1)
 
                 if !session.subtitle.isEmpty {
                     Text(session.subtitle)
                         .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.48))
+                        .foregroundStyle(.white.opacity(0.54))
                         .lineLimit(1)
                 }
             }
@@ -1782,21 +2737,25 @@ private struct OrbSessionRow: View {
                     .foregroundStyle(.white.opacity(0.60))
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
         .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(
-                    isSelected
-                    ? AppVisualTheme.rowSelection.opacity(0.78)
-                    : AppVisualTheme.panelTint.opacity(0.34)
+                    LinearGradient(
+                        colors: isSelected
+                            ? [AppVisualTheme.rowSelection.opacity(0.82), AppVisualTheme.rowSelection.opacity(0.46)]
+                            : [AppVisualTheme.panelTint.opacity(0.42), AppVisualTheme.panelTint.opacity(0.28)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .stroke(
                             isSelected
-                            ? AppVisualTheme.accentTint.opacity(0.26)
-                            : Color.white.opacity(0.05),
+                                ? AppVisualTheme.accentTint.opacity(0.30)
+                                : Color.white.opacity(0.07),
                             lineWidth: 0.6
                         )
                 )
@@ -1811,7 +2770,7 @@ private struct OrbSessionRow: View {
         } else {
             Circle()
                 .fill(statusColor)
-                .frame(width: 6, height: 6)
+                .frame(width: 7, height: 7)
         }
     }
 
@@ -1839,35 +2798,38 @@ private struct BusySessionIndicator: View {
 
 private struct OrbWorkingActivityRow: View {
     let item: AssistantToolCallState
+    let tint: Color
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Circle()
-                .fill(statusTint)
-                .frame(width: 7, height: 7)
-                .padding(.top, 5)
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(statusTint.opacity(0.18))
+                    .frame(width: 20, height: 20)
+                Circle()
+                    .fill(statusTint)
+                    .frame(width: 7, height: 7)
+            }
+            .padding(.top, 1)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(item.title)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.88))
+                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.90))
 
                 if let detail = (item.hudDetail ?? item.detail)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
                     Text(detail)
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.58))
+                        .foregroundStyle(.white.opacity(0.62))
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
             Spacer(minLength: 0)
         }
-        .padding(10)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(Color.white.opacity(0.04))
-        )
+        .orbInsetSurface(tint: tint, cornerRadius: 14, fillOpacity: 0.08)
     }
 
     private var statusTint: Color {
@@ -1885,14 +2847,18 @@ private struct OrbWorkingActivityRow: View {
 private struct OrbComposerTextView: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
+    var isEnabled: Bool = true
+    var shouldFocus: Bool = false
     var onSubmit: () -> Void
+    var onToggleMode: (() -> Void)? = nil
+    var onPasteAttachment: ((AssistantAttachment) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = OrbComposerScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
@@ -1902,20 +2868,26 @@ private struct OrbComposerTextView: NSViewRepresentable {
         let textView = OrbSubmittableTextView()
         textView.isRichText = false
         textView.allowsUndo = true
-        textView.font = .systemFont(ofSize: 12, weight: .regular)
+        textView.font = .systemFont(ofSize: 12.5, weight: .regular)
         textView.textColor = NSColor.white.withAlphaComponent(0.92)
+        textView.insertionPointColor = NSColor.white.withAlphaComponent(0.90)
         textView.backgroundColor = .clear
         textView.drawsBackground = false
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.isEditable = true
         textView.isSelectable = true
-        textView.textContainerInset = NSSize(width: 10, height: 8)
-        textView.textContainer?.lineFragmentPadding = 3
+        textView.textContainerInset = NSSize(width: 12, height: 7)
+        textView.textContainer?.lineFragmentPadding = 2
         textView.textContainer?.widthTracksTextView = true
         textView.delegate = context.coordinator
+        textView.isEditable = isEnabled
+        textView.isSelectable = isEnabled
         textView.onSubmit = onSubmit
+        textView.onToggleMode = onToggleMode
+        textView.onPasteAttachment = onPasteAttachment
         textView.placeholder = placeholder
+        AssistantComposerBridge.shared.register(textView: textView, target: .assistantOrb)
 
         scrollView.documentView = textView
         return scrollView
@@ -1923,17 +2895,35 @@ private struct OrbComposerTextView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? OrbSubmittableTextView else { return }
+        AssistantComposerBridge.shared.register(textView: textView, target: .assistantOrb)
         if textView.string != text {
             let selectedRanges = textView.selectedRanges
             textView.string = text
             textView.selectedRanges = selectedRanges
         }
+        textView.isEditable = isEnabled
+        textView.isSelectable = isEnabled
+        textView.onSubmit = onSubmit
+        textView.onToggleMode = onToggleMode
+        textView.onPasteAttachment = onPasteAttachment
         textView.placeholder = placeholder
         textView.needsDisplay = true
+
+        if shouldFocus {
+            if !context.coordinator.didHandleFocusRequest {
+                context.coordinator.didHandleFocusRequest = true
+                DispatchQueue.main.async {
+                    textView.window?.makeFirstResponder(textView)
+                }
+            }
+        } else {
+            context.coordinator.didHandleFocusRequest = false
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         let parent: OrbComposerTextView
+        var didHandleFocusRequest = false
 
         init(parent: OrbComposerTextView) {
             self.parent = parent
@@ -1947,9 +2937,34 @@ private struct OrbComposerTextView: NSViewRepresentable {
     }
 }
 
+private final class OrbComposerScrollView: NSScrollView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let textView = documentView as? NSTextView, textView.isEditable else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        window?.makeFirstResponder(textView)
+        let insertionPoint = textView.string.utf16.count
+        textView.setSelectedRange(NSRange(location: insertionPoint, length: 0))
+        textView.scrollRangeToVisible(textView.selectedRange())
+        textView.needsDisplay = true
+    }
+}
+
 private final class OrbSubmittableTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    var onToggleMode: (() -> Void)?
+    var onPasteAttachment: ((AssistantAttachment) -> Void)?
     var placeholder: String = ""
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -1957,11 +2972,11 @@ private final class OrbSubmittableTextView: NSTextView {
         guard string.isEmpty, !placeholder.isEmpty else { return }
 
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: font ?? NSFont.systemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.32)
+            .font: font ?? NSFont.systemFont(ofSize: 12.5, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.38)
         ]
         let placeholderRect = NSRect(
-            x: textContainerInset.width + 2,
+            x: textContainerInset.width + 1,
             y: textContainerInset.height + 1,
             width: bounds.width - (textContainerInset.width * 2) - 4,
             height: bounds.height - (textContainerInset.height * 2)
@@ -1969,12 +2984,33 @@ private final class OrbSubmittableTextView: NSTextView {
         NSString(string: placeholder).draw(in: placeholderRect, withAttributes: attributes)
     }
 
+    override func mouseDown(with event: NSEvent) {
+        if isEditable {
+            window?.makeFirstResponder(self)
+        }
+        super.mouseDown(with: event)
+        needsDisplay = true
+    }
+
+    override func paste(_ sender: Any?) {
+        if let attachment = AssistantAttachmentSupport.attachment(fromPasteboard: NSPasteboard.general) {
+            onPasteAttachment?(attachment)
+            return
+        }
+        super.paste(sender)
+    }
+
     override func keyDown(with event: NSEvent) {
         let isReturn = event.keyCode == 36
         let isShift = event.modifierFlags.contains(.shift)
+        let isTab = event.keyCode == 48
 
         if isReturn && !isShift {
             onSubmit?()
+            return
+        }
+        if isTab && isShift {
+            onToggleMode?()
             return
         }
 
@@ -1990,115 +3026,128 @@ private struct OrbSphere: View {
     let level: CGFloat
     let time: TimeInterval
 
-    private let sphereSize: CGFloat = 42
+    private let sphereSize: CGFloat = 48
+    private let containerSize: CGFloat = 64
 
     var body: some View {
         let pulse = pulseScale
         let c = colors
         let speed = animSpeed
+        let motion = motionAmplitude
+        let highlightTravel = highlightTravelDistance
 
         ZStack {
-            // 1 — Wide ambient glow
             Circle()
                 .fill(
                     RadialGradient(
                         colors: [
-                            c.primary.opacity(0.60),
-                            c.secondary.opacity(0.30),
-                            c.accent.opacity(0.12),
+                            c.primary.opacity(0.44),
+                            c.secondary.opacity(0.18),
                             Color.clear
                         ],
                         center: .center,
-                        startRadius: 4,
-                        endRadius: 46
+                        startRadius: 6,
+                        endRadius: 28
                     )
                 )
-                .frame(width: 90, height: 90)
-                .blur(radius: 18)
-                .scaleEffect(pulse * 1.08)
+                .frame(width: containerSize, height: containerSize)
+                .blur(radius: 10)
+                .scaleEffect((1.02 + ((pulse - 1.0) * 0.65)) * glowBreathingScale)
 
-            // 2 — Luminous color-filled base + flowing blobs (Siri-style)
             ZStack {
-                // Colored base instead of dark — mid-tone of primary
-                Circle().fill(
-                    RadialGradient(
-                        colors: [
-                            c.primary.opacity(0.70),
-                            c.secondary.opacity(0.50),
-                            c.primary.opacity(0.35)
-                        ],
-                        center: .center,
-                        startRadius: 0,
-                        endRadius: 24
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.black.opacity(0.36),
+                                c.secondary.opacity(0.58),
+                                c.primary.opacity(0.82)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
                     )
-                )
 
-                // Primary blob — large, saturated
                 Circle()
                     .fill(
                         RadialGradient(
-                            colors: [c.primary, c.primary.opacity(0.50), Color.clear],
+                            colors: [Color.white.opacity(0.20), c.primary.opacity(0.72), Color.clear],
+                            center: UnitPoint(
+                                x: 0.42 + (sin(time * speed * 0.26) * highlightTravel * 1.4),
+                                y: 0.34 + (cos(time * speed * 0.20) * highlightTravel * 1.1)
+                            ),
+                            startRadius: 0,
+                            endRadius: 24
+                        )
+                    )
+                    .frame(width: 44, height: 44)
+                    .offset(
+                        x: CGFloat(sin(time * speed * 0.33)) * motion * 0.88,
+                        y: CGFloat(cos(time * speed * 0.24)) * motion * 0.62
+                    )
+                    .blur(radius: 7.0)
+
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [c.secondary.opacity(0.94), c.accent.opacity(0.22), Color.clear],
                             center: .center,
                             startRadius: 0,
                             endRadius: 22
                         )
                     )
-                    .frame(width: 40, height: 40)
+                    .frame(width: 36, height: 36)
                     .offset(
-                        x: CGFloat(sin(time * speed * 0.35)) * 7,
-                        y: CGFloat(cos(time * speed * 0.25)) * 7
+                        x: CGFloat(cos(time * speed * 0.50)) * motion * 0.78,
+                        y: CGFloat(sin(time * speed * 0.38)) * motion * 0.54
                     )
+                    .blur(radius: 6.0)
+
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [Color.white.opacity(0.26), c.accent.opacity(0.22), Color.clear],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 16
+                        )
+                    )
+                    .frame(width: 28, height: 28)
+                    .offset(
+                        x: CGFloat(sin(time * speed * 0.62)) * motion * 0.58,
+                        y: CGFloat(cos(time * speed * 0.46)) * motion * 0.64
+                    )
+                    .blur(radius: 4.8)
+
+                Ellipse()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.black.opacity(0.26),
+                                Color.clear
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .frame(width: 30, height: 16)
+                    .offset(y: 14)
                     .blur(radius: 6)
 
-                // Secondary blob
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [c.secondary.opacity(0.95), c.secondary.opacity(0.30), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 18
-                        )
-                    )
-                    .frame(width: 32, height: 32)
-                    .offset(
-                        x: CGFloat(cos(time * speed * 0.55)) * 8,
-                        y: CGFloat(sin(time * speed * 0.40)) * 6
-                    )
-                    .blur(radius: 5)
-
-                // Accent blob
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [c.accent.opacity(0.85), c.accent.opacity(0.20), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 14
-                        )
-                    )
-                    .frame(width: 26, height: 26)
-                    .offset(
-                        x: CGFloat(sin(time * speed * 0.70)) * 6,
-                        y: CGFloat(cos(time * speed * 0.50)) * 7
-                    )
-                    .blur(radius: 4)
-
-                // Bright highlight wash — adds luminosity
                 Circle()
                     .fill(
                         RadialGradient(
                             colors: [
-                                Color.white.opacity(0.20),
-                                c.primary.opacity(0.15),
+                                Color.white.opacity(0.26),
+                                Color.white.opacity(0.08),
                                 Color.clear
                             ],
                             center: UnitPoint(
-                                x: 0.5 + sin(time * speed * 0.2) * 0.15,
-                                y: 0.5 + cos(time * speed * 0.15) * 0.15
+                                x: 0.34 + sin(time * speed * 0.18) * highlightTravel,
+                                y: 0.28 + cos(time * speed * 0.14) * highlightTravel
                             ),
                             startRadius: 0,
-                            endRadius: 20
+                            endRadius: 24
                         )
                     )
                     .frame(width: sphereSize, height: sphereSize)
@@ -2106,24 +3155,22 @@ private struct OrbSphere: View {
             .frame(width: sphereSize, height: sphereSize)
             .clipShape(Circle())
 
-            // 3 — Glass inner glow (additive)
             Circle()
                 .fill(
                     RadialGradient(
                         colors: [
-                            Color.white.opacity(0.38),
-                            Color.white.opacity(0.10),
+                            Color.white.opacity(0.32),
+                            Color.white.opacity(0.08),
                             Color.clear
                         ],
                         center: UnitPoint(x: 0.36, y: 0.28),
                         startRadius: 0,
-                        endRadius: 18
+                        endRadius: 20
                     )
                 )
                 .frame(width: sphereSize, height: sphereSize)
                 .blendMode(.screen)
 
-            // 4 — Specular catch-light
             Circle()
                 .fill(
                     RadialGradient(
@@ -2134,66 +3181,145 @@ private struct OrbSphere: View {
                         ],
                         center: UnitPoint(x: 0.30, y: 0.22),
                         startRadius: 0,
-                        endRadius: 9
+                        endRadius: 10
                     )
                 )
                 .frame(width: sphereSize, height: sphereSize)
+                .offset(x: -1, y: -1)
 
-            // 5 — Edge ring with color
             Circle()
-                .stroke(
+                .strokeBorder(
                     AngularGradient(
                         colors: [
-                            c.primary.opacity(0.30),
-                            Color.white.opacity(0.22),
-                            c.secondary.opacity(0.25),
-                            Color.white.opacity(0.15),
-                            c.primary.opacity(0.30)
+                            c.primary.opacity(0.42),
+                            Color.white.opacity(0.28),
+                            c.secondary.opacity(0.30),
+                            Color.white.opacity(0.14),
+                            c.primary.opacity(0.42)
                         ],
                         center: .center
+                    ),
+                    lineWidth: 1.0
+                )
+                .frame(width: sphereSize, height: sphereSize)
+                .rotationEffect(rimRotation)
+
+            Circle()
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.18),
+                            Color.clear,
+                            Color.black.opacity(0.20)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
                     ),
                     lineWidth: 0.8
                 )
                 .frame(width: sphereSize, height: sphereSize)
         }
-        .shadow(color: c.primary.opacity(0.60), radius: 16, x: 0, y: 3)
+        .frame(width: containerSize, height: containerSize)
+        .offset(y: floatOffset)
         .scaleEffect(pulse)
     }
 
     // MARK: Animation
 
+    private var floatOffset: CGFloat {
+        switch phase {
+        case .thinking: return CGFloat(sin(time * 2.4)) * 1.2
+        case .acting: return CGFloat(sin(time * 2.8)) * 1.0
+        case .streaming: return CGFloat(sin(time * 2.6)) * 1.1
+        case .listening: return CGFloat(sin(time * 2.0)) * 0.8
+        default: return 0
+        }
+    }
+
     private var pulseScale: CGFloat {
         switch phase {
         case .idle:
-            return 1.0 + CGFloat(sin(time * 1.2)) * 0.008
+            return 1.0
         case .listening:
-            return 1.0 + level * 0.10 + CGFloat(sin(time * 2.0)) * 0.015
+            return 1.0 + min(level * 0.055, 0.055) + CGFloat(sin(time * 1.6)) * 0.008
         case .thinking:
-            return 1.0 + CGFloat(sin(time * 1.6)) * 0.025
+            return 1.0 + CGFloat(sin(time * 2.5)) * 0.018
         case .acting:
-            return 1.01 + CGFloat(sin(time * 2.2)) * 0.02
+            return 1.002 + CGFloat(sin(time * 3.0)) * 0.020
         case .waitingForPermission:
-            return 0.99 + CGFloat(sin(time * 0.9)) * 0.02
+            return 1.0 + CGFloat(sin(time * 0.8)) * 0.006
         case .streaming:
-            return 1.005 + CGFloat(sin(time * 1.8)) * 0.02
+            return 1.002 + CGFloat(sin(time * 2.7)) * 0.016
         case .success:
-            return 1.02
+            return 1.008 + CGFloat(sin(time * 0.7)) * 0.003
         case .failed:
-            return 1.0 + CGFloat(sin(time * 4.0)) * 0.015
+            return 1.0 + CGFloat(sin(time * 2.2)) * 0.010
         }
     }
 
     /// Controls how fast the internal blobs drift.
     private var animSpeed: Double {
         switch phase {
-        case .idle: return 1.0
-        case .listening: return 2.4
-        case .thinking: return 1.8
-        case .acting: return 3.0
-        case .waitingForPermission: return 0.8
-        case .streaming: return 2.2
-        case .success: return 1.2
-        case .failed: return 4.0
+        case .idle: return 0.0
+        case .listening: return 1.35 + Double(min(level, 1)) * 0.55
+        case .thinking: return 1.05
+        case .acting: return 1.45
+        case .waitingForPermission: return 0.55
+        case .streaming: return 1.20
+        case .success: return 0.80
+        case .failed: return 1.65
+        }
+    }
+
+    private var motionAmplitude: CGFloat {
+        switch phase {
+        case .idle:
+            return 0.0
+        case .listening:
+            return 3.2 + min(level * 1.4, 1.4)
+        case .thinking:
+            return 2.9
+        case .acting:
+            return 3.4
+        case .waitingForPermission:
+            return 2.1
+        case .streaming:
+            return 3.0
+        case .success:
+            return 2.0
+        case .failed:
+            return 2.8
+        }
+    }
+
+    private var highlightTravelDistance: CGFloat {
+        switch phase {
+        case .idle:
+            return 0.0
+        case .success:
+            return 0.04
+        case .listening, .acting, .streaming:
+            return 0.06
+        case .thinking, .waitingForPermission, .failed:
+            return 0.05
+        }
+    }
+
+    private var glowBreathingScale: CGFloat {
+        switch phase {
+        case .thinking: return 1.0 + CGFloat(sin(time * 2.8)) * 0.05
+        case .acting: return 1.0 + CGFloat(sin(time * 3.2)) * 0.05
+        case .streaming: return 1.0 + CGFloat(sin(time * 3.0)) * 0.04
+        default: return 1.0
+        }
+    }
+
+    private var rimRotation: Angle {
+        switch phase {
+        case .thinking: return .degrees(time * 30)
+        case .acting: return .degrees(time * 40)
+        case .streaming: return .degrees(time * 35)
+        default: return .zero
         }
     }
 
