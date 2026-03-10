@@ -1144,6 +1144,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             lastExternalApplication = frontmost
         }
 
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+
         accessibilityTrustObserver = NotificationCenter.default.addObserver(
             forName: SettingsStore.accessibilityTrustDidBecomeGrantedNotification,
             object: settings,
@@ -1363,6 +1370,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         updatePermissionGate(openOnboardingIfNeeded: true)
+    }
+
+    @objc private func systemDidWake(_ notification: Notification) {
+        // Delay 500ms to allow the accessibility event server and
+        // WindowServer session to fully reinitialize after wake.
+        // Without this, AXIsProcessTrusted() may transiently return
+        // false, causing stopPermissionDependentFeatures() to fire
+        // and discarding any in-flight transcript.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.updatePermissionGate(
+                openOnboardingIfNeeded: false,
+                reconfigureHotkeysIfReady: true
+            )
+        }
     }
 
     func checkForUpdatesFromSettings() {
@@ -2132,6 +2153,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         continuousToggleHotkeyManager?.stop()
         continuousToggleHotkeyManager = nil
         guard permissionsReady else { return }
+
+        // If a recording is active, stop it cleanly before destroying
+        // the manager that would otherwise deliver the onStop callback.
+        if isDictating {
+            stopRecording()
+            dictationInputMode = .idle
+        }
 
         hotkeyManager = HoldToTalkManager(
             keyCode: settings.shortcutKeyCode,
