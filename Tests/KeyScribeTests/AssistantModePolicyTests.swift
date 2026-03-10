@@ -117,10 +117,23 @@ final class AssistantModePolicyTests: XCTestCase {
                 toolName: "computer_use"
             )
         )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .conversational,
+                activityKind: .dynamicToolCall,
+                toolName: "web_lookup"
+            )
+        )
         XCTAssertFalse(
             AssistantModePolicy.isAllowed(
                 mode: .conversational,
                 activityKind: .subagent
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .conversational,
+                activityKind: .other
             )
         )
         XCTAssertTrue(

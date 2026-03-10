@@ -7,6 +7,13 @@ enum AssistantCommandSafetyClass: Equatable, Sendable {
 }
 
 enum AssistantModePolicy {
+    private static func normalizedToolName(_ toolName: String?) -> String? {
+        toolName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nonEmpty
+    }
+
     static func commandSafetyClass(for command: String) -> AssistantCommandSafetyClass {
         let normalized = normalize(command)
         guard !normalized.isEmpty else { return .mutatingOrUnknown }
@@ -74,13 +81,19 @@ enum AssistantModePolicy {
             }
         case .webSearch:
             return true
-        case .fileChange, .browserAutomation, .mcpToolCall, .dynamicToolCall, .subagent:
-            _ = toolName
+        case .dynamicToolCall:
+            switch mode {
+            case .conversational:
+                return normalizedToolName(toolName) != "computer_use"
+            case .plan, .agentic:
+                return true
+            }
+        case .fileChange, .browserAutomation, .mcpToolCall, .subagent:
             return false
         case .reasoning:
             return true
         case .other:
-            return false
+            return true
         }
     }
 

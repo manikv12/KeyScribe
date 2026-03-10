@@ -788,6 +788,10 @@ final class AssistantStore: ObservableObject {
     @Published var interactionMode: AssistantInteractionMode = .conversational {
         didSet {
             refreshModeSwitchSuggestion()
+            guard oldValue != interactionMode else { return }
+            Task { @MainActor [weak self] in
+                await self?.refreshCurrentSessionConfigurationForModeChange()
+            }
         }
     }
     @Published private(set) var proposedPlan: String?
@@ -2177,6 +2181,18 @@ final class AssistantStore: ObservableObject {
         runtime.interactionMode = interactionMode
         runtime.maxToolCallsPerTurn = settings.assistantMaxToolCallsPerTurn
         runtime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn
+    }
+
+    private func refreshCurrentSessionConfigurationForModeChange() async {
+        guard !runtime.hasActiveTurn,
+              let sessionID = runtime.currentSessionID?.nonEmpty else {
+            return
+        }
+
+        try? await runtime.refreshCurrentSessionConfiguration(
+            cwd: resolvedSessionCWD(for: sessionID),
+            preferredModelID: selectedModelID
+        )
     }
 
     private func applyPreferredModelSelection(using models: [AssistantModelOption]) {

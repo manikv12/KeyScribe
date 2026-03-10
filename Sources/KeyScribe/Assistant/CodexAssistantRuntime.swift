@@ -311,6 +311,23 @@ final class CodexAssistantRuntime {
         updateHUD(phase: .idle, title: "Thread ready", detail: nil)
     }
 
+    func refreshCurrentSessionConfiguration(cwd: String?, preferredModelID: String? = nil) async throws {
+        guard let activeSessionID else { return }
+        try await ensureTransport()
+        _ = try await sendRequest(
+            method: "thread/resume",
+            params: threadResumeParams(
+                threadID: activeSessionID,
+                cwd: cwd,
+                modelID: preferredModelID ?? self.preferredModelID
+            )
+        )
+        onHealthUpdate?(makeHealth(
+            availability: activeTurnID == nil ? .ready : .active,
+            summary: "Connected"
+        ))
+    }
+
     func sendPrompt(
         _ prompt: String,
         attachments: [AssistantAttachment] = [],
@@ -1360,7 +1377,7 @@ final class CodexAssistantRuntime {
         }
 
         let sessionID = params["threadId"] as? String ?? activeSessionID ?? ""
-        let arguments = params["arguments"] ?? [:]
+        let arguments = dynamicToolArguments(from: params)
 
         if computerUseApprovedSessionIDs.contains(sessionID) {
             await executeComputerUseCall(
@@ -2554,12 +2571,44 @@ final class CodexAssistantRuntime {
     }
 
     private func dynamicToolName(from payload: [String: Any]) -> String? {
-        firstNonEmptyString(
-            payload["tool"] as? String,
-            payload["name"] as? String,
-            payload["toolName"] as? String,
-            payload["tool_name"] as? String
-        )
+        let candidatePayloads: [[String: Any]] = [
+            payload,
+            payload["item"] as? [String: Any],
+            payload["toolCall"] as? [String: Any],
+            payload["tool_call"] as? [String: Any]
+        ].compactMap { $0 }
+
+        for candidate in candidatePayloads {
+            if let toolName = firstNonEmptyString(
+                candidate["tool"] as? String,
+                candidate["name"] as? String,
+                candidate["toolName"] as? String,
+                candidate["tool_name"] as? String
+            ) {
+                return toolName
+            }
+        }
+
+        return nil
+    }
+
+    private func dynamicToolArguments(from payload: [String: Any]) -> Any {
+        if let arguments = payload["arguments"] {
+            return arguments
+        }
+        if let item = payload["item"] as? [String: Any],
+           let arguments = item["arguments"] {
+            return arguments
+        }
+        if let toolCall = payload["toolCall"] as? [String: Any],
+           let arguments = toolCall["arguments"] {
+            return arguments
+        }
+        if let toolCall = payload["tool_call"] as? [String: Any],
+           let arguments = toolCall["arguments"] {
+            return arguments
+        }
+        return [:]
     }
 
     private func threadStartParams(cwd: String?, modelID: String?) -> [String: Any] {

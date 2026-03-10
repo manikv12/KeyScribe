@@ -132,6 +132,19 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 toolName: "computer_use"
             )
         )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "dynamicToolCall",
+                toolName: "web_lookup"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "some_new_status_type"
+            )
+        )
         XCTAssertFalse(
             runtime.isToolActivityAllowedForTesting(
                 mode: .conversational,
