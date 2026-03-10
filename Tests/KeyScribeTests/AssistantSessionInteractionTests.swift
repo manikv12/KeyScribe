@@ -382,6 +382,30 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testChatModeDoesNotExposeComputerUseDynamicTool() {
+        let runtime = CodexAssistantRuntime()
+
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), [])
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["computer_use"])
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .agentic), ["computer_use"])
+    }
+
+    @MainActor
+    func testDynamicToolStateReadsToolNameAliases() {
+        let runtime = CodexAssistantRuntime()
+
+        let state = runtime.toolCallStateForTesting(from: [
+            "id": "tool-2",
+            "type": "dynamicToolCall",
+            "toolName": "computer_use",
+            "status": "running",
+            "arguments": ["task": "Open Safari."]
+        ])
+
+        XCTAssertEqual(state?.title, "Computer Use")
+    }
+
+    @MainActor
     func testBrowserAutomationRequirementBlocksBrowserTaskUntilSetupIsReady() {
         XCTAssertEqual(
             AssistantStore.browserAutomationRequirement(

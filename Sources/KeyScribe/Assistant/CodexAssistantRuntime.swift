@@ -1337,11 +1337,7 @@ final class CodexAssistantRuntime {
     }
 
     private func handleDynamicToolCall(id: JSONRPCRequestID, params: [String: Any]) async {
-        let tool = firstNonEmptyString(
-            params["tool"] as? String,
-            params["name"] as? String,
-            "Tool"
-        ) ?? "Tool"
+        let tool = dynamicToolName(from: params) ?? "Tool"
 
         guard tool == AssistantComputerUseToolDefinition.name else {
             do {
@@ -2149,6 +2145,12 @@ final class CodexAssistantRuntime {
             && !redirectedImageToolCallForActiveTurn
     }
 
+    func dynamicToolNamesForTesting(mode: AssistantInteractionMode) -> [String] {
+        dynamicToolSpecs(for: mode).compactMap { tool in
+            tool["name"] as? String
+        }
+    }
+
     func blockedToolUseMessage(
         for mode: AssistantInteractionMode,
         activityTitle: String? = nil,
@@ -2258,7 +2260,7 @@ final class CodexAssistantRuntime {
             }
             return ("File Changes", nil)
         case "item/tool/call":
-            let toolName = params["tool"] as? String ?? params["name"] as? String
+            let toolName = dynamicToolName(from: params)
             guard !AssistantModePolicy.isAllowed(
                 mode: interactionMode,
                 activityKind: .dynamicToolCall,
@@ -2279,7 +2281,7 @@ final class CodexAssistantRuntime {
         let rawType = item["type"] as? String
         let kind = activityKind(from: rawType)
         let command = item["command"] as? String
-        let toolName = item["tool"] as? String
+        let toolName = dynamicToolName(from: item)
 
         guard !AssistantModePolicy.isAllowed(
             mode: interactionMode,
@@ -2417,7 +2419,7 @@ final class CodexAssistantRuntime {
                 detail: compactDetail(extractString(item["arguments"]))
             )
         case "dynamicToolCall":
-            let rawTool = item["tool"] as? String ?? "Tool"
+            let rawTool = dynamicToolName(from: item) ?? "Tool"
             let tool = rawTool == AssistantComputerUseToolDefinition.name ? "Computer Use" : rawTool
             return AssistantToolCallState(
                 id: id,
@@ -2542,6 +2544,24 @@ final class CodexAssistantRuntime {
     /// Session IDs that have been detached. Notifications from these sessions are dropped.
     private var detachedSessionIDs: Set<String> = []
 
+    private func dynamicToolSpecs(for mode: AssistantInteractionMode) -> [[String: Any]] {
+        switch mode {
+        case .conversational:
+            return []
+        case .plan, .agentic:
+            return [AssistantComputerUseToolDefinition.dynamicToolSpec()]
+        }
+    }
+
+    private func dynamicToolName(from payload: [String: Any]) -> String? {
+        firstNonEmptyString(
+            payload["tool"] as? String,
+            payload["name"] as? String,
+            payload["toolName"] as? String,
+            payload["tool_name"] as? String
+        )
+    }
+
     private func threadStartParams(cwd: String?, modelID: String?) -> [String: Any] {
         var params: [String: Any] = [
             "approvalPolicy": "on-request",
@@ -2550,7 +2570,7 @@ final class CodexAssistantRuntime {
             "serviceName": "KeyScribe",
             "ephemeral": false
         ]
-        params["dynamicTools"] = [AssistantComputerUseToolDefinition.dynamicToolSpec()]
+        params["dynamicTools"] = dynamicToolSpecs(for: interactionMode)
         params["cwd"] = cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
         if let modelID = modelID?.nonEmpty {
             params["model"] = modelID
