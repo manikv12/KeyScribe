@@ -188,7 +188,10 @@ actor AssistantComputerUseService {
                         )
                     }
 
-                    lastScreenshot = try execute(actions: computerCall.actions, previousSnapshot: lastScreenshot)
+                    lastScreenshot = try await execute(
+                        actions: computerCall.actions,
+                        previousSnapshot: lastScreenshot
+                    )
                     response = try await continueResponse(
                         previousResponseID: response.id,
                         callID: computerCall.callID,
@@ -304,6 +307,10 @@ actor AssistantComputerUseService {
         return nil
     }
 
+    static func responsesEndpointStringForTesting(from baseURL: String) -> String? {
+        responsesEndpoint(from: baseURL)?.absoluteString
+    }
+
     private func resolveAuth(preferredModelID: String?) async throws -> AuthContext {
         let snapshot = await MainActor.run { () -> (apiKey: String, baseURL: String, oauth: PromptRewriteOAuthSession?) in
             let settings = SettingsStore.shared
@@ -321,7 +328,11 @@ actor AssistantComputerUseService {
             ?? Self.defaultModelID
 
         if !snapshot.apiKey.isEmpty {
-            let endpoint = Self.responsesEndpoint(from: snapshot.baseURL)
+            guard let endpoint = Self.responsesEndpoint(from: snapshot.baseURL) else {
+                throw ServiceError.requestFailed(
+                    "Computer Use could not build the OpenAI endpoint from the configured base URL."
+                )
+            }
             return AuthContext(
                 credential: .apiKey(snapshot.apiKey),
                 endpoint: endpoint,
@@ -429,7 +440,7 @@ actor AssistantComputerUseService {
     private func execute(
         actions: [[String: Any]],
         previousSnapshot: DisplaySnapshot?
-    ) throws -> DisplaySnapshot {
+    ) async throws -> DisplaySnapshot {
         guard AXIsProcessTrusted() else {
             throw ServiceError.accessibilityRequired
         }
@@ -454,21 +465,21 @@ actor AssistantComputerUseService {
                 coordinateSnapshot = try captureSnapshot()
             case "click":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try click(at: point, button: button(from: action["button"] as? String), clickCount: 1)
+                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 1)
             case "double_click":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try click(at: point, button: .left, clickCount: 2)
+                try await click(at: point, button: .left, clickCount: 2)
             case "move":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
                 try moveMouse(to: point)
             case "drag":
                 let path = try dragPath(from: action, snapshot: coordinateSnapshot)
-                try drag(along: path)
+                try await drag(along: path)
             case "scroll":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
                 let scrollX = number(from: action["scroll_x"]) ?? 0
                 let scrollY = number(from: action["scroll_y"]) ?? 0
-                try scroll(at: point, deltaX: scrollX, deltaY: scrollY)
+                try await scroll(at: point, deltaX: scrollX, deltaY: scrollY)
             case "keypress":
                 let keys = (action["keys"] as? [Any])?.compactMap { value -> String? in
                     if let text = value as? String {
@@ -476,17 +487,17 @@ actor AssistantComputerUseService {
                     }
                     return nil
                 } ?? []
-                try keypress(keys)
+                try await keypress(keys)
             case "type":
                 let text = (action["text"] as? String) ?? ""
-                try typeText(text)
+                try await typeText(text)
             case "wait":
-                Thread.sleep(forTimeInterval: 1.0)
+                try await pause(for: 1.0)
             default:
                 continue
             }
 
-            Thread.sleep(forTimeInterval: 0.18)
+            try await pause(for: 0.18)
         }
 
         return try captureSnapshot()
@@ -557,7 +568,7 @@ actor AssistantComputerUseService {
         }
     }
 
-    private func click(at point: CGPoint, button: CGMouseButton, clickCount: Int) throws {
+    private func click(at point: CGPoint, button: CGMouseButton, clickCount: Int) async throws {
         let source = try eventSource()
         let moved = mouseEvent(source: source, type: .mouseMoved, point: point, button: .left)
         moved.post(tap: .cgSessionEventTap)
@@ -572,7 +583,7 @@ actor AssistantComputerUseService {
             up.setIntegerValueField(.mouseEventClickState, value: Int64(index))
             down.post(tap: .cgSessionEventTap)
             up.post(tap: .cgSessionEventTap)
-            Thread.sleep(forTimeInterval: 0.05)
+            try await pause(for: 0.05)
         }
     }
 
@@ -582,22 +593,22 @@ actor AssistantComputerUseService {
         moved.post(tap: .cgSessionEventTap)
     }
 
-    private func drag(along path: [CGPoint]) throws {
+    private func drag(along path: [CGPoint]) async throws {
         guard let first = path.first else { return }
         let source = try eventSource()
 
         let moved = mouseEvent(source: source, type: .mouseMoved, point: first, button: .left)
         moved.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: 0.04)
+        try await pause(for: 0.04)
 
         let down = mouseEvent(source: source, type: .leftMouseDown, point: first, button: .left)
         down.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: 0.04)
+        try await pause(for: 0.04)
 
         for point in path.dropFirst() {
             let dragged = mouseEvent(source: source, type: .leftMouseDragged, point: point, button: .left)
             dragged.post(tap: .cgSessionEventTap)
-            Thread.sleep(forTimeInterval: 0.03)
+            try await pause(for: 0.03)
         }
 
         if let last = path.last {
@@ -606,11 +617,11 @@ actor AssistantComputerUseService {
         }
     }
 
-    private func scroll(at point: CGPoint, deltaX: Double, deltaY: Double) throws {
+    private func scroll(at point: CGPoint, deltaX: Double, deltaY: Double) async throws {
         let source = try eventSource()
         let moved = mouseEvent(source: source, type: .mouseMoved, point: point, button: .left)
         moved.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: 0.03)
+        try await pause(for: 0.03)
 
         guard let event = CGEvent(
             scrollWheelEvent2Source: source,
@@ -626,7 +637,7 @@ actor AssistantComputerUseService {
         event.post(tap: .cgSessionEventTap)
     }
 
-    private func keypress(_ keys: [String]) throws {
+    private func keypress(_ keys: [String]) async throws {
         guard !keys.isEmpty else { return }
         let source = try eventSource()
 
@@ -666,13 +677,13 @@ actor AssistantComputerUseService {
                 down.post(tap: .cgSessionEventTap)
                 up.post(tap: .cgSessionEventTap)
             } else if modifiers.isEmpty {
-                try typeText(key)
+                try await typeText(key)
             }
-            Thread.sleep(forTimeInterval: 0.03)
+            try await pause(for: 0.03)
         }
     }
 
-    private func typeText(_ text: String) throws {
+    private func typeText(_ text: String) async throws {
         let source = try eventSource()
         for scalar in text.unicodeScalars {
             if scalar.value == 10 {
@@ -698,7 +709,7 @@ actor AssistantComputerUseService {
             up.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
             down.post(tap: .cgSessionEventTap)
             up.post(tap: .cgSessionEventTap)
-            Thread.sleep(forTimeInterval: 0.01)
+            try await pause(for: 0.01)
         }
     }
 
@@ -723,15 +734,27 @@ actor AssistantComputerUseService {
         keyCodeMap[key]
     }
 
-    private static func responsesEndpoint(from baseURL: String) -> URL {
+    private func pause(for seconds: TimeInterval) async throws {
+        let nanoseconds = UInt64((seconds * 1_000_000_000).rounded())
+        try await Task.sleep(nanoseconds: nanoseconds)
+    }
+
+    private static func responsesEndpoint(from baseURL: String) -> URL? {
         let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = trimmed.isEmpty ? "https://api.openai.com/v1" : trimmed
         let withoutTrailingSlash = normalized.hasSuffix("/") ? String(normalized.dropLast()) : normalized
 
-        if withoutTrailingSlash.hasSuffix("/responses"), let url = URL(string: withoutTrailingSlash) {
-            return url
+        let endpointString = withoutTrailingSlash.hasSuffix("/responses")
+            ? withoutTrailingSlash
+            : withoutTrailingSlash + "/responses"
+        guard let url = URL(string: endpointString),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "https" || scheme == "http"),
+              let host = url.host,
+              !host.isEmpty else {
+            return nil
         }
-        return URL(string: withoutTrailingSlash + "/responses")!
+        return url
     }
 
     private static func errorDetail(from data: Data) -> String {

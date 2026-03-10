@@ -1362,6 +1362,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             NotificationCenter.default.removeObserver(assistantStopVoiceCaptureObserver)
             self.assistantStopVoiceCaptureObserver = nil
         }
+        if let assistantMinimizeToOrbObserver {
+            NotificationCenter.default.removeObserver(assistantMinimizeToOrbObserver)
+            self.assistantMinimizeToOrbObserver = nil
+        }
         stopMemoryPressureMonitoring()
         settingsApplyWorkItem?.cancel()
         settingsApplyWorkItem = nil

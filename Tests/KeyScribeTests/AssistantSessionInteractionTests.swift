@@ -5,6 +5,9 @@ private final class AssistantRuntimeEventRecorder: @unchecked Sendable {
     var toolSnapshots: [[AssistantToolCallState]] = []
     var activityTitles: [String] = []
     var systemMessages: [String] = []
+    var transcriptEntries: [AssistantTranscriptEntry] = []
+    var statusMessages: [String?] = []
+    var hudStates: [AssistantHUDState] = []
 }
 
 final class AssistantSessionInteractionTests: XCTestCase {
@@ -601,6 +604,24 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testBuildInstructionsIncludesBrowserTurnReminderWhenProfileIsConfigured() {
+        let runtime = CodexAssistantRuntime()
+        runtime.browserProfileContext = [
+            "browser": "Brave Browser",
+            "channel": "brave",
+            "profileDir": "Profile 1",
+            "userDataDir": "/Users/test/Library/Application Support/BraveSoftware/Brave-Browser",
+            "profileName": "Personal"
+        ]
+
+        let instructions = runtime.buildInstructionsForTesting()
+
+        XCTAssertTrue(instructions.contains("# Browser Task Override"))
+        XCTAssertTrue(instructions.contains("Do NOT use MCP browser tools"))
+        XCTAssertTrue(instructions.contains("Profile: Personal"))
+    }
+
+    @MainActor
     func testShouldPreserveProposedPlanOnlyForMatchingSession() {
         XCTAssertTrue(
             AssistantStore.shouldPreserveProposedPlan(
@@ -758,5 +779,43 @@ final class AssistantSessionInteractionTests: XCTestCase {
             hit,
             AssistantRepeatedCommandLimitHit(command: "pwd", attemptCount: 3)
         )
+    }
+
+    @MainActor
+    func testTransientReconnectNotificationStaysOutOfErrorTranscript() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTranscript = { recorder.transcriptEntries.append($0) }
+        runtime.onStatusMessage = { recorder.statusMessages.append($0) }
+        runtime.onHUDUpdate = { recorder.hudStates.append($0) }
+
+        await runtime.processErrorNotificationForTesting("Reconnecting... 2/5")
+
+        XCTAssertTrue(recorder.transcriptEntries.isEmpty)
+        XCTAssertEqual(recorder.statusMessages.last ?? nil, "Reconnecting... 2/5")
+        XCTAssertEqual(recorder.hudStates.last?.phase, .streaming)
+        XCTAssertEqual(recorder.hudStates.last?.title, "Reconnecting")
+        XCTAssertEqual(recorder.hudStates.last?.detail, "Reconnecting... 2/5")
+    }
+
+    @MainActor
+    func testFinalStreamDisconnectStillAppearsAsError() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTranscript = { recorder.transcriptEntries.append($0) }
+        runtime.onStatusMessage = { recorder.statusMessages.append($0) }
+        runtime.onHUDUpdate = { recorder.hudStates.append($0) }
+
+        let message = "stream disconnected before completion: An error occurred while processing your request. Please include the request ID 47b48761-427a-4703-95a2-fb23d4fa2dd9 in your message."
+        await runtime.processErrorNotificationForTesting(message)
+
+        XCTAssertEqual(recorder.transcriptEntries.count, 1)
+        XCTAssertEqual(recorder.transcriptEntries.first?.role, .error)
+        XCTAssertEqual(recorder.transcriptEntries.first?.text, message)
+        XCTAssertTrue(recorder.statusMessages.isEmpty)
+        XCTAssertEqual(recorder.hudStates.last?.phase, .failed)
+        XCTAssertEqual(recorder.hudStates.last?.detail, message)
     }
 }

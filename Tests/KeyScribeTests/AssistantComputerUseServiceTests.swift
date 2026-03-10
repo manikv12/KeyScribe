@@ -66,4 +66,21 @@ final class AssistantComputerUseServiceTests: XCTestCase {
             """
         )
     }
+
+    func testResponsesEndpointAppendsResponsesPath() {
+        XCTAssertEqual(
+            AssistantComputerUseService.responsesEndpointStringForTesting(from: "https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
+        )
+        XCTAssertEqual(
+            AssistantComputerUseService.responsesEndpointStringForTesting(from: "https://api.openai.com/v1/responses"),
+            "https://api.openai.com/v1/responses"
+        )
+    }
+
+    func testResponsesEndpointRejectsMalformedBaseURL() {
+        XCTAssertNil(
+            AssistantComputerUseService.responsesEndpointStringForTesting(from: "not a valid url")
+        )
+    }
 }

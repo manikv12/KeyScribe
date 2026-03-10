@@ -150,6 +150,7 @@ struct CodexSessionCatalog {
 
         for entry in existingEntries {
             guard let existingID = stringValue(entry["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+                rewrittenLines.append(try jsonStringLine(entry))
                 continue
             }
 
@@ -171,6 +172,7 @@ struct CodexSessionCatalog {
                 stringValue(entry["threadName"]),
                 stringValue(entry["title"])
             ) else {
+                rewrittenLines.append(try jsonStringLine(entry))
                 continue
             }
 

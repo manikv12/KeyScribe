@@ -827,13 +827,24 @@ final class CodexAssistantRuntime {
             activeTurnID = nil
             handleTurnCompleted(params)
         case "error":
-            flushStreamingBuffer()
-            flushCommentaryBuffer()
             let message = firstNonEmptyString(
                 params["message"] as? String,
                 extractString(params["error"]),
                 "Codex reported an error."
             ) ?? "Codex reported an error."
+            if let reconnectStatus = transientReconnectStatusMessage(from: message) {
+                onStatusMessage?(reconnectStatus)
+                onHealthUpdate?(connectedHealthForCurrentState(detail: reconnectStatus))
+                updateHUD(
+                    phase: activeTurnID != nil ? .streaming : .thinking,
+                    title: "Reconnecting",
+                    detail: reconnectStatus
+                )
+                CrashReporter.logWarning("Assistant runtime reconnect notice: \(reconnectStatus)")
+                break
+            }
+            flushStreamingBuffer()
+            flushCommentaryBuffer()
             onTranscript?(AssistantTranscriptEntry(role: .error, text: message, emphasis: true))
             emitTimelineSystemMessage(message, emphasis: true)
             // Keep availability as .ready so the user can retry — the transport
@@ -2224,6 +2235,20 @@ final class CodexAssistantRuntime {
         )
     }
 
+    func buildInstructionsForTesting() -> String {
+        buildInstructions()
+    }
+
+    func processErrorNotificationForTesting(
+        _ message: String,
+        activeTurnID: String? = "turn-1"
+    ) async {
+        let previousTurnID = self.activeTurnID
+        self.activeTurnID = activeTurnID
+        defer { self.activeTurnID = previousTurnID }
+        await handleNotification(method: "error", params: ["message": message])
+    }
+
     func blockedToolUseMessage(
         for mode: AssistantInteractionMode,
         activityTitle: String? = nil,
@@ -2784,6 +2809,9 @@ final class CodexAssistantRuntime {
            !custom.isEmpty {
             sections.append("# Custom Instructions\n\n\(custom)")
         }
+        if let browserInstructions = browserTurnReminder() {
+            sections.append(browserInstructions)
+        }
         return sections.joined(separator: "\n\n")
     }
 
@@ -3131,6 +3159,21 @@ final class CodexAssistantRuntime {
             }
         }
         return nil
+    }
+
+    private func transientReconnectStatusMessage(from message: String) -> String? {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let range = trimmed.range(
+            of: #"(?i)^reconnecting\.\.\.\s+\d+/\d+$"#,
+            options: .regularExpression
+        ) else {
+            return nil
+        }
+        guard range.lowerBound == trimmed.startIndex, range.upperBound == trimmed.endIndex else {
+            return nil
+        }
+        return trimmed
     }
 
     private func extractString(_ raw: Any?) -> String? {

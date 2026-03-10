@@ -8,11 +8,19 @@ final class AssistantModePolicyTests: XCTestCase {
             .readOnly
         )
         XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "find Sources -name '*.swift'"),
+            .readOnly
+        )
+        XCTAssertEqual(
             AssistantModePolicy.commandSafetyClass(for: "sed -n '1,20p' README.md"),
             .readOnly
         )
         XCTAssertEqual(
             AssistantModePolicy.commandSafetyClass(for: "git diff --stat"),
+            .readOnly
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "plutil -p Info.plist"),
             .readOnly
         )
         XCTAssertEqual(
@@ -53,6 +61,18 @@ final class AssistantModePolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             AssistantModePolicy.commandSafetyClass(for: "swift package update"),
+            .mutatingOrUnknown
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "find . -delete"),
+            .mutatingOrUnknown
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "find . -exec rm {} +"),
+            .mutatingOrUnknown
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "plutil -replace Foo -string Bar Info.plist"),
             .mutatingOrUnknown
         )
         XCTAssertEqual(

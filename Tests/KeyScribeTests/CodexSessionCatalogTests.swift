@@ -497,6 +497,56 @@ final class CodexSessionCatalogTests: XCTestCase {
         XCTAssertEqual(sessions.first?.title, "Pinned Friendly Name")
     }
 
+    func testRenameSessionPreservesIncompleteIndexEntries() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "rename-me",
+            dayPath: "2026/03/07",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "rename-me",
+                    timestamp: "2026-03-07T10:00:00Z",
+                    cwd: "/Users/test/RenameMe",
+                    source: "exec",
+                    originator: "KeyScribe"
+                )
+            ]
+        )
+        try writeSessionIndex(
+            entries: [
+                [
+                    "id": "rename-me",
+                    "thread_name": "Old Thread Name",
+                    "updated_at": "2026-03-07T10:01:00Z"
+                ],
+                [
+                    "id": "legacy-entry",
+                    "updated_at": "2026-03-07T10:02:00Z"
+                ],
+                [
+                    "thread_name": "Untitled Legacy Entry",
+                    "updated_at": "2026-03-07T10:03:00Z"
+                ]
+            ],
+            in: homeDirectory
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        try catalog.renameSession(sessionID: "rename-me", title: "New Friendly Name")
+
+        let indexContents = try String(
+            contentsOf: homeDirectory.appendingPathComponent(".codex/session_index.jsonl"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(indexContents.contains("\"thread_name\":\"New Friendly Name\""))
+        XCTAssertTrue(indexContents.contains("\"id\":\"legacy-entry\""))
+        XCTAssertTrue(indexContents.contains("\"thread_name\":\"Untitled Legacy Entry\""))
+        XCTAssertEqual(indexContents.split(whereSeparator: \.isNewline).count, 3)
+    }
+
     func testLoadTranscriptFiltersSetupNoiseAndDeduplicatesAgentEchoes() async throws {
         let homeDirectory = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: homeDirectory) }

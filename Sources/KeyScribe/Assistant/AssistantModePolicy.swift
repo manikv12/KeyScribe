@@ -8,9 +8,9 @@ enum AssistantCommandSafetyClass: Equatable, Sendable {
 
 enum AssistantModePolicy {
     private static let simpleReadOnlyExecutables: Set<String> = [
-        "pwd", "ls", "rg", "find", "cat", "head", "tail", "grep",
+        "pwd", "ls", "rg", "cat", "head", "tail", "grep",
         "sort", "uniq", "cut", "wc", "which", "mdfind", "stat",
-        "file", "plutil"
+        "file"
     ]
 
     private static let gitReadOnlyCommands: Set<String> = [
@@ -86,6 +86,10 @@ enum AssistantModePolicy {
         let firstThree = tokens.prefix(3).joined(separator: " ")
 
         switch executable {
+        case "find":
+            return isReadOnlyFindCommand(tokens) ? .readOnly : .mutatingOrUnknown
+        case "plutil":
+            return isReadOnlyPlutilCommand(tokens) ? .readOnly : .mutatingOrUnknown
         case let executable where simpleReadOnlyExecutables.contains(executable):
             return .readOnly
         case "sed":
@@ -254,6 +258,36 @@ enum AssistantModePolicy {
             return false
         }
         return directObsidianReadOnlyCommands.contains(command)
+    }
+
+    private static func isReadOnlyFindCommand(_ tokens: [String]) -> Bool {
+        let unsafeFlags: Set<String> = [
+            "-delete", "-exec", "-execdir", "-ok", "-okdir",
+            "-fprint", "-fprint0", "-fprintf", "-fls"
+        ]
+
+        for token in tokens.dropFirst() {
+            if unsafeFlags.contains(token) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func isReadOnlyPlutilCommand(_ tokens: [String]) -> Bool {
+        let arguments = Array(tokens.dropFirst())
+        guard let firstArgument = arguments.first else {
+            return false
+        }
+
+        if arguments.contains("-replace")
+            || arguments.contains("-insert")
+            || arguments.contains("-remove")
+            || arguments.contains("-create") {
+            return false
+        }
+
+        return firstArgument == "-p" || firstArgument == "-lint"
     }
 
     private static func isTrustedReadOnlyPythonWrapper(_ tokens: [String]) -> Bool {
