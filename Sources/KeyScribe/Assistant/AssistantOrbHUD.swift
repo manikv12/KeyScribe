@@ -762,6 +762,12 @@ final class AssistantOrbHUDManager {
 
 // MARK: - Key-capable Panel with native drag
 
+fileprivate enum OrbTheme: String, CaseIterable {
+    case standard = "Standard"
+    case solarEclipse = "Solar Eclipse"
+    case bloodMoon = "Blood Moon"
+}
+
 private class OrbHUDPanel: NSPanel {
     var allowsKeyStatus = false
     var onPositionPersist: (() -> Void)?
@@ -838,9 +844,35 @@ private class OrbHUDPanel: NSPanel {
 
     private func showOrbContextMenu(at event: NSEvent) {
         let menu = NSMenu()
+        
+        let themeItem = NSMenuItem(title: "Theme", action: nil, keyEquivalent: "")
+        let themeMenu = NSMenu()
+        let currentThemeStr = UserDefaults.standard.string(forKey: "AssistantOrbTheme") ?? OrbTheme.standard.rawValue
+        
+        for theme in OrbTheme.allCases {
+            let item = NSMenuItem(title: theme.rawValue, action: #selector(setTheme(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = theme.rawValue
+            if theme.rawValue == currentThemeStr {
+                item.state = .on
+            }
+            themeMenu.addItem(item)
+        }
+        
+        themeItem.submenu = themeMenu
+        menu.addItem(themeItem)
+        
+        menu.addItem(NSMenuItem.separator())
+        
         let quitItem = NSMenuItem(title: "Quit KeyScribe", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
         NSMenu.popUpContextMenu(menu, with: event, for: contentView!)
+    }
+
+    @objc private func setTheme(_ sender: NSMenuItem) {
+        if let themeObj = sender.representedObject as? String {
+            UserDefaults.standard.set(themeObj, forKey: "AssistantOrbTheme")
+        }
     }
 }
 
@@ -849,6 +881,7 @@ private class OrbHUDPanel: NSPanel {
 private struct AssistantOrbHUDView: View {
     @ObservedObject var model: AssistantOrbHUDModel
     @FocusState private var isTextFieldFocused: Bool
+    @AppStorage("AssistantOrbTheme") private var orbTheme: String = OrbTheme.standard.rawValue
 
     private var showingPopup: Bool {
         (model.showDoneDetail || model.showWorkingDetail || model.pendingPermissionRequest != nil) && !model.isExpanded
@@ -937,7 +970,8 @@ private struct AssistantOrbHUDView: View {
             OrbSphere(
                 phase: model.state.phase,
                 level: CGFloat(model.level),
-                time: context.date.timeIntervalSinceReferenceDate
+                time: context.date.timeIntervalSinceReferenceDate,
+                theme: OrbTheme(rawValue: orbTheme) ?? .standard
             )
             .frame(width: 56, height: 56)
         }
@@ -1718,7 +1752,15 @@ private struct AssistantOrbHUDView: View {
     }
 
     private var glowColor: Color {
-        OrbSphere.phaseColor(for: model.state.phase)
+        let theme = OrbTheme(rawValue: orbTheme) ?? .standard
+        switch theme {
+        case .solarEclipse:
+            return Color.white
+        case .bloodMoon:
+            return Color(red: 0.9, green: 0.1, blue: 0.1)
+        case .standard:
+            return OrbSphere.phaseColor(for: model.state.phase)
+        }
     }
 
     private func sessionMatches(_ lhs: String?, _ rhs: String?) -> Bool {
@@ -1989,6 +2031,7 @@ private struct OrbSphere: View {
     let phase: AssistantHUDPhase
     let level: CGFloat
     let time: TimeInterval
+    let theme: OrbTheme
 
     private let sphereSize: CGFloat = 42
 
@@ -2206,55 +2249,70 @@ private struct OrbSphere: View {
     }
 
     private var colors: OrbColors {
-        switch phase {
-        case .idle:
+        switch theme {
+        case .solarEclipse:
             return OrbColors(
-                primary: AppVisualTheme.accentTint,
-                secondary: AppVisualTheme.accentTint.opacity(0.65),
-                accent: Color.white.opacity(0.30)
+                primary: Color(white: 0.15),
+                secondary: Color(white: 0.95),
+                accent: Color.yellow.opacity(0.8)
             )
-        case .listening:
+        case .bloodMoon:
             return OrbColors(
-                primary: Color(red: 0.0, green: 0.75, blue: 0.95),
-                secondary: Color(red: 0.20, green: 0.30, blue: 0.90),
-                accent: Color(red: 0.10, green: 0.85, blue: 0.80)
+                primary: Color(red: 0.25, green: 0.05, blue: 0.05),
+                secondary: Color(red: 0.9, green: 0.1, blue: 0.1),
+                accent: Color(red: 0.8, green: 0.2, blue: 0.2)
             )
-        case .thinking:
-            return OrbColors(
-                primary: Color(red: 0.50, green: 0.30, blue: 0.95),
-                secondary: Color(red: 0.75, green: 0.35, blue: 0.90),
-                accent: Color(red: 0.35, green: 0.20, blue: 0.80)
-            )
-        case .acting:
-            return OrbColors(
-                primary: Color(red: 0.10, green: 0.82, blue: 0.72),
-                secondary: Color(red: 0.25, green: 0.90, blue: 0.55),
-                accent: Color(red: 0.06, green: 0.52, blue: 0.48)
-            )
-        case .waitingForPermission:
-            return OrbColors(
-                primary: Color(red: 0.95, green: 0.60, blue: 0.10),
-                secondary: Color(red: 0.95, green: 0.80, blue: 0.20),
-                accent: Color(red: 0.72, green: 0.38, blue: 0.05)
-            )
-        case .streaming:
-            return OrbColors(
-                primary: Color(red: 0.28, green: 0.65, blue: 0.98),
-                secondary: Color(red: 0.45, green: 0.80, blue: 0.98),
-                accent: Color(red: 0.18, green: 0.42, blue: 0.85)
-            )
-        case .success:
-            return OrbColors(
-                primary: Color(red: 0.20, green: 0.85, blue: 0.45),
-                secondary: Color(red: 0.45, green: 0.92, blue: 0.55),
-                accent: Color(red: 0.15, green: 0.60, blue: 0.35)
-            )
-        case .failed:
-            return OrbColors(
-                primary: Color(red: 0.92, green: 0.20, blue: 0.20),
-                secondary: Color(red: 0.95, green: 0.35, blue: 0.15),
-                accent: Color(red: 0.65, green: 0.10, blue: 0.12)
-            )
+        case .standard:
+            switch phase {
+            case .idle:
+                return OrbColors(
+                    primary: AppVisualTheme.accentTint,
+                    secondary: AppVisualTheme.accentTint.opacity(0.65),
+                    accent: Color.white.opacity(0.30)
+                )
+            case .listening:
+                return OrbColors(
+                    primary: Color(red: 0.0, green: 0.75, blue: 0.95),
+                    secondary: Color(red: 0.20, green: 0.30, blue: 0.90),
+                    accent: Color(red: 0.10, green: 0.85, blue: 0.80)
+                )
+            case .thinking:
+                return OrbColors(
+                    primary: Color(red: 0.50, green: 0.30, blue: 0.95),
+                    secondary: Color(red: 0.75, green: 0.35, blue: 0.90),
+                    accent: Color(red: 0.35, green: 0.20, blue: 0.80)
+                )
+            case .acting:
+                return OrbColors(
+                    primary: Color(red: 0.10, green: 0.82, blue: 0.72),
+                    secondary: Color(red: 0.25, green: 0.90, blue: 0.55),
+                    accent: Color(red: 0.06, green: 0.52, blue: 0.48)
+                )
+            case .waitingForPermission:
+                return OrbColors(
+                    primary: Color(red: 0.95, green: 0.60, blue: 0.10),
+                    secondary: Color(red: 0.95, green: 0.80, blue: 0.20),
+                    accent: Color(red: 0.72, green: 0.38, blue: 0.05)
+                )
+            case .streaming:
+                return OrbColors(
+                    primary: Color(red: 0.28, green: 0.65, blue: 0.98),
+                    secondary: Color(red: 0.45, green: 0.80, blue: 0.98),
+                    accent: Color(red: 0.18, green: 0.42, blue: 0.85)
+                )
+            case .success:
+                return OrbColors(
+                    primary: Color(red: 0.20, green: 0.85, blue: 0.45),
+                    secondary: Color(red: 0.45, green: 0.92, blue: 0.55),
+                    accent: Color(red: 0.15, green: 0.60, blue: 0.35)
+                )
+            case .failed:
+                return OrbColors(
+                    primary: Color(red: 0.92, green: 0.20, blue: 0.20),
+                    secondary: Color(red: 0.95, green: 0.35, blue: 0.15),
+                    accent: Color(red: 0.65, green: 0.10, blue: 0.12)
+                )
+            }
         }
     }
 
