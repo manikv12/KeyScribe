@@ -2040,9 +2040,7 @@ struct AssistantWindowView: View {
                     )
                 }
                 .padding(.horizontal, 10)
-                .padding(.bottom, 2)
-
-                Spacer(minLength: 2)
+                .padding(.bottom, 6)
             }
             .background(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
