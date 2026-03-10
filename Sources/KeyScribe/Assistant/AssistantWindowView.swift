@@ -128,13 +128,15 @@ struct AssistantWindowView: View {
     @State private var visibleHistoryLimit = Self.initialVisibleHistoryLimit
     @State private var chatViewportHeight: CGFloat = 0
     @State private var isLoadingOlderHistory = false
+    @State private var hoveredInlineCopyMessageID: String?
+    @State private var inlineCopyHideWorkItem: DispatchWorkItem?
     @State private var previewAttachment: AssistantAttachment?
     @AppStorage("assistantRuntimeExpanded") private var isRuntimeExpanded = true
 
     /// Uses the pre-computed render items from AssistantStore (rebuilt only when
     /// timelineItems changes, not on every @Published update).
     private var allRenderItems: [AssistantTimelineRenderItem] {
-        assistant.cachedRenderItems
+        assistant.isTransitioningSession ? [] : assistant.cachedRenderItems
     }
 
     private var visibleRenderItems: [AssistantTimelineRenderItem] {
@@ -172,6 +174,9 @@ struct AssistantWindowView: View {
     private var composerPlaceholder: String {
         if !settings.assistantBetaEnabled {
             return "Enable assistant in Settings to chat."
+        }
+        if isVoiceCapturing {
+            return "Listening... release to paste."
         }
         if assistant.isLoadingModels {
             return "Loading models..."
@@ -279,17 +284,17 @@ struct AssistantWindowView: View {
                 AppIconBadge(
                     symbol: "sparkles.rectangle.stack.fill",
                     tint: AppVisualTheme.accentTint,
-                    size: 30,
-                    symbolSize: 13,
-                    isEmphasized: true
+                    size: 28,
+                    symbolSize: 12,
+                    isEmphasized: false
                 )
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Assistant")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.94))
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.88))
                     Text("Sessions")
                         .font(.system(size: 11, weight: .regular))
-                        .foregroundStyle(AppVisualTheme.mutedText)
+                        .foregroundStyle(.white.opacity(0.45))
                 }
                 Spacer()
                 Button {
@@ -388,7 +393,7 @@ struct AssistantWindowView: View {
                         }
                         .frame(height: 0)
 
-                        if hiddenRenderItemCount > 0 {
+                        if hiddenRenderItemCount > 0 && !assistant.isTransitioningSession {
                             historyWindowNotice
                                 .padding(.horizontal, 24)
                                 .padding(.top, 16)
@@ -461,6 +466,7 @@ struct AssistantWindowView: View {
                     }
                 }
                 .onChange(of: timelineLastUpdatedAt) { _ in
+                    guard !assistant.isTransitioningSession else { return }
                     if !userHasScrolledUp {
                         scrollToLatestMessage(with: proxy)
                     }
@@ -548,7 +554,7 @@ struct AssistantWindowView: View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.up.message")
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(AppVisualTheme.accentTint)
+                .foregroundStyle(.white.opacity(0.50))
 
             Text("Older chat history is hidden for speed. Scroll up to load more.")
                 .font(.system(size: 11, weight: .medium))
@@ -584,7 +590,7 @@ struct AssistantWindowView: View {
                     .fill(Color.black.opacity(0.82))
                     .overlay(
                         Capsule(style: .continuous)
-                            .stroke(AppVisualTheme.accentTint.opacity(0.24), lineWidth: 0.8)
+                            .stroke(Color.white.opacity(0.14), lineWidth: 0.5)
                     )
             )
             .shadow(color: .black.opacity(0.22), radius: 10, y: 4)
@@ -612,17 +618,24 @@ struct AssistantWindowView: View {
         Task { await assistant.renameSession(session.id, to: proposedTitle) }
     }
 
-    private func copyMessageButton(text: String, helpText: String) -> some View {
+    private func copyMessageButton(text: String, helpText: String, isVisible: Bool = true) -> some View {
         Button {
             copyAssistantTextToPasteboard(text)
         } label: {
             Image(systemName: "doc.on.doc")
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.46))
-                .frame(width: 18, height: 18)
+                .foregroundStyle(.white.opacity(0.78))
+                .frame(width: 28, height: 28)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(isVisible ? 0.10 : 0.001))
+                )
         }
         .buttonStyle(.plain)
         .help(helpText)
+        .opacity(isVisible ? 1 : 0)
+        .allowsHitTesting(isVisible)
+        .animation(.easeOut(duration: 0.12), value: isVisible)
     }
 
     private func resetVisibleHistoryWindow() {
@@ -632,7 +645,7 @@ struct AssistantWindowView: View {
     }
 
     private func updateUserScrollState(bottomOffset: CGFloat) {
-        guard chatViewportHeight > 0 else { return }
+        guard !assistant.isTransitioningSession, chatViewportHeight > 0 else { return }
 
         let isNearBottom =
             bottomOffset >= 0 &&
@@ -641,7 +654,9 @@ struct AssistantWindowView: View {
     }
 
     private func loadOlderHistoryIfNeeded(topOffset: CGFloat, with proxy: ScrollViewProxy) {
-        guard hiddenRenderItemCount > 0,
+        guard !assistant.isTransitioningSession,
+              userHasScrolledUp,
+              hiddenRenderItemCount > 0,
               topOffset > -Self.loadOlderThreshold,
               !isLoadingOlderHistory,
               let anchorID = visibleRenderItems.first?.id else {
@@ -676,7 +691,7 @@ struct AssistantWindowView: View {
                 .font(.system(size: 44, weight: .ultraLight))
                 .foregroundStyle(
                     LinearGradient(
-                        colors: [AppVisualTheme.accentTint, AppVisualTheme.accentTint.opacity(0.4)],
+                        colors: [.white.opacity(0.35), .white.opacity(0.12)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
@@ -733,38 +748,49 @@ struct AssistantWindowView: View {
     private func timelineRow(_ item: AssistantTimelineItem) -> some View {
         switch item.kind {
         case .userMessage:
-            timelineUserBubble(text: item.text ?? "", timestamp: item.sortDate, imageAttachments: item.imageAttachments)
+            timelineUserBubble(
+                text: item.text ?? "",
+                timestamp: item.sortDate,
+                imageAttachments: item.imageAttachments,
+                messageID: item.id
+            )
 
         case .assistantProgress:
             timelineAssistantRow(
+                messageID: item.id,
                 text: AssistantVisibleTextSanitizer.clean(item.text) ?? "",
                 timestamp: item.sortDate,
                 title: "Assistant",
                 tint: Color.white.opacity(0.30),
                 isStreaming: item.isStreaming,
                 compact: true,
+                showsInlineCopyButton: true,
                 showsMemoryActions: false
             )
 
         case .assistantFinal:
             timelineAssistantRow(
+                messageID: item.id,
                 text: AssistantVisibleTextSanitizer.clean(item.text) ?? "",
                 timestamp: item.sortDate,
                 title: "Assistant",
                 tint: Color(red: 0.55, green: 0.65, blue: 0.80),
                 isStreaming: item.isStreaming,
                 compact: false,
+                showsInlineCopyButton: true,
                 showsMemoryActions: settings.assistantMemoryEnabled && !item.isStreaming
             )
 
         case .system:
             timelineAssistantRow(
+                messageID: item.id,
                 text: item.text ?? "",
                 timestamp: item.sortDate,
                 title: item.emphasis ? "Needs Attention" : "System",
                 tint: item.emphasis ? .red : .white.opacity(0.5),
                 isStreaming: false,
                 compact: true,
+                showsInlineCopyButton: true,
                 showsMemoryActions: false
             )
 
@@ -805,7 +831,12 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func timelineUserBubble(text: String, timestamp: Date, imageAttachments: [Data]? = nil) -> some View {
+    private func timelineUserBubble(
+        text: String,
+        timestamp: Date,
+        imageAttachments: [Data]? = nil,
+        messageID: String
+    ) -> some View {
         HStack {
             Spacer(minLength: 80)
 
@@ -829,16 +860,24 @@ struct AssistantWindowView: View {
                 Text(verbatim: text)
                     .font(.system(size: 14, weight: .regular))
                     .foregroundStyle(.white.opacity(0.94))
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 14)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
                     .background(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(AppVisualTheme.accentTint.opacity(0.18))
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(AppVisualTheme.accentTint.opacity(0.12))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .stroke(AppVisualTheme.accentTint.opacity(0.08), lineWidth: 0.5)
+                            )
                     )
                     .textSelection(.enabled)
 
                 HStack(spacing: 6) {
-                    copyMessageButton(text: text, helpText: "Copy user message")
+                    copyMessageButton(
+                        text: text,
+                        helpText: "Copy user message",
+                        isVisible: inlineCopyButtonIsVisible(for: messageID)
+                    )
 
                     Text(timestamp.formatted(date: .omitted, time: .shortened))
                         .font(.system(size: 11))
@@ -846,7 +885,12 @@ struct AssistantWindowView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
         .padding(.vertical, 6)
+        .onHover { hovering in
+            updateInlineCopyHoverState(for: messageID, hovering: hovering)
+        }
         .contextMenu {
             Button("Copy Message") {
                 copyAssistantTextToPasteboard(text)
@@ -855,12 +899,14 @@ struct AssistantWindowView: View {
     }
 
     private func timelineAssistantRow(
+        messageID: String,
         text: String,
         timestamp: Date,
         title: String,
         tint: Color,
         isStreaming: Bool,
         compact: Bool,
+        showsInlineCopyButton: Bool,
         showsMemoryActions: Bool
     ) -> some View {
         HStack(alignment: .top, spacing: 10) {
@@ -881,10 +927,13 @@ struct AssistantWindowView: View {
 
                     Spacer(minLength: 8)
 
-                    copyMessageButton(
-                        text: text,
-                        helpText: title == "Assistant" ? "Copy assistant message" : "Copy message"
-                    )
+                    if showsInlineCopyButton {
+                        copyMessageButton(
+                            text: text,
+                            helpText: title == "Assistant" ? "Copy assistant message" : "Copy message",
+                            isVisible: inlineCopyButtonIsVisible(for: messageID)
+                        )
+                    }
                 }
 
                 AssistantMarkdownText(
@@ -898,7 +947,13 @@ struct AssistantWindowView: View {
 
             Spacer(minLength: 24)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .padding(.vertical, compact ? 5 : 8)
+        .onHover { hovering in
+            guard showsInlineCopyButton else { return }
+            updateInlineCopyHoverState(for: messageID, hovering: hovering)
+        }
         .contextMenu {
             Button("Copy Message") {
                 copyAssistantTextToPasteboard(text)
@@ -914,220 +969,272 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func timelineActivityRow(_ activity: AssistantActivityItem) -> some View {
-        let isExpanded = Binding(
-            get: { expandedActivityIDs.contains(activity.id) },
-            set: { expanded in
-                if expanded {
-                    expandedActivityIDs.insert(activity.id)
-                } else {
-                    expandedActivityIDs.remove(activity.id)
+    private func inlineCopyButtonIsVisible(for messageID: String) -> Bool {
+        hoveredInlineCopyMessageID == messageID
+    }
+
+    private func updateInlineCopyHoverState(for messageID: String, hovering: Bool) {
+        if hovering {
+            inlineCopyHideWorkItem?.cancel()
+            hoveredInlineCopyMessageID = messageID
+        } else if hoveredInlineCopyMessageID == messageID {
+            inlineCopyHideWorkItem?.cancel()
+            let workItem = DispatchWorkItem {
+                if hoveredInlineCopyMessageID == messageID {
+                    hoveredInlineCopyMessageID = nil
                 }
             }
-        )
+            inlineCopyHideWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: workItem)
+        }
+    }
 
-        return HStack(alignment: .top, spacing: 0) {
-            DisclosureGroup(isExpanded: isExpanded) {
-                VStack(alignment: .leading, spacing: 10) {
+    private func timelineActivityRow(_ activity: AssistantActivityItem) -> some View {
+        let expanded = expandedActivityIDs.contains(activity.id)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if expanded {
+                        expandedActivityIDs.remove(activity.id)
+                    } else {
+                        expandedActivityIDs.insert(activity.id)
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 10)
+
+                    Image(systemName: activityIconName(activity))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(activityIconTint(activity))
+                        .frame(width: 16, height: 16)
+
+                    Text(activity.title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.78))
+
+                    Text(activity.friendlySummary)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    Spacer(minLength: 4)
+
+                    Text(activityStatusLabel(activity))
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(activityStatusTint(activity))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(activityStatusTint(activity).opacity(0.12))
+                        )
+
+                    Text(activity.updatedAt.formatted(date: .omitted, time: .shortened))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.30))
+                }
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 8) {
                     Text(activity.friendlySummary)
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.76))
+                        .foregroundStyle(.white.opacity(0.70))
                         .fixedSize(horizontal: false, vertical: true)
 
                     if let rawDetails = activity.rawDetails?.assistantNonEmpty {
                         Text(rawDetails)
                             .font(.system(size: 11, weight: .regular, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.50))
+                            .foregroundStyle(.white.opacity(0.45))
                             .fixedSize(horizontal: false, vertical: true)
                             .textSelection(.enabled)
                     }
                 }
+                .padding(.leading, 34)
                 .padding(.top, 8)
-            } label: {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: activityIconName(activity))
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(activityIconTint(activity))
-                        .frame(width: 14, height: 14)
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(activity.title)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.78))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                        Text(activity.friendlySummary)
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle(.white.opacity(0.50))
-                            .lineLimit(2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    VStack(alignment: .trailing, spacing: 4) {
-                        Text(activityStatusLabel(activity))
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundStyle(activityStatusTint(activity))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(activityStatusTint(activity).opacity(0.12))
-                            )
-
-                        Text(activity.updatedAt.formatted(date: .omitted, time: .shortened))
-                            .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.35))
-                    }
-                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
-            .tint(.white.opacity(0.35))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.white.opacity(0.05))
-            )
-
-            Spacer(minLength: 80)
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+        .padding(.trailing, 60)
         .padding(.vertical, 2)
     }
 
     private func timelineActivityGroupRow(_ group: AssistantTimelineActivityGroup) -> some View {
-        let isExpanded = Binding(
-            get: { expandedActivityIDs.contains(group.id) },
-            set: { expanded in
-                if expanded {
-                    expandedActivityIDs.insert(group.id)
-                } else {
-                    expandedActivityIDs.remove(group.id)
+        let expanded = expandedActivityIDs.contains(group.id)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if expanded {
+                        expandedActivityIDs.remove(group.id)
+                    } else {
+                        expandedActivityIDs.insert(group.id)
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 10)
+
+                    Image(systemName: activityGroupIconName(group))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(activityGroupIconTint(group))
+                        .frame(width: 16, height: 16)
+
+                    Text(activityGroupTitle(group))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.78))
+
+                    Text(activityGroupSummary(group))
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    Spacer(minLength: 4)
+
+                    Text(activityGroupStatusLabel(group))
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(activityGroupStatusTint(group))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(activityGroupStatusTint(group).opacity(0.12))
+                        )
+
+                    Text(group.lastUpdatedAt.formatted(date: .omitted, time: .shortened))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.30))
                 }
             }
-        )
+            .buttonStyle(.plain)
 
-        return HStack(alignment: .top, spacing: 0) {
-            DisclosureGroup(isExpanded: isExpanded) {
-                VStack(alignment: .leading, spacing: 10) {
+            if expanded {
+                VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(group.activities.enumerated()), id: \.element.id) { index, activity in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .top, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            HStack(spacing: 8) {
                                 Image(systemName: activityIconName(activity))
                                     .font(.system(size: 10, weight: .semibold))
                                     .foregroundStyle(activityIconTint(activity))
                                     .frame(width: 14, height: 14)
 
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(activity.title)
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(.white.opacity(0.82))
+                                Text(activity.title)
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.72))
 
-                                    Text(activity.friendlySummary)
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.56))
-                                        .fixedSize(horizontal: false, vertical: true)
+                                Text(activity.friendlySummary)
+                                    .font(.system(size: 11, weight: .regular))
+                                    .foregroundStyle(.white.opacity(0.42))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
 
-                                    if let rawDetails = activity.rawDetails?.assistantNonEmpty {
-                                        Text(rawDetails)
-                                            .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                            .foregroundStyle(.white.opacity(0.46))
-                                            .fixedSize(horizontal: false, vertical: true)
-                                            .textSelection(.enabled)
-                                    }
-                                }
+                                Spacer(minLength: 4)
+                            }
+                            .padding(.vertical, 6)
 
-                                Spacer(minLength: 16)
+                            if let rawDetails = activity.rawDetails?.assistantNonEmpty {
+                                Text(rawDetails)
+                                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                    .foregroundStyle(.white.opacity(0.40))
+                                    .lineLimit(3)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                                    .padding(.leading, 22)
+                                    .padding(.bottom, 4)
                             }
 
                             if index < group.activities.count - 1 {
                                 Rectangle()
-                                    .fill(Color.white.opacity(0.06))
-                                    .frame(height: 1)
-                                    .padding(.leading, 24)
+                                    .fill(Color.white.opacity(0.05))
+                                    .frame(height: 0.5)
+                                    .padding(.leading, 22)
                             }
                         }
                     }
                 }
-                .padding(.top, 8)
-            } label: {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: activityGroupIconName(group))
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(activityGroupIconTint(group))
-                        .frame(width: 14, height: 14)
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(activityGroupTitle(group))
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.82))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                        Text(activityGroupSummary(group))
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.52))
-                            .lineLimit(2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    VStack(alignment: .trailing, spacing: 4) {
-                        Text(activityGroupStatusLabel(group))
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundStyle(activityGroupStatusTint(group))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(activityGroupStatusTint(group).opacity(0.12))
-                            )
-
-                        Text(group.lastUpdatedAt.formatted(date: .omitted, time: .shortened))
-                            .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.35))
-                    }
-                }
+                .padding(.leading, 34)
+                .padding(.top, 6)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
-            .tint(.white.opacity(0.35))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.white.opacity(0.05))
-            )
-
-            Spacer(minLength: 80)
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+        .padding(.trailing, 60)
         .padding(.vertical, 2)
     }
 
     private var toolActivityStrip: some View {
-        DisclosureGroup(isExpanded: $toolCallsExpanded) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    if !assistant.toolCalls.isEmpty {
-                        toolActivitySection(title: "Active", calls: assistant.toolCalls)
-                    }
-                    if !assistant.recentToolCalls.isEmpty {
-                        toolActivitySection(title: "Recent", calls: assistant.recentToolCalls)
-                    }
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    toolCallsExpanded.toggle()
                 }
-                .padding(.top, 4)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .rotationEffect(.degrees(toolCallsExpanded ? 90 : 0))
+                        .frame(width: 10)
+
+                    Image(systemName: "bolt.horizontal.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.4))
+
+                    Text(toolActivitySummary)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.5))
+
+                    Spacer()
+                }
             }
-            .frame(maxHeight: 200)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "bolt.horizontal.fill")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.4))
-                Text(toolActivitySummary)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.5))
+            .buttonStyle(.plain)
+
+            if toolCallsExpanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if !assistant.toolCalls.isEmpty {
+                            toolActivitySection(title: "Active", calls: assistant.toolCalls)
+                        }
+                        if !assistant.recentToolCalls.isEmpty {
+                            toolActivitySection(title: "Recent", calls: assistant.recentToolCalls)
+                        }
+                    }
+                    .padding(.top, 8)
+                    .padding(.leading, 18)
+                }
+                .frame(maxHeight: 200)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .tint(.white.opacity(0.35))
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.04))
         )
     }
 
@@ -1419,25 +1526,17 @@ struct AssistantWindowView: View {
     }
 
     private func toggleInteractionMode() {
-        let allModes = AssistantInteractionMode.allCases
-        guard let currentIndex = allModes.firstIndex(of: assistant.interactionMode) else {
-            assistant.interactionMode = .conversational
-            return
-        }
-        let nextIndex = allModes.index(after: currentIndex)
-        assistant.interactionMode = nextIndex == allModes.endIndex ? allModes[allModes.startIndex] : allModes[nextIndex]
+        assistant.interactionMode = assistant.interactionMode.nextMode
     }
 
     private var chatComposer: some View {
         VStack(spacing: 8) {
-            // Main composer card
-            VStack(spacing: 0) {
-                // Text input area
+            VStack(alignment: .leading, spacing: 10) {
                 ZStack(alignment: .topLeading) {
-                    if assistant.promptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if trimmedPromptDraft.isEmpty {
                         Text(composerPlaceholder)
                             .font(.system(size: 14, weight: .regular))
-                            .foregroundStyle(.white.opacity(0.32))
+                            .foregroundStyle(.white.opacity(0.30))
                             .padding(.horizontal, 16)
                             .padding(.vertical, 12)
                             .allowsHitTesting(false)
@@ -1445,68 +1544,62 @@ struct AssistantWindowView: View {
 
                     ComposerTextView(
                         text: $assistant.promptDraft,
-                        isEnabled: canStartConversation,
+                        isEnabled: settings.assistantBetaEnabled && !isVoiceCapturing,
                         onSubmit: { sendCurrentPrompt() },
                         onToggleMode: { toggleInteractionMode() },
                         onPasteAttachment: { attachment in
-                            DispatchQueue.main.async {
-                                assistant.attachments.append(attachment)
-                            }
+                            assistant.attachments.append(attachment)
                         }
                     )
-                    .frame(minHeight: 40, maxHeight: 120)
+                    .frame(minHeight: 48, maxHeight: 120)
                 }
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color.white.opacity(0.05))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+                        )
+                )
                 .onDrop(of: [.fileURL, .image, .png, .jpeg], isTargeted: nil) { providers in
                     handleDrop(providers)
                     return true
                 }
 
-                // Attachment preview strip
                 if !assistant.attachments.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 8) {
                             ForEach(assistant.attachments) { attachment in
                                 attachmentChip(attachment)
                             }
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 4)
+                        .padding(.horizontal, 2)
+                        .padding(.vertical, 1)
                     }
                 }
 
-                // Toolbar row: attach, mode, model, effort, context, send
-                HStack(spacing: 8) {
-                    // Attach file button
+                HStack(spacing: 7) {
                     Button { openFilePicker() } label: {
                         Image(systemName: "paperclip")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.45))
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.50))
+                            .frame(width: 28, height: 28)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(Color.white.opacity(0.04))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                                    )
+                            )
                     }
                     .buttonStyle(.plain)
                     .help("Attach files or images")
-                    // Interaction mode indicator (toggle with Shift-Tab or click)
-                    HStack(spacing: 3) {
-                        Image(systemName: assistant.interactionMode.icon)
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(
-                                assistant.interactionMode == .conversational
-                                ? .blue
-                                : (assistant.interactionMode == .plan ? .yellow : AppVisualTheme.accentTint)
-                            )
-                        Text(assistant.interactionMode.label)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.55))
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.white.opacity(0.07))
-                    )
-                    .help("\(assistant.interactionMode.hint) (Shift-Tab to switch)")
-                    .onTapGesture { toggleInteractionMode() }
 
-                    // Model selector (inline, always visible)
+                    AssistantModePicker(selection: assistant.interactionMode) { mode in
+                        assistant.interactionMode = mode
+                    }
+
                     Menu {
                         ForEach(assistant.visibleModels) { model in
                             Button {
@@ -1521,31 +1614,34 @@ struct AssistantWindowView: View {
                             }
                         }
                     } label: {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 4) {
                             Image(systemName: "bolt.fill")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(AppVisualTheme.accentTint)
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
                             Text(assistant.selectedModelSummary)
-                                .font(.system(size: 11, weight: .medium))
+                                .font(.system(size: 10.25, weight: .medium))
                                 .foregroundStyle(.white.opacity(0.55))
                             if !assistant.visibleModels.isEmpty {
                                 Image(systemName: "chevron.down")
-                                    .font(.system(size: 7, weight: .bold))
-                                    .foregroundStyle(.white.opacity(0.25))
+                                    .font(.system(size: 6, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.20))
                             }
                         }
                         .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
+                        .padding(.vertical, 4.5)
                         .background(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(Color.white.opacity(0.07))
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.white.opacity(0.04))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                                )
                         )
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
                     .disabled(assistant.visibleModels.isEmpty)
 
-                    // Reasoning effort selector (filtered by selected model)
                     Menu {
                         ForEach(supportedEfforts, id: \.self) { effort in
                             Button {
@@ -1560,84 +1656,78 @@ struct AssistantWindowView: View {
                             }
                         }
                     } label: {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 4) {
                             Text(assistant.reasoningEffort.label)
-                                .font(.system(size: 11, weight: .medium))
+                                .font(.system(size: 10.25, weight: .medium))
                                 .foregroundStyle(.white.opacity(0.55))
                             Image(systemName: "chevron.down")
-                                .font(.system(size: 7, weight: .bold))
-                                .foregroundStyle(.white.opacity(0.25))
+                                .font(.system(size: 6, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.20))
                         }
                         .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
+                        .padding(.vertical, 4.5)
                         .background(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(Color.white.opacity(0.07))
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.white.opacity(0.04))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                                )
                         )
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
                     .disabled(assistant.selectedModel == nil)
 
-                    // Context window usage for current session
-                    if assistant.tokenUsage.currentContextTokens > 0 {
-                        Divider()
-                            .frame(height: 14)
-                            .padding(.horizontal, 2)
-
-                        HStack(spacing: 4) {
-                            if let fraction = assistant.tokenUsage.contextUsageFraction {
-                                ContextUsageBar(fraction: fraction)
-                                    .frame(width: 40, height: 4)
-                            }
-                            Text(assistant.tokenUsage.contextSummary)
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                .foregroundStyle({
-                                    if let f = assistant.tokenUsage.contextUsageFraction, f > 0.8 {
-                                        return Color.red.opacity(0.7)
-                                    }
-                                    return Color.white.opacity(0.35)
-                                }() as Color)
+                    if !assistant.attachments.isEmpty {
+                        HStack(spacing: 5) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text("\(assistant.attachments.count)")
+                                .font(.system(size: 10, weight: .semibold))
                         }
+                        .foregroundStyle(.white.opacity(0.55))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.06))
+                        )
                     }
 
-                    Spacer()
+                    Spacer(minLength: 0)
 
-                    // Send / Stop button
-                    if isVoiceCapturing {
-                        Button {
-                            NotificationCenter.default.post(name: .keyScribeStopAssistantVoiceCapture, object: nil)
-                        } label: {
-                            Image(systemName: "stop.fill")
-                                .font(.system(size: 12, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(width: 28, height: 28)
-                                .background(
-                                    Circle()
-                                        .fill(Color.orange.opacity(0.8))
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .help("Stop listening")
-                    } else if isAgentBusy {
+                    if isAgentBusy {
                         Button {
                             Task { await assistant.cancelActiveTurn() }
                         } label: {
                             Image(systemName: "stop.fill")
                                 .font(.system(size: 12, weight: .bold))
                                 .foregroundStyle(.white)
-                                .frame(width: 28, height: 28)
+                                .frame(width: 30, height: 30)
                                 .background(
                                     Circle()
-                                        .fill(Color.red.opacity(0.7))
+                                        .fill(Color.red.opacity(0.65))
                                 )
                         }
                         .buttonStyle(.plain)
                         .help("Stop the current turn")
                     } else {
+                        AssistantPushToTalkButton(
+                            isListening: isVoiceCapturing,
+                            level: CGFloat(assistant.voiceCaptureLevel),
+                            isEnabled: settings.assistantVoiceTaskEntryEnabled
+                        ) { isPressed in
+                            if isPressed {
+                                NotificationCenter.default.post(name: .keyScribeStartAssistantVoiceCapture, object: nil)
+                            } else if isVoiceCapturing {
+                                NotificationCenter.default.post(name: .keyScribeStopAssistantVoiceCapture, object: nil)
+                            }
+                        }
+
                         Button { sendCurrentPrompt() } label: {
                             Image(systemName: "arrow.up")
-                                .font(.system(size: 12, weight: .bold))
+                                .font(.system(size: 11, weight: .bold))
                                 .foregroundStyle(.white)
                                 .frame(width: 30, height: 30)
                                 .background(
@@ -1645,97 +1735,144 @@ struct AssistantWindowView: View {
                                         .fill(
                                             canSendMessage
                                             ? AppVisualTheme.accentTint
-                                            : Color.white.opacity(0.10)
+                                            : Color.white.opacity(0.08)
                                         )
                                 )
                         }
                         .buttonStyle(.plain)
-                        .disabled(!canSendMessage)
+                        .disabled(!canSendMessage || isVoiceCapturing)
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 6)
 
                 if let memoryStatusMessage = assistant.memoryStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !memoryStatusMessage.isEmpty {
-                    HStack(spacing: 6) {
-                        Image(systemName: "brain.head.profile")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(AppVisualTheme.accentTint.opacity(0.85))
-                        Text(memoryStatusMessage)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.58))
-                        Spacer()
+                    composerStatusBanner(
+                        symbol: "brain.head.profile",
+                        text: memoryStatusMessage,
+                        tint: .white.opacity(0.50)
+                    ) {
                         if !assistant.pendingMemorySuggestions.isEmpty {
                             Button("Review") {
                                 assistant.openMemorySuggestionReview()
                             }
                             .buttonStyle(.plain)
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(AppVisualTheme.accentTint.opacity(0.9))
+                            .foregroundStyle(.white.opacity(0.65))
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
                 }
 
                 if let blockedReason = assistant.conversationBlockedReason {
-                    HStack(spacing: 6) {
-                        Image(systemName: assistant.isLoadingModels ? "hourglass" : "exclamationmark.circle")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(AppVisualTheme.accentTint.opacity(0.85))
-                        Text(blockedReason)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.58))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
+                    composerStatusBanner(
+                        symbol: assistant.isLoadingModels ? "hourglass" : "exclamationmark.circle",
+                        text: blockedReason,
+                        tint: assistant.isLoadingModels ? .white.opacity(0.50) : .orange
+                    )
                 }
 
+                if let suggestion = assistant.modeSwitchSuggestion {
+                    composerStatusBanner(
+                        symbol: suggestion.source == .blocked ? "arrow.triangle.branch" : "lightbulb",
+                        text: suggestion.message,
+                        tint: suggestion.source == .blocked ? .orange : .white.opacity(0.50)
+                    ) {
+                        modeSwitchSuggestionButtons(suggestion)
+                    }
+                }
             }
+            .padding(14)
             .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.white.opacity(0.03))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
                     )
             )
 
-            // Bottom row: browser profile
             HStack(spacing: 8) {
                 Spacer()
 
-                if settings.browserAutomationEnabled {
-                    Button {
-                        assistant.requestBrowserProfileSelection()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "globe")
-                                .font(.system(size: 10))
-                            if let profile = assistant.selectedBrowserProfile {
-                                Text(profile.label)
-                                    .font(.system(size: 10, weight: .medium))
-                            } else {
-                                Text("No browser")
-                                    .font(.system(size: 10, weight: .medium))
-                            }
-                        }
-                        .foregroundStyle(
-                            assistant.selectedBrowserProfile != nil
-                                ? Color.green.opacity(0.7)
-                                : Color.white.opacity(0.35)
-                        )
-                    }
-                    .buttonStyle(.plain)
+                if assistant.tokenUsage.currentContextTokens > 0 {
+                    ContextUsageCircle(usage: assistant.tokenUsage)
                 }
             }
         }
     }
 
     private var canSendMessage: Bool {
-        canStartConversation && !assistant.promptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        canStartConversation && (!trimmedPromptDraft.isEmpty || !assistant.attachments.isEmpty)
+    }
+
+    private var trimmedPromptDraft: String {
+        assistant.promptDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var composerSupportText: String {
+        if !assistant.attachments.isEmpty {
+            return "Images and files are ready to send with this message."
+        }
+        if isVoiceCapturing {
+            return "Voice capture is active. Release to add the draft here."
+        }
+        return "Drop files, paste screenshots, or click the paperclip to add context."
+    }
+
+    @ViewBuilder
+    private func composerStatusBanner<Accessory: View>(
+        symbol: String,
+        text: String,
+        tint: Color,
+        @ViewBuilder accessory: () -> Accessory = { EmptyView() }
+    ) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(tint.opacity(0.9))
+
+            Text(text)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.64))
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+
+            accessory()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(tint.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(tint.opacity(0.12), lineWidth: 0.6)
+                )
+        )
+    }
+
+    @ViewBuilder
+    private func modeSwitchSuggestionButtons(_ suggestion: AssistantModeSwitchSuggestion) -> some View {
+        HStack(spacing: 6) {
+            ForEach(suggestion.choices) { choice in
+                Button(choice.title) {
+                    Task { await assistant.applyModeSwitchSuggestion(choice) }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(AppVisualTheme.accentTint.opacity(suggestion.source == .blocked ? 0.24 : 0.18))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+                        )
+                )
+            }
+        }
     }
 
     private var supportedEfforts: [AssistantReasoningEffort] {
@@ -1747,51 +1884,52 @@ struct AssistantWindowView: View {
     }
 
     private var runtimeCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        isRuntimeExpanded.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(runtimeDotColor)
-                            .frame(width: 7, height: 7)
-                            .shadow(color: runtimeDotColor.opacity(0.5), radius: 3)
-                        Text("Runtime")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.90))
-                        Image(systemName: isRuntimeExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.4))
-                    }
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    isRuntimeExpanded.toggle()
                 }
-                .buttonStyle(.plain)
-
-                Spacer()
+            } label: {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(runtimeDotColor)
+                        .frame(width: 6, height: 6)
+                        .shadow(color: runtimeDotColor.opacity(0.4), radius: 2)
+                    Text("Runtime")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.80))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.30))
+                        .rotationEffect(.degrees(isRuntimeExpanded ? 90 : 0))
+                    Spacer()
+                }
             }
+            .buttonStyle(.plain)
 
             if isRuntimeExpanded {
-                Text(assistant.runtimeHealth.summary)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.80))
-                if let detail = assistant.runtimeHealth.detail, !detail.isEmpty,
-                   !detail.lowercased().contains("failed to load rollout") {
-                    Text(detail)
-                        .font(.system(size: 11))
-                        .foregroundStyle(AppVisualTheme.mutedText)
-                }
-                if assistant.accountSnapshot.isLoggedIn {
-                    HStack(spacing: 5) {
-                        Image(systemName: "person.crop.circle.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(AppVisualTheme.accentTint.opacity(0.8))
-                        Text(assistant.accountSnapshot.summary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(assistant.runtimeHealth.summary)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.70))
+                    if let detail = assistant.runtimeHealth.detail, !detail.isEmpty,
+                       !detail.lowercased().contains("failed to load rollout") {
+                        Text(detail)
                             .font(.system(size: 11))
-                            .foregroundStyle(.white.opacity(0.70))
+                            .foregroundStyle(.white.opacity(0.50))
+                    }
+                    if assistant.accountSnapshot.isLoggedIn {
+                        HStack(spacing: 5) {
+                            Image(systemName: "person.crop.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.45))
+                            Text(assistant.accountSnapshot.summary)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.55))
+                        }
                     }
                 }
+                .padding(.leading, 13)
             }
 
             if !assistant.rateLimits.isEmpty {
@@ -1804,10 +1942,18 @@ struct AssistantWindowView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .padding(.leading, 13)
             }
         }
-        .padding(12)
-        .appThemedSurface(cornerRadius: 12, tint: AppVisualTheme.accentTint, strokeOpacity: 0.12, tintOpacity: 0.03)
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                )
+        )
         .contentShape(Rectangle())
         .allowsHitTesting(!isRefreshing)
     }
@@ -1854,7 +2000,7 @@ struct AssistantWindowView: View {
                     }
                 }
 
-                if let toolKind = request.toolKind, !toolKind.isEmpty {
+                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "modeSwitch" {
                     Button("Always Allow") {
                         assistant.alwaysAllowToolKind(toolKind)
                         let sessionOption = request.options.first(where: { $0.id == "acceptForSession" })
@@ -1920,7 +2066,7 @@ struct AssistantWindowView: View {
             HStack {
                 Image(systemName: "doc.text")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(AppVisualTheme.accentTint)
+                    .foregroundStyle(.white.opacity(0.55))
                 Text("Proposed Plan")
                     .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(.white.opacity(0.88))
@@ -2046,7 +2192,7 @@ struct AssistantWindowView: View {
     // MARK: - Attachments
 
     private func attachmentChip(_ attachment: AssistantAttachment) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 8) {
             if attachment.isImage, let nsImage = NSImage(data: attachment.data) {
                 Button {
                     previewAttachment = attachment
@@ -2054,98 +2200,65 @@ struct AssistantWindowView: View {
                     Image(nsImage: nsImage)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
-                        .frame(width: 20, height: 20)
-                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .frame(width: 24, height: 24)
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 }
                 .buttonStyle(.plain)
             } else {
-                Image(systemName: "doc.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.5))
+                ZStack {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(AppVisualTheme.accentTint.opacity(0.16))
+                        .frame(width: 24, height: 24)
+                    Image(systemName: "doc.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.accentTint.opacity(0.95))
+                }
             }
-            Text(attachment.filename)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.white.opacity(0.6))
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.filename)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.76))
+                    .lineLimit(1)
+                Text(attachment.isImage ? "Image attachment" : "File attachment")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.42))
+            }
             Button {
                 assistant.attachments.removeAll { $0.id == attachment.id }
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.4))
+                    .foregroundStyle(.white.opacity(0.45))
+                    .frame(width: 18, height: 18)
+                    .background(
+                        Circle()
+                            .fill(Color.white.opacity(0.06))
+                    )
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
         .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
+            Capsule(style: .continuous)
                 .fill(Color.white.opacity(0.08))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.07), lineWidth: 0.6)
+                )
         )
     }
 
     private func openFilePicker() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.image, .plainText, .json, .yaml, .xml, .html, .sourceCode, .pdf, .data]
-        panel.begin { response in
-            guard response == .OK else { return }
-            for url in panel.urls {
-                addAttachmentFromURL(url)
-            }
-        }
-    }
-
-    private func addAttachmentFromURL(_ url: URL) {
-        guard let data = try? Data(contentsOf: url) else { return }
-        let filename = url.lastPathComponent
-        let mimeType = mimeTypeForExtension(url.pathExtension.lowercased())
-        let attachment = AssistantAttachment(filename: filename, data: data, mimeType: mimeType)
-        DispatchQueue.main.async {
-            assistant.attachments.append(attachment)
+        AssistantAttachmentSupport.openFilePicker { attachments in
+            guard !attachments.isEmpty else { return }
+            assistant.attachments.append(contentsOf: attachments)
         }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) {
-        for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier("public.file-url") {
-                provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { item, _ in
-                    guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                    addAttachmentFromURL(url)
-                }
-            } else if provider.canLoadObject(ofClass: NSImage.self) {
-                provider.loadObject(ofClass: NSImage.self) { item, _ in
-                    guard let image = item as? NSImage,
-                          let tiff = image.tiffRepresentation,
-                          let rep = NSBitmapImageRep(data: tiff),
-                          let png = rep.representation(using: .png, properties: [:]) else { return }
-                    let attachment = AssistantAttachment(filename: "pasted-image.png", data: png, mimeType: "image/png")
-                    DispatchQueue.main.async {
-                        assistant.attachments.append(attachment)
-                    }
-                }
-            }
-        }
-    }
-
-    private func mimeTypeForExtension(_ ext: String) -> String {
-        switch ext {
-        case "png": return "image/png"
-        case "jpg", "jpeg": return "image/jpeg"
-        case "gif": return "image/gif"
-        case "webp": return "image/webp"
-        case "svg": return "image/svg+xml"
-        case "pdf": return "application/pdf"
-        case "json": return "application/json"
-        case "txt", "md", "log": return "text/plain"
-        case "html", "htm": return "text/html"
-        case "csv": return "text/csv"
-        case "xml": return "text/xml"
-        case "yaml", "yml": return "text/yaml"
-        case "swift", "py", "js", "ts", "rs", "go", "java", "c", "cpp", "h", "m", "rb", "sh", "zsh", "bash":
-            return "text/plain"
-        default: return "application/octet-stream"
+        AssistantAttachmentSupport.handleDrop(providers) { attachment in
+            assistant.attachments.append(attachment)
         }
     }
 }
@@ -2293,42 +2406,45 @@ private struct AssistantSessionRow: View {
     private var badgeTint: Color {
         switch session.source {
         case .cli:
-            return AppVisualTheme.baseTint
+            return .white.opacity(0.50)
         case .vscode:
-            return AppVisualTheme.accentTint
+            return .white.opacity(0.50)
         case .appServer:
-            return .green
+            return .green.opacity(0.70)
         case .other:
-            return .orange
+            return .white.opacity(0.40)
         }
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            AppIconBadge(
-                symbol: badgeSymbol,
-                tint: badgeTint,
-                size: 22,
-                symbolSize: 10
-            )
-            VStack(alignment: .leading, spacing: 3) {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: badgeSymbol)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(badgeTint)
+                .frame(width: 20, height: 20)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(isSelected ? 0.08 : 0.04))
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
                 Text(session.title)
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(isSelected ? 0.98 : 0.88))
+                    .foregroundStyle(.white.opacity(isSelected ? 0.95 : 0.78))
                     .lineLimit(1)
                 Text(session.subtitle)
                     .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(isSelected ? 0.55 : 0.45))
+                    .foregroundStyle(.white.opacity(isSelected ? 0.50 : 0.38))
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isSelected ? AppVisualTheme.rowSelection.opacity(0.28) : Color.clear)
+                .fill(isSelected ? Color.white.opacity(0.08) : Color.clear)
         )
     }
 }
@@ -2374,11 +2490,11 @@ private struct AssistantChatBubble: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
                     .background(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .fill(AppVisualTheme.accentTint.opacity(0.22))
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(AppVisualTheme.accentTint.opacity(0.12))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                                    .stroke(AppVisualTheme.accentTint.opacity(0.15), lineWidth: 0.6)
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .stroke(AppVisualTheme.accentTint.opacity(0.08), lineWidth: 0.5)
                             )
                     )
                     .textSelection(.enabled)
@@ -2441,14 +2557,29 @@ private struct AssistantMarkdownText: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            renderedText
+            if isStreaming {
+                StreamingCursor()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var renderedText: some View {
+        switch AssistantTextRenderingPolicy.style(for: text, isStreaming: isStreaming) {
+        case .plain:
+            Text(verbatim: text)
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(.white.opacity(0.88))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        case .markdown:
             Markdown(text)
                 .markdownTheme(assistantTheme)
                 .markdownCodeSyntaxHighlighter(.plainText)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if isStreaming {
-                StreamingCursor()
-            }
         }
     }
 
@@ -2757,6 +2888,7 @@ enum AssistantVisibleTextSanitizer {
         }
 
         text = text
+            .removingAssistantAttachmentPlaceholders()
             .replacingOccurrences(of: "<analysis>", with: "", options: [.caseInsensitive])
             .replacingOccurrences(of: "</analysis>", with: "", options: [.caseInsensitive])
             .replacingOccurrences(of: "<proposed_plan>", with: "", options: [.caseInsensitive])
@@ -2928,7 +3060,7 @@ private struct ComposerTextView: NSViewRepresentable {
         textView.onSubmit = onSubmit
         textView.onToggleMode = onToggleMode
         textView.onPasteAttachment = onPasteAttachment
-        AssistantComposerBridge.shared.register(textView: textView)
+        AssistantComposerBridge.shared.register(textView: textView, target: .assistantWindow)
 
         scrollView.documentView = textView
         return scrollView
@@ -2936,7 +3068,7 @@ private struct ComposerTextView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
-        AssistantComposerBridge.shared.register(textView: textView)
+        AssistantComposerBridge.shared.register(textView: textView, target: .assistantWindow)
         if textView.string != text {
             let selectedRanges = textView.selectedRanges
             textView.string = text
@@ -2944,6 +3076,11 @@ private struct ComposerTextView: NSViewRepresentable {
         }
         textView.isEditable = isEnabled
         textView.isSelectable = isEnabled
+        if let textView = textView as? SubmittableTextView {
+            textView.onSubmit = onSubmit
+            textView.onToggleMode = onToggleMode
+            textView.onPasteAttachment = onPasteAttachment
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -2963,32 +3100,10 @@ private final class SubmittableTextView: NSTextView {
     var onPasteAttachment: ((AssistantAttachment) -> Void)?
 
     override func paste(_ sender: Any?) {
-        let pb = NSPasteboard.general
-        
-        // Check for images
-        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage], let firstImage = images.first {
-            if let tiff = firstImage.tiffRepresentation,
-               let rep = NSBitmapImageRep(data: tiff),
-               let png = rep.representation(using: .png, properties: [:]) {
-                let attachment = AssistantAttachment(filename: "pasted-image.png", data: png, mimeType: "image/png")
-                onPasteAttachment?(attachment)
-                return
-            }
+        if let attachment = AssistantAttachmentSupport.attachment(fromPasteboard: NSPasteboard.general) {
+            onPasteAttachment?(attachment)
+            return
         }
-        
-        // Check for file URLs
-        if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-            for url in urls {
-                let ext = url.pathExtension.lowercased()
-                if ["png", "jpg", "jpeg", "gif", "webp"].contains(ext),
-                   let data = try? Data(contentsOf: url) {
-                    let attachment = AssistantAttachment(filename: url.lastPathComponent, data: data, mimeType: "image/\(ext == "jpg" ? "jpeg" : ext)")
-                    onPasteAttachment?(attachment)
-                    return
-                }
-            }
-        }
-        
         super.paste(sender)
     }
 
@@ -3030,6 +3145,47 @@ private struct ContextUsageBar: View {
                     .frame(width: geo.size.width * CGFloat(fraction))
             }
         }
+    }
+}
+
+// MARK: - Context Usage Circle
+
+private struct ContextUsageCircle: View {
+    let usage: TokenUsageSnapshot
+
+    private var fraction: Double {
+        usage.contextUsageFraction ?? 0
+    }
+
+    private var ringColor: Color {
+        if fraction > 0.85 { return .red }
+        if fraction > 0.65 { return .orange }
+        return AppVisualTheme.accentTint
+    }
+
+    private var percentText: String {
+        "\(Int(round(fraction * 100)))%"
+    }
+
+    private var tooltipText: String {
+        let pct = Int(round(fraction * 100))
+        return "Context window: \(pct)% full\n\(usage.contextSummary) tokens used"
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.white.opacity(0.08), lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(ringColor.opacity(0.8), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            Text(percentText)
+                .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                .foregroundStyle(ringColor.opacity(0.9))
+        }
+        .frame(width: 22, height: 22)
+        .help(tooltipText)
     }
 }
 
@@ -3091,7 +3247,7 @@ private struct SubagentStrip: View {
             HStack(spacing: 6) {
                 Image(systemName: "person.3.fill")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(AppVisualTheme.accentTint.opacity(0.8))
+                    .foregroundStyle(.white.opacity(0.50))
                 Text("\(activeAgents.count) active agent\(activeAgents.count == 1 ? "" : "s")")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.65))

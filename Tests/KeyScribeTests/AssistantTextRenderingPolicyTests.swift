@@ -64,4 +64,15 @@ final class AssistantTextRenderingPolicyTests: XCTestCase {
 
         XCTAssertEqual(cleaned, "If you want, I can now turn this into a step-by-step checklist.")
     }
+
+    func testVisibleTextSanitizerRemovesImagePlaceholders() {
+        let cleaned = AssistantVisibleTextSanitizer.clean(
+            """
+            <image></image>
+            What does the dead letter mean here?
+            """
+        )
+
+        XCTAssertEqual(cleaned, "What does the dead letter mean here?")
+    }
 }

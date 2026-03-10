@@ -10,6 +10,7 @@ extension Notification.Name {
     static let keyScribeOpenSettings = Notification.Name("KeyScribe.openSettings")
     static let keyScribeOpenAssistant = Notification.Name("KeyScribe.openAssistant")
     static let keyScribeOpenAssistantSetup = Notification.Name("KeyScribe.openAssistantSetup")
+    static let keyScribeStartAssistantVoiceCapture = Notification.Name("KeyScribe.startAssistantVoiceCapture")
     static let keyScribeStopAssistantVoiceCapture = Notification.Name("KeyScribe.stopAssistantVoiceCapture")
     static let keyScribeStartOrbVoiceCapture = Notification.Name("KeyScribe.startOrbVoiceCapture")
     static let keyScribeStopOrbVoiceCapture = Notification.Name("KeyScribe.stopOrbVoiceCapture")
@@ -669,7 +670,7 @@ struct KeyScribeApp: App {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NSPopoverDelegate {
     static weak var shared: AppDelegate?
 
     private enum UpdateCheckFallback {
@@ -708,6 +709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private let transcriptHistory = TranscriptHistoryStore.shared
     private var windowCoordinator: AppWindowCoordinator?
     private var assistantOrbHUD: AssistantOrbHUDManager?
+    private var isAssistantWindowVisible = false
 
     private var statusItem: NSStatusItem?
     private let statusBarViewModel = StatusBarViewModel()
@@ -718,6 +720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var settingsRequestObserver: NSObjectProtocol?
     private var assistantRequestObserver: NSObjectProtocol?
     private var assistantSetupRequestObserver: NSObjectProtocol?
+    private var assistantStartVoiceCaptureObserver: NSObjectProtocol?
     private var assistantStopVoiceCaptureObserver: NSObjectProtocol?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var adaptiveCorrectionObserver: AnyCancellable?
@@ -732,6 +735,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var dictationInputMode: DictationInputMode = .idle
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
+    private var lastStatusIconRenderState: StatusIconRenderState?
+    private var statusIconCache: [StatusIconRenderState: NSImage] = [:]
     private var hasScheduledPermissionRestart = false
     private var pendingUpdateCheckFallbackWorkItem: DispatchWorkItem?
     private var settingsApplyWorkItem: DispatchWorkItem?
@@ -744,6 +749,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var assistantVoiceBaselineNoise: Float = 0
     private var assistantVoiceBaselineSamples: [Float] = []
     private var assistantVoiceBaselineCalibrated = false
+
+    private enum AssistantVoiceStopMode {
+        case silenceAutoStop
+        case manualRelease
+    }
+
+    private struct StatusIconRenderState: Hashable {
+        private static let bucketCount = 12
+
+        let isRecording: Bool
+        let bucket: Int
+
+        init(isRecording: Bool, level: Float, animationPhase: Double) {
+            self.isRecording = isRecording
+
+            if isRecording {
+                let normalizedLevel = max(0, min(1, level))
+                let waveMotion = Float((sin(animationPhase) + 1) * 0.5)
+                let idlePulse = 0.30 + (0.40 * waveMotion)
+                let animatedLevel = max(normalizedLevel, idlePulse)
+                let rawBucket = Int((animatedLevel * Float(Self.bucketCount)).rounded())
+                self.bucket = min(max(0, rawBucket), Self.bucketCount)
+            } else {
+                let idleBucket = Int((0.45 * Double(Self.bucketCount)).rounded())
+                self.bucket = min(max(0, idleBucket), Self.bucketCount)
+            }
+        }
+
+        var variableValue: Double {
+            if isRecording {
+                return max(0.30, Double(bucket) / Double(Self.bucketCount))
+            }
+            return 0.45
+        }
+    }
+
+    private var assistantVoiceStopMode: AssistantVoiceStopMode = .silenceAutoStop
+    private var orbVoiceStopMode: AssistantVoiceStopMode = .manualRelease
 
     private enum PromptRewriteFailureChoice {
         case retry
@@ -947,7 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         setupStatusBar()
         assistantOrbHUD = AssistantOrbHUDManager(controller: assistantController)
-        assistantOrbHUD?.isEnabled = settings.assistantFloatingHUDEnabled
+        syncAssistantOrbVisibility()
         assistantHUDObserver = assistantController.$hudState
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -969,6 +1012,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self?.insertText(text)
             }
         )
+        windowCoordinator?.onAssistantWindowVisibilityChanged = { [weak self] isVisible in
+            self?.isAssistantWindowVisible = isVisible
+            self?.syncAssistantOrbVisibility()
+        }
         automationAPICoordinator.setNotificationInteractionHandler { [weak self] source in
             guard let self else { return }
             if let source, Self.activateTerminalForSource(source) {
@@ -1079,12 +1126,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self.currentAudioLevel = max(0, min(1, level))
                 self.waveform.updateLevel(level)
                 if self.assistantVoiceCaptureActive {
+                    self.assistantController.updateVoiceCaptureLevel(level)
                     self.assistantOrbHUD?.updateLevel(level)
                     self.evaluateAssistantVoiceSilence(level: level)
                 } else if self.orbVoiceCaptureActive {
+                    self.assistantController.updateVoiceCaptureLevel(0)
                     self.assistantOrbHUD?.updateLevel(level)
                     self.evaluateOrbVoiceSilence(level: level)
                 } else {
+                    self.assistantController.updateVoiceCaptureLevel(0)
                     self.assistantOrbHUD?.updateLevel(0)
                 }
                 self.updateMenuState()
@@ -1096,6 +1146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self?.isDictating = isRecording
                 if !isRecording {
                     self?.currentAudioLevel = 0
+                    self?.assistantController.updateVoiceCaptureLevel(0)
                     if let currentMode = self?.dictationInputMode {
                         self?.dictationInputMode = DictationInputModeStateMachine.onRecordingEnded(currentMode)
                     }
@@ -1196,6 +1247,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             }
         }
 
+        assistantStartVoiceCaptureObserver = NotificationCenter.default.addObserver(
+            forName: .keyScribeStartAssistantVoiceCapture,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.beginAssistantVoiceTaskCapture(stopMode: .manualRelease)
+            }
+        }
+
         assistantStopVoiceCaptureObserver = NotificationCenter.default.addObserver(
             forName: .keyScribeStopAssistantVoiceCapture,
             object: nil,
@@ -1259,6 +1320,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         if let assistantSetupRequestObserver {
             NotificationCenter.default.removeObserver(assistantSetupRequestObserver)
             self.assistantSetupRequestObserver = nil
+        }
+        if let assistantStartVoiceCaptureObserver {
+            NotificationCenter.default.removeObserver(assistantStartVoiceCaptureObserver)
+            self.assistantStartVoiceCaptureObserver = nil
         }
         if let assistantStopVoiceCaptureObserver {
             NotificationCenter.default.removeObserver(assistantStopVoiceCaptureObserver)
@@ -1628,7 +1693,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem?.button?.title = ""
         statusItem?.button?.imagePosition = .imageOnly
-        statusItem?.button?.image = makeStatusIcon(isRecording: false, level: 0)
         statusItem?.button?.toolTip = "KeyScribe"
         statusItem?.button?.target = self
         statusItem?.button?.action = #selector(togglePopover)
@@ -1673,14 +1737,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
 
         let popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 10)
+        popover.contentSize = NSSize(width: 320, height: 360)
         popover.behavior = .transient
-        popover.animates = true
+        popover.animates = false
         popover.appearance = NSAppearance(named: .vibrantDark)
+        popover.delegate = self
         popover.contentViewController = NSHostingController(
             rootView: StatusBarPopoverView(viewModel: statusBarViewModel)
         )
         self.popover = popover
+        updateMenuState(forcePopoverRefresh: true, forceIconRefresh: true)
     }
 
     @objc private func togglePopover() {
@@ -1688,7 +1754,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         if let popover, popover.isShown {
             popover.performClose(nil)
         } else {
+            statusBarViewModel.isPopoverVisible = true
+            updateMenuState(forcePopoverRefresh: true)
             popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        statusBarViewModel.isPopoverVisible = true
+        updateMenuState(forcePopoverRefresh: true)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        statusBarViewModel.isPopoverVisible = false
+        if statusBarViewModel.currentAudioLevel != 0 {
+            statusBarViewModel.currentAudioLevel = 0
         }
     }
 
@@ -1704,13 +1784,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             return
         }
 
+        assistantOrbHUD?.hide()
         windowCoordinator?.openAssistantWindow(
             rootView: AssistantWindowView(assistant: assistantController)
             .environmentObject(settings)
         )
     }
 
-    private func beginAssistantVoiceTaskCapture() {
+    private func syncAssistantOrbVisibility() {
+        let shouldEnableOrb =
+            FeatureFlags.personalAssistantEnabled
+            && settings.assistantBetaEnabled
+            && settings.assistantFloatingHUDEnabled
+            && !isAssistantWindowVisible
+
+        assistantOrbHUD?.isEnabled = shouldEnableOrb
+
+        guard shouldEnableOrb else {
+            assistantOrbHUD?.hide()
+            return
+        }
+
+        assistantOrbHUD?.update(state: assistantController.hudState)
+    }
+
+    private func beginAssistantVoiceTaskCapture(stopMode: AssistantVoiceStopMode = .silenceAutoStop) {
         guard FeatureFlags.personalAssistantEnabled else { return }
         guard settings.assistantBetaEnabled else {
             setUIStatus(.message("Turn on Assistant in Settings first."))
@@ -1730,6 +1828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         openAssistantWindow()
         assistantVoiceCaptureActive = true
+        assistantVoiceStopMode = stopMode
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
@@ -1740,7 +1839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     func sendAssistantTypedPrompt(_ prompt: String) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty || !assistantController.attachments.isEmpty else { return }
 
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
@@ -1770,6 +1869,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopAssistantVoiceCapture() {
         guard assistantVoiceCaptureActive else { return }
         // Keep assistantVoiceCaptureActive = true so handleFinalTranscript routes to assistant
+        assistantVoiceStopMode = .silenceAutoStop
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
@@ -1784,7 +1884,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     // MARK: - Orb Voice Capture
 
-    private func beginOrbVoiceCapture() {
+    private func beginOrbVoiceCapture(stopMode: AssistantVoiceStopMode = .manualRelease) {
         guard !isDictating else { return }
         guard permissionsReady else {
             updatePermissionGate(openOnboardingIfNeeded: true)
@@ -1793,6 +1893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
 
         orbVoiceCaptureActive = true
+        orbVoiceStopMode = stopMode
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
@@ -1801,6 +1902,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if !isDictating {
             orbVoiceCaptureActive = false
+            orbVoiceStopMode = .manualRelease
             assistantOrbHUD?.receiveVoiceTranscript("")
         }
     }
@@ -1808,10 +1910,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopOrbVoiceCapture() {
         guard orbVoiceCaptureActive else { return }
         // Keep orbVoiceCaptureActive = true so handleFinalTranscript routes to orb
+        orbVoiceStopMode = .manualRelease
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
         assistantVoiceBaselineCalibrated = false
+        assistantOrbHUD?.setVoiceRecording(false)
         transcriber.stopRecording()
         isDictating = false
         currentAudioLevel = 0
@@ -1821,6 +1925,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     private func evaluateOrbVoiceSilence(level: Float) {
+        guard orbVoiceStopMode == .silenceAutoStop else { return }
+
         let calibrationSampleCount = 15
         let speechMultiplier: Float = 3.0
         let minimumSpeechThreshold: Float = 0.08
@@ -1857,6 +1963,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     private func evaluateAssistantVoiceSilence(level: Float) {
+        guard assistantVoiceStopMode == .silenceAutoStop else { return }
+
         let calibrationSampleCount = 15
         let speechMultiplier: Float = 3.0
         let minimumSpeechThreshold: Float = 0.08
@@ -1898,6 +2006,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopAssistantFromMenuBar() {
         if orbVoiceCaptureActive {
             orbVoiceCaptureActive = false
+            orbVoiceStopMode = .manualRelease
             transcriber.stopRecording(emitFinalText: false)
             isDictating = false
             currentAudioLevel = 0
@@ -1911,6 +2020,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
+            assistantVoiceStopMode = .silenceAutoStop
             transcriber.stopRecording(emitFinalText: false)
             isDictating = false
             currentAudioLevel = 0
@@ -1939,6 +2049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopAssistantExperience() {
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
+            assistantVoiceStopMode = .silenceAutoStop
             transcriber.stopRecording(emitFinalText: false)
         }
         assistantOrbHUD?.hide()
@@ -2077,7 +2188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             stopAssistantExperience()
         }
 
-        assistantOrbHUD?.isEnabled = settings.assistantFloatingHUDEnabled
+        syncAssistantOrbVisibility()
 
         automationAPICoordinator.applySettings(settings)
         lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
@@ -2203,6 +2314,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             return
         }
 
+        if beginVoiceCaptureForActiveAssistantComposerIfPossible() {
+            dictationInputMode = .holdToTalk
+            updateMenuState()
+            return
+        }
+
         startRecording()
         if isDictating {
             dictationInputMode = .holdToTalk
@@ -2213,8 +2330,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         guard DictationInputModeStateMachine.onHoldStop(dictationInputMode) == .idle else {
             return
         }
+
+        if stopVoiceCaptureForActiveAssistantComposerIfNeeded() {
+            dictationInputMode = .idle
+            updateMenuState()
+            return
+        }
+
         stopRecording()
         dictationInputMode = .idle
+    }
+
+    private func beginVoiceCaptureForActiveAssistantComposerIfPossible() -> Bool {
+        guard settings.assistantVoiceTaskEntryEnabled else { return false }
+
+        switch AssistantComposerBridge.shared.activeCaptureTarget {
+        case .assistantWindow:
+            beginAssistantVoiceTaskCapture(stopMode: .manualRelease)
+            return assistantVoiceCaptureActive
+        case .assistantOrb:
+            assistantOrbHUD?.setVoiceRecording(true)
+            beginOrbVoiceCapture(stopMode: .manualRelease)
+            return orbVoiceCaptureActive
+        case nil:
+            return false
+        }
+    }
+
+    private func stopVoiceCaptureForActiveAssistantComposerIfNeeded() -> Bool {
+        if orbVoiceCaptureActive {
+            stopOrbVoiceCapture()
+            return true
+        }
+
+        if assistantVoiceCaptureActive {
+            stopAssistantVoiceCapture()
+            return true
+        }
+
+        return false
     }
 
     private func toggleContinuousDictation() {
@@ -2245,10 +2399,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             updatePermissionGate(openOnboardingIfNeeded: true)
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
+                assistantVoiceStopMode = .silenceAutoStop
                 assistantController.failVoiceDraft("Assistant voice capture needs microphone and accessibility permissions.")
             }
             if orbVoiceCaptureActive {
                 orbVoiceCaptureActive = false
+                orbVoiceStopMode = .manualRelease
                 assistantOrbHUD?.receiveVoiceTranscript("")
             }
             return
@@ -2277,10 +2433,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         } else {
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
+                assistantVoiceStopMode = .silenceAutoStop
                 assistantController.failVoiceDraft("KeyScribe could not start voice capture.")
             }
             if orbVoiceCaptureActive {
                 orbVoiceCaptureActive = false
+                orbVoiceStopMode = .manualRelease
                 assistantOrbHUD?.receiveVoiceTranscript("")
             }
             waveform.hide()
@@ -2323,6 +2481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if orbVoiceCaptureActive {
             orbVoiceCaptureActive = false
+            orbVoiceStopMode = .manualRelease
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
             assistantOrbHUD?.receiveVoiceTranscript(cleaned)
@@ -2333,6 +2492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
+            assistantVoiceStopMode = .silenceAutoStop
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
             openAssistantWindow()
@@ -3491,7 +3651,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             return
         }
 
-        statusBarViewModel.uiStatus = status
+        if statusBarViewModel.uiStatus != status {
+            statusBarViewModel.uiStatus = status
+        }
 
         if status.resetsDictationIndicators {
             isDictating = false
@@ -3513,20 +3675,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         sound.play()
     }
 
-    private func updateMenuState() {
-        statusBarViewModel.isContinuousMode = (dictationInputMode == .continuous)
-        statusBarViewModel.permissionsReady = permissionsReady
-        statusBarViewModel.isDictating = isDictating
-        statusBarViewModel.currentAudioLevel = currentAudioLevel
-        statusBarViewModel.assistantEnabled = FeatureFlags.personalAssistantEnabled && settings.assistantBetaEnabled
+    private func updateMenuState(
+        forcePopoverRefresh: Bool = false,
+        forceIconRefresh: Bool = false
+    ) {
+        updateStatusBarViewModel(\.isContinuousMode, value: dictationInputMode == .continuous)
+        updateStatusBarViewModel(\.permissionsReady, value: permissionsReady)
+        updateStatusBarViewModel(\.isDictating, value: isDictating)
+        updateStatusBarViewModel(
+            \.assistantEnabled,
+            value: FeatureFlags.personalAssistantEnabled && settings.assistantBetaEnabled
+        )
+
         let assistantBusy = assistantVoiceCaptureActive
             || assistantController.pendingPermissionRequest != nil
             || [.thinking, .acting, .waitingForPermission, .streaming].contains(assistantController.hudState.phase)
-        statusBarViewModel.assistantCanStopCurrentAction = statusBarViewModel.assistantEnabled && assistantBusy
-        statusBarViewModel.assistantStopActionLabel = assistantVoiceCaptureActive
-            ? "Stop Assistant Listening"
-            : "Cancel Assistant Turn"
-        statusItem?.button?.image = makeStatusIcon(isRecording: isDictating, level: currentAudioLevel)
+        updateStatusBarViewModel(
+            \.assistantCanStopCurrentAction,
+            value: statusBarViewModel.assistantEnabled && assistantBusy
+        )
+        updateStatusBarViewModel(
+            \.assistantStopActionLabel,
+            value: assistantVoiceCaptureActive
+                ? "Stop Assistant Listening"
+                : "Cancel Assistant Turn"
+        )
+
+        let popoverVisible = statusBarViewModel.isPopoverVisible || popover?.isShown == true
+        let normalizedLevel = max(0, min(1, currentAudioLevel))
+        if popoverVisible || forcePopoverRefresh {
+            updateStatusBarAudioLevel(normalizedLevel, force: forcePopoverRefresh)
+        } else if statusBarViewModel.currentAudioLevel != 0 {
+            statusBarViewModel.currentAudioLevel = 0
+        }
+
+        updateStatusItemIcon(force: forceIconRefresh)
+    }
+
+    private func updateStatusBarAudioLevel(_ value: Float, force: Bool) {
+        let currentValue = statusBarViewModel.currentAudioLevel
+        let delta = abs(currentValue - value)
+        let threshold: Float = value == 0 || currentValue == 0 ? 0.01 : 0.04
+        if force || delta >= threshold {
+            statusBarViewModel.currentAudioLevel = value
+        }
+    }
+
+    private func updateStatusBarViewModel<T: Equatable>(
+        _ keyPath: ReferenceWritableKeyPath<StatusBarViewModel, T>,
+        value: T
+    ) {
+        if statusBarViewModel[keyPath: keyPath] != value {
+            statusBarViewModel[keyPath: keyPath] = value
+        }
+    }
+
+    private func updateStatusItemIcon(force: Bool = false) {
+        let renderState = StatusIconRenderState(
+            isRecording: isDictating,
+            level: currentAudioLevel,
+            animationPhase: statusIconAnimationPhase
+        )
+
+        guard force || renderState != lastStatusIconRenderState else { return }
+        lastStatusIconRenderState = renderState
+
+        if let cached = statusIconCache[renderState] {
+            statusItem?.button?.image = cached
+            statusItem?.button?.contentTintColor = nil
+            return
+        }
+
+        guard let image = makeStatusIcon(renderState: renderState) else { return }
+        statusIconCache[renderState] = image
+        statusItem?.button?.image = image
         statusItem?.button?.contentTintColor = nil
     }
 
@@ -3559,17 +3781,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         statusIconAnimationPhase = 0
     }
 
-    private func makeStatusIcon(isRecording: Bool, level: Float) -> NSImage? {
-        let normalizedLevel = max(0, min(1, level))
-        let waveMotion = Float((sin(statusIconAnimationPhase) + 1) * 0.5)
-        // Idle pulse sweeps from 0.3 to 0.7 so bars animate from center outward
-        let idlePulse = isRecording ? 0.30 + (0.40 * waveMotion) : 0
-        let animatedLevel = isRecording ? max(normalizedLevel, idlePulse) : normalizedLevel
-
+    private func makeStatusIcon(renderState: StatusIconRenderState) -> NSImage? {
         let symbol: NSImage?
         if #available(macOS 13.3, *) {
-            let variableValue = isRecording ? max(0.30, Double(animatedLevel)) : 0.45
-            symbol = NSImage(systemSymbolName: "waveform.circle", variableValue: variableValue, accessibilityDescription: "KeyScribe")
+            symbol = NSImage(
+                systemSymbolName: "waveform.circle",
+                variableValue: renderState.variableValue,
+                accessibilityDescription: "KeyScribe"
+            )
         } else {
             symbol = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "KeyScribe")
         }
@@ -5368,6 +5587,49 @@ struct SettingsView: View {
 
                     Button("Reset") {
                         settings.assistantMaxToolCallsPerTurn = 75
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            .padding(12)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.trianglehead.2.clockwise")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Text("Repeated Command Limit")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+
+                Text("Maximum number of times the same terminal command can repeat back-to-back in a single turn before it is automatically stopped. Set to 0 for unlimited.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 12) {
+                    TextField(
+                        "Max repeats",
+                        value: $settings.assistantMaxRepeatedCommandAttemptsPerTurn,
+                        format: .number
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 80)
+
+                    Text(
+                        settings.assistantMaxRepeatedCommandAttemptsPerTurn == 0
+                            ? "Unlimited"
+                            : "\(settings.assistantMaxRepeatedCommandAttemptsPerTurn) attempts"
+                    )
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button("Reset") {
+                        settings.assistantMaxRepeatedCommandAttemptsPerTurn = 3
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)

@@ -141,28 +141,51 @@ struct CodexSessionCatalog {
         }
 
         let updatedAt = Self.fractionalSecondsDateFormatter.string(from: Date())
-        let existingLines = (try? String(contentsOf: indexURL, encoding: .utf8))
-            .map { $0.split(whereSeparator: \.isNewline).map(String.init) } ?? []
+        let existingContents = (try? String(contentsOf: indexURL, encoding: .utf8)) ?? ""
+        let existingEntries = sessionIndexEntries(from: existingContents)
 
         var rewrittenLines: [String] = []
         var replacedExistingEntry = false
         let normalizedLookupID = normalizedSessionID.lowercased()
 
-        for line in existingLines {
-            guard let json = jsonObject(from: Substring(line)),
-                  let existingID = stringValue(json["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
-                  existingID.lowercased() == normalizedLookupID else {
-                rewrittenLines.append(line)
+        for entry in existingEntries {
+            guard let existingID = stringValue(entry["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
                 continue
             }
 
-            let rewrittenLine = try jsonStringLine([
-                "id": existingID,
-                "thread_name": normalizedTitle,
-                "updated_at": updatedAt
-            ])
-            rewrittenLines.append(rewrittenLine)
-            replacedExistingEntry = true
+            if existingID.lowercased() == normalizedLookupID {
+                if !replacedExistingEntry {
+                    let rewrittenLine = try jsonStringLine([
+                        "id": existingID,
+                        "thread_name": normalizedTitle,
+                        "updated_at": updatedAt
+                    ])
+                    rewrittenLines.append(rewrittenLine)
+                    replacedExistingEntry = true
+                }
+                continue
+            }
+
+            guard let existingTitle = firstNonEmptyString(
+                stringValue(entry["thread_name"]),
+                stringValue(entry["threadName"]),
+                stringValue(entry["title"])
+            ) else {
+                continue
+            }
+
+            let existingUpdatedAt = firstNonEmptyString(
+                stringValue(entry["updated_at"]),
+                stringValue(entry["updatedAt"])
+            ) ?? updatedAt
+
+            rewrittenLines.append(
+                try jsonStringLine([
+                    "id": existingID,
+                    "thread_name": existingTitle,
+                    "updated_at": existingUpdatedAt
+                ])
+            )
         }
 
         if !replacedExistingEntry {
@@ -175,7 +198,7 @@ struct CodexSessionCatalog {
             )
         }
 
-        let serialized = rewrittenLines.joined(separator: "\n")
+        let serialized = rewrittenLines.joined(separator: "\n") + "\n"
         try serialized.write(to: indexURL, atomically: true, encoding: .utf8)
     }
 
@@ -1104,6 +1127,10 @@ struct CodexSessionCatalog {
                     guard let text = cleanedAssistantMessage(stringValue(payload["last_agent_message"])) else {
                         continue
                     }
+                    if let latestAssistantText = latestAssistantTimelineText(in: items),
+                       normalizedDeduplicationText(latestAssistantText) == normalizedDeduplicationText(text) {
+                        continue
+                    }
                     appendTimelineMessage(
                         .assistantFinal(
                             id: "task-complete-\(index)",
@@ -1292,6 +1319,20 @@ struct CodexSessionCatalog {
         }
 
         items.append(item)
+    }
+
+    private func latestAssistantTimelineText(in items: [AssistantTimelineItem]) -> String? {
+        for item in items.reversed() {
+            switch item.kind {
+            case .assistantProgress, .assistantFinal:
+                if let text = item.text?.assistantNonEmpty {
+                    return text
+                }
+            default:
+                continue
+            }
+        }
+        return nil
     }
 
     private func upsertTimelineActivity(
@@ -1755,9 +1796,8 @@ struct CodexSessionCatalog {
         }
 
         var overrides: [String: String] = [:]
-        for rawLine in contents.split(whereSeparator: \.isNewline) {
-            guard let json = jsonObject(from: rawLine),
-                  let sessionID = stringValue(json["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+        for json in sessionIndexEntries(from: contents) {
+            guard let sessionID = stringValue(json["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
                   let title = firstNonEmptyString(
                     stringValue(json["thread_name"]),
                     stringValue(json["threadName"]),
@@ -1768,6 +1808,34 @@ struct CodexSessionCatalog {
             overrides[sessionID.lowercased()] = title
         }
         return overrides
+    }
+
+    private func sessionIndexEntries(from contents: String) -> [[String: Any]] {
+        guard !contents.isEmpty else { return [] }
+
+        var entries: [[String: Any]] = []
+        for rawLine in contents.split(whereSeparator: \.isNewline) {
+            let rawText = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rawText.isEmpty else { continue }
+
+            if let json = jsonObject(from: Substring(rawText)) {
+                entries.append(json)
+                continue
+            }
+
+            let repaired = rawText.replacingOccurrences(
+                of: #"(?<=\})\s*(?=\{)"#,
+                with: "\n",
+                options: .regularExpression
+            )
+            for candidate in repaired.split(whereSeparator: \.isNewline) {
+                if let json = jsonObject(from: candidate) {
+                    entries.append(json)
+                }
+            }
+        }
+
+        return entries
     }
 
     private func applyingThreadNameOverride(
@@ -1842,6 +1910,15 @@ struct CodexSessionCatalog {
             return nil
         }
 
+        // Server-echoed system context that carries no user-useful info.
+        if text.hasPrefix("<turn_aborted>") ||
+           text.hasPrefix("<skill>") ||
+           text.hasPrefix("# Recovered Thread Context") ||
+           text.hasPrefix("# Context from my IDE setup:") ||
+           text.hasPrefix("# Files mentioned by the user:") {
+            return nil
+        }
+
         if text.contains("## My request for Codex:"),
            let extracted = extractSuffix(after: "## My request for Codex:", in: text) {
             text = extracted
@@ -1849,10 +1926,6 @@ struct CodexSessionCatalog {
             text = extracted
         } else if let extracted = extractSuffix(after: "User prompt:", in: text) {
             text = extracted
-        }
-
-        if text.hasPrefix("<INSTRUCTIONS>") && text.contains("</INSTRUCTIONS>") {
-            return nil
         }
 
         if text.contains("## Available skills") && text.count > 400 {
@@ -1977,7 +2050,7 @@ struct CodexSessionCatalog {
             return nil
         }
 
-        return value
+        return sanitizeAttachmentPlaceholders(in: value)
             .replacingOccurrences(of: "\r\n", with: "\n")
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1991,10 +2064,34 @@ struct CodexSessionCatalog {
             return nil
         }
 
-        let normalized = value
+        let normalized = sanitizeAttachmentPlaceholders(in: value)
             .replacingOccurrences(of: "\r\n", with: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty ? nil : normalized
+    }
+
+    private func sanitizeAttachmentPlaceholders(in value: String) -> String {
+        value
+            .replacingOccurrences(
+                of: #"<image>\s*</image>"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"</?image>"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"</?input_image>"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"\s+"#,
+                with: " ",
+                options: .regularExpression
+            )
     }
 
     private func jsonObject(from rawLine: Substring) -> [String: Any]? {

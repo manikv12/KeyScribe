@@ -1,6 +1,12 @@
 import XCTest
 @testable import KeyScribe
 
+private final class AssistantRuntimeEventRecorder: @unchecked Sendable {
+    var toolSnapshots: [[AssistantToolCallState]] = []
+    var activityTitles: [String] = []
+    var systemMessages: [String] = []
+}
+
 final class AssistantSessionInteractionTests: XCTestCase {
     @MainActor
     func testShouldBlockSessionSwitchOnlyWhenAnotherTurnIsActive() {
@@ -34,11 +40,300 @@ final class AssistantSessionInteractionTests: XCTestCase {
         let runtime = CodexAssistantRuntime()
 
         XCTAssertFalse(runtime.shouldRenderActivity(for: "agentMessage"))
+        XCTAssertFalse(runtime.shouldRenderActivity(for: "agent_message"))
         XCTAssertFalse(runtime.shouldRenderActivity(for: "userMessage"))
+        XCTAssertFalse(runtime.shouldRenderActivity(for: "user_message"))
         XCTAssertFalse(runtime.shouldRenderActivity(for: "reasoning"))
         XCTAssertFalse(runtime.shouldRenderActivity(for: "plan"))
         XCTAssertTrue(runtime.shouldRenderActivity(for: "commandExecution"))
+        XCTAssertTrue(runtime.shouldRenderActivity(for: "command_execution"))
         XCTAssertTrue(runtime.shouldRenderActivity(for: "webSearch"))
+        XCTAssertTrue(runtime.shouldRenderActivity(for: "web_search_call"))
+    }
+
+    @MainActor
+    func testModePolicyAllowsExpectedToolActivityByMode() {
+        let runtime = CodexAssistantRuntime()
+
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "webSearch"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "web_search_call"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "web_search_call"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "commandExecution",
+                command: "rg --files Sources"
+            )
+        )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "commandExecution",
+                command: "swift test"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "commandExecution",
+                command: "swift test"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "fileChange"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "browserAutomation"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "dynamicToolCall",
+                toolName: "computer_use"
+            )
+        )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "browserAutomation"
+            )
+        )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "mcpToolCall"
+            )
+        )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "dynamicToolCall",
+                toolName: "computer_use"
+            )
+        )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "collabAgentToolCall"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .agentic,
+                rawType: "fileChange"
+            )
+        )
+    }
+
+    @MainActor
+    func testComputerUseDynamicToolCallUsesFriendlyTitleAndSummary() {
+        let runtime = CodexAssistantRuntime()
+
+        let state = runtime.toolCallStateForTesting(from: [
+            "id": "tool-1",
+            "type": "dynamicToolCall",
+            "tool": "computer_use",
+            "status": "running",
+            "arguments": ["task": "Open Mail and read the latest message."]
+        ])
+
+        XCTAssertEqual(state?.title, "Computer Use")
+        XCTAssertEqual(
+            runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: state?.title ?? ""),
+            "Used the computer."
+        )
+    }
+
+    @MainActor
+    func testSnakeCaseWebSearchUsesFriendlyTitleAndSummary() {
+        let runtime = CodexAssistantRuntime()
+
+        let state = runtime.toolCallStateForTesting(from: [
+            "id": "web-1",
+            "type": "web_search_call",
+            "status": "completed",
+            "action": ["query": "SCIM duplicate user conflict"]
+        ])
+
+        XCTAssertEqual(state?.title, "Web Search")
+        XCTAssertEqual(state?.detail, "SCIM duplicate user conflict")
+        XCTAssertEqual(
+            runtime.activitySummaryForTesting(kind: .webSearch, title: state?.title ?? ""),
+            "Searched the web."
+        )
+    }
+
+    @MainActor
+    func testComputerUseApprovalStaysScopedToTheSameSession() {
+        let runtime = CodexAssistantRuntime()
+
+        runtime.rememberComputerUseApprovalForTesting("thread-1")
+
+        XCTAssertTrue(runtime.isComputerUseApprovedForTesting("thread-1"))
+        XCTAssertFalse(runtime.isComputerUseApprovedForTesting("thread-2"))
+    }
+
+    @MainActor
+    func testBlockedToolUseMessagesTellUserToSwitchModes() {
+        let runtime = CodexAssistantRuntime()
+
+        let conversational = runtime.blockedToolUseMessage(
+            for: .conversational,
+            activityTitle: "Command",
+            commandClass: .validation
+        )
+        XCTAssertTrue(conversational.contains("cannot run build or test checks"))
+        XCTAssertTrue(conversational.contains("Plan or Agentic mode"))
+
+        let plan = runtime.blockedToolUseMessage(
+            for: .plan,
+            activityTitle: "Command"
+        )
+        XCTAssertEqual(plan, "Tool use is allowed in Plan mode.")
+
+        let computerUse = runtime.blockedToolUseMessage(
+            for: .conversational,
+            activityTitle: "Computer Use"
+        )
+        XCTAssertTrue(computerUse.contains("live screen or browser"))
+        XCTAssertTrue(computerUse.contains("attached image"))
+    }
+
+    @MainActor
+    func testDraftPlanRequestSuggestsSwitchToPlanMode() {
+        let suggestion = AssistantStore.modeSwitchSuggestion(
+            forDraft: "Can you make a plan for this refactor first?",
+            currentMode: .conversational
+        )
+
+        XCTAssertEqual(suggestion?.source, .draft)
+        XCTAssertEqual(suggestion?.choices.map(\.mode), [.plan])
+        XCTAssertEqual(suggestion?.choices.first?.resendLastRequest, false)
+    }
+
+    @MainActor
+    func testBlockedValidationInChatSuggestsPlanAndAgenticRetry() {
+        let suggestion = AssistantStore.modeSwitchSuggestion(
+            for: AssistantModeRestrictionEvent(
+                mode: .conversational,
+                activityTitle: "Command",
+                commandClass: .validation
+            )
+        )
+
+        XCTAssertEqual(suggestion?.source, .blocked)
+        XCTAssertEqual(suggestion?.choices.map(\.mode), [.plan, .agentic])
+        XCTAssertTrue(suggestion?.choices.allSatisfy(\.resendLastRequest) == true)
+    }
+
+    @MainActor
+    func testAssistantModelOptionTracksImageInputSupport() {
+        let imageModel = AssistantModelOption(
+            id: "gpt-5.4",
+            displayName: "GPT-5.4",
+            description: "Vision ready",
+            isDefault: false,
+            hidden: false,
+            supportedReasoningEfforts: [],
+            defaultReasoningEffort: nil,
+            inputModalities: ["text", "image"]
+        )
+        XCTAssertTrue(imageModel.supportsImageInput)
+
+        let textOnlyModel = AssistantModelOption(
+            id: "text-only",
+            displayName: "Text Only",
+            description: "No vision",
+            isDefault: false,
+            hidden: false,
+            supportedReasoningEfforts: [],
+            defaultReasoningEffort: nil,
+            inputModalities: ["text"]
+        )
+        XCTAssertFalse(textOnlyModel.supportsImageInput)
+    }
+
+    @MainActor
+    func testUnsupportedImageAttachmentMessageAppearsForTextOnlyModel() {
+        let attachment = AssistantAttachment(
+            filename: "screen.png",
+            data: Data([0x89, 0x50, 0x4E, 0x47]),
+            mimeType: "image/png"
+        )
+        let model = AssistantModelOption(
+            id: "text-only",
+            displayName: "Text Only",
+            description: "No vision",
+            isDefault: false,
+            hidden: false,
+            supportedReasoningEfforts: [],
+            defaultReasoningEffort: nil,
+            inputModalities: ["text"]
+        )
+
+        let message = AssistantStore.unsupportedImageAttachmentMessage(
+            for: [attachment],
+            selectedModel: model
+        )
+
+        XCTAssertEqual(
+            message,
+            "The selected model Text Only cannot read image attachments. Choose a model that supports image input and try again. Chat mode can still analyze attached images when the model supports them, but live screen or browser inspection needs Agentic mode."
+        )
+    }
+
+    @MainActor
+    func testChatModeRedirectsFirstToolAttemptBackToAttachedImageAnalysis() {
+        let runtime = CodexAssistantRuntime()
+        runtime.interactionMode = .conversational
+        runtime.configureImageAttachmentContextForTesting(
+            includesImages: true,
+            modelSupportsImageInput: true
+        )
+
+        XCTAssertTrue(runtime.shouldRedirectBlockedImageToolRequestForTesting(method: "item/tool/call"))
+
+        runtime.configureImageAttachmentContextForTesting(
+            includesImages: true,
+            modelSupportsImageInput: true,
+            redirectedAlready: true
+        )
+        XCTAssertFalse(runtime.shouldRedirectBlockedImageToolRequestForTesting(method: "item/tool/call"))
+    }
+
+    @MainActor
+    func testImageAttachmentUsesCodexInputImageShape() {
+        let attachment = AssistantAttachment(
+            filename: "screen.png",
+            data: Data([0x89, 0x50, 0x4E, 0x47]),
+            mimeType: "image/png"
+        )
+
+        let item = attachment.toInputItem()
+
+        XCTAssertEqual(item["type"] as? String, "input_image")
+        XCTAssertTrue((item["image_url"] as? String)?.hasPrefix("data:image/png;base64,") == true)
     }
 
     @MainActor
@@ -153,6 +448,64 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testBlockedCommandActivityDoesNotPublishToolRowBeforeMessage() {
+        let runtime = CodexAssistantRuntime()
+        runtime.interactionMode = .conversational
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onToolCallUpdate = { recorder.toolSnapshots.append($0) }
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation,
+               item.kind == .activity,
+               let activity = item.activity {
+                recorder.activityTitles.append(activity.title)
+            }
+        }
+        runtime.onTranscript = { entry in
+            if entry.role == .system {
+                recorder.systemMessages.append(entry.text)
+            }
+        }
+
+        runtime.processActivityEventForTesting([
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "status": "running",
+            "command": "swift test"
+        ])
+
+        XCTAssertTrue(recorder.toolSnapshots.isEmpty)
+        XCTAssertTrue(recorder.activityTitles.isEmpty)
+        XCTAssertEqual(recorder.systemMessages.count, 1)
+        XCTAssertTrue(recorder.systemMessages[0].contains("cannot run build or test checks"))
+    }
+
+    @MainActor
+    func testBlockedActivityMessageIsOnlyEmittedOnceForStartedAndCompletedEvents() {
+        let runtime = CodexAssistantRuntime()
+        runtime.interactionMode = .conversational
+        let recorder = AssistantRuntimeEventRecorder()
+        runtime.onTranscript = { entry in
+            if entry.role == .system {
+                recorder.systemMessages.append(entry.text)
+            }
+        }
+
+        let blockedItem: [String: Any] = [
+            "id": "cmd-2",
+            "type": "commandExecution",
+            "status": "running",
+            "command": "swift test"
+        ]
+
+        runtime.processActivityEventForTesting(blockedItem)
+        runtime.processActivityEventForTesting(blockedItem, isCompleted: true)
+
+        XCTAssertEqual(recorder.systemMessages.count, 1)
+        XCTAssertTrue(recorder.systemMessages[0].contains("cannot run build or test checks"))
+    }
+
+    @MainActor
     func testBrowserTurnReminderCarriesCurrentProfileDetails() {
         let reminder = CodexAssistantRuntime.browserTurnReminder(from: [
             "browser": "Brave Browser",
@@ -254,5 +607,78 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertNotNil(context)
         XCTAssertTrue(context?.contains("User: What all is in my obsidian vault you said?") == true)
         XCTAssertTrue(context?.contains("Assistant: Your Macs Obsidian vault currently shows three items.") == true)
+    }
+
+    @MainActor
+    func testGeneratedSessionTitleOnlyReplacesFallbackStyleTitles() {
+        XCTAssertTrue(
+            AssistantStore.shouldApplyGeneratedSessionTitle(
+                existingTitle: "Check browser profile usage",
+                fallbackTitle: "Check browser profile usage",
+                cwd: "/Users/test/project"
+            )
+        )
+
+        XCTAssertTrue(
+            AssistantStore.shouldApplyGeneratedSessionTitle(
+                existingTitle: "New Assistant Session",
+                fallbackTitle: "Check browser profile usage",
+                cwd: "/Users/test/project"
+            )
+        )
+
+        XCTAssertTrue(
+            AssistantStore.shouldApplyGeneratedSessionTitle(
+                existingTitle: "/Users/test/project",
+                fallbackTitle: "Check browser profile usage",
+                cwd: "/Users/test/project"
+            )
+        )
+
+        XCTAssertFalse(
+            AssistantStore.shouldApplyGeneratedSessionTitle(
+                existingTitle: "My Custom Thread Name",
+                fallbackTitle: "Check browser profile usage",
+                cwd: "/Users/test/project"
+            )
+        )
+    }
+
+    @MainActor
+    func testRepeatedCommandTrackerStopsWhenNormalizedCommandHitsLimit() {
+        var tracker = AssistantRepeatedCommandTracker()
+
+        XCTAssertNil(tracker.record(command: "pwd", maxAttempts: 3))
+        XCTAssertNil(tracker.record(command: "  pwd  ", maxAttempts: 3))
+
+        let hit = tracker.record(command: "\npwd\n", maxAttempts: 3)
+        XCTAssertEqual(
+            hit,
+            AssistantRepeatedCommandLimitHit(command: "pwd", attemptCount: 3)
+        )
+    }
+
+    @MainActor
+    func testRepeatedCommandTrackerTreatsWhitespaceOnlyDifferencesAsSameCommand() {
+        XCTAssertEqual(
+            AssistantRepeatedCommandTracker.normalizedSignature(for: "ls   -la\t/tmp"),
+            AssistantRepeatedCommandTracker.normalizedSignature(for: "  ls -la /tmp  ")
+        )
+    }
+
+    @MainActor
+    func testRepeatedCommandTrackerResetsWhenDifferentCommandBreaksTheLoop() {
+        var tracker = AssistantRepeatedCommandTracker()
+
+        XCTAssertNil(tracker.record(command: "pwd", maxAttempts: 3))
+        XCTAssertNil(tracker.record(command: "ls", maxAttempts: 3))
+        XCTAssertNil(tracker.record(command: "pwd", maxAttempts: 3))
+        XCTAssertNil(tracker.record(command: "pwd", maxAttempts: 3))
+
+        let hit = tracker.record(command: "pwd", maxAttempts: 3)
+        XCTAssertEqual(
+            hit,
+            AssistantRepeatedCommandLimitHit(command: "pwd", attemptCount: 3)
+        )
     }
 }

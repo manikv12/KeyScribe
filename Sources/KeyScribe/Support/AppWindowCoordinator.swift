@@ -18,6 +18,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let transcriptHistory: TranscriptHistoryStore
     private let onStatusUpdate: (DictationUIStatus) -> Void
     private let onInsertText: (String) -> Void
+    var onAssistantWindowVisibilityChanged: ((Bool) -> Void)?
 
     private var settingsWindowController: NSWindowController?
     private var aiStudioWindowController: NSWindowController?
@@ -246,6 +247,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         onStatusUpdate(.ready)
+        onAssistantWindowVisibilityChanged?(true)
     }
 
     func closePermissionOnboardingWindow() {
@@ -257,6 +259,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         assistantWindowController?.close()
         assistantWindowController = nil
         setActivationPolicyForOpenWindows()
+        onAssistantWindowVisibilityChanged?(false)
     }
 
     func openHistoryWindow() {
@@ -332,6 +335,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         historyWindowController?.close()
         historyWindowController = nil
         setActivationPolicyForOpenWindows()
+        onAssistantWindowVisibilityChanged?(false)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -342,6 +346,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
                 aiStudioWindowController = nil
             } else if closingWindow === assistantWindowController?.window {
                 assistantWindowController = nil
+                onAssistantWindowVisibilityChanged?(false)
             } else if closingWindow === historyWindowController?.window {
                 historyWindowController = nil
             } else if closingWindow === onboardingWindowController?.window {

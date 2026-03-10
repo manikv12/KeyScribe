@@ -321,8 +321,8 @@ struct AssistantAttachment: Identifiable, Equatable {
         if isImage {
             let base64 = data.base64EncodedString()
             return [
-                "type": "image",
-                "url": "data:\(mimeType);base64,\(base64)"
+                "type": "input_image",
+                "image_url": "data:\(mimeType);base64,\(base64)"
             ]
         } else {
             let text = String(data: data, encoding: .utf8) ?? data.base64EncodedString()
@@ -474,7 +474,7 @@ enum AssistantInteractionMode: String, CaseIterable, Sendable {
 
     var label: String {
         switch self {
-        case .conversational: return "Conversational"
+        case .conversational: return "Chat"
         case .plan: return "Plan"
         case .agentic: return "Agentic"
         }
@@ -490,9 +490,9 @@ enum AssistantInteractionMode: String, CaseIterable, Sendable {
 
     var hint: String {
         switch self {
-        case .conversational: return "Chat only without making changes"
-        case .plan: return "Make a plan without executing work"
-        case .agentic: return "Full tool access to execute work"
+        case .conversational: return "Inspect files and search, but do not make changes"
+        case .plan: return "Inspect, search, and run checks before making a plan"
+        case .agentic: return "Full tool access to inspect and make changes"
         }
     }
 
@@ -504,6 +504,34 @@ enum AssistantInteractionMode: String, CaseIterable, Sendable {
         case .agentic: return "default"
         }
     }
+}
+
+struct AssistantModeSwitchChoice: Identifiable, Equatable, Sendable {
+    let mode: AssistantInteractionMode
+    let title: String
+    let resendLastRequest: Bool
+
+    var id: String {
+        "\(mode.rawValue)-\(resendLastRequest ? "retry" : "switch")"
+    }
+}
+
+struct AssistantModeSwitchSuggestion: Equatable, Sendable {
+    enum Source: String, Sendable {
+        case draft
+        case blocked
+    }
+
+    let source: Source
+    let originMode: AssistantInteractionMode
+    let message: String
+    let choices: [AssistantModeSwitchChoice]
+}
+
+struct AssistantModeRestrictionEvent: Equatable, Sendable {
+    let mode: AssistantInteractionMode
+    let activityTitle: String?
+    let commandClass: AssistantCommandSafetyClass?
 }
 
 struct AssistantPlanEntry: Identifiable, Equatable, Codable, Sendable {
@@ -659,6 +687,54 @@ struct AssistantModelOption: Identifiable, Equatable, Sendable {
     var hidden: Bool
     var supportedReasoningEfforts: [String]
     var defaultReasoningEffort: String?
+    var inputModalities: [String] = []
+
+    var supportsImageInput: Bool {
+        inputModalities.contains { modality in
+            let normalized = modality.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized == "image" || normalized == "vision"
+        }
+    }
+
+    var hasKnownInputModalities: Bool {
+        !inputModalities.isEmpty
+    }
+
+    static func normalizedInputModalities(from raw: Any?) -> [String] {
+        let values: [String]
+
+        if let strings = raw as? [String] {
+            values = strings
+        } else if let rows = raw as? [[String: Any]] {
+            values = rows.compactMap { row in
+                (row["modality"] as? String)
+                    ?? (row["type"] as? String)
+                    ?? (row["name"] as? String)
+            }
+        } else if let array = raw as? [Any] {
+            values = array.compactMap { value in
+                if let text = value as? String {
+                    return text
+                }
+                if let row = value as? [String: Any] {
+                    return (row["modality"] as? String)
+                        ?? (row["type"] as? String)
+                        ?? (row["name"] as? String)
+                }
+                return nil
+            }
+        } else {
+            values = []
+        }
+
+        var seen: Set<String> = []
+        return values.compactMap { value in
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty, !seen.contains(normalized) else { return nil }
+            seen.insert(normalized)
+            return normalized
+        }
+    }
 }
 
 struct AssistantEnvironmentDetails: Sendable {
@@ -690,7 +766,14 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var availableModels: [AssistantModelOption] = []
     @Published private(set) var selectedModelID: String?
     @Published private(set) var isLoadingModels = false
-    @Published var promptDraft = ""
+    @Published var promptDraft = "" {
+        didSet {
+            if promptDraft.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+                blockedModeSwitchSuggestion = nil
+            }
+            refreshModeSwitchSuggestion()
+        }
+    }
     @Published var selectedSessionID: String?
     @Published var assistantEnabled = false
     @Published var lastStatusMessage: String?
@@ -700,10 +783,16 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var tokenUsage: TokenUsageSnapshot = .empty
     @Published private(set) var rateLimits: AccountRateLimits = .empty
     @Published private(set) var subagents: [SubagentState] = []
+    @Published private(set) var voiceCaptureLevel: Float = 0
     @Published var reasoningEffort: AssistantReasoningEffort = .high
-    @Published var interactionMode: AssistantInteractionMode = .conversational
+    @Published var interactionMode: AssistantInteractionMode = .conversational {
+        didSet {
+            refreshModeSwitchSuggestion()
+        }
+    }
     @Published private(set) var proposedPlan: String?
     @Published var attachments: [AssistantAttachment] = []
+    @Published private(set) var modeSwitchSuggestion: AssistantModeSwitchSuggestion?
     @Published private(set) var currentMemoryFileURL: URL?
     @Published private(set) var memoryStatusMessage: String?
     @Published private(set) var pendingMemorySuggestions: [AssistantMemorySuggestion] = []
@@ -719,15 +808,18 @@ final class AssistantStore: ObservableObject {
     private var lastSubmittedPrompt: String?
     private var transcriptSessionID: String?
     private var timelineSessionID: String?
+    private var transcriptEntriesBySessionID: [String: [AssistantTranscriptEntry]] = [:]
     private var timelineItemsBySessionID: [String: [AssistantTimelineItem]] = [:]
+    private var sessionLoadRequestID = UUID()
     private var isSendingPrompt = false
     private var isRefreshingEnvironment = false
     private var isRefreshingSessions = false
     private var oneShotSessionInstructions: String?
+    private var blockedModeSwitchSuggestion: AssistantModeSwitchSuggestion?
     private var proposedPlanSessionID: String?
     private var memoryScopeBySessionID: [String: MemoryScopeContext] = [:]
-    private var browserAutomationPrimedSignaturesBySessionID: [String: String] = [:]
     private var pendingResumeContextSessionIDs: Set<String> = []
+    private var lastSubmittedAttachments: [AssistantAttachment] = []
 
     private init(
         installSupport: CodexInstallSupport = CodexInstallSupport(),
@@ -786,6 +878,12 @@ final class AssistantStore: ObservableObject {
         }
         self.runtime.onHUDUpdate = { [weak self] state in
             Task { @MainActor in self?.hudState = state }
+        }
+        self.runtime.onModeRestriction = { [weak self] event in
+            Task { @MainActor in
+                self?.blockedModeSwitchSuggestion = Self.modeSwitchSuggestion(for: event)
+                self?.refreshModeSwitchSuggestion()
+            }
         }
         self.runtime.onPlanUpdate = { [weak self] entries in
             Task { @MainActor in self?.planEntries = entries }
@@ -859,6 +957,17 @@ final class AssistantStore: ObservableObject {
                     : (self?.runtime.currentSessionID ?? self?.selectedSessionID)
             }
         }
+        self.runtime.onTitleRequest = { [weak self] sessionID, userPrompt, assistantResponse in
+            Task { @MainActor in
+                self?.generateSessionTitle(
+                    sessionID: sessionID,
+                    userPrompt: userPrompt,
+                    assistantResponse: assistantResponse
+                )
+            }
+        }
+
+        refreshModeSwitchSuggestion()
     }
 
     var composerText: String {
@@ -914,6 +1023,24 @@ final class AssistantStore: ObservableObject {
         return visibleModels.first(where: { $0.id == selectedModelID })
     }
 
+    var selectedModelSupportsImageInput: Bool {
+        guard let selectedModel else { return true }
+        guard selectedModel.hasKnownInputModalities else { return true }
+        return selectedModel.supportsImageInput
+    }
+
+    static func unsupportedImageAttachmentMessage(
+        for attachments: [AssistantAttachment],
+        selectedModel: AssistantModelOption?
+    ) -> String? {
+        guard attachments.contains(where: \.isImage) else { return nil }
+        guard let selectedModel else { return nil }
+        guard selectedModel.hasKnownInputModalities else { return nil }
+        guard !selectedModel.supportsImageInput else { return nil }
+
+        return "The selected model \(selectedModel.displayName) cannot read image attachments. Choose a model that supports image input and try again. Chat mode can still analyze attached images when the model supports them, but live screen or browser inspection needs Agentic mode."
+    }
+
     var isRuntimeReadyForConversation: Bool {
         switch runtimeHealth.availability {
         case .ready, .active:
@@ -928,7 +1055,24 @@ final class AssistantStore: ObservableObject {
     }
 
     var conversationBlockedReason: String? {
-        guard isRuntimeReadyForConversation else { return nil }
+        if !isRuntimeReadyForConversation {
+            switch runtimeHealth.availability {
+            case .idle, .checking:
+                return "Waiting for Codex to start."
+            case .connecting:
+                return "Connecting to Codex."
+            case .installRequired:
+                return "Install Codex to start the assistant."
+            case .loginRequired:
+                return "Sign in to Codex before starting a conversation."
+            case .unavailable:
+                return "Codex is not available right now."
+            case .failed:
+                return runtimeHealth.detail ?? "Codex needs attention. Check Setup."
+            case .ready, .active:
+                break // shouldn't happen, but fall through
+            }
+        }
         if isLoadingModels {
             return "Loading models from Codex before chat starts."
         }
@@ -937,6 +1081,10 @@ final class AssistantStore: ObservableObject {
         }
         if selectedModel == nil {
             return "Choose a model before starting a conversation. Then confirm the reasoning level."
+        }
+        if attachments.contains(where: \.isImage), !selectedModelSupportsImageInput {
+            let modelName = selectedModel?.displayName ?? "The selected model"
+            return "\(modelName) cannot read image attachments. Choose a model with image support, then try again."
         }
         return nil
     }
@@ -960,6 +1108,11 @@ final class AssistantStore: ObservableObject {
         case none
         case enableAutomation
         case selectProfile
+    }
+
+    enum ImageInputRequirement: Equatable {
+        case none
+        case unsupportedSelectedModel
     }
 
     static func shouldBlockSessionSwitch(
@@ -1081,6 +1234,70 @@ final class AssistantStore: ObservableObject {
             return false
         }
         return primedBrowserSignature != currentBrowserSignature
+    }
+
+    static func looksLikeImageReferenceRequest(_ prompt: String) -> Bool {
+        let normalized = prompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        let searchable = " " + normalized
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines) + " "
+
+        func containsPhrase(_ phrase: String) -> Bool {
+            let normalizedPhrase = phrase
+                .lowercased()
+                .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedPhrase.isEmpty else { return false }
+            return searchable.contains(" \(normalizedPhrase) ")
+        }
+
+        let directImageSignals = [
+            "image",
+            "images",
+            "screenshot",
+            "screen shot",
+            "photo",
+            "picture",
+            "diagram",
+            "graph",
+            "chart"
+        ]
+        if directImageSignals.contains(where: containsPhrase) {
+            return true
+        }
+
+        let deicticImageQuestions = [
+            "what s going on here",
+            "what is going on here",
+            "what happened here",
+            "what does this show",
+            "what is in this",
+            "what did it do",
+            "describe this",
+            "explain this",
+            "read this"
+        ]
+        return deicticImageQuestions.contains(where: containsPhrase)
+    }
+
+    static func imageInputRequirement(
+        for prompt: String,
+        attachments: [AssistantAttachment],
+        selectedModelSupportsImageInput: Bool,
+        hasRecentImageContext: Bool
+    ) -> ImageInputRequirement {
+        guard !selectedModelSupportsImageInput else { return .none }
+        if attachments.contains(where: \.isImage) {
+            return .unsupportedSelectedModel
+        }
+        if hasRecentImageContext, looksLikeImageReferenceRequest(prompt) {
+            return .unsupportedSelectedModel
+        }
+        return .none
     }
 
     var isOpenAIConnectedInAIStudio: Bool {
@@ -1273,10 +1490,11 @@ final class AssistantStore: ObservableObject {
     }
 
     func startNewSession(cwd: String? = nil) async {
-        guard ensureConversationCanStart() else { return }
-        if runtime.hasActiveTurn {
-            lastStatusMessage = "Wait for the current task to finish before starting a new session."
-            return
+        guard await ensureConversationCanStart() else { return }
+        let interruptedActiveTurn = runtime.hasActiveTurn
+        if interruptedActiveTurn {
+            lastStatusMessage = "Stopping the current task and starting a new session..."
+            await runtime.cancelActiveTurn()
         }
         setVisibleTimeline([], for: nil)
         transcript = []
@@ -1295,7 +1513,6 @@ final class AssistantStore: ObservableObject {
         syncRuntimeContext()
         do {
             let sessionID = try await runtime.startNewSession(cwd: cwd, preferredModelID: selectedModelID)
-            markBrowserAutomationPrimedIfNeeded(for: sessionID)
             recordOwnedSessionID(sessionID)
             selectedSessionID = sessionID
             ensureSessionVisible(sessionID)
@@ -1305,68 +1522,115 @@ final class AssistantStore: ObservableObject {
             refreshMemoryState(for: sessionID)
             await refreshSessions()
             ensureSessionVisible(sessionID)
+            if interruptedActiveTurn {
+                lastStatusMessage = "Stopped the current task and started a new session."
+            }
         } catch {
             lastStatusMessage = error.localizedDescription
         }
     }
 
     func openSession(_ session: AssistantSessionSummary) async {
-        clearActiveProposedPlanIfNeeded(for: session.id)
+        let normalizedSessionID = session.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return }
 
-        // Show loading state and clear old content immediately so the view
-        // never renders stale items at the wrong scroll position.
-        isTransitioningSession = true
-        selectedSessionID = session.id
+        clearActiveProposedPlanIfNeeded(for: normalizedSessionID)
 
-        // Load timeline and transcript in parallel (off main thread)
-        async let timelineTask = sessionCatalog.loadMergedTimeline(sessionID: session.id)
-        async let transcriptTask = sessionCatalog.loadTranscript(sessionID: session.id)
+        if sessionsMatch(selectedSessionID, normalizedSessionID),
+           sessionsMatch(transcriptSessionID, normalizedSessionID),
+           sessionsMatch(timelineSessionID, normalizedSessionID),
+           !isTransitioningSession {
+            refreshMemoryState(for: normalizedSessionID)
+            return
+        }
+
+        let requestID = UUID()
+        sessionLoadRequestID = requestID
+        selectedSessionID = normalizedSessionID
+
+        let cachedTimeline = timelineItemsBySessionID[normalizedSessionID] ?? []
+        let cachedTranscript = transcriptEntriesBySessionID[normalizedSessionID] ?? []
+        let hasCachedHistory = timelineItemsBySessionID.keys.contains(normalizedSessionID)
+            || transcriptEntriesBySessionID.keys.contains(normalizedSessionID)
+
+        if hasCachedHistory {
+            setVisibleTimeline(cachedTimeline, for: normalizedSessionID)
+            setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
+            isTransitioningSession = false
+        } else {
+            isTransitioningSession = true
+            timelineItems = []
+            timelineSessionID = nil
+            rebuildRenderItemsCache()
+            transcript = []
+            transcriptSessionID = nil
+        }
+
+        async let timelineTask = sessionCatalog.loadMergedTimeline(sessionID: normalizedSessionID)
+        async let transcriptTask = sessionCatalog.loadTranscript(sessionID: normalizedSessionID)
         let (loadedTimeline, loadedTranscript) = await (timelineTask, transcriptTask)
+
+        guard sessionLoadRequestID == requestID,
+              sessionsMatch(selectedSessionID, normalizedSessionID) else {
+            return
+        }
+
         let mergedTimeline = mergeTimelineHistory(
             loadedTimeline,
-            with: timelineItemsBySessionID[session.id] ?? []
+            with: timelineItemsBySessionID[normalizedSessionID] ?? []
+        )
+        let mergedTranscript = mergeTranscriptHistory(
+            loadedTranscript,
+            with: transcriptEntriesBySessionID[normalizedSessionID] ?? []
         )
 
-        // Set all @Published properties in one synchronous block so SwiftUI
-        // coalesces them into a single view update (no intermediate render).
-        setVisibleTimeline(mergedTimeline, for: session.id)
-        transcript = loadedTranscript
-        transcriptSessionID = session.id
-        refreshMemoryState(for: session.id)
+        setVisibleTimeline(mergedTimeline, for: normalizedSessionID)
+        setVisibleTranscript(mergedTranscript, for: normalizedSessionID)
+        refreshMemoryState(for: normalizedSessionID)
         isTransitioningSession = false
     }
 
     func sendPrompt(_ prompt: String) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
-        switch Self.browserAutomationRequirement(
-            for: trimmed,
-            browserAutomationEnabled: settings.browserAutomationEnabled,
-            hasSelectedBrowserProfile: selectedBrowserProfile != nil
-        ) {
-        case .enableAutomation:
-            if selectedBrowserProfile != nil {
-                lastStatusMessage = "Turn on Browser Automation before sending a browser task."
-            } else {
-                lastStatusMessage = "Turn on Browser Automation and choose a browser profile before sending a browser task."
-            }
-            return
-        case .selectProfile:
-            lastStatusMessage = "Choose a browser profile before sending a browser task."
-            requestBrowserProfileSelection()
-            return
-        case .none:
-            break
-        }
-        guard ensureConversationCanStart() else {
+        guard await ensureConversationCanStart() else {
             if oneShotSessionInstructions != nil {
                 oneShotSessionInstructions = nil
                 syncRuntimeContext()
             }
             return
         }
+
         lastSubmittedPrompt = trimmed
         let pendingAttachments = attachments
+        lastSubmittedAttachments = pendingAttachments
+        blockedModeSwitchSuggestion = nil
+        refreshModeSwitchSuggestion()
+        if let imageCapabilityMessage = Self.unsupportedImageAttachmentMessage(
+            for: pendingAttachments,
+            selectedModel: selectedModel
+        ) {
+            lastStatusMessage = imageCapabilityMessage
+            appendTranscriptEntry(
+                AssistantTranscriptEntry(
+                    role: .error,
+                    text: imageCapabilityMessage,
+                    emphasis: true
+                )
+            )
+            if let selectedSessionID {
+                appendTimelineItem(
+                    .system(
+                        sessionID: selectedSessionID,
+                        text: imageCapabilityMessage,
+                        createdAt: Date(),
+                        emphasis: true,
+                        source: .runtime
+                    )
+                )
+            }
+            return
+        }
         attachments = []
         promptDraft = ""
         isSendingPrompt = true
@@ -1380,16 +1644,6 @@ final class AssistantStore: ObservableObject {
         syncRuntimeContext()
         do {
             let sessionID = try await prepareSessionForPrompt()
-            let browserContextOverride: String?
-            if Self.shouldInjectBrowserContextOverride(
-                for: trimmed,
-                currentBrowserSignature: currentBrowserAutomationSignature,
-                primedBrowserSignature: browserAutomationPrimedSignaturesBySessionID[sessionID]
-            ) {
-                browserContextOverride = runtime.browserTurnReminder()
-            } else {
-                browserContextOverride = nil
-            }
             let resumeContext = resumeContextIfNeeded(for: sessionID)
             let memoryContext: String?
             if settings.assistantMemoryEnabled {
@@ -1430,14 +1684,11 @@ final class AssistantStore: ObservableObject {
                 trimmed,
                 attachments: pendingAttachments,
                 preferredModelID: selectedModelID,
+                modelSupportsImageInput: selectedModelSupportsImageInput,
                 resumeContext: resumeContext,
-                memoryContext: memoryContext,
-                browserContextOverride: browserContextOverride
+                memoryContext: memoryContext
             )
             pendingResumeContextSessionIDs.remove(sessionID)
-            if browserContextOverride != nil {
-                markBrowserAutomationPrimedIfNeeded(for: sessionID)
-            }
             ensureSessionVisible(sessionID)
         } catch {
             lastStatusMessage = error.localizedDescription
@@ -1460,7 +1711,7 @@ final class AssistantStore: ObservableObject {
     /// its chat history, timeline, and memory context during the handoff.
     func executePlan() async {
         guard let plan = proposedPlan, !plan.isEmpty else { return }
-        guard ensureConversationCanStart() else { return }
+        guard await ensureConversationCanStart() else { return }
         guard let executionSessionID = Self.planExecutionSessionID(planSessionID: proposedPlanSessionID) else {
             lastStatusMessage = "This plan must run in the same session that created it. Please reopen that session and try again."
             return
@@ -1496,6 +1747,37 @@ final class AssistantStore: ObservableObject {
         proposedPlanSessionID = nil
     }
 
+    func applyModeSwitchSuggestion(_ choice: AssistantModeSwitchChoice) async {
+        interactionMode = choice.mode
+        syncRuntimeContext()
+
+        let switchedText = "Switched to \(choice.mode.label) mode."
+        blockedModeSwitchSuggestion = nil
+        refreshModeSwitchSuggestion()
+
+        guard choice.resendLastRequest else {
+            lastStatusMessage = switchedText
+            return
+        }
+
+        let retryPrompt = lastSubmittedPrompt ?? ""
+        let retryAttachments = lastSubmittedAttachments
+        guard retryPrompt.nonEmpty != nil || !retryAttachments.isEmpty else {
+            lastStatusMessage = switchedText
+            return
+        }
+
+        attachments = retryAttachments
+        promptDraft = retryPrompt
+        lastStatusMessage = "Switched to \(choice.mode.label) mode and restored your last request."
+        await sendPrompt(retryPrompt)
+    }
+
+    func dismissModeSwitchSuggestion() {
+        blockedModeSwitchSuggestion = nil
+        refreshModeSwitchSuggestion()
+    }
+
     func cancelActiveTurn() async {
         await runtime.cancelActiveTurn()
     }
@@ -1512,7 +1794,7 @@ final class AssistantStore: ObservableObject {
             let deleted = try await sessionCatalog.deleteSession(sessionID: normalizedSessionID)
             try? threadMemoryService.clearMemory(for: normalizedSessionID)
             try? memorySuggestionService.clearSuggestions(for: normalizedSessionID)
-            browserAutomationPrimedSignaturesBySessionID.removeValue(forKey: normalizedSessionID)
+
             removeOwnedSessionID(normalizedSessionID)
             if deleted {
                 lastStatusMessage = "Deleted the KeyScribe session."
@@ -1521,6 +1803,7 @@ final class AssistantStore: ObservableObject {
             }
 
             if selectedSessionID == normalizedSessionID {
+                sessionLoadRequestID = UUID()
                 selectedSessionID = nil
                 transcriptSessionID = nil
                 timelineSessionID = nil
@@ -1532,6 +1815,8 @@ final class AssistantStore: ObservableObject {
                 pendingPermissionRequest = nil
             }
 
+            transcriptEntriesBySessionID.removeValue(forKey: normalizedSessionID)
+            timelineItemsBySessionID.removeValue(forKey: normalizedSessionID)
             sessions.removeAll { $0.id == normalizedSessionID }
             refreshMemoryState(for: selectedSessionID)
             await refreshSessions()
@@ -1584,9 +1869,10 @@ final class AssistantStore: ObservableObject {
             for sessionID in ownedSessionIDs {
                 try? threadMemoryService.clearMemory(for: sessionID)
                 try? memorySuggestionService.clearSuggestions(for: sessionID)
-                browserAutomationPrimedSignaturesBySessionID.removeValue(forKey: sessionID)
+
             }
             settings.assistantOwnedThreadIDs = []
+            sessionLoadRequestID = UUID()
             selectedSessionID = nil
             transcriptSessionID = nil
             timelineSessionID = nil
@@ -1597,6 +1883,8 @@ final class AssistantStore: ObservableObject {
             recentToolCalls = []
             pendingPermissionRequest = nil
             sessions = []
+            transcriptEntriesBySessionID = [:]
+            timelineItemsBySessionID = [:]
             refreshMemoryState(for: nil)
             lastStatusMessage = deletedCount == 1
                 ? "Deleted 1 KeyScribe session."
@@ -1763,6 +2051,7 @@ final class AssistantStore: ObservableObject {
     }
 
     func prepareForVoiceCapture() {
+        voiceCaptureLevel = 0
         hudState = AssistantHUDState(
             phase: .listening,
             title: "Listening",
@@ -1773,8 +2062,21 @@ final class AssistantStore: ObservableObject {
 
     func receiveVoiceDraft(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        voiceCaptureLevel = 0
+
+        guard !trimmed.isEmpty else {
+            hudState = .idle
+            return
+        }
+
+        if AssistantComposerBridge.shared.insert(trimmed) {
+            hudState = .idle
+            lastStatusMessage = "Voice draft pasted into the composer."
+            return
+        }
+
         promptDraft = trimmed
-        hudState = trimmed.isEmpty ? .idle : AssistantHUDState(
+        hudState = AssistantHUDState(
             phase: .success,
             title: "Voice task ready",
             detail: "Review the draft in the assistant window"
@@ -1790,6 +2092,7 @@ final class AssistantStore: ObservableObject {
     }
 
     func failVoiceDraft(_ message: String) {
+        voiceCaptureLevel = 0
         hudState = AssistantHUDState(
             phase: .failed,
             title: "Voice task failed",
@@ -1800,6 +2103,7 @@ final class AssistantStore: ObservableObject {
     }
 
     func finalizingVoiceCapture() {
+        voiceCaptureLevel = 0
         hudState = AssistantHUDState(
             phase: .thinking,
             title: "Processing",
@@ -1808,9 +2112,14 @@ final class AssistantStore: ObservableObject {
     }
 
     func cancelVoiceDraft(_ message: String = "Assistant listening stopped.") {
+        voiceCaptureLevel = 0
         hudState = .idle
         lastStatusMessage = message
         transcript.append(AssistantTranscriptEntry(role: .status, text: message))
+    }
+
+    func updateVoiceCaptureLevel(_ level: Float) {
+        voiceCaptureLevel = max(0, min(1, level))
     }
 
     func runPreferredInstallCommand() {
@@ -1855,18 +2164,6 @@ final class AssistantStore: ObservableObject {
     }
 
     func syncRuntimeContext() {
-        if settings.browserAutomationEnabled, let profile = selectedBrowserProfile {
-            runtime.browserProfileContext = [
-                "browser": profile.browser.rawValue,
-                "channel": profile.browser.playwrightChannel,
-                "profileDir": profile.directoryName,
-                "userDataDir": profile.userDataDir,
-                "profileName": profile.label
-            ]
-        } else {
-            runtime.browserProfileContext = nil
-        }
-
         // Combine global + per-session instructions
         let global = settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let session = sessionInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1879,6 +2176,7 @@ final class AssistantStore: ObservableObject {
         runtime.reasoningEffort = reasoningEffort.wireValue
         runtime.interactionMode = interactionMode
         runtime.maxToolCallsPerTurn = settings.assistantMaxToolCallsPerTurn
+        runtime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn
     }
 
     private func applyPreferredModelSelection(using models: [AssistantModelOption]) {
@@ -1937,7 +2235,17 @@ final class AssistantStore: ObservableObject {
     }
 
     @discardableResult
-    private func ensureConversationCanStart() -> Bool {
+    private func ensureConversationCanStart() async -> Bool {
+        if canStartConversation { return true }
+
+        // If the runtime dropped (idle/failed/connecting), attempt a transparent
+        // reconnection before giving up — the user shouldn't have to manually
+        // refresh just because Codex restarted between turns.
+        if !isRuntimeReadyForConversation, !isRefreshingEnvironment {
+            CrashReporter.logInfo("Assistant auto-recovering runtime availability=\(runtimeHealth.availability.rawValue)")
+            await refreshEnvironment()
+        }
+
         guard canStartConversation else {
             lastStatusMessage = conversationBlockedReason ?? "Choose a model before starting a conversation."
             return false
@@ -2034,11 +2342,55 @@ final class AssistantStore: ObservableObject {
             ) else { return }
 
             await MainActor.run {
-                if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
-                    sessions[index].title = title
+                let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalizedSessionID.isEmpty, !normalizedTitle.isEmpty else { return }
+
+                let fallbackTitle = Self.sessionTitle(from: userPrompt)
+                if let index = sessions.firstIndex(where: { sessionsMatch($0.id, normalizedSessionID) }) {
+                    let summary = sessions[index]
+                    guard Self.shouldApplyGeneratedSessionTitle(
+                        existingTitle: summary.title,
+                        fallbackTitle: fallbackTitle,
+                        cwd: summary.cwd ?? ""
+                    ) else {
+                        return
+                    }
+                }
+
+                do {
+                    try sessionCatalog.renameSession(
+                        sessionID: normalizedSessionID,
+                        title: normalizedTitle
+                    )
+                } catch {
+                    return
+                }
+
+                if let index = sessions.firstIndex(where: { sessionsMatch($0.id, normalizedSessionID) }) {
+                    sessions[index].title = normalizedTitle
                 }
             }
         }
+    }
+
+    static func shouldApplyGeneratedSessionTitle(
+        existingTitle: String,
+        fallbackTitle: String,
+        cwd: String
+    ) -> Bool {
+        let normalizedExisting = existingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedExisting.isEmpty else { return true }
+
+        if normalizedExisting == cwd {
+            return true
+        }
+
+        if normalizedExisting == "New Assistant Session" {
+            return true
+        }
+
+        return normalizedExisting.caseInsensitiveCompare(fallbackTitle) == .orderedSame
     }
 
     private func recordOwnedSessionID(_ sessionID: String?) {
@@ -2097,6 +2449,7 @@ final class AssistantStore: ObservableObject {
         let targetSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? selectedSessionID
 
         guard sessionsMatch(targetSessionID, selectedSessionID) || transcriptSessionID == nil else {
+            storeTranscriptEntryInCache(entry, sessionID: targetSessionID)
             updateVisibleSessionPreview(with: entry, sessionID: targetSessionID)
             return
         }
@@ -2109,6 +2462,9 @@ final class AssistantStore: ObservableObject {
             transcript[existingIndex] = entry
         } else {
             transcript.append(entry)
+        }
+        if let targetSessionID {
+            transcriptEntriesBySessionID[targetSessionID] = transcript
         }
         updateVisibleSessionPreview(with: entry, sessionID: targetSessionID)
 
@@ -2320,6 +2676,128 @@ final class AssistantStore: ObservableObject {
         sessions.first(where: { sessionsMatch($0.id, sessionID) })?.latestAssistantMessage
     }
 
+    private func refreshModeSwitchSuggestion() {
+        if let blockedModeSwitchSuggestion,
+           blockedModeSwitchSuggestion.originMode == interactionMode {
+            modeSwitchSuggestion = blockedModeSwitchSuggestion
+            return
+        }
+
+        modeSwitchSuggestion = Self.modeSwitchSuggestion(
+            forDraft: promptDraft,
+            currentMode: interactionMode
+        )
+    }
+
+    static func modeSwitchSuggestion(
+        forDraft draft: String,
+        currentMode: AssistantInteractionMode
+    ) -> AssistantModeSwitchSuggestion? {
+        guard currentMode == .conversational else { return nil }
+        guard looksLikePlanModeRequest(draft) else { return nil }
+
+        return AssistantModeSwitchSuggestion(
+            source: .draft,
+            originMode: currentMode,
+            message: "This request sounds like planning work. You can switch to Plan mode for a plan-first response.",
+            choices: [
+                AssistantModeSwitchChoice(
+                    mode: .plan,
+                    title: "Switch to Plan",
+                    resendLastRequest: false
+                )
+            ]
+        )
+    }
+
+    static func modeSwitchSuggestion(
+        for event: AssistantModeRestrictionEvent
+    ) -> AssistantModeSwitchSuggestion? {
+        guard event.mode == .conversational else { return nil }
+
+        let normalizedTitle = event.activityTitle?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if event.commandClass == .validation {
+            return AssistantModeSwitchSuggestion(
+                source: .blocked,
+                originMode: event.mode,
+                message: "Chat mode stopped because this request needs checks. You can retry it in Plan mode or Agentic mode.",
+                choices: [
+                    AssistantModeSwitchChoice(
+                        mode: .plan,
+                        title: "Switch & Retry in Plan",
+                        resendLastRequest: true
+                    ),
+                    AssistantModeSwitchChoice(
+                        mode: .agentic,
+                        title: "Switch & Retry in Agentic",
+                        resendLastRequest: true
+                    )
+                ]
+            )
+        }
+
+        if normalizedTitle == "browser" || normalizedTitle == "computer use" {
+            return AssistantModeSwitchSuggestion(
+                source: .blocked,
+                originMode: event.mode,
+                message: "Chat mode stopped because this needs live browser or computer control. You can retry it in Agentic mode.",
+                choices: [
+                    AssistantModeSwitchChoice(
+                        mode: .agentic,
+                        title: "Switch & Retry in Agentic",
+                        resendLastRequest: true
+                    )
+                ]
+            )
+        }
+
+        return AssistantModeSwitchSuggestion(
+            source: .blocked,
+            originMode: event.mode,
+            message: "Chat mode stopped because this request needs stronger tool access. You can retry it in Agentic mode.",
+            choices: [
+                AssistantModeSwitchChoice(
+                    mode: .agentic,
+                    title: "Switch & Retry in Agentic",
+                    resendLastRequest: true
+                )
+            ]
+        )
+    }
+
+    private static func looksLikePlanModeRequest(_ prompt: String) -> Bool {
+        let normalized = prompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        let tokens = normalized
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        let tokenSet = Set(tokens)
+
+        if tokenSet.contains("plan") || tokenSet.contains("checklist") || tokenSet.contains("roadmap") {
+            return true
+        }
+
+        let phrases = [
+            "make a plan",
+            "give me a plan",
+            "switch to plan",
+            "step by step plan",
+            "step-by-step plan",
+            "implementation plan",
+            "outline the steps",
+            "brainstorm",
+            "plan this"
+        ]
+
+        return phrases.contains { normalized.contains($0) }
+    }
+
     private func maybeCreateAutomaticFailureSuggestions(
         text: String,
         sessionID: String
@@ -2462,11 +2940,6 @@ final class AssistantStore: ObservableObject {
         return "\(header)\n\n\(shortenedBody)"
     }
 
-    private func markBrowserAutomationPrimedIfNeeded(for sessionID: String) {
-        guard let signature = currentBrowserAutomationSignature else { return }
-        browserAutomationPrimedSignaturesBySessionID[sessionID] = signature
-    }
-
     private func preferredSessionID(preferConversationContent: Bool = true) -> String? {
         if preferConversationContent,
            let session = sessions.first(where: { $0.hasConversationContent }) {
@@ -2494,7 +2967,6 @@ final class AssistantStore: ObservableObject {
             if let selectedSession = sessions.first(where: { sessionsMatch($0.id, selectedSessionID) }) {
                 try await runtime.resumeSession(selectedSession.id, cwd: selectedSession.cwd, preferredModelID: selectedModelID)
                 pendingResumeContextSessionIDs.insert(selectedSession.id)
-                markBrowserAutomationPrimedIfNeeded(for: selectedSession.id)
                 return selectedSession.id
             }
         }
@@ -2504,7 +2976,6 @@ final class AssistantStore: ObservableObject {
         }
 
         let sessionID = try await runtime.startNewSession(preferredModelID: selectedModelID)
-        markBrowserAutomationPrimedIfNeeded(for: sessionID)
         return sessionID
     }
 
@@ -2515,25 +2986,48 @@ final class AssistantStore: ObservableObject {
             return
         }
 
+        let cachedTimeline = timelineItemsBySessionID[selectedSessionID] ?? []
+        let cachedTranscript = transcriptEntriesBySessionID[selectedSessionID] ?? []
+        if !cachedTimeline.isEmpty,
+           (!sessionsMatch(timelineSessionID, selectedSessionID) || timelineItems.isEmpty) {
+            setVisibleTimeline(cachedTimeline, for: selectedSessionID)
+        }
+        if !cachedTranscript.isEmpty,
+           (!sessionsMatch(transcriptSessionID, selectedSessionID) || transcript.isEmpty) {
+            setVisibleTranscript(cachedTranscript, for: selectedSessionID)
+        }
+
         guard force
             || transcriptSessionID != selectedSessionID
             || timelineSessionID != selectedSessionID else {
             return
         }
 
+        let requestID = UUID()
+        sessionLoadRequestID = requestID
         let loadedTimeline = await sessionCatalog.loadMergedTimeline(sessionID: selectedSessionID)
         let loadedTranscript = await sessionCatalog.loadTranscript(sessionID: selectedSessionID)
+
+        guard sessionLoadRequestID == requestID,
+              sessionsMatch(self.selectedSessionID, selectedSessionID) else {
+            return
+        }
+
         let mergedTimeline = mergeTimelineHistory(
             loadedTimeline,
             with: timelineItemsBySessionID[selectedSessionID] ?? []
         )
+        let mergedTranscript = mergeTranscriptHistory(
+            loadedTranscript,
+            with: transcriptEntriesBySessionID[selectedSessionID] ?? []
+        )
         if !mergedTimeline.isEmpty || timelineItems.isEmpty || timelineSessionID != selectedSessionID {
             setVisibleTimeline(mergedTimeline, for: selectedSessionID)
         }
-        if !loadedTranscript.isEmpty || transcript.isEmpty || transcriptSessionID != selectedSessionID {
-            transcript = loadedTranscript
-            transcriptSessionID = selectedSessionID
+        if !mergedTranscript.isEmpty || transcript.isEmpty || transcriptSessionID != selectedSessionID {
+            setVisibleTranscript(mergedTranscript, for: selectedSessionID)
         }
+        isTransitioningSession = false
     }
 
     private func resumeContextIfNeeded(for sessionID: String) -> String? {
@@ -2560,6 +3054,53 @@ final class AssistantStore: ObservableObject {
             timelineItemsBySessionID[sessionID] = items
         }
         rebuildRenderItemsCache()
+    }
+
+    private func setVisibleTranscript(_ entries: [AssistantTranscriptEntry], for sessionID: String?) {
+        transcript = entries
+        transcriptSessionID = sessionID
+        if let sessionID = sessionID?.nonEmpty {
+            transcriptEntriesBySessionID[sessionID] = entries
+        }
+    }
+
+    private func storeTranscriptEntryInCache(_ entry: AssistantTranscriptEntry, sessionID: String?) {
+        guard let sessionID = sessionID?.nonEmpty else { return }
+        var entries = transcriptEntriesBySessionID[sessionID] ?? []
+        if let existingIndex = entries.lastIndex(where: { $0.id == entry.id }) {
+            entries[existingIndex] = entry
+        } else {
+            entries.append(entry)
+        }
+        entries.sort {
+            if $0.createdAt == $1.createdAt {
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            return $0.createdAt < $1.createdAt
+        }
+        transcriptEntriesBySessionID[sessionID] = entries
+    }
+
+    private func mergeTranscriptHistory(
+        _ persistedEntries: [AssistantTranscriptEntry],
+        with cachedEntries: [AssistantTranscriptEntry]
+    ) -> [AssistantTranscriptEntry] {
+        guard !persistedEntries.isEmpty || !cachedEntries.isEmpty else { return [] }
+
+        var mergedByID: [UUID: AssistantTranscriptEntry] = [:]
+        for entry in persistedEntries {
+            mergedByID[entry.id] = entry
+        }
+        for entry in cachedEntries {
+            mergedByID[entry.id] = entry
+        }
+
+        return mergedByID.values.sorted {
+            if $0.createdAt == $1.createdAt {
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            return $0.createdAt < $1.createdAt
+        }
     }
 
     /// Rebuilds the cached render items from the current timeline items.
@@ -2864,6 +3405,29 @@ extension String {
 
     var assistantNonEmpty: String? {
         nonEmpty
+    }
+
+    func removingAssistantAttachmentPlaceholders() -> String {
+        var text = self
+        let blockPatterns = [
+            #"<image\b[^>]*>[\s\S]*?</image>"#,
+            #"<localimage\b[^>]*>[\s\S]*?</localimage>"#
+        ]
+        for pattern in blockPatterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            text = regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")
+        }
+
+        text = text.replacingOccurrences(
+            of: #"</?(image|localimage)\b[^>]*>"#,
+            with: " ",
+            options: [.regularExpression, .caseInsensitive]
+        )
+
+        return text
     }
 }
 
