@@ -753,6 +753,11 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var installGuidance: AssistantInstallGuidance = .placeholder
     @Published private(set) var permissions: AssistantPermissionSnapshot = .unknown
     @Published private(set) var sessions: [AssistantSessionSummary] = []
+    @Published var visibleSessionsLimit: Int = 10
+    
+    func loadMoreSessions() {
+        visibleSessionsLimit += 10
+    }
     @Published private(set) var timelineItems: [AssistantTimelineItem] = []
     /// Pre-computed render items, rebuilt only when `timelineItems` changes (not on every @Published update).
     @Published private(set) var cachedRenderItems: [AssistantTimelineRenderItem] = []
@@ -2120,7 +2125,7 @@ final class AssistantStore: ObservableObject {
         hudState = AssistantHUDState(
             phase: .thinking,
             title: "Processing",
-            detail: "Transcribing your voice input"
+            detail: "Preparing your assistant draft"
         )
     }
 

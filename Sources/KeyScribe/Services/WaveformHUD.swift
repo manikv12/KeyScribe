@@ -352,7 +352,6 @@ struct WaveformPanelView: View {
             HUDCapsuleBackground(tint: AppVisualTheme.baseTint)
         )
         .frame(width: HUDLayout.waveformWidth, height: HUDLayout.waveformHeight, alignment: .center)
-        .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
     }
 }
 
@@ -415,7 +414,6 @@ struct HUDToastView: View {
             HUDCapsuleBackground(tint: AppVisualTheme.accentTint)
         )
         .frame(width: HUDLayout.toastWidth, height: HUDLayout.toastHeight, alignment: .center)
-        .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
     }
 }
 
@@ -468,7 +466,6 @@ struct HUDCorrectionDecisionView: View {
             HUDCapsuleBackground(tint: AppVisualTheme.accentTint)
         )
         .frame(width: HUDLayout.correctionWidth, height: HUDLayout.correctionHeight, alignment: .center)
-        .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 2)
     }
 }
 
@@ -486,9 +483,9 @@ struct HUDCapsuleBackground: View {
             .fill(
                 LinearGradient(
                     colors: [
-                        tokens.surfaceTop.opacity(0.66),
-                        tint.opacity(0.18),
-                        tokens.surfaceBottom.opacity(0.94)
+                        tokens.surfaceTop.opacity(0.80),
+                        tint.opacity(0.24),
+                        tokens.surfaceBottom.opacity(0.96)
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -498,7 +495,7 @@ struct HUDCapsuleBackground: View {
                 if tokens.useMaterial {
                     Capsule(style: .continuous)
                         .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
-                        .opacity(0.42)
+                        .opacity(0.56)
                 }
             }
             .overlay(

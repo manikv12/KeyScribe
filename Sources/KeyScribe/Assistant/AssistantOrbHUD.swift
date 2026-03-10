@@ -276,10 +276,54 @@ final class AssistantOrbHUDModel: ObservableObject {
         if isExpanded { collapse() } else { expand() }
     }
 
+    @discardableResult
+    func handleOrbTap() -> OrbTapResult {
+        if isExpanded {
+            collapse()
+            return .collapsedExpandedPanel
+        }
+
+        if showDoneDetail {
+            dismissDoneDetail()
+            return .dismissedDoneDetail
+        }
+
+        if showWorkingDetail {
+            dismissWorkingDetail()
+            return .dismissedWorkingDetail
+        }
+
+        if pendingPermissionRequest != nil {
+            return .keptPermissionCardVisible
+        }
+
+        if modeSwitchSuggestion != nil {
+            onDismissModeSwitchSuggestion?()
+            return .dismissedModeSwitchSuggestion
+        }
+
+        if presentWorkingDetailIfAvailable() {
+            return .presentedWorkingDetail
+        }
+
+        expand()
+        return .expandedInlinePanel
+    }
+
     /// Display name for the session that will receive the message.
     var targetSessionName: String? {
         guard let sid = selectedSessionID else { return nil }
         return sessions.first(where: { $0.id == sid })?.title.nonEmpty ?? "Selected session"
+    }
+
+    enum OrbTapResult: Equatable {
+        case collapsedExpandedPanel
+        case dismissedDoneDetail
+        case dismissedWorkingDetail
+        case keptPermissionCardVisible
+        case dismissedModeSwitchSuggestion
+        case presentedWorkingDetail
+        case expandedInlinePanel
     }
 }
 
@@ -1271,14 +1315,12 @@ private struct AssistantOrbHUDView: View {
                     Circle()
                         .fill(glowColor.opacity(0.92))
                         .frame(width: 5, height: 5)
-                        .shadow(color: glowColor.opacity(0.55), radius: 4, x: 0, y: 0)
 
                     Text(phaseLabel)
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                         .tracking(0.9)
                         .textCase(.uppercase)
                         .foregroundStyle(.white.opacity(0.94))
-                        .shadow(color: glowColor.opacity(0.30), radius: 8, x: 0, y: 0)
                         .contentTransition(.opacity)
                 }
 
@@ -1971,24 +2013,7 @@ private struct AssistantOrbHUDView: View {
     }
 
     private func handleOrbTap() {
-        if model.isExpanded {
-            model.collapse()
-            return
-        }
-
-        // If a popup is already showing (done/permission/working), expand inline
-        if model.showDoneDetail || model.showWorkingDetail || model.pendingPermissionRequest != nil {
-            model.expand()
-            return
-        }
-
-        // If the agent is actively working, show the working detail popup
-        if model.presentWorkingDetailIfAvailable() {
-            return
-        }
-
-        // Default: expand inline popup (composer + session list)
-        model.expand()
+        model.handleOrbTap()
     }
 
     private func sendDoneFollowUp() {
@@ -2746,7 +2771,6 @@ private struct OrbSessionRow: View {
             Circle()
                 .fill(statusColor)
                 .frame(width: 7, height: 7)
-                .shadow(color: statusColor.opacity(0.40), radius: 3, x: 0, y: 0)
         }
     }
 

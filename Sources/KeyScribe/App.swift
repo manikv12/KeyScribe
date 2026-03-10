@@ -720,6 +720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private let automationAPICoordinator = AutomationAPICoordinator.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     private let promptRewriteService = PromptRewriteService.shared
+    private let assistantVoiceDraftRefinementService = AssistantVoiceDraftRefinementService()
     private let promptRewriteConversationStore = PromptRewriteConversationStore.shared
     private let conversationContextResolverV2 = ConversationContextResolverV2()
     private let postInsertCorrectionMonitor = PostInsertCorrectionMonitor()
@@ -2535,7 +2536,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             orbVoiceStopMode = .manualRelease
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
-            assistantOrbHUD?.receiveVoiceTranscript(cleaned)
+            let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
+            assistantOrbHUD?.receiveVoiceTranscript(refinedAssistantDraft)
             setUIStatus(.ready)
             updateMenuState()
             return
@@ -2547,7 +2549,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
             openAssistantWindow()
-            assistantController.receiveVoiceDraft(cleaned)
+            let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
+            assistantController.receiveVoiceDraft(refinedAssistantDraft)
             setUIStatus(.ready)
             updateMenuState()
             return
@@ -2615,6 +2618,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         if !isDictating {
             setUIStatus(.ready)
         }
+    }
+
+    private func refinedAssistantVoiceDraft(from transcript: String) async -> String {
+        await assistantVoiceDraftRefinementService.refine(
+            transcript,
+            aiCorrectionEnabled: settings.promptRewriteEnabled
+        )
     }
 
     @MainActor

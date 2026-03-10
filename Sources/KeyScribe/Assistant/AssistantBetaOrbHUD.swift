@@ -67,7 +67,6 @@ private struct AssistantBetaOrbDock: View {
                 strokeOpacity: 0.18,
                 tintOpacity: 0.06
             )
-            .shadow(color: phaseTint.opacity(0.24), radius: 20, x: 0, y: 10)
         }
     }
 
@@ -131,7 +130,6 @@ private struct AssistantBetaOrbCore: View {
                     lineWidth: 3.0
                 )
                 .frame(width: 62, height: 62)
-                .shadow(color: orbColors.primary.opacity(0.55), radius: 8, x: 0, y: 0)
 
             Circle()
                 .fill(
@@ -153,7 +151,6 @@ private struct AssistantBetaOrbCore: View {
                         .blur(radius: 6)
                 )
                 .frame(width: 46, height: 46)
-                .shadow(color: orbColors.primary.opacity(0.62), radius: 12, x: 0, y: 4)
                 .scaleEffect(pulse)
 
             Circle()
@@ -230,7 +227,6 @@ private struct AssistantBetaSpectrumStrip: View {
                             )
                         )
                         .frame(width: width, height: barHeight(index: index, maxHeight: height))
-                        .shadow(color: spectrumColors.primary.opacity(0.22), radius: 3, x: 0, y: 1)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -341,7 +337,6 @@ private struct AssistantBetaOrbPhaseChip: View {
             Circle()
                 .fill(tint)
                 .frame(width: 7, height: 7)
-                .shadow(color: tint.opacity(0.55), radius: 3, x: 0, y: 0)
 
             Text(label)
                 .font(.caption.weight(.semibold))

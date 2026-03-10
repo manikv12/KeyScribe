@@ -2,6 +2,119 @@ import XCTest
 @testable import KeyScribe
 
 final class AssistantTimelineGroupingTests: XCTestCase {
+    func testFormattedActivityDetailPrettyPrintsJSONObject() {
+        let formatted = assistantFormattedActivityDetailText("{\"b\":2,\"a\":1}")
+
+        XCTAssertTrue(formatted.contains("\n"))
+        XCTAssertTrue(formatted.contains("\"a\""))
+        XCTAssertTrue(formatted.contains("\"b\""))
+    }
+
+    func testFormattedActivityDetailPrettyPrintsJSONArray() {
+        let formatted = assistantFormattedActivityDetailText("[{\"type\":\"text\",\"text\":\"hello\"}]")
+
+        XCTAssertTrue(formatted.contains("["))
+        XCTAssertTrue(formatted.contains("\n"))
+        XCTAssertTrue(formatted.contains("\"type\""))
+    }
+
+    func testFormattedActivityDetailLeavesPlainTextAlone() {
+        let formatted = assistantFormattedActivityDetailText("plain tool output")
+
+        XCTAssertEqual(formatted, "plain tool output")
+    }
+
+    func testActivityOpenTargetsExtractFilesFromPatchOutput() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = root
+            .appendingPathComponent("Sources", isDirectory: true)
+            .appendingPathComponent("KeyScribe", isDirectory: true)
+            .appendingPathComponent("Assistant", isDirectory: true)
+            .appendingPathComponent("AssistantWindowView.swift")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("test".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let activity = AssistantActivityItem(
+            id: "file-change",
+            sessionID: "session-1",
+            turnID: "turn-1",
+            kind: .fileChange,
+            title: "File Changes",
+            status: .completed,
+            friendlySummary: "Edited files in the workspace.",
+            rawDetails: "Success. Updated the following files:\nM Sources/KeyScribe/Assistant/AssistantWindowView.swift\n",
+            startedAt: Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+
+        let targets = assistantActivityOpenTargets(
+            for: activity,
+            sessionCWD: root.path
+        )
+
+        XCTAssertEqual(targets.map(\.label), ["AssistantWindowView.swift"])
+        XCTAssertEqual(targets.first?.kind, .file)
+        XCTAssertEqual(targets.first?.url.path, fileURL.path)
+    }
+
+    func testActivityOpenTargetsExtractFilesFromCommandText() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = root.appendingPathComponent("README.md")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("hello".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let activity = AssistantActivityItem(
+            id: "command-1",
+            sessionID: "session-1",
+            turnID: "turn-1",
+            kind: .commandExecution,
+            title: "Command",
+            status: .completed,
+            friendlySummary: "Ran a terminal command.",
+            rawDetails: "cat README.md",
+            startedAt: Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+
+        let targets = assistantActivityOpenTargets(
+            for: activity,
+            sessionCWD: root.path
+        )
+
+        XCTAssertEqual(targets.map(\.label), ["README.md"])
+        XCTAssertEqual(targets.first?.url.path, fileURL.path)
+    }
+
+    func testActivityOpenTargetsBuildSearchURLForWebSearch() {
+        let activity = AssistantActivityItem(
+            id: "search-1",
+            sessionID: "session-1",
+            turnID: "turn-1",
+            kind: .webSearch,
+            title: "Web Search",
+            status: .completed,
+            friendlySummary: "Searched the web.",
+            rawDetails: "codex app server timeline ui",
+            startedAt: Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+
+        let targets = assistantActivityOpenTargets(for: activity)
+
+        XCTAssertEqual(targets.count, 1)
+        XCTAssertEqual(targets.first?.kind, .webSearch)
+        XCTAssertTrue(targets.first?.url.absoluteString.contains("google.com/search") == true)
+        XCTAssertTrue(targets.first?.url.absoluteString.contains("codex") == true)
+    }
+
     func testConsecutiveActivitiesBecomeOneGroupedRenderItem() {
         let startedAt = Date(timeIntervalSince1970: 1_741_400_000)
         let items: [AssistantTimelineItem] = [

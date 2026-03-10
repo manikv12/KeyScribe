@@ -168,6 +168,82 @@ final class AssistantOrbHUDModelTests: XCTestCase {
     }
 
     @MainActor
+    func testOrbTapDismissesDoneDetailInsteadOfExpandingInlinePanel() {
+        let model = AssistantOrbHUDModel()
+        model.showPreview("Reply ready.")
+
+        let result = model.handleOrbTap()
+
+        XCTAssertEqual(result, .dismissedDoneDetail)
+        XCTAssertFalse(model.showDoneDetail)
+        XCTAssertFalse(model.isExpanded)
+    }
+
+    @MainActor
+    func testOrbTapDismissesWorkingDetailInsteadOfExpandingInlinePanel() {
+        let model = AssistantOrbHUDModel()
+        model.showWorkingDetail = true
+
+        let result = model.handleOrbTap()
+
+        XCTAssertEqual(result, .dismissedWorkingDetail)
+        XCTAssertFalse(model.showWorkingDetail)
+        XCTAssertFalse(model.isExpanded)
+    }
+
+    @MainActor
+    func testOrbTapDismissesModeSwitchSuggestionInsteadOfExpandingInlinePanel() {
+        let model = AssistantOrbHUDModel()
+        var dismissedSuggestion = false
+        model.controllerModeSwitchSuggestion = AssistantModeSwitchSuggestion(
+            source: .draft,
+            originMode: .conversational,
+            message: "Switch to Plan mode first.",
+            choices: [
+                AssistantModeSwitchChoice(
+                    mode: .plan,
+                    title: "Switch to Plan",
+                    resendLastRequest: false
+                )
+            ]
+        )
+        model.onDismissModeSwitchSuggestion = {
+            dismissedSuggestion = true
+        }
+
+        let result = model.handleOrbTap()
+
+        XCTAssertEqual(result, .dismissedModeSwitchSuggestion)
+        XCTAssertTrue(dismissedSuggestion)
+        XCTAssertFalse(model.isExpanded)
+    }
+
+    @MainActor
+    func testOrbTapStillOpensWorkingDetailDuringActiveTurn() {
+        let model = AssistantOrbHUDModel()
+        model.activeSessionSummary = AssistantSessionSummary(
+            id: "session-6",
+            title: "Active work",
+            source: .appServer,
+            status: .active,
+            cwd: "/tmp"
+        )
+        model.update(
+            state: AssistantHUDState(
+                phase: .acting,
+                title: "Working",
+                detail: "Editing files"
+            )
+        )
+
+        let result = model.handleOrbTap()
+
+        XCTAssertEqual(result, .presentedWorkingDetail)
+        XCTAssertTrue(model.showWorkingDetail)
+        XCTAssertFalse(model.isExpanded)
+    }
+
+    @MainActor
     func testLevelUpdatesAreSmoothedAndStayWithinBounds() {
         let model = AssistantOrbHUDModel()
 
