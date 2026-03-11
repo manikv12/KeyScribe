@@ -35,9 +35,15 @@ enum AssistantAttachmentSupport {
         for provider in providers {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    guard let data = item as? Data,
-                          let url = URL(dataRepresentation: data, relativeTo: nil),
-                          let attachment = attachment(from: url) else { return }
+                    let url: URL?
+                    if let nsURL = item as? NSURL {
+                        url = nsURL as URL
+                    } else if let data = item as? Data {
+                        url = URL(dataRepresentation: data, relativeTo: nil)
+                    } else {
+                        url = nil
+                    }
+                    guard let url, let attachment = attachment(from: url) else { return }
                     Task { @MainActor in
                         onAttachment(attachment)
                     }
