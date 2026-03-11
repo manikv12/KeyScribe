@@ -2733,7 +2733,7 @@ final class CodexAssistantRuntime {
            let arguments = toolCall["arguments"] {
             return arguments
         }
-        return [:]
+        return [String: Any]()
     }
 
     private func threadStartParams(cwd: String?, modelID: String?) -> [String: Any] {
