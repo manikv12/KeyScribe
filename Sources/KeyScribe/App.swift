@@ -10,9 +10,14 @@ extension Notification.Name {
     static let keyScribeOpenSettings = Notification.Name("KeyScribe.openSettings")
     static let keyScribeOpenAssistant = Notification.Name("KeyScribe.openAssistant")
     static let keyScribeOpenAssistantSetup = Notification.Name("KeyScribe.openAssistantSetup")
+    static let keyScribeStartAssistantVoiceCapture = Notification.Name("KeyScribe.startAssistantVoiceCapture")
     static let keyScribeStopAssistantVoiceCapture = Notification.Name("KeyScribe.stopAssistantVoiceCapture")
     static let keyScribeStartOrbVoiceCapture = Notification.Name("KeyScribe.startOrbVoiceCapture")
     static let keyScribeStopOrbVoiceCapture = Notification.Name("KeyScribe.stopOrbVoiceCapture")
+    static let keyScribeAssistantZoomIn = Notification.Name("KeyScribe.assistantZoomIn")
+    static let keyScribeAssistantZoomOut = Notification.Name("KeyScribe.assistantZoomOut")
+    static let keyScribeAssistantZoomReset = Notification.Name("KeyScribe.assistantZoomReset")
+    static let keyScribeMinimizeAssistantToOrb = Notification.Name("KeyScribe.minimizeAssistantToOrb")
 }
 
 @MainActor
@@ -665,11 +670,29 @@ struct KeyScribeApp: App {
             SettingsView()
                 .environmentObject(settings)
         }
+        .commands {
+            CommandGroup(after: .toolbar) {
+                Button("Zoom In") {
+                    NotificationCenter.default.post(name: .keyScribeAssistantZoomIn, object: nil)
+                }
+                .keyboardShortcut("+", modifiers: .command)
+
+                Button("Zoom Out") {
+                    NotificationCenter.default.post(name: .keyScribeAssistantZoomOut, object: nil)
+                }
+                .keyboardShortcut("-", modifiers: .command)
+
+                Button("Actual Size") {
+                    NotificationCenter.default.post(name: .keyScribeAssistantZoomReset, object: nil)
+                }
+                .keyboardShortcut("0", modifiers: .command)
+            }
+        }
     }
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NSPopoverDelegate {
     static weak var shared: AppDelegate?
 
     private enum UpdateCheckFallback {
@@ -697,6 +720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private let automationAPICoordinator = AutomationAPICoordinator.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     private let promptRewriteService = PromptRewriteService.shared
+    private let assistantVoiceDraftRefinementService = AssistantVoiceDraftRefinementService()
     private let promptRewriteConversationStore = PromptRewriteConversationStore.shared
     private let conversationContextResolverV2 = ConversationContextResolverV2()
     private let postInsertCorrectionMonitor = PostInsertCorrectionMonitor()
@@ -708,6 +732,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private let transcriptHistory = TranscriptHistoryStore.shared
     private var windowCoordinator: AppWindowCoordinator?
     private var assistantOrbHUD: AssistantOrbHUDManager?
+    private var isAssistantWindowVisible = false
 
     private var statusItem: NSStatusItem?
     private let statusBarViewModel = StatusBarViewModel()
@@ -718,7 +743,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var settingsRequestObserver: NSObjectProtocol?
     private var assistantRequestObserver: NSObjectProtocol?
     private var assistantSetupRequestObserver: NSObjectProtocol?
+    private var assistantStartVoiceCaptureObserver: NSObjectProtocol?
     private var assistantStopVoiceCaptureObserver: NSObjectProtocol?
+    private var assistantMinimizeToOrbObserver: NSObjectProtocol?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var assistantHUDObserver: AnyCancellable?
@@ -732,6 +759,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var dictationInputMode: DictationInputMode = .idle
     private var statusIconAnimationTimer: DispatchSourceTimer?
     private var statusIconAnimationPhase: Double = 0
+    private var lastStatusIconRenderState: StatusIconRenderState?
+    private var statusIconCache: [StatusIconRenderState: NSImage] = [:]
     private var hasScheduledPermissionRestart = false
     private var pendingUpdateCheckFallbackWorkItem: DispatchWorkItem?
     private var settingsApplyWorkItem: DispatchWorkItem?
@@ -744,6 +773,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var assistantVoiceBaselineNoise: Float = 0
     private var assistantVoiceBaselineSamples: [Float] = []
     private var assistantVoiceBaselineCalibrated = false
+
+    private enum AssistantVoiceStopMode {
+        case silenceAutoStop
+        case manualRelease
+    }
+
+    private struct StatusIconRenderState: Hashable {
+        private static let bucketCount = 12
+
+        let isRecording: Bool
+        let bucket: Int
+
+        init(isRecording: Bool, level: Float, animationPhase: Double) {
+            self.isRecording = isRecording
+
+            if isRecording {
+                let normalizedLevel = max(0, min(1, level))
+                let waveMotion = Float((sin(animationPhase) + 1) * 0.5)
+                let idlePulse = 0.30 + (0.40 * waveMotion)
+                let animatedLevel = max(normalizedLevel, idlePulse)
+                let rawBucket = Int((animatedLevel * Float(Self.bucketCount)).rounded())
+                self.bucket = min(max(0, rawBucket), Self.bucketCount)
+            } else {
+                let idleBucket = Int((0.45 * Double(Self.bucketCount)).rounded())
+                self.bucket = min(max(0, idleBucket), Self.bucketCount)
+            }
+        }
+
+        var variableValue: Double {
+            if isRecording {
+                return max(0.30, Double(bucket) / Double(Self.bucketCount))
+            }
+            return 0.45
+        }
+    }
+
+    private var assistantVoiceStopMode: AssistantVoiceStopMode = .silenceAutoStop
+    private var orbVoiceStopMode: AssistantVoiceStopMode = .manualRelease
 
     private enum PromptRewriteFailureChoice {
         case retry
@@ -947,7 +1014,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         setupStatusBar()
         assistantOrbHUD = AssistantOrbHUDManager(controller: assistantController)
-        assistantOrbHUD?.isEnabled = settings.assistantFloatingHUDEnabled
+        syncAssistantOrbVisibility()
         assistantHUDObserver = assistantController.$hudState
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -969,6 +1036,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self?.insertText(text)
             }
         )
+        windowCoordinator?.onAssistantWindowVisibilityChanged = { [weak self] isVisible in
+            self?.isAssistantWindowVisible = isVisible
+            self?.syncAssistantOrbVisibility()
+        }
         automationAPICoordinator.setNotificationInteractionHandler { [weak self] source in
             guard let self else { return }
             if let source, Self.activateTerminalForSource(source) {
@@ -1079,12 +1150,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self.currentAudioLevel = max(0, min(1, level))
                 self.waveform.updateLevel(level)
                 if self.assistantVoiceCaptureActive {
+                    self.assistantController.updateVoiceCaptureLevel(level)
                     self.assistantOrbHUD?.updateLevel(level)
                     self.evaluateAssistantVoiceSilence(level: level)
                 } else if self.orbVoiceCaptureActive {
+                    self.assistantController.updateVoiceCaptureLevel(0)
                     self.assistantOrbHUD?.updateLevel(level)
                     self.evaluateOrbVoiceSilence(level: level)
                 } else {
+                    self.assistantController.updateVoiceCaptureLevel(0)
                     self.assistantOrbHUD?.updateLevel(0)
                 }
                 self.updateMenuState()
@@ -1096,6 +1170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 self?.isDictating = isRecording
                 if !isRecording {
                     self?.currentAudioLevel = 0
+                    self?.assistantController.updateVoiceCaptureLevel(0)
                     if let currentMode = self?.dictationInputMode {
                         self?.dictationInputMode = DictationInputModeStateMachine.onRecordingEnded(currentMode)
                     }
@@ -1196,6 +1271,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             }
         }
 
+        assistantStartVoiceCaptureObserver = NotificationCenter.default.addObserver(
+            forName: .keyScribeStartAssistantVoiceCapture,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.beginAssistantVoiceTaskCapture(stopMode: .manualRelease)
+            }
+        }
+
         assistantStopVoiceCaptureObserver = NotificationCenter.default.addObserver(
             forName: .keyScribeStopAssistantVoiceCapture,
             object: nil,
@@ -1203,6 +1288,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.stopAssistantVoiceCapture()
+            }
+        }
+
+        assistantMinimizeToOrbObserver = NotificationCenter.default.addObserver(
+            forName: .keyScribeMinimizeAssistantToOrb,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.minimizeAssistantToOrb()
             }
         }
 
@@ -1260,9 +1355,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             NotificationCenter.default.removeObserver(assistantSetupRequestObserver)
             self.assistantSetupRequestObserver = nil
         }
+        if let assistantStartVoiceCaptureObserver {
+            NotificationCenter.default.removeObserver(assistantStartVoiceCaptureObserver)
+            self.assistantStartVoiceCaptureObserver = nil
+        }
         if let assistantStopVoiceCaptureObserver {
             NotificationCenter.default.removeObserver(assistantStopVoiceCaptureObserver)
             self.assistantStopVoiceCaptureObserver = nil
+        }
+        if let assistantMinimizeToOrbObserver {
+            NotificationCenter.default.removeObserver(assistantMinimizeToOrbObserver)
+            self.assistantMinimizeToOrbObserver = nil
         }
         stopMemoryPressureMonitoring()
         settingsApplyWorkItem?.cancel()
@@ -1628,7 +1731,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem?.button?.title = ""
         statusItem?.button?.imagePosition = .imageOnly
-        statusItem?.button?.image = makeStatusIcon(isRecording: false, level: 0)
         statusItem?.button?.toolTip = "KeyScribe"
         statusItem?.button?.target = self
         statusItem?.button?.action = #selector(togglePopover)
@@ -1673,14 +1775,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
 
         let popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 10)
+        popover.contentSize = NSSize(width: 320, height: 360)
         popover.behavior = .transient
-        popover.animates = true
+        popover.animates = false
         popover.appearance = NSAppearance(named: .vibrantDark)
+        popover.delegate = self
         popover.contentViewController = NSHostingController(
             rootView: StatusBarPopoverView(viewModel: statusBarViewModel)
         )
         self.popover = popover
+        updateMenuState(forcePopoverRefresh: true, forceIconRefresh: true)
     }
 
     @objc private func togglePopover() {
@@ -1688,7 +1792,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         if let popover, popover.isShown {
             popover.performClose(nil)
         } else {
+            statusBarViewModel.isPopoverVisible = true
+            updateMenuState(forcePopoverRefresh: true)
             popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        statusBarViewModel.isPopoverVisible = true
+        updateMenuState(forcePopoverRefresh: true)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        statusBarViewModel.isPopoverVisible = false
+        if statusBarViewModel.currentAudioLevel != 0 {
+            statusBarViewModel.currentAudioLevel = 0
         }
     }
 
@@ -1704,13 +1822,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             return
         }
 
+        assistantOrbHUD?.hide()
         windowCoordinator?.openAssistantWindow(
             rootView: AssistantWindowView(assistant: assistantController)
             .environmentObject(settings)
         )
     }
 
-    private func beginAssistantVoiceTaskCapture() {
+    private func minimizeAssistantToOrb() {
+        guard settings.assistantFloatingHUDEnabled else { return }
+        windowCoordinator?.closeAssistantWindow()
+        // The orb becomes visible via syncAssistantOrbVisibility (triggered by
+        // onAssistantWindowVisibilityChanged). If there's a selected session,
+        // show its follow-up preview on the orb.
+        if let sessionID = assistantController.selectedSessionID,
+           let session = assistantController.sessions.first(where: { $0.id == sessionID }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.assistantOrbHUD?.showFollowUp(for: session)
+            }
+        }
+    }
+
+    private func syncAssistantOrbVisibility() {
+        let shouldEnableOrb =
+            FeatureFlags.personalAssistantEnabled
+            && settings.assistantBetaEnabled
+            && settings.assistantFloatingHUDEnabled
+            && !isAssistantWindowVisible
+
+        assistantOrbHUD?.isEnabled = shouldEnableOrb
+
+        guard shouldEnableOrb else {
+            assistantOrbHUD?.hide()
+            return
+        }
+
+        assistantOrbHUD?.update(state: assistantController.hudState)
+    }
+
+    private func beginAssistantVoiceTaskCapture(stopMode: AssistantVoiceStopMode = .silenceAutoStop) {
         guard FeatureFlags.personalAssistantEnabled else { return }
         guard settings.assistantBetaEnabled else {
             setUIStatus(.message("Turn on Assistant in Settings first."))
@@ -1730,6 +1880,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         openAssistantWindow()
         assistantVoiceCaptureActive = true
+        assistantVoiceStopMode = stopMode
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
@@ -1740,7 +1891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     func sendAssistantTypedPrompt(_ prompt: String) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty || !assistantController.attachments.isEmpty else { return }
 
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
@@ -1770,6 +1921,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopAssistantVoiceCapture() {
         guard assistantVoiceCaptureActive else { return }
         // Keep assistantVoiceCaptureActive = true so handleFinalTranscript routes to assistant
+        assistantVoiceStopMode = .silenceAutoStop
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
@@ -1784,7 +1936,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     // MARK: - Orb Voice Capture
 
-    private func beginOrbVoiceCapture() {
+    private func beginOrbVoiceCapture(stopMode: AssistantVoiceStopMode = .manualRelease) {
         guard !isDictating else { return }
         guard permissionsReady else {
             updatePermissionGate(openOnboardingIfNeeded: true)
@@ -1793,6 +1945,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
 
         orbVoiceCaptureActive = true
+        orbVoiceStopMode = stopMode
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
@@ -1801,6 +1954,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if !isDictating {
             orbVoiceCaptureActive = false
+            orbVoiceStopMode = .manualRelease
             assistantOrbHUD?.receiveVoiceTranscript("")
         }
     }
@@ -1808,10 +1962,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopOrbVoiceCapture() {
         guard orbVoiceCaptureActive else { return }
         // Keep orbVoiceCaptureActive = true so handleFinalTranscript routes to orb
+        orbVoiceStopMode = .manualRelease
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
         assistantVoiceBaselineCalibrated = false
+        assistantOrbHUD?.setVoiceRecording(false)
         transcriber.stopRecording()
         isDictating = false
         currentAudioLevel = 0
@@ -1821,6 +1977,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     private func evaluateOrbVoiceSilence(level: Float) {
+        guard orbVoiceStopMode == .silenceAutoStop else { return }
+
         let calibrationSampleCount = 15
         let speechMultiplier: Float = 3.0
         let minimumSpeechThreshold: Float = 0.08
@@ -1857,6 +2015,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
 
     private func evaluateAssistantVoiceSilence(level: Float) {
+        guard assistantVoiceStopMode == .silenceAutoStop else { return }
+
         let calibrationSampleCount = 15
         let speechMultiplier: Float = 3.0
         let minimumSpeechThreshold: Float = 0.08
@@ -1898,6 +2058,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopAssistantFromMenuBar() {
         if orbVoiceCaptureActive {
             orbVoiceCaptureActive = false
+            orbVoiceStopMode = .manualRelease
             transcriber.stopRecording(emitFinalText: false)
             isDictating = false
             currentAudioLevel = 0
@@ -1911,6 +2072,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
+            assistantVoiceStopMode = .silenceAutoStop
             transcriber.stopRecording(emitFinalText: false)
             isDictating = false
             currentAudioLevel = 0
@@ -1939,6 +2101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private func stopAssistantExperience() {
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
+            assistantVoiceStopMode = .silenceAutoStop
             transcriber.stopRecording(emitFinalText: false)
         }
         assistantOrbHUD?.hide()
@@ -2077,7 +2240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             stopAssistantExperience()
         }
 
-        assistantOrbHUD?.isEnabled = settings.assistantFloatingHUDEnabled
+        syncAssistantOrbVisibility()
 
         automationAPICoordinator.applySettings(settings)
         lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
@@ -2203,6 +2366,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             return
         }
 
+        if beginVoiceCaptureForActiveAssistantComposerIfPossible() {
+            dictationInputMode = .holdToTalk
+            updateMenuState()
+            return
+        }
+
         startRecording()
         if isDictating {
             dictationInputMode = .holdToTalk
@@ -2213,8 +2382,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         guard DictationInputModeStateMachine.onHoldStop(dictationInputMode) == .idle else {
             return
         }
+
+        if stopVoiceCaptureForActiveAssistantComposerIfNeeded() {
+            dictationInputMode = .idle
+            updateMenuState()
+            return
+        }
+
         stopRecording()
         dictationInputMode = .idle
+    }
+
+    private func beginVoiceCaptureForActiveAssistantComposerIfPossible() -> Bool {
+        guard settings.assistantVoiceTaskEntryEnabled else { return false }
+
+        switch AssistantComposerBridge.shared.activeCaptureTarget {
+        case .assistantWindow:
+            beginAssistantVoiceTaskCapture(stopMode: .manualRelease)
+            return assistantVoiceCaptureActive
+        case .assistantOrb:
+            assistantOrbHUD?.setVoiceRecording(true)
+            beginOrbVoiceCapture(stopMode: .manualRelease)
+            return orbVoiceCaptureActive
+        case nil:
+            return false
+        }
+    }
+
+    private func stopVoiceCaptureForActiveAssistantComposerIfNeeded() -> Bool {
+        if orbVoiceCaptureActive {
+            stopOrbVoiceCapture()
+            return true
+        }
+
+        if assistantVoiceCaptureActive {
+            stopAssistantVoiceCapture()
+            return true
+        }
+
+        return false
     }
 
     private func toggleContinuousDictation() {
@@ -2245,10 +2451,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             updatePermissionGate(openOnboardingIfNeeded: true)
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
+                assistantVoiceStopMode = .silenceAutoStop
                 assistantController.failVoiceDraft("Assistant voice capture needs microphone and accessibility permissions.")
             }
             if orbVoiceCaptureActive {
                 orbVoiceCaptureActive = false
+                orbVoiceStopMode = .manualRelease
                 assistantOrbHUD?.receiveVoiceTranscript("")
             }
             return
@@ -2277,10 +2485,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         } else {
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
+                assistantVoiceStopMode = .silenceAutoStop
                 assistantController.failVoiceDraft("KeyScribe could not start voice capture.")
             }
             if orbVoiceCaptureActive {
                 orbVoiceCaptureActive = false
+                orbVoiceStopMode = .manualRelease
                 assistantOrbHUD?.receiveVoiceTranscript("")
             }
             waveform.hide()
@@ -2323,9 +2533,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if orbVoiceCaptureActive {
             orbVoiceCaptureActive = false
+            orbVoiceStopMode = .manualRelease
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
-            assistantOrbHUD?.receiveVoiceTranscript(cleaned)
+            let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
+            assistantOrbHUD?.receiveVoiceTranscript(refinedAssistantDraft)
             setUIStatus(.ready)
             updateMenuState()
             return
@@ -2333,10 +2545,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
+            assistantVoiceStopMode = .silenceAutoStop
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
             openAssistantWindow()
-            assistantController.receiveVoiceDraft(cleaned)
+            let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
+            assistantController.receiveVoiceDraft(refinedAssistantDraft)
             setUIStatus(.ready)
             updateMenuState()
             return
@@ -2404,6 +2618,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         if !isDictating {
             setUIStatus(.ready)
         }
+    }
+
+    private func refinedAssistantVoiceDraft(from transcript: String) async -> String {
+        await assistantVoiceDraftRefinementService.refine(
+            transcript,
+            aiCorrectionEnabled: settings.promptRewriteEnabled
+        )
     }
 
     @MainActor
@@ -3491,7 +3712,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             return
         }
 
-        statusBarViewModel.uiStatus = status
+        if statusBarViewModel.uiStatus != status {
+            statusBarViewModel.uiStatus = status
+        }
 
         if status.resetsDictationIndicators {
             isDictating = false
@@ -3513,20 +3736,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         sound.play()
     }
 
-    private func updateMenuState() {
-        statusBarViewModel.isContinuousMode = (dictationInputMode == .continuous)
-        statusBarViewModel.permissionsReady = permissionsReady
-        statusBarViewModel.isDictating = isDictating
-        statusBarViewModel.currentAudioLevel = currentAudioLevel
-        statusBarViewModel.assistantEnabled = FeatureFlags.personalAssistantEnabled && settings.assistantBetaEnabled
+    private func updateMenuState(
+        forcePopoverRefresh: Bool = false,
+        forceIconRefresh: Bool = false
+    ) {
+        updateStatusBarViewModel(\.isContinuousMode, value: dictationInputMode == .continuous)
+        updateStatusBarViewModel(\.permissionsReady, value: permissionsReady)
+        updateStatusBarViewModel(\.isDictating, value: isDictating)
+        updateStatusBarViewModel(
+            \.assistantEnabled,
+            value: FeatureFlags.personalAssistantEnabled && settings.assistantBetaEnabled
+        )
+
         let assistantBusy = assistantVoiceCaptureActive
             || assistantController.pendingPermissionRequest != nil
             || [.thinking, .acting, .waitingForPermission, .streaming].contains(assistantController.hudState.phase)
-        statusBarViewModel.assistantCanStopCurrentAction = statusBarViewModel.assistantEnabled && assistantBusy
-        statusBarViewModel.assistantStopActionLabel = assistantVoiceCaptureActive
-            ? "Stop Assistant Listening"
-            : "Cancel Assistant Turn"
-        statusItem?.button?.image = makeStatusIcon(isRecording: isDictating, level: currentAudioLevel)
+        updateStatusBarViewModel(
+            \.assistantCanStopCurrentAction,
+            value: statusBarViewModel.assistantEnabled && assistantBusy
+        )
+        updateStatusBarViewModel(
+            \.assistantStopActionLabel,
+            value: assistantVoiceCaptureActive
+                ? "Stop Assistant Listening"
+                : "Cancel Assistant Turn"
+        )
+
+        let popoverVisible = statusBarViewModel.isPopoverVisible || popover?.isShown == true
+        let normalizedLevel = max(0, min(1, currentAudioLevel))
+        if popoverVisible || forcePopoverRefresh {
+            updateStatusBarAudioLevel(normalizedLevel, force: forcePopoverRefresh)
+        } else if statusBarViewModel.currentAudioLevel != 0 {
+            statusBarViewModel.currentAudioLevel = 0
+        }
+
+        updateStatusItemIcon(force: forceIconRefresh)
+    }
+
+    private func updateStatusBarAudioLevel(_ value: Float, force: Bool) {
+        let currentValue = statusBarViewModel.currentAudioLevel
+        let delta = abs(currentValue - value)
+        let threshold: Float = value == 0 || currentValue == 0 ? 0.01 : 0.04
+        if force || delta >= threshold {
+            statusBarViewModel.currentAudioLevel = value
+        }
+    }
+
+    private func updateStatusBarViewModel<T: Equatable>(
+        _ keyPath: ReferenceWritableKeyPath<StatusBarViewModel, T>,
+        value: T
+    ) {
+        if statusBarViewModel[keyPath: keyPath] != value {
+            statusBarViewModel[keyPath: keyPath] = value
+        }
+    }
+
+    private func updateStatusItemIcon(force: Bool = false) {
+        let renderState = StatusIconRenderState(
+            isRecording: isDictating,
+            level: currentAudioLevel,
+            animationPhase: statusIconAnimationPhase
+        )
+
+        guard force || renderState != lastStatusIconRenderState else { return }
+        lastStatusIconRenderState = renderState
+
+        if let cached = statusIconCache[renderState] {
+            statusItem?.button?.image = cached
+            statusItem?.button?.contentTintColor = nil
+            return
+        }
+
+        guard let image = makeStatusIcon(renderState: renderState) else { return }
+        statusIconCache[renderState] = image
+        statusItem?.button?.image = image
         statusItem?.button?.contentTintColor = nil
     }
 
@@ -3559,17 +3842,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         statusIconAnimationPhase = 0
     }
 
-    private func makeStatusIcon(isRecording: Bool, level: Float) -> NSImage? {
-        let normalizedLevel = max(0, min(1, level))
-        let waveMotion = Float((sin(statusIconAnimationPhase) + 1) * 0.5)
-        // Idle pulse sweeps from 0.3 to 0.7 so bars animate from center outward
-        let idlePulse = isRecording ? 0.30 + (0.40 * waveMotion) : 0
-        let animatedLevel = isRecording ? max(normalizedLevel, idlePulse) : normalizedLevel
-
+    private func makeStatusIcon(renderState: StatusIconRenderState) -> NSImage? {
         let symbol: NSImage?
         if #available(macOS 13.3, *) {
-            let variableValue = isRecording ? max(0.30, Double(animatedLevel)) : 0.45
-            symbol = NSImage(systemSymbolName: "waveform.circle", variableValue: variableValue, accessibilityDescription: "KeyScribe")
+            symbol = NSImage(
+                systemSymbolName: "waveform.circle",
+                variableValue: renderState.variableValue,
+                accessibilityDescription: "KeyScribe"
+            )
         } else {
             symbol = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "KeyScribe")
         }
@@ -3635,7 +3915,6 @@ struct SettingsView: View {
         case speech
         case aiModels
         case integrations
-        case assistant
         case corrections
         case about
 
@@ -3648,7 +3927,6 @@ struct SettingsView: View {
             case .speech: return "Speech & Input"
             case .aiModels: return "AI & Models"
             case .integrations: return "Integrations"
-            case .assistant: return "Assistant"
             case .corrections: return "Corrections"
             case .about: return "About & Permissions"
             }
@@ -3661,7 +3939,6 @@ struct SettingsView: View {
             case .speech: return "Microphone, engine, whisper models, timing, and text quality"
             case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
             case .integrations: return "Local automation and agent notifications"
-            case .assistant: return "Codex assistant, saved threads, and live workflow"
             case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
             }
@@ -3674,7 +3951,6 @@ struct SettingsView: View {
             case .speech: return "waveform.and.mic"
             case .aiModels: return "shippingbox.fill"
             case .integrations: return "point.3.connected.trianglepath.dotted"
-            case .assistant: return "sparkles.rectangle.stack.fill"
             case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"
             }
@@ -3692,8 +3968,6 @@ struct SettingsView: View {
                 return Color(red: 0.45, green: 0.56, blue: 0.92)
             case .integrations:
                 return Color(red: 0.84, green: 0.52, blue: 0.28)
-            case .assistant:
-                return Color(red: 0.22, green: 0.70, blue: 1.00)
             case .corrections:
                 return Color(red: 0.21, green: 0.70, blue: 0.73)
             case .about:
@@ -3713,8 +3987,6 @@ struct SettingsView: View {
                 return ["ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "style", "conversation", "history"]
             case .integrations:
                 return ["integrations", "automation", "api", "localhost", "claude", "codex", "cloud", "hooks", "notification", "speech", "sound", "token", "port"]
-            case .assistant:
-                return ["assistant", "codex", "threads", "voice task", "resume", "top bar", "hud", "install", "chatgpt", "model"]
             case .corrections:
                 return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
             case .about:
@@ -3798,7 +4070,6 @@ struct SettingsView: View {
     @StateObject private var adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
     @StateObject private var localAISetupService = LocalAISetupService.shared
-    @StateObject private var assistantController = AssistantFeatureController.shared
     @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
     @StateObject private var automationAPICoordinator = AutomationAPICoordinator.shared
     @State private var selectedSection: SettingsSection = .essentials
@@ -3990,7 +4261,7 @@ struct SettingsView: View {
             sanitizePinnedConversationContextSelection()
         }
         .onReceive(NotificationCenter.default.publisher(for: .keyScribeOpenAssistantSetup)) { _ in
-            selectedSection = .assistant
+            NotificationCenter.default.post(name: .keyScribeOpenAIMemoryStudio, object: nil)
         }
         .sheet(isPresented: $isCorrectionEditorPresented) {
             correctionEditorSheet
@@ -4293,8 +4564,6 @@ struct SettingsView: View {
             aiModelsSection
         case .integrations:
             integrationsSection
-        case .assistant:
-            assistantSection
         case .corrections:
             correctionsSection
         case .about:
@@ -5120,332 +5389,6 @@ struct SettingsView: View {
         }
         .onAppear {
             localAISetupService.refreshStatus()
-        }
-    }
-
-    @ViewBuilder
-    private var assistantSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .assistant)
-
-            settingsCard(
-                title: "Assistant",
-                subtitle: "Codex-powered personal assistant with voice task entry.",
-                symbol: "sparkles.rectangle.stack.fill",
-                tint: Color(red: 0.22, green: 0.70, blue: 1.00)
-            ) {
-                Toggle("Enable assistant", isOn: $settings.assistantBetaEnabled)
-
-                if !settings.assistantBetaWarningAcknowledged {
-                    Text("This assistant can read files, continue Codex threads, and guide bigger tasks. Review the assistant window before using it for important work.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Button("I understand") {
-                        settings.assistantBetaWarningAcknowledged = true
-                    }
-                    .buttonStyle(.bordered)
-                }
-
-                Toggle("Enable voice task entry", isOn: $settings.assistantVoiceTaskEntryEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                Toggle("Show floating activity bubble", isOn: $settings.assistantFloatingHUDEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                if assistantController.accountSnapshot.isLoggedIn {
-                    HStack(spacing: 6) {
-                        Image(systemName: "person.crop.circle.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text(assistantController.accountSnapshot.summary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                if assistantController.accountSnapshot.isLoggedIn && assistantController.visibleModels.isEmpty {
-                    Text(
-                        assistantController.isLoadingModels
-                            ? "Loading assistant models..."
-                            : "No assistant models are available yet."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-
-                if !assistantController.visibleModels.isEmpty {
-                    Picker(
-                        "Model",
-                        selection: Binding(
-                            get: { assistantController.selectedModelID ?? "" },
-                            set: { assistantController.chooseModel($0) }
-                        )
-                    ) {
-                        Text("Select a model").tag("")
-                        ForEach(assistantController.visibleModels) { model in
-                            Text(model.displayName).tag(model.id)
-                        }
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open Assistant") {
-                        NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                    switch assistantController.environment.state {
-                    case .missingCodex:
-                        Button("Install Codex") {
-                            assistantController.runPreferredInstallCommand()
-                        }
-                        .buttonStyle(.bordered)
-                    case .needsLogin:
-                        Button("Sign In with ChatGPT") {
-                            assistantController.runLoginCommand()
-                        }
-                        .buttonStyle(.bordered)
-                    case .ready:
-                        EmptyView()
-                    case .failed:
-                        Button("Codex Docs") {
-                            assistantController.openInstallDocs()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-
-                if assistantController.environment.state != .ready {
-                    Text(assistantController.environment.installHelpText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            settingsCard(
-                title: "Memory",
-                subtitle: "Short-term file memory for the current Codex thread, plus reviewed long-term lessons.",
-                symbol: "brain.head.profile",
-                tint: Color(red: 0.46, green: 0.79, blue: 0.66)
-            ) {
-                Toggle("Enable assistant memory", isOn: $settings.assistantMemoryEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                Toggle("Review before saving long-term memory", isOn: $settings.assistantMemoryReviewEnabled)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                Stepper(value: $settings.assistantMemorySummaryMaxChars, in: 400...4000, step: 200) {
-                    HStack {
-                        Text("Memory summary size")
-                        Spacer()
-                        Text("\(settings.assistantMemorySummaryMaxChars) chars")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                if let memoryStatusMessage = assistantController.memoryStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !memoryStatusMessage.isEmpty {
-                    Text(memoryStatusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    Text("Assistant memory stays separate from voice-to-text memory.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open Current Memory File") {
-                        assistantController.openCurrentMemoryFile()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                    Button("Reset Current Task Memory") {
-                        assistantController.resetCurrentTaskMemory()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Review Memory Suggestions") {
-                        assistantController.openMemorySuggestionReview()
-                        NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                    Button("Clear This Thread Memory", role: .destructive) {
-                        assistantController.clearCurrentThreadMemory()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-                }
-            }
-
-            BrowserAutomationSettingsView(settings: settings)
-
-            // Custom instructions
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "text.quote")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text("Custom Instructions")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-
-                Text("These instructions are sent to every new assistant session. Use them to set coding style, preferred tools, personality, or any rules.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                TextEditor(text: $settings.assistantCustomInstructions)
-                    .font(.system(size: 12, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                    .frame(minHeight: 80, maxHeight: 160)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.white.opacity(0.05))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(Color.white.opacity(0.10), lineWidth: 0.8)
-                            )
-                    )
-
-                if !settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle")
-                            .foregroundStyle(.green)
-                            .font(.system(size: 11))
-                        Text("Instructions will be applied to the next new session.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
-
-            // Agent turn limit
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "gauge.with.dots.needle.33percent")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text("Agent Turn Limit")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-
-                Text("Maximum number of tool calls the agent can make in a single turn before it is automatically stopped. Set to 0 for unlimited.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 12) {
-                    TextField(
-                        "Max tool calls",
-                        value: $settings.assistantMaxToolCallsPerTurn,
-                        format: .number
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 80)
-
-                    Text("\(settings.assistantMaxToolCallsPerTurn == 0 ? "Unlimited" : "\(settings.assistantMaxToolCallsPerTurn) tool calls")")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-
-                    Spacer()
-
-                    Button("Reset") {
-                        settings.assistantMaxToolCallsPerTurn = 75
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
-
-            if !assistantController.sessions.isEmpty {
-                settingsCard(
-                    title: "Recent Sessions",
-                    subtitle: "\(assistantController.sessions.count) session\(assistantController.sessions.count == 1 ? "" : "s") saved in KeyScribe.",
-                    symbol: "clock.arrow.circlepath",
-                    tint: AppVisualTheme.baseTint
-                ) {
-                    ForEach(Array(assistantController.sessions.prefix(4))) { session in
-                        HStack(alignment: .top, spacing: 10) {
-                            AppIconBadge(
-                                symbol: assistantSessionBadgeSymbol(for: session.source),
-                                tint: assistantSessionBadgeTint(for: session.source),
-                                size: 22,
-                                symbolSize: 10,
-                                isEmphasized: assistantController.selectedSessionID == session.id
-                            )
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(session.title)
-                                    .font(.callout.weight(.semibold))
-                                    .foregroundStyle(.white.opacity(0.94))
-                                    .lineLimit(1)
-                                Text(session.detail.isEmpty ? (session.cwd ?? "") : session.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                            Spacer()
-                        }
-                        .padding(.vertical, 2)
-                    }
-
-                    if assistantController.sessions.count > 4 {
-                        Button("View All in Assistant Window") {
-                            NotificationCenter.default.post(name: .keyScribeOpenAssistant, object: nil)
-                        }
-                        .font(.caption)
-                        .buttonStyle(.bordered)
-                        .disabled(!settings.assistantBetaEnabled)
-                    }
-                }
-            }
-        }
-        .onAppear {
-            assistantController.refreshAll()
-        }
-    }
-
-    private func assistantSessionBadgeSymbol(for source: AssistantSessionSource) -> String {
-        switch source {
-        case .cli:
-            return "terminal.fill"
-        case .vscode:
-            return "chevron.left.forwardslash.chevron.right"
-        case .appServer:
-            return "sparkles"
-        case .other:
-            return "tray.full.fill"
-        }
-    }
-
-    private func assistantSessionBadgeTint(for source: AssistantSessionSource) -> Color {
-        switch source {
-        case .cli:
-            return AppVisualTheme.baseTint
-        case .vscode:
-            return AppVisualTheme.accentTint
-        case .appServer:
-            return .green
-        case .other:
-            return .orange
         }
     }
 
@@ -7225,10 +7168,6 @@ struct SettingsView: View {
             .init(section: .integrations, title: "Codex CLI notify config", detail: "Copy the Codex CLI notify snippet for ~/.codex/config.toml", keywords: ["codex", "notify", "config", "toml", "cloud"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Codex Cloud beta", detail: "Watch local codex cloud tasks and alert when they are ready or fail", keywords: ["codex", "cloud", "beta", "polling", "ready", "failed"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Automation notification permission", detail: "Allow desktop notifications for local API alerts", keywords: ["notification", "permission", "desktop", "grant"], integrationsPage: .automationNotifications),
-            .init(section: .assistant, title: "Enable assistant", detail: "Turn on the personal assistant experience", keywords: ["assistant", "codex"]),
-            .init(section: .assistant, title: "Codex status", detail: "See whether Codex is installed and ready", keywords: ["codex", "install", "login", "cli", "chatgpt"]),
-            .init(section: .assistant, title: "Voice task entry", detail: "Use your voice to draft assistant tasks", keywords: ["voice", "assistant", "task", "speak"]),
-            .init(section: .assistant, title: "Open assistant window", detail: "Launch the live assistant workspace", keywords: ["assistant window", "sessions", "resume"]),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall KeyScribe", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
@@ -7251,12 +7190,7 @@ struct SettingsView: View {
     }
 
     private var filteredSections: [SettingsSection] {
-        let availableSections = SettingsSection.allCases.filter { section in
-            if section == .assistant {
-                return FeatureFlags.personalAssistantEnabled
-            }
-            return true
-        }
+        let availableSections = SettingsSection.allCases
 
         guard !trimmedSearchQuery.isEmpty else {
             return availableSections

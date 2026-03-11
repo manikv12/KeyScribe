@@ -48,6 +48,62 @@ private enum CodexIncomingEvent: @unchecked Sendable {
     case processExited(String?)
 }
 
+struct AssistantRepeatedCommandLimitHit: Equatable, Sendable {
+    let command: String
+    let attemptCount: Int
+}
+
+struct AssistantRepeatedCommandTracker: Sendable {
+    private(set) var lastSignature: String?
+    private(set) var consecutiveCount = 0
+
+    mutating func reset() {
+        lastSignature = nil
+        consecutiveCount = 0
+    }
+
+    mutating func record(
+        command: String,
+        maxAttempts: Int
+    ) -> AssistantRepeatedCommandLimitHit? {
+        guard maxAttempts > 0,
+              let signature = Self.normalizedSignature(for: command) else {
+            return nil
+        }
+
+        if signature == lastSignature {
+            consecutiveCount += 1
+        } else {
+            lastSignature = signature
+            consecutiveCount = 1
+        }
+
+        guard consecutiveCount >= maxAttempts else {
+            return nil
+        }
+
+        return AssistantRepeatedCommandLimitHit(
+            command: Self.collapsedCommandText(command),
+            attemptCount: consecutiveCount
+        )
+    }
+
+    static func normalizedSignature(for command: String) -> String? {
+        let collapsed = collapsedCommandText(command)
+        return collapsed.isEmpty ? nil : collapsed
+    }
+
+    static func collapsedCommandText(_ command: String) -> String {
+        command
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: #"\s+"#,
+                with: " ",
+                options: .regularExpression
+            )
+    }
+}
+
 @MainActor
 final class CodexAssistantRuntime {
     var onHealthUpdate: (@Sendable (AssistantRuntimeHealth) -> Void)?
@@ -65,6 +121,7 @@ final class CodexAssistantRuntime {
     var onRateLimitsUpdate: (@Sendable (AccountRateLimits) -> Void)?
     var onSubagentUpdate: (@Sendable ([SubagentState]) -> Void)?
     var onProposedPlan: (@Sendable (String?) -> Void)?
+    var onModeRestriction: (@Sendable (AssistantModeRestrictionEvent) -> Void)?
     /// Fired after the first successful turn of a new session with (sessionID, userPrompt, assistantResponse).
     var onTitleRequest: (@Sendable (_ sessionID: String, _ userPrompt: String, _ assistantResponse: String) -> Void)?
 
@@ -82,9 +139,11 @@ final class CodexAssistantRuntime {
     private var metadataRefreshTask: Task<Void, Never>?
     private var transportStartupTask: Task<Void, Error>?
     private var turnToolCallCount = 0
+    private var repeatedCommandTracker = AssistantRepeatedCommandTracker()
     private var sessionTurnCount = 0
     private var firstTurnUserPrompt: String?
     var maxToolCallsPerTurn: Int = 75
+    var maxRepeatedCommandAttemptsPerTurn: Int = 3
 
     // Title generation: ephemeral thread whose notifications are filtered from the main UI
     private var titleGenThreadID: String?
@@ -112,6 +171,8 @@ final class CodexAssistantRuntime {
 
     // Subagent tracking
     private var activeSubagents: [String: SubagentState] = [:]
+    private let computerUseService: AssistantComputerUseService
+    private var computerUseApprovedSessionIDs: Set<String> = []
 
     var currentSessionID: String? {
         activeSessionID
@@ -121,8 +182,12 @@ final class CodexAssistantRuntime {
         activeTurnID != nil
     }
 
-    init(preferredModelID: String? = nil) {
+    init(
+        preferredModelID: String? = nil,
+        computerUseService: AssistantComputerUseService = AssistantComputerUseService()
+    ) {
         self.preferredModelID = preferredModelID?.nonEmpty
+        self.computerUseService = computerUseService
     }
 
     func setPreferredModelID(_ modelID: String?) {
@@ -195,6 +260,7 @@ final class CodexAssistantRuntime {
         try await ensureTransport()
         toolCalls.removeAll()
         liveActivities.removeAll()
+        repeatedCommandTracker.reset()
         resetStreamingTimelineState()
         onToolCallUpdate?([])
         onPlanUpdate?([])
@@ -245,13 +311,30 @@ final class CodexAssistantRuntime {
         updateHUD(phase: .idle, title: "Thread ready", detail: nil)
     }
 
+    func refreshCurrentSessionConfiguration(cwd: String?, preferredModelID: String? = nil) async throws {
+        guard let activeSessionID else { return }
+        try await ensureTransport()
+        _ = try await sendRequest(
+            method: "thread/resume",
+            params: threadResumeParams(
+                threadID: activeSessionID,
+                cwd: cwd,
+                modelID: preferredModelID ?? self.preferredModelID
+            )
+        )
+        onHealthUpdate?(makeHealth(
+            availability: activeTurnID == nil ? .ready : .active,
+            summary: "Connected"
+        ))
+    }
+
     func sendPrompt(
         _ prompt: String,
         attachments: [AssistantAttachment] = [],
         preferredModelID: String? = nil,
+        modelSupportsImageInput: Bool = true,
         resumeContext: String? = nil,
-        memoryContext: String? = nil,
-        browserContextOverride: String? = nil
+        memoryContext: String? = nil
     ) async throws {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
@@ -259,6 +342,11 @@ final class CodexAssistantRuntime {
         // Reset plan buffer for the new turn
         proposedPlanBuffer = ""
         allowsProposedPlanForActiveTurn = interactionMode == .plan
+        blockedToolUseHandledForActiveTurn = false
+        blockedToolUseInterruptionMessage = nil
+        currentTurnIncludesImageAttachments = attachments.contains(where: \.isImage)
+        currentTurnModelSupportsImageInput = modelSupportsImageInput
+        redirectedImageToolCallForActiveTurn = false
 
         // Track the first user prompt for title generation
         if sessionTurnCount == 0 {
@@ -274,7 +362,8 @@ final class CodexAssistantRuntime {
         }
 
         turnToolCallCount = 0
-        updateHUD(phase: .streaming, title: "Codex is working", detail: nil)
+        repeatedCommandTracker.reset()
+        updateHUD(phase: .streaming, title: "Starting", detail: nil)
         let requestedModelID = preferredModelID ?? self.preferredModelID
         CrashReporter.logInfo("Assistant runtime requesting turn/start threadID=\(activeSessionID) model=\(requestedModelID ?? "server-default") promptChars=\(trimmed.count) attachments=\(attachments.count)")
 
@@ -286,8 +375,7 @@ final class CodexAssistantRuntime {
                 attachments: attachments,
                 modelID: requestedModelID,
                 resumeContext: resumeContext,
-                memoryContext: memoryContext,
-                browserContextOverride: browserContextOverride
+                memoryContext: memoryContext
             )
         )
 
@@ -355,6 +443,7 @@ final class CodexAssistantRuntime {
         activeSessionID = nil
         toolCalls.removeAll()
         liveActivities.removeAll()
+        repeatedCommandTracker.reset()
         resetStreamingTimelineState()
         onToolCallUpdate?([])
         onPlanUpdate?([])
@@ -374,6 +463,7 @@ final class CodexAssistantRuntime {
         activeSessionID = nil
         toolCalls.removeAll()
         liveActivities.removeAll()
+        repeatedCommandTracker.reset()
         resetStreamingTimelineState()
         onToolCallUpdate?([])
         onPlanUpdate?([])
@@ -695,7 +785,6 @@ final class CodexAssistantRuntime {
                 let channel = (params["channel"] as? String)?.lowercased()
                 if channel == "commentary" {
                     appendCommentaryDelta(delta)
-                    updateHUD(phase: .acting, title: "Working", detail: delta)
                 } else {
                     // Accumulate deltas into a single growing entry
                     if streamingEntryID == nil {
@@ -709,7 +798,7 @@ final class CodexAssistantRuntime {
                         isStreaming: true
                     ))
                     appendAssistantDelta(delta)
-                    updateHUD(phase: .streaming, title: "Codex is responding", detail: nil)
+                    updateHUD(phase: .streaming, title: "Responding", detail: nil)
                 }
             }
         case "item/plan/delta":
@@ -719,13 +808,13 @@ final class CodexAssistantRuntime {
                 proposedPlanBuffer += delta
                 onProposedPlan?(proposedPlanBuffer)
                 emitPlanTimeline(text: proposedPlanBuffer, isStreaming: true)
-                updateHUD(phase: .streaming, title: "Building plan", detail: nil)
+                updateHUD(phase: .streaming, title: "Planning", detail: nil)
             }
         case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
             if let delta = params["delta"] as? String, delta.nonEmpty != nil {
                 onTranscript?(AssistantTranscriptEntry(role: .status, text: delta))
                 appendCommentaryDelta(delta)
-                updateHUD(phase: .thinking, title: "Thinking", detail: delta)
+                updateHUD(phase: .thinking, title: "Reasoning", detail: nil)
             }
         case "item/started":
             handleItemStartedOrCompleted(params, isCompleted: false)
@@ -738,16 +827,29 @@ final class CodexAssistantRuntime {
             activeTurnID = nil
             handleTurnCompleted(params)
         case "error":
-            flushStreamingBuffer()
-            flushCommentaryBuffer()
             let message = firstNonEmptyString(
                 params["message"] as? String,
                 extractString(params["error"]),
                 "Codex reported an error."
             ) ?? "Codex reported an error."
+            if let reconnectStatus = transientReconnectStatusMessage(from: message) {
+                onStatusMessage?(reconnectStatus)
+                onHealthUpdate?(connectedHealthForCurrentState(detail: reconnectStatus))
+                updateHUD(
+                    phase: activeTurnID != nil ? .streaming : .thinking,
+                    title: "Reconnecting",
+                    detail: reconnectStatus
+                )
+                CrashReporter.logWarning("Assistant runtime reconnect notice: \(reconnectStatus)")
+                break
+            }
+            flushStreamingBuffer()
+            flushCommentaryBuffer()
             onTranscript?(AssistantTranscriptEntry(role: .error, text: message, emphasis: true))
             emitTimelineSystemMessage(message, emphasis: true)
-            onHealthUpdate?(makeHealth(availability: .failed, summary: "Codex needs attention", detail: message))
+            // Keep availability as .ready so the user can retry — the transport
+            // connection is still alive; only the individual operation failed.
+            onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected", detail: message))
             updateHUD(phase: .failed, title: "Needs attention", detail: message)
             CrashReporter.logError("Assistant runtime error notification: \(message)")
         case "model/rerouted", "configWarning", "deprecationNotice":
@@ -1000,32 +1102,25 @@ final class CodexAssistantRuntime {
             return
         }
 
-        // In non-agentic modes, auto-decline tool execution requests so the
-        // agent can only chat or plan without making changes.
-        if interactionMode != .agentic {
-            switch method {
-            case "item/commandExecution/requestApproval",
-                 "item/fileChange/requestApproval":
-                do {
-                    try await transport?.sendResponse(
-                        id: id,
-                        result: ["decision": "decline"]
-                    )
-                } catch {
-                    await MainActor.run {
-                        onStatusMessage?(error.localizedDescription)
-                    }
-                }
-                let label = method.contains("command") ? "command execution" : "file changes"
-                onTranscript?(AssistantTranscriptEntry(
-                    role: .system,
-                    text: "Declined \(label) — \(interactionMode.label.lowercased()) mode does not allow tool use.",
-                    emphasis: false
-                ))
+        if let blocked = blockedServerRequestContext(method: method, params: params) {
+            if await redirectBlockedImageToolRequestIfPossible(id: id, method: method) {
                 return
-            default:
-                break
             }
+            let message = blockedToolUseMessage(
+                for: interactionMode,
+                activityTitle: blocked.activityTitle,
+                commandClass: blocked.commandClass
+            )
+            await declineBlockedServerRequest(id: id, method: method, message: message)
+            interruptForBlockedToolUse(
+                activityTitle: blocked.activityTitle,
+                commandClass: blocked.commandClass
+            )
+            return
+        }
+
+        if await autoApproveServerRequestIfPossible(id: id, method: method, params: params) {
+            return
         }
 
         switch method {
@@ -1035,6 +1130,8 @@ final class CodexAssistantRuntime {
             await presentFileChangeApprovalRequest(id: id, params: params)
         case "item/tool/requestUserInput":
             await presentToolUserInputRequest(id: id, params: params)
+        case "item/tool/call":
+            await handleDynamicToolCall(id: id, params: params)
         case "mcpServer/elicitation/request":
             let message = firstNonEmptyString(
                 params["message"] as? String,
@@ -1066,6 +1163,31 @@ final class CodexAssistantRuntime {
             onStatusMessage?(message)
         default:
             onStatusMessage?("Codex requested an unsupported action: \(method)")
+        }
+    }
+
+    private func autoApproveServerRequestIfPossible(
+        id: JSONRPCRequestID,
+        method: String,
+        params: [String: Any]
+    ) async -> Bool {
+        guard method == "item/commandExecution/requestApproval",
+              let command = params["command"] as? String,
+              AssistantModePolicy.shouldAutoApproveCommandRequest(
+                mode: interactionMode,
+                command: command
+              ) else {
+            return false
+        }
+
+        do {
+            try await transport?.sendResponse(id: id, result: ["decision": "accept"])
+            return true
+        } catch {
+            await MainActor.run {
+                onStatusMessage?(error.localizedDescription)
+            }
+            return false
         }
     }
 
@@ -1126,7 +1248,7 @@ final class CodexAssistantRuntime {
                 )
             )
         )
-        updateHUD(phase: .waitingForPermission, title: "Approval needed", detail: command)
+        updateHUD(phase: .waitingForPermission, title: "Approve Command", detail: friendlyCommandSummary(command))
     }
 
     private func presentFileChangeApprovalRequest(id: JSONRPCRequestID, params: [String: Any]) async {
@@ -1186,7 +1308,7 @@ final class CodexAssistantRuntime {
                 )
             )
         )
-        updateHUD(phase: .waitingForPermission, title: "Approval needed", detail: "File changes")
+        updateHUD(phase: .waitingForPermission, title: "Approve Edit", detail: "File changes")
     }
 
     private func presentToolUserInputRequest(id: JSONRPCRequestID, params: [String: Any]) async {
@@ -1267,7 +1389,191 @@ final class CodexAssistantRuntime {
                 )
             )
         )
-        updateHUD(phase: .waitingForPermission, title: "Need input", detail: request.toolTitle)
+        updateHUD(phase: .waitingForPermission, title: "Input Needed", detail: request.toolTitle)
+    }
+
+    private func handleDynamicToolCall(id: JSONRPCRequestID, params: [String: Any]) async {
+        let tool = dynamicToolName(from: params) ?? "Tool"
+
+        guard tool == AssistantComputerUseToolDefinition.name else {
+            do {
+                try await transport?.sendResponse(
+                    id: id,
+                    result: [
+                        "contentItems": [[
+                            "type": "inputText",
+                            "text": "KeyScribe does not support the dynamic tool `\(tool)` yet."
+                        ]],
+                        "success": false
+                    ]
+                )
+            } catch {
+                await MainActor.run {
+                    onStatusMessage?(error.localizedDescription)
+                }
+            }
+            return
+        }
+
+        let sessionID = params["threadId"] as? String ?? activeSessionID ?? ""
+        let arguments = dynamicToolArguments(from: params)
+
+        if computerUseApprovedSessionIDs.contains(sessionID) {
+            await executeComputerUseCall(
+                requestID: id,
+                arguments: arguments
+            )
+            return
+        }
+
+        let taskSummary: String
+        if let parsed = try? AssistantComputerUseService.parseTask(from: arguments) {
+            taskSummary = parsed.task
+        } else {
+            taskSummary = "Use the local computer"
+        }
+
+        let options = [
+            AssistantPermissionOption(id: "acceptForSession", title: "Allow for Session", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: true),
+            AssistantPermissionOption(id: "accept", title: "Allow Once", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: false),
+            AssistantPermissionOption(id: "decline", title: "Decline", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: false),
+            AssistantPermissionOption(id: "cancel", title: "Cancel Turn", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: false)
+        ]
+
+        let request = AssistantPermissionRequest(
+            id: approvalRequestID(from: id),
+            sessionID: sessionID,
+            toolTitle: "Computer Use",
+            toolKind: AssistantComputerUseToolDefinition.toolKind,
+            rationale: """
+            Computer Use can click, scroll, type, and capture screenshots on your Mac.
+
+            Requested task: \(taskSummary)
+            """,
+            options: options,
+            rawPayloadSummary: taskSummary
+        )
+
+        pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+            guard let self else { return }
+
+            switch optionID {
+            case "acceptForSession":
+                await self.rememberComputerUseApproval(for: sessionID)
+                await self.executeComputerUseCall(
+                    requestID: id,
+                    arguments: arguments
+                )
+            case "accept":
+                await self.executeComputerUseCall(
+                    requestID: id,
+                    arguments: arguments
+                )
+            case "cancel":
+                let message = "Computer Use was canceled for this turn."
+                do {
+                    try await self.transport?.sendResponse(
+                        id: id,
+                        result: [
+                            "contentItems": [["type": "inputText", "text": message]],
+                            "success": false
+                        ]
+                    )
+                } catch {
+                    await MainActor.run {
+                        self.onStatusMessage?(error.localizedDescription)
+                    }
+                }
+                await self.cancelActiveTurn()
+            default:
+                let message = "Computer Use was declined for this request."
+                do {
+                    try await self.transport?.sendResponse(
+                        id: id,
+                        result: [
+                            "contentItems": [["type": "inputText", "text": message]],
+                            "success": false
+                        ]
+                    )
+                } catch {
+                    await MainActor.run {
+                        self.onStatusMessage?(error.localizedDescription)
+                    }
+                }
+            }
+        } cancelHandler: { [weak self] in
+            guard let self else { return }
+            let message = "Computer Use was canceled for this turn."
+            do {
+                try await self.transport?.sendResponse(
+                    id: id,
+                    result: [
+                        "contentItems": [["type": "inputText", "text": message]],
+                        "success": false
+                    ]
+                )
+            } catch {
+                await MainActor.run {
+                    self.onStatusMessage?(error.localizedDescription)
+                }
+            }
+        }
+
+        onPermissionRequest?(request)
+        onTranscript?(AssistantTranscriptEntry(role: .permission, text: "Codex wants to use Computer Use.", emphasis: true))
+        onTimelineMutation?(
+            .upsert(
+                .permission(
+                    id: "permission-\(request.id)",
+                    sessionID: request.sessionID,
+                    turnID: activeTurnID,
+                    request: request,
+                    createdAt: Date(),
+                    source: .runtime
+                )
+            )
+        )
+        updateHUD(phase: .waitingForPermission, title: "Approve Action", detail: taskSummary)
+    }
+
+    private func executeComputerUseCall(
+        requestID: JSONRPCRequestID,
+        arguments: Any
+    ) async {
+        updateHUD(phase: .acting, title: "Computer Use", detail: "Working on the current screen")
+
+        let result = await computerUseService.run(
+            arguments: arguments,
+            preferredModelID: preferredModelID
+        )
+
+        do {
+            try await transport?.sendResponse(
+                id: requestID,
+                result: [
+                    "contentItems": result.contentItems.map { $0.dictionaryRepresentation() },
+                    "success": result.success
+                ]
+            )
+        } catch {
+            await MainActor.run {
+                onStatusMessage?(error.localizedDescription)
+            }
+        }
+
+        if !result.summary.isEmpty {
+            onStatusMessage?(result.summary)
+        }
+        updateHUD(
+            phase: result.success ? .acting : .failed,
+            title: result.success ? "Computer Use finished" : "Computer Use failed",
+            detail: result.summary
+        )
+    }
+
+    private func rememberComputerUseApproval(for sessionID: String) {
+        guard !sessionID.isEmpty else { return }
+        computerUseApprovedSessionIDs.insert(sessionID)
     }
 
     private func handleThreadStatusChanged(_ params: [String: Any]) {
@@ -1347,8 +1653,19 @@ final class CodexAssistantRuntime {
             emitPlanTimeline(text: text, isStreaming: false)
         }
 
-        guard let item = params["item"] as? [String: Any],
-              let state = parseToolCallState(from: item) else {
+        guard let item = params["item"] as? [String: Any] else {
+            return
+        }
+
+        if let blocked = blockedActivityContext(from: item) {
+            interruptForBlockedToolUse(
+                activityTitle: blocked.activityTitle,
+                commandClass: blocked.commandClass
+            )
+            return
+        }
+
+        guard let state = parseToolCallState(from: item) else {
             return
         }
 
@@ -1383,6 +1700,21 @@ final class CodexAssistantRuntime {
 
         if !isCompleted {
             turnToolCallCount += 1
+            if let repeatedCommandLimitHit = repeatedCommandLimitHit(for: item) {
+                let repeatedCommand = compactDetail(repeatedCommandLimitHit.command) ?? "Command"
+                let message = "Stopped this turn because the same command repeated \(repeatedCommandLimitHit.attemptCount) times in a row: \(repeatedCommand)"
+                CrashReporter.logInfo(
+                    "Assistant runtime: repeated command limit reached (\(maxRepeatedCommandAttemptsPerTurn)) command=\(repeatedCommand)"
+                )
+                onTranscript?(AssistantTranscriptEntry(
+                    role: .system,
+                    text: message,
+                    emphasis: true
+                ))
+                emitTimelineSystemMessage(message, emphasis: true)
+                Task { [weak self] in await self?.cancelActiveTurn() }
+                return
+            }
             if maxToolCallsPerTurn > 0 && turnToolCallCount >= maxToolCallsPerTurn {
                 CrashReporter.logInfo("Assistant runtime: tool call limit reached (\(maxToolCallsPerTurn)), auto-cancelling turn")
                 onTranscript?(AssistantTranscriptEntry(
@@ -1394,7 +1726,18 @@ final class CodexAssistantRuntime {
                 Task { [weak self] in await self?.cancelActiveTurn() }
                 return
             }
-            updateHUD(phase: .acting, title: state.title, detail: state.hudDetail ?? state.detail)
+            updateHUD(phase: .acting, title: hudLabelForToolKind(state.kind, fallback: state.title), detail: state.hudDetail ?? state.detail)
+        }
+    }
+
+    private func hudLabelForToolKind(_ kind: String?, fallback: String) -> String {
+        switch kind {
+        case "commandExecution": return "Running"
+        case "fileChange": return "Editing"
+        case "webSearch": return "Searching"
+        case "browserAutomation": return "Browsing"
+        case "collabAgentToolCall": return "Delegating"
+        default: return fallback
         }
     }
 
@@ -1460,9 +1803,13 @@ final class CodexAssistantRuntime {
             sessionTurnCount += 1
         case "interrupted":
             finalizeActiveActivities(with: .interrupted)
-            onTranscript?(AssistantTranscriptEntry(role: .status, text: "This turn was interrupted."))
-            emitTimelineSystemMessage("This turn was interrupted.")
-            updateHUD(phase: .idle, title: "Interrupted", detail: nil)
+            if blockedToolUseInterruptionMessage == nil {
+                onTranscript?(AssistantTranscriptEntry(role: .status, text: "This turn was interrupted."))
+                emitTimelineSystemMessage("This turn was interrupted.")
+                updateHUD(phase: .idle, title: "Interrupted", detail: nil)
+            } else {
+                updateHUD(phase: .idle, title: "Mode restriction", detail: nil)
+            }
             onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected"))
         case "failed":
             finalizeActiveActivities(with: .failed)
@@ -1470,10 +1817,15 @@ final class CodexAssistantRuntime {
             onTranscript?(AssistantTranscriptEntry(role: .error, text: errorText, emphasis: true))
             emitTimelineSystemMessage(errorText, emphasis: true)
             updateHUD(phase: .failed, title: "Needs attention", detail: errorText)
-            onHealthUpdate?(makeHealth(availability: .failed, summary: "Codex needs attention", detail: errorText))
+            // The turn failed but the transport is still connected — keep availability
+            // as .ready so the user can send follow-up messages.
+            onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected", detail: errorText))
         default:
             updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
         }
+
+        blockedToolUseHandledForActiveTurn = false
+        blockedToolUseInterruptionMessage = nil
 
         // Clean up any lingering AppleScript/osascript processes spawned during the turn
         Self.cleanupAppleScriptProcesses()
@@ -1511,9 +1863,10 @@ final class CodexAssistantRuntime {
 
         guard let timelineID = streamingTimelineID else { return }
 
-        // Throttle timeline mutations to ~12Hz during streaming to reduce view invalidation
+        // Throttle timeline mutations to ~20Hz during streaming so text feels
+        // more live without overwhelming the full assistant window.
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastTimelineMutationTime >= 0.08 else { return }
+        guard now - lastTimelineMutationTime >= 0.05 else { return }
         lastTimelineMutationTime = now
 
         onTimelineMutation?(
@@ -1655,7 +2008,7 @@ final class CodexAssistantRuntime {
     private func parseActivityItem(from item: [String: Any]) -> AssistantActivityItem? {
         guard let state = parseToolCallState(from: item) else { return nil }
 
-        let rawKind = item["type"] as? String ?? state.kind ?? "other"
+        let rawKind = normalizedActivityType(item["type"] as? String ?? state.kind ?? "other")
         let kind = activityKind(from: rawKind)
         let status = parsedActivityStatus(from: state.status, fallback: .running)
         let details = firstNonEmptyString(
@@ -1682,8 +2035,40 @@ final class CodexAssistantRuntime {
         )
     }
 
+    private func normalizedActivityType(_ rawValue: String?) -> String {
+        let value = rawValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            ?? "other"
+
+        switch value {
+        case "command_execution":
+            return "commandExecution"
+        case "file_change":
+            return "fileChange"
+        case "web_search", "web_search_call":
+            return "webSearch"
+        case "browser_automation":
+            return "browserAutomation"
+        case "mcp_tool_call":
+            return "mcpToolCall"
+        case "dynamic_tool_call", "custom_tool_call", "custom_tool_call_output":
+            return "dynamicToolCall"
+        case "collab_agent_tool_call":
+            return "collabAgentToolCall"
+        case "agent_message":
+            return "agentMessage"
+        case "assistant_message":
+            return "assistantMessage"
+        case "user_message":
+            return "userMessage"
+        default:
+            return value
+        }
+    }
+
     private func activityKind(from rawValue: String?) -> AssistantActivityKind {
-        switch rawValue {
+        switch normalizedActivityType(rawValue) {
         case "commandExecution":
             return .commandExecution
         case "fileChange":
@@ -1731,6 +2116,20 @@ final class CodexAssistantRuntime {
         }
     }
 
+    private func repeatedCommandLimitHit(
+        for item: [String: Any]
+    ) -> AssistantRepeatedCommandLimitHit? {
+        guard normalizedActivityType(item["type"] as? String) == "commandExecution",
+              let command = item["command"] as? String else {
+            return nil
+        }
+
+        return repeatedCommandTracker.record(
+            command: command,
+            maxAttempts: maxRepeatedCommandAttemptsPerTurn
+        )
+    }
+
     private func activitySummary(kind: AssistantActivityKind, title: String) -> String {
         switch kind {
         case .commandExecution:
@@ -1744,13 +2143,357 @@ final class CodexAssistantRuntime {
         case .mcpToolCall:
             return "Used an MCP tool."
         case .dynamicToolCall:
-            return "Used \(title)."
+            return title == "Computer Use" ? "Used the computer." : "Used \(title)."
         case .subagent:
             return "Worked with a subagent."
         case .reasoning:
             return "Thought through the task."
         case .other:
             return "Ran a tool."
+        }
+    }
+
+    func toolCallStateForTesting(from item: [String: Any]) -> AssistantToolCallState? {
+        parseToolCallState(from: item)
+    }
+
+    func activitySummaryForTesting(kind: AssistantActivityKind, title: String) -> String {
+        activitySummary(kind: kind, title: title)
+    }
+
+    func commandSafetyClassForTesting(_ command: String) -> AssistantCommandSafetyClass {
+        AssistantModePolicy.commandSafetyClass(for: command)
+    }
+
+    func isToolActivityAllowedForTesting(
+        mode: AssistantInteractionMode,
+        rawType: String,
+        command: String? = nil,
+        toolName: String? = nil
+    ) -> Bool {
+        AssistantModePolicy.isAllowed(
+            mode: mode,
+            activityKind: activityKind(from: rawType),
+            command: command,
+            toolName: toolName
+        )
+    }
+
+    func processActivityEventForTesting(
+        _ item: [String: Any],
+        isCompleted: Bool = false
+    ) {
+        handleItemStartedOrCompleted(["item": item], isCompleted: isCompleted)
+    }
+
+    func rememberComputerUseApprovalForTesting(_ sessionID: String) {
+        rememberComputerUseApproval(for: sessionID)
+    }
+
+    func isComputerUseApprovedForTesting(_ sessionID: String) -> Bool {
+        computerUseApprovedSessionIDs.contains(sessionID)
+    }
+
+    func configureImageAttachmentContextForTesting(
+        includesImages: Bool,
+        modelSupportsImageInput: Bool,
+        redirectedAlready: Bool = false
+    ) {
+        currentTurnIncludesImageAttachments = includesImages
+        currentTurnModelSupportsImageInput = modelSupportsImageInput
+        redirectedImageToolCallForActiveTurn = redirectedAlready
+    }
+
+    func shouldRedirectBlockedImageToolRequestForTesting(method: String) -> Bool {
+        interactionMode != .agentic
+            && method == "item/tool/call"
+            && currentTurnIncludesImageAttachments
+            && currentTurnModelSupportsImageInput
+            && !redirectedImageToolCallForActiveTurn
+    }
+
+    func dynamicToolNamesForTesting(mode: AssistantInteractionMode) -> [String] {
+        dynamicToolSpecs(for: mode).compactMap { tool in
+            tool["name"] as? String
+        }
+    }
+
+    func turnStartParamsForTesting(
+        mode: AssistantInteractionMode,
+        threadID: String = "thread-1",
+        prompt: String = "Hello",
+        modelID: String? = "gpt-5.4"
+    ) -> [String: Any] {
+        let previousMode = interactionMode
+        interactionMode = mode
+        defer { interactionMode = previousMode }
+        return turnStartParams(
+            threadID: threadID,
+            prompt: prompt,
+            attachments: [],
+            modelID: modelID
+        )
+    }
+
+    func buildInstructionsForTesting() -> String {
+        buildInstructions()
+    }
+
+    func processErrorNotificationForTesting(
+        _ message: String,
+        activeTurnID: String? = "turn-1"
+    ) async {
+        let previousTurnID = self.activeTurnID
+        self.activeTurnID = activeTurnID
+        defer { self.activeTurnID = previousTurnID }
+        await handleNotification(method: "error", params: ["message": message])
+    }
+
+    func blockedToolUseMessage(
+        for mode: AssistantInteractionMode,
+        activityTitle: String? = nil,
+        commandClass: AssistantCommandSafetyClass? = nil
+    ) -> String {
+        if mode == .conversational,
+           currentTurnIncludesImageAttachments,
+           let normalizedTitle = activityTitle?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           normalizedTitle == "tool" || normalizedTitle == "computer use" || normalizedTitle == "browser" {
+            return "I stopped before using a tool because your image was already attached. Chat mode should answer directly from attached images when the selected model supports image input. Live screen or browser inspection still needs Agentic mode."
+        }
+
+        return AssistantModePolicy.blockedMessage(
+            mode: mode,
+            activityTitle: activityTitle,
+            commandClass: commandClass
+        )
+    }
+
+    private func interruptForBlockedToolUse(
+        activityTitle: String? = nil,
+        commandClass: AssistantCommandSafetyClass? = nil
+    ) {
+        guard interactionMode != .agentic else { return }
+        guard !blockedToolUseHandledForActiveTurn else { return }
+
+        blockedToolUseHandledForActiveTurn = true
+        let message = blockedToolUseMessage(
+            for: interactionMode,
+            activityTitle: activityTitle,
+            commandClass: commandClass
+        )
+        onModeRestriction?(AssistantModeRestrictionEvent(
+            mode: interactionMode,
+            activityTitle: activityTitle,
+            commandClass: commandClass
+        ))
+        blockedToolUseInterruptionMessage = message
+        onTranscript?(AssistantTranscriptEntry(role: .system, text: message, emphasis: true))
+        emitTimelineSystemMessage(message, emphasis: true)
+        onStatusMessage?(message)
+        updateHUD(phase: .idle, title: "Mode restriction", detail: activityTitle)
+
+        Task { [weak self] in
+            await self?.cancelActiveTurn()
+        }
+    }
+
+    private func redirectBlockedImageToolRequestIfPossible(
+        id: JSONRPCRequestID,
+        method: String
+    ) async -> Bool {
+        guard interactionMode != .agentic else { return false }
+        guard method == "item/tool/call" else { return false }
+        guard currentTurnIncludesImageAttachments, currentTurnModelSupportsImageInput else {
+            return false
+        }
+        guard !redirectedImageToolCallForActiveTurn else { return false }
+
+        redirectedImageToolCallForActiveTurn = true
+
+        let message = """
+        The user already attached the image for this turn. Do not use tools, browser automation, or computer control to inspect it. Read the attached image directly and answer from it.
+        """
+
+        do {
+            try await transport?.sendResponse(
+                id: id,
+                result: [
+                    "contentItems": [["type": "inputText", "text": message]],
+                    "success": false
+                ]
+            )
+        } catch {
+            await MainActor.run {
+                onStatusMessage?(error.localizedDescription)
+            }
+        }
+
+        return true
+    }
+
+    private func blockedServerRequestContext(
+        method: String,
+        params: [String: Any]
+    ) -> (activityTitle: String, commandClass: AssistantCommandSafetyClass?)? {
+        guard interactionMode != .agentic else { return nil }
+
+        switch method {
+        case "item/commandExecution/requestApproval":
+            let command = params["command"] as? String ?? ""
+            let commandClass = AssistantModePolicy.commandSafetyClass(for: command)
+            guard !AssistantModePolicy.isAllowed(
+                mode: interactionMode,
+                activityKind: .commandExecution,
+                command: command
+            ) else {
+                return nil
+            }
+            return (AssistantModePolicy.activityTitle(forBlockedCommand: command), commandClass)
+        case "item/fileChange/requestApproval":
+            guard !AssistantModePolicy.isAllowed(
+                mode: interactionMode,
+                activityKind: .fileChange
+            ) else {
+                return nil
+            }
+            return ("File Changes", nil)
+        case "item/tool/call":
+            let toolName = dynamicToolName(from: params)
+            guard !AssistantModePolicy.isAllowed(
+                mode: interactionMode,
+                activityKind: .dynamicToolCall,
+                toolName: toolName
+            ) else {
+                return nil
+            }
+            return (dynamicToolDisplayName(toolName), nil)
+        default:
+            return nil
+        }
+    }
+
+    private func blockedActivityContext(
+        from item: [String: Any]
+    ) -> (activityTitle: String, commandClass: AssistantCommandSafetyClass?)? {
+        guard interactionMode != .agentic else { return nil }
+        let rawType = item["type"] as? String
+        let kind = activityKind(from: rawType)
+        let command = item["command"] as? String
+        let toolName = dynamicToolName(from: item)
+
+        guard !AssistantModePolicy.isAllowed(
+            mode: interactionMode,
+            activityKind: kind,
+            command: command,
+            toolName: toolName
+        ) else {
+            return nil
+        }
+
+        let title = activityTitleForPolicy(kind: kind, item: item)
+        let commandClass = kind == .commandExecution
+            ? AssistantModePolicy.commandSafetyClass(for: command ?? "")
+            : nil
+        return (title, commandClass)
+    }
+
+    private func activityTitleForPolicy(
+        kind: AssistantActivityKind,
+        item: [String: Any]
+    ) -> String {
+        switch kind {
+        case .commandExecution:
+            return AssistantModePolicy.activityTitle(forBlockedCommand: item["command"] as? String)
+        case .fileChange:
+            return "File Changes"
+        case .webSearch:
+            return "Web Search"
+        case .browserAutomation:
+            return "Browser"
+        case .mcpToolCall:
+            let server = item["server"] as? String ?? "MCP"
+            let tool = item["tool"] as? String ?? "tool"
+            return "\(server): \(tool)"
+        case .dynamicToolCall:
+            return dynamicToolDisplayName(dynamicToolName(from: item))
+        case .subagent:
+            return "Subagent"
+        case .reasoning:
+            return "Reasoning"
+        case .other:
+            return "Tool"
+        }
+    }
+
+    private func dynamicToolDisplayName(_ rawTool: String?) -> String {
+        let tool = rawTool ?? "Tool"
+        return tool == AssistantComputerUseToolDefinition.name ? "Computer Use" : tool
+    }
+
+    private func threadApprovalPolicy(for mode: AssistantInteractionMode) -> String {
+        switch mode {
+        case .conversational:
+            return "untrusted"
+        case .plan, .agentic:
+            return "on-request"
+        }
+    }
+
+    private func threadSandboxMode(for mode: AssistantInteractionMode) -> String {
+        switch mode {
+        case .conversational:
+            return "read-only"
+        case .plan, .agentic:
+            return "danger-full-access"
+        }
+    }
+
+    private func turnApprovalPolicy(for mode: AssistantInteractionMode) -> String {
+        switch mode {
+        case .conversational:
+            return "untrusted"
+        case .plan, .agentic:
+            return "on-request"
+        }
+    }
+
+    private func turnSandboxPolicy(for mode: AssistantInteractionMode) -> [String: Any]? {
+        switch mode {
+        case .conversational:
+            return [
+                "type": "readOnly",
+                "networkAccess": true
+            ]
+        case .plan, .agentic:
+            return nil
+        }
+    }
+
+    private func declineBlockedServerRequest(
+        id: JSONRPCRequestID,
+        method: String,
+        message: String
+    ) async {
+        do {
+            switch method {
+            case "item/commandExecution/requestApproval",
+                 "item/fileChange/requestApproval":
+                try await transport?.sendResponse(id: id, result: ["decision": "decline"])
+            case "item/tool/call":
+                try await transport?.sendResponse(
+                    id: id,
+                    result: [
+                        "contentItems": [["type": "inputText", "text": message]],
+                        "success": false
+                    ]
+                )
+            default:
+                break
+            }
+        } catch {
+            await MainActor.run {
+                onStatusMessage?(error.localizedDescription)
+            }
         }
     }
 
@@ -1777,7 +2520,7 @@ final class CodexAssistantRuntime {
 
     private func parseToolCallState(from item: [String: Any]) -> AssistantToolCallState? {
         guard let id = item["id"] as? String else { return nil }
-        let type = item["type"] as? String ?? "work"
+        let type = normalizedActivityType(item["type"] as? String ?? "work")
         guard shouldRenderActivity(for: type) else { return nil }
         let status = item["status"] as? String ?? "inProgress"
 
@@ -1810,22 +2553,31 @@ final class CodexAssistantRuntime {
                 title: "\(server): \(tool)",
                 kind: type,
                 status: status,
-                detail: compactDetail(extractString(item["arguments"]))
+                detail: compactDetail(extractString(item["arguments"])),
+                hudDetail: "Using \(tool)"
             )
         case "dynamicToolCall":
-            let tool = item["tool"] as? String ?? "Tool"
+            let rawTool = dynamicToolName(from: item) ?? "Tool"
+            let tool = rawTool == AssistantComputerUseToolDefinition.name ? "Computer Use" : rawTool
             return AssistantToolCallState(
                 id: id,
                 title: tool,
                 kind: type,
                 status: status,
-                detail: compactDetail(extractString(item["arguments"]))
+                detail: compactDetail(extractString(item["arguments"])),
+                hudDetail: "Using \(tool)"
             )
         case "webSearch":
-            return AssistantToolCallState(id: id, title: "Web Search", kind: type, status: status, detail: nil)
+            let query = firstNonEmptyString(
+                item["query"] as? String,
+                ((item["action"] as? [String: Any])?["query"] as? String)
+            )
+            let truncatedQuery = query.map { String($0.prefix(40)) }
+            let searchHudDetail = truncatedQuery.map { "Searching: \($0)" } ?? "Searching the web"
+            return AssistantToolCallState(id: id, title: "Web Search", kind: type, status: status, detail: compactDetail(query), hudDetail: searchHudDetail)
         case "browserAutomation":
             let action = item["action"] as? String ?? "Browser action"
-            return AssistantToolCallState(id: id, title: "Browser", kind: type, status: status, detail: compactDetail(action))
+            return AssistantToolCallState(id: id, title: "Browser", kind: type, status: status, detail: compactDetail(action), hudDetail: "Browsing")
         case "collabAgentToolCall":
             handleCollabToolCall(item: item, status: status)
             let tool = item["tool"] as? String ?? "collab"
@@ -1844,7 +2596,7 @@ final class CodexAssistantRuntime {
     }
 
     func shouldRenderActivity(for rawType: String) -> Bool {
-        switch rawType {
+        switch normalizedActivityType(rawType) {
         case "agentMessage", "assistantMessage", "message", "plan", "reasoning", "userMessage":
             return false
         default:
@@ -1910,7 +2662,8 @@ final class CodexAssistantRuntime {
                 isDefault: row["isDefault"] as? Bool ?? false,
                 hidden: row["hidden"] as? Bool ?? false,
                 supportedReasoningEfforts: efforts,
-                defaultReasoningEffort: row["defaultReasoningEffort"] as? String
+                defaultReasoningEffort: row["defaultReasoningEffort"] as? String,
+                inputModalities: AssistantModelOption.normalizedInputModalities(from: row["inputModalities"])
             )
         }
     }
@@ -1918,7 +2671,13 @@ final class CodexAssistantRuntime {
     var browserProfileContext: [String: String]?
     var customInstructions: String?
     var reasoningEffort: String?
+    var serviceTier: String?
     var interactionMode: AssistantInteractionMode = .agentic
+    private var currentTurnIncludesImageAttachments = false
+    private var currentTurnModelSupportsImageInput = false
+    private var redirectedImageToolCallForActiveTurn = false
+    private var blockedToolUseHandledForActiveTurn = false
+    private var blockedToolUseInterruptionMessage: String?
 
     // Proposed plan streaming: accumulates item/plan/delta content
     private var proposedPlanBuffer: String = ""
@@ -1927,17 +2686,71 @@ final class CodexAssistantRuntime {
     /// Session IDs that have been detached. Notifications from these sessions are dropped.
     private var detachedSessionIDs: Set<String> = []
 
+    private func dynamicToolSpecs(for mode: AssistantInteractionMode) -> [[String: Any]] {
+        switch mode {
+        case .conversational, .plan:
+            return []
+        case .agentic:
+            return [AssistantComputerUseToolDefinition.dynamicToolSpec()]
+        }
+    }
+
+    private func dynamicToolName(from payload: [String: Any]) -> String? {
+        let candidatePayloads: [[String: Any]] = [
+            payload,
+            payload["item"] as? [String: Any],
+            payload["toolCall"] as? [String: Any],
+            payload["tool_call"] as? [String: Any]
+        ].compactMap { $0 }
+
+        for candidate in candidatePayloads {
+            if let toolName = firstNonEmptyString(
+                candidate["tool"] as? String,
+                candidate["name"] as? String,
+                candidate["toolName"] as? String,
+                candidate["tool_name"] as? String
+            ) {
+                return toolName
+            }
+        }
+
+        return nil
+    }
+
+    private func dynamicToolArguments(from payload: [String: Any]) -> Any {
+        if let arguments = payload["arguments"] {
+            return arguments
+        }
+        if let item = payload["item"] as? [String: Any],
+           let arguments = item["arguments"] {
+            return arguments
+        }
+        if let toolCall = payload["toolCall"] as? [String: Any],
+           let arguments = toolCall["arguments"] {
+            return arguments
+        }
+        if let toolCall = payload["tool_call"] as? [String: Any],
+           let arguments = toolCall["arguments"] {
+            return arguments
+        }
+        return [String: Any]()
+    }
+
     private func threadStartParams(cwd: String?, modelID: String?) -> [String: Any] {
         var params: [String: Any] = [
-            "approvalPolicy": "on-request",
-            "sandbox": "danger-full-access",
+            "approvalPolicy": threadApprovalPolicy(for: interactionMode),
+            "sandbox": threadSandboxMode(for: interactionMode),
             "personality": "friendly",
             "serviceName": "KeyScribe",
             "ephemeral": false
         ]
+        params["dynamicTools"] = dynamicToolSpecs(for: interactionMode)
         params["cwd"] = cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
         if let modelID = modelID?.nonEmpty {
             params["model"] = modelID
+        }
+        if let tier = serviceTier?.nonEmpty {
+            params["serviceTier"] = tier
         }
         let instructions = buildInstructions()
         if !instructions.isEmpty {
@@ -1967,17 +2780,23 @@ final class CodexAssistantRuntime {
         switch interactionMode {
         case .conversational:
             sections.append("""
-            # Conversational Mode
+            # Chat Mode
 
-            You are in conversational mode. Reply with normal helpful text.
+            You are in Chat mode. Reply with normal helpful text.
             Do NOT propose or output a structured plan, checklist, outline, or step-by-step implementation plan in this mode.
-            Do NOT take action or present yourself as executing work in this mode.
+            You may inspect the workspace, search the web, and run safe read-only commands when needed to answer accurately.
+            If the user attaches images and the selected model supports image input, read those attached images directly and answer from them.
+            Do NOT edit files, run validation checks like builds or tests, use browser automation, use computer-control tools, or use unsafe commands.
+            If the task requires changes or higher-risk execution, explain that Chat mode can inspect and search but cannot make changes, and tell the user to switch to Agentic mode.
             """)
         case .plan:
             sections.append("""
             # Plan Mode
 
-            You are in plan mode. Produce a clear plan only.
+            You are in Plan mode. Produce a clear plan only.
+            Use the Codex app server's native plan behavior.
+            You may inspect the workspace, search the web, and use tools when needed to ground the plan.
+            If the user attaches images and the selected model supports image input, read those attached images directly when they help the plan.
             Do NOT claim to have already executed the work.
             Do NOT take action or present tool results as if the work is done.
             Keep the output focused on the proposed plan so the user can review it before execution.
@@ -1986,128 +2805,14 @@ final class CodexAssistantRuntime {
             break
         }
 
-        // When browser automation is configured with a user profile, place the
-        // MCP-tool ban at the very top so it is the first thing the model reads.
-        if browserProfileContext != nil {
-            sections.append("""
-            # CRITICAL: Browser Tool Restriction
-
-            You MUST NOT call any MCP-provided browser tools such as `browser_navigate`, `browser_run_code`, `browser_click`, `browser_snapshot`, or any tool whose name starts with `playwright:` or `browser_`. These tools do not use the user's configured browser profile and will open a separate, unauthenticated browser. Instead, use osascript (AppleScript) or Playwright scripts as described in the Browser Automation section below.
-            """)
-        }
-
         if let custom = customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines),
            !custom.isEmpty {
             sections.append("# Custom Instructions\n\n\(custom)")
         }
-        if let browser = browserInstructions() {
-            sections.append(browser)
+        if let browserInstructions = browserTurnReminder() {
+            sections.append(browserInstructions)
         }
         return sections.joined(separator: "\n\n")
-    }
-
-    private func browserInstructions() -> String? {
-        guard let ctx = browserProfileContext,
-              let browser = ctx["browser"],
-              let channel = ctx["channel"],
-              let profileDir = ctx["profileDir"],
-              let userDataDir = ctx["userDataDir"] else {
-            return nil
-        }
-
-        let profilePath = "\(userDataDir)/\(profileDir)"
-        let escapedProfilePath = profilePath.replacingOccurrences(of: "'", with: "\\'")
-
-        let launchOptions: String
-        if channel == "brave" {
-            launchOptions = """
-                headless: false,
-                executablePath: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-            """
-        } else {
-            launchOptions = """
-                headless: false,
-                channel: '\(channel)',
-            """
-        }
-
-        let appName: String
-        if channel == "brave" {
-            appName = "Brave Browser"
-        } else {
-            appName = "Google Chrome"
-        }
-
-        return """
-        # Browser Automation
-
-        You have access to browser automation for the user's \(browser) browser (profile: "\(ctx["profileName"] ?? "Default")"). This means you can access their existing login sessions, cookies, and bookmarks.
-
-        **DO NOT use any MCP browser tools** (e.g. `playwright:browser_navigate`, `playwright:browser_run_code`, or any other MCP-provided browser automation tools). They do not use the user's configured browser profile. Use one of the two approaches below instead.
-
-        ## Option 1: AppleScript / osascript (preferred for simple tasks)
-
-        For quick tasks like reading page content, navigating, or extracting text, use osascript to interact with the already-open browser. This is faster and does not require installing anything.
-
-        ```bash
-        # Open a URL in the user's browser
-        osascript -e 'tell application "\(appName)" to open location "https://example.com"'
-
-        # Get the URL and title of the active tab
-        osascript -e 'tell application "\(appName)" to tell active tab of front window to return {URL, title}'
-
-        # Read page text from the active tab
-        osascript -e 'tell application "\(appName)" to tell active tab of front window to execute javascript "document.body.innerText.slice(0, 5000)"'
-
-        # Execute JavaScript and get results
-        osascript -e 'tell application "\(appName)" to tell active tab of front window to execute javascript "JSON.stringify({url: location.href, title: document.title})"'
-
-        # Click or interact via JavaScript
-        osascript -e 'tell application "\(appName)" to tell active tab of front window to execute javascript "document.querySelector(\\'button.submit\\').click()"'
-        ```
-
-        ## Option 2: Playwright scripts (for complex multi-step automation)
-
-        For complex tasks that need reliable element selection, waiting, or multi-page flows, use Playwright with the user's browser profile.
-
-        Setup (one time per session):
-        ```bash
-        cd /tmp && mkdir -p keyscribe-pw && cd keyscribe-pw && [ -d node_modules/playwright-core ] || npm init -y --silent && npm install playwright-core --silent
-        ```
-
-        Write a .mjs script and run it with node:
-        ```javascript
-        // save as /tmp/keyscribe-pw/task.mjs
-        import { chromium } from 'playwright-core';
-
-        const context = await chromium.launchPersistentContext(
-          '\(escapedProfilePath)',
-          {
-        \(launchOptions)    args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check'],
-            ignoreDefaultArgs: ['--enable-automation'],
-            viewport: null,
-          }
-        );
-        const page = context.pages()[0] || await context.newPage();
-
-        // Your automation here:
-        // await page.goto('https://example.com');
-        // const text = await page.textContent('h1');
-        // console.log(text);
-
-        await context.close();
-        ```
-
-        Then run: `node /tmp/keyscribe-pw/task.mjs`
-
-        ## Important rules
-        - The browser has the user's REAL profile -- they are already logged in to their accounts
-        - Prefer osascript for simple reads/navigations; use Playwright for complex flows
-        - When using Playwright, always close the context when done (`await context.close()`)
-        - When using Playwright, use `headless: false` so the user can see what is happening
-        - When using Playwright, make sure the browser is not already open; if it is, ask the user to close it first
-        - NEVER navigate to banking, financial, or sensitive account pages without explicit user instruction
-        """
     }
 
     func browserTurnReminder() -> String? {
@@ -2163,17 +2868,12 @@ final class CodexAssistantRuntime {
         attachments: [AssistantAttachment] = [],
         modelID: String?,
         resumeContext: String? = nil,
-        memoryContext: String? = nil,
-        browserContextOverride: String? = nil
+        memoryContext: String? = nil
     ) -> [String: Any] {
         var inputItems: [[String: Any]] = []
         // Add attachment items first so the model sees them before the prompt text
         for attachment in attachments {
             inputItems.append(attachment.toInputItem())
-        }
-        if let browserContextOverride = browserContextOverride?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !browserContextOverride.isEmpty {
-            inputItems.append(["type": "text", "text": browserContextOverride])
         }
         if let resumeContext = resumeContext?.trimmingCharacters(in: .whitespacesAndNewlines), !resumeContext.isEmpty {
             inputItems.append(["type": "text", "text": resumeContext])
@@ -2184,11 +2884,20 @@ final class CodexAssistantRuntime {
         if !prompt.isEmpty {
             inputItems.append(["type": "text", "text": prompt])
         }
+        if attachments.contains(where: \.isImage) {
+            inputItems.append([
+                "type": "text",
+                "text": "If image attachments are present, analyze those attached images directly. Do not use tools, browser automation, or computer control just to inspect attached images."
+            ])
+        }
         var params: [String: Any] = [
             "threadId": threadID,
             "input": inputItems,
-            "approvalPolicy": "on-request"
+            "approvalPolicy": turnApprovalPolicy(for: interactionMode)
         ]
+        if let sandboxPolicy = turnSandboxPolicy(for: interactionMode) {
+            params["sandboxPolicy"] = sandboxPolicy
+        }
         if let modelID = modelID?.nonEmpty {
             params["model"] = modelID
         }
@@ -2283,71 +2992,146 @@ final class CodexAssistantRuntime {
         let firstLine = cmd.components(separatedBy: .newlines).first ?? cmd
         let tokens = firstLine.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
         let base = tokens.first ?? cmd
+        let baseName = (base as NSString).lastPathComponent
+        let sub = tokens.count > 1 ? tokens[1] : nil
 
-        // Map well-known commands to friendly labels
-        let labels: [String: String] = [
-            "npm": "Running npm",
-            "npx": "Running npx",
-            "yarn": "Running yarn",
-            "pnpm": "Running pnpm",
-            "bun": "Running bun",
-            "node": "Running Node.js",
-            "python": "Running Python",
-            "python3": "Running Python",
-            "pip": "Installing packages",
-            "pip3": "Installing packages",
-            "swift": "Running Swift",
-            "swiftc": "Compiling Swift",
-            "xcodebuild": "Building with Xcode",
-            "xcrun": "Running Xcode tool",
-            "git": "Running git",
-            "cargo": "Running Cargo",
-            "rustc": "Compiling Rust",
-            "go": "Running Go",
-            "make": "Running make",
-            "cmake": "Running CMake",
-            "docker": "Running Docker",
-            "kubectl": "Running kubectl",
-            "curl": "Fetching URL",
-            "wget": "Fetching URL",
-            "cat": "Reading file",
-            "ls": "Listing files",
-            "find": "Searching files",
-            "grep": "Searching content",
-            "rg": "Searching content",
-            "sed": "Editing text",
-            "awk": "Processing text",
-            "mkdir": "Creating directory",
-            "rm": "Removing files",
-            "cp": "Copying files",
-            "mv": "Moving files",
-            "chmod": "Changing permissions",
-            "brew": "Running Homebrew",
-            "apt": "Installing packages",
-            "apt-get": "Installing packages",
-            "cd": "Changing directory",
-            "echo": "Running shell command",
-            "env": "Running command",
-            "which": "Locating command",
-            "ruby": "Running Ruby",
-            "gem": "Running gem",
-            "java": "Running Java",
-            "javac": "Compiling Java",
-            "gradle": "Running Gradle",
-            "mvn": "Running Maven",
-            "pytest": "Running tests",
-            "jest": "Running tests",
-            "vitest": "Running tests",
+        // Subcommand-specific descriptions for multi-verb CLIs
+        let subcommandDescriptions: [String: [String: String]] = [
+            "git": [
+                "status": "Checking repo status", "diff": "Reviewing changes",
+                "add": "Staging changes", "commit": "Committing changes",
+                "push": "Pushing to remote", "pull": "Pulling latest",
+                "clone": "Cloning repository", "checkout": "Switching branch",
+                "switch": "Switching branch", "branch": "Managing branches",
+                "log": "Viewing history", "stash": "Stashing changes",
+                "merge": "Merging branches", "rebase": "Rebasing",
+                "fetch": "Fetching remote", "reset": "Resetting changes",
+                "tag": "Managing tags", "init": "Initializing repository",
+                "remote": "Managing remotes", "cherry-pick": "Cherry-picking",
+                "restore": "Restoring files", "clean": "Cleaning repo",
+            ],
+            "npm": [
+                "install": "Installing dependencies", "i": "Installing dependencies",
+                "ci": "Installing dependencies", "test": "Running tests",
+                "t": "Running tests", "start": "Starting application",
+                "build": "Building project", "publish": "Publishing package",
+                "init": "Initializing project", "uninstall": "Removing package",
+                "update": "Updating dependencies", "audit": "Auditing dependencies",
+                "link": "Linking package", "pack": "Packing module",
+            ],
+            "yarn": [
+                "install": "Installing dependencies", "add": "Installing dependencies",
+                "test": "Running tests", "build": "Building project",
+                "start": "Starting application", "remove": "Removing package",
+            ],
+            "pnpm": [
+                "install": "Installing dependencies", "i": "Installing dependencies",
+                "add": "Installing dependencies", "test": "Running tests",
+                "build": "Building project", "start": "Starting application",
+                "remove": "Removing package",
+            ],
+            "bun": [
+                "install": "Installing dependencies", "i": "Installing dependencies",
+                "add": "Installing dependencies", "test": "Running tests",
+                "build": "Building project", "run": "Running script",
+                "remove": "Removing package",
+            ],
+            "swift": [
+                "build": "Building project", "test": "Running tests",
+                "run": "Running application", "package": "Managing package",
+            ],
+            "cargo": [
+                "build": "Building project", "test": "Running tests",
+                "run": "Running application", "check": "Checking code",
+                "clippy": "Linting code", "fmt": "Formatting code",
+                "doc": "Building docs", "publish": "Publishing crate",
+                "install": "Installing crate", "update": "Updating dependencies",
+                "bench": "Running benchmarks", "clean": "Cleaning build",
+            ],
+            "go": [
+                "build": "Building project", "test": "Running tests",
+                "run": "Running application", "mod": "Managing modules",
+                "fmt": "Formatting code", "vet": "Checking code",
+                "get": "Installing dependencies", "install": "Installing package",
+                "generate": "Generating code",
+            ],
+            "docker": [
+                "build": "Building image", "run": "Running container",
+                "compose": "Managing services", "push": "Pushing image",
+                "pull": "Pulling image", "stop": "Stopping container",
+                "exec": "Running in container",
+            ],
+            "kubectl": [
+                "apply": "Applying config", "get": "Fetching resources",
+                "describe": "Inspecting resource", "delete": "Deleting resource",
+                "logs": "Viewing logs", "exec": "Running in pod",
+            ],
+            "brew": [
+                "install": "Installing package", "uninstall": "Removing package",
+                "update": "Updating Homebrew", "upgrade": "Upgrading packages",
+                "search": "Searching packages", "info": "Package info",
+            ],
         ]
 
-        // Check for a known command
-        let baseName = (base as NSString).lastPathComponent
-        if let label = labels[baseName] {
-            // Append subcommand for multi-verb CLIs where it adds clarity
-            let multiVerb: Set<String> = ["git", "npm", "npx", "yarn", "pnpm", "bun", "swift", "cargo", "go", "docker", "kubectl", "brew", "apt", "apt-get"]
-            if multiVerb.contains(baseName), tokens.count > 1 {
-                return "\(label) \(tokens[1])"
+        // Check for subcommand-specific descriptions first
+        if let sub, let subMap = subcommandDescriptions[baseName], let desc = subMap[sub] {
+            return desc
+        }
+
+        // Handle "npm/yarn/pnpm run <script>" — look up the script name
+        let runScriptDescriptions: [String: String] = [
+            "test": "Running tests", "build": "Building project",
+            "start": "Starting application", "dev": "Starting dev server",
+            "lint": "Linting code", "format": "Formatting code",
+            "serve": "Starting server", "watch": "Watching for changes",
+            "clean": "Cleaning build", "deploy": "Deploying",
+            "typecheck": "Type-checking", "check": "Checking code",
+            "preview": "Previewing",
+        ]
+        let npmLike: Set<String> = ["npm", "yarn", "pnpm", "bun", "npx"]
+        if npmLike.contains(baseName), sub == "run", tokens.count > 2 {
+            if let desc = runScriptDescriptions[tokens[2]] {
+                return desc
             }
+            return "Running \(tokens[2])"
+        }
+
+        // Semantic labels for single commands (no subcommand needed)
+        let labels: [String: String] = [
+            "node": "Executing script",
+            "python": "Executing script", "python3": "Executing script",
+            "pip": "Installing packages", "pip3": "Installing packages",
+            "swiftc": "Compiling Swift",
+            "xcodebuild": "Building with Xcode", "xcrun": "Running Xcode tool",
+            "rustc": "Compiling Rust",
+            "make": "Building", "cmake": "Configuring build",
+            "curl": "Downloading", "wget": "Downloading",
+            "cat": "Reading file", "less": "Reading file", "more": "Reading file",
+            "ls": "Listing directory", "tree": "Listing directory",
+            "find": "Searching filesystem",
+            "grep": "Searching code", "rg": "Searching code", "ag": "Searching code",
+            "sed": "Editing text", "awk": "Processing text",
+            "mkdir": "Creating directory",
+            "rm": "Removing files", "rmdir": "Removing directory",
+            "cp": "Copying files", "mv": "Moving files",
+            "chmod": "Changing permissions", "chown": "Changing ownership",
+            "apt": "Installing packages", "apt-get": "Installing packages",
+            "cd": "Changing directory",
+            "echo": "Running shell", "env": "Running command",
+            "which": "Locating command", "where": "Locating command",
+            "ruby": "Executing script", "gem": "Managing gems",
+            "java": "Running Java", "javac": "Compiling Java",
+            "gradle": "Building project", "mvn": "Building project",
+            "pytest": "Running tests", "jest": "Running tests",
+            "vitest": "Running tests", "mocha": "Running tests",
+            "tsc": "Type-checking", "eslint": "Linting code",
+            "prettier": "Formatting code", "black": "Formatting code",
+            "flake8": "Linting code", "mypy": "Type-checking",
+            "tar": "Archiving files", "zip": "Compressing files",
+            "unzip": "Extracting files",
+        ]
+
+        if let label = labels[baseName] {
             return label
         }
 
@@ -2375,6 +3159,21 @@ final class CodexAssistantRuntime {
             }
         }
         return nil
+    }
+
+    private func transientReconnectStatusMessage(from message: String) -> String? {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let range = trimmed.range(
+            of: #"(?i)^reconnecting\.\.\.\s+\d+/\d+$"#,
+            options: .regularExpression
+        ) else {
+            return nil
+        }
+        guard range.lowerBound == trimmed.startIndex, range.upperBound == trimmed.endIndex else {
+            return nil
+        }
+        return trimmed
     }
 
     private func extractString(_ raw: Any?) -> String? {

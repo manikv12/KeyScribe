@@ -44,6 +44,27 @@ final class AssistantPermissionCardStateTests: XCTestCase {
         )
     }
 
+    func testMatchingPendingComputerUseRequestStaysWaitingForApproval() {
+        let request = AssistantPermissionRequest(
+            id: 42,
+            sessionID: "session-1",
+            toolTitle: "Computer Use",
+            toolKind: "computerUse",
+            rationale: "Allow computer control?",
+            options: [],
+            rawPayloadSummary: nil
+        )
+
+        XCTAssertEqual(
+            assistantPermissionCardState(
+                for: request,
+                pendingRequest: request,
+                sessionStatus: .completed
+            ),
+            .waitingForApproval
+        )
+    }
+
     func testCompletedSessionMarksOldRequestCompleted() {
         let request = AssistantPermissionRequest(
             id: 42,

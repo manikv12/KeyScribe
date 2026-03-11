@@ -7,7 +7,8 @@ KeyScribe.app/
 dist/
 Vendor/Whisper/
 
-# Local build script (contains signing identity)
+# Local build scripts
+build
 build-local.sh
 
 # Dev artifacts

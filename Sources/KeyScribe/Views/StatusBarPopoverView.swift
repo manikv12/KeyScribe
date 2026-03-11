@@ -4,6 +4,7 @@ import SwiftUI
 
 final class StatusBarViewModel: ObservableObject {
     @Published var uiStatus: DictationUIStatus = .ready
+    @Published var isPopoverVisible: Bool = false
     @Published var isDictating: Bool = false
     @Published var currentAudioLevel: Float = 0
     @Published var isContinuousMode: Bool = false
@@ -37,7 +38,7 @@ struct StatusBarPopoverView: View {
                     .padding(.horizontal, 2)
                     .padding(.bottom, 10)
 
-                if viewModel.isDictating {
+                if viewModel.isPopoverVisible && viewModel.isDictating {
                     RecordingIndicatorView(audioLevel: viewModel.currentAudioLevel)
                         .transition(.move(edge: .top).combined(with: .opacity))
                         .padding(.bottom, 10)

@@ -562,8 +562,10 @@ final class SettingsStore: ObservableObject {
         static let browserAutomationEnabled = "KeyScribe.browserAutomationEnabled"
         static let browserSelectedProfileID = "KeyScribe.browserSelectedProfileID"
         static let assistantAlwaysApprovedToolKinds = "KeyScribe.assistantAlwaysApprovedToolKinds"
+        static let assistantConversationalToolUsePreference = "KeyScribe.assistantConversationalToolUsePreference"
         static let assistantCustomInstructions = "KeyScribe.assistantCustomInstructions"
         static let assistantMaxToolCallsPerTurn = "KeyScribe.assistantMaxToolCallsPerTurn"
+        static let assistantMaxRepeatedCommandAttemptsPerTurn = "KeyScribe.assistantMaxRepeatedCommandAttemptsPerTurn"
         static let assistantMemoryEnabled = "KeyScribe.assistantMemoryEnabled"
         static let assistantMemoryReviewEnabled = "KeyScribe.assistantMemoryReviewEnabled"
         static let assistantMemorySummaryMaxChars = "KeyScribe.assistantMemorySummaryMaxChars"
@@ -1245,6 +1247,13 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Maximum number of times the same command can repeat back-to-back in one turn before auto-cancelling. 0 = unlimited.
+    @Published var assistantMaxRepeatedCommandAttemptsPerTurn: Int {
+        didSet {
+            save()
+        }
+    }
+
     @Published var assistantMemoryEnabled: Bool {
         didSet {
             save()
@@ -1827,7 +1836,6 @@ final class SettingsStore: ObservableObject {
         assistantAlwaysApprovedToolKinds = Set(
             defaults.stringArray(forKey: Keys.assistantAlwaysApprovedToolKinds) ?? []
         )
-
         if defaults.object(forKey: Keys.browserAutomationEnabled) == nil {
             browserAutomationEnabled = false
         } else {
@@ -1836,8 +1844,16 @@ final class SettingsStore: ObservableObject {
         browserSelectedProfileID = defaults.string(forKey: Keys.browserSelectedProfileID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         assistantCustomInstructions = defaults.string(forKey: Keys.assistantCustomInstructions) ?? ""
-        let storedMaxCalls = defaults.integer(forKey: Keys.assistantMaxToolCallsPerTurn)
-        assistantMaxToolCallsPerTurn = storedMaxCalls > 0 ? storedMaxCalls : 75
+        assistantMaxToolCallsPerTurn = Self.restoredInteger(
+            defaults: defaults,
+            key: Keys.assistantMaxToolCallsPerTurn,
+            defaultValue: 75
+        )
+        assistantMaxRepeatedCommandAttemptsPerTurn = Self.restoredInteger(
+            defaults: defaults,
+            key: Keys.assistantMaxRepeatedCommandAttemptsPerTurn,
+            defaultValue: 3
+        )
         if defaults.object(forKey: Keys.assistantMemoryEnabled) == nil {
             assistantMemoryEnabled = true
         } else {
@@ -2003,11 +2019,26 @@ final class SettingsStore: ObservableObject {
         defaults.set(browserSelectedProfileID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.browserSelectedProfileID)
         defaults.set(assistantCustomInstructions, forKey: Keys.assistantCustomInstructions)
         defaults.set(assistantMaxToolCallsPerTurn, forKey: Keys.assistantMaxToolCallsPerTurn)
+        defaults.set(
+            assistantMaxRepeatedCommandAttemptsPerTurn,
+            forKey: Keys.assistantMaxRepeatedCommandAttemptsPerTurn
+        )
         defaults.set(assistantMemoryEnabled, forKey: Keys.assistantMemoryEnabled)
         defaults.set(assistantMemoryReviewEnabled, forKey: Keys.assistantMemoryReviewEnabled)
         defaults.set(assistantMemorySummaryMaxChars, forKey: Keys.assistantMemorySummaryMaxChars)
 
         scheduleOnChangeNotificationIfNeeded()
+    }
+
+    static func restoredInteger(
+        defaults: UserDefaults,
+        key: String,
+        defaultValue: Int
+    ) -> Int {
+        guard let stored = defaults.object(forKey: key) as? NSNumber else {
+            return defaultValue
+        }
+        return stored.intValue
     }
 
     private func scheduleOnChangeNotificationIfNeeded() {
@@ -2033,6 +2064,14 @@ final class SettingsStore: ObservableObject {
 
     var shortcutModifierFlags: NSEvent.ModifierFlags {
         ShortcutValidation.filteredModifierFlags(from: shortcutModifiers)
+    }
+
+    var holdToTalkShortcutDisplayString: String {
+        ShortcutValidation.displaySegments(
+            keyCode: shortcutKeyCode,
+            modifiersRaw: shortcutModifiers
+        )
+        .joined(separator: " ")
     }
 
     var continuousToggleShortcutModifierFlags: NSEvent.ModifierFlags {
