@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the KeyScribe app icon: a microphone with sound waves inside a thin circle."""
+"""Generate the Open Assist app icon: a microphone with sound waves inside a thin circle."""
 
 from PIL import Image, ImageDraw
 import math

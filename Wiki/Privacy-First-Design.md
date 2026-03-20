@@ -1,6 +1,6 @@
 # Privacy First Design
 
-KeyScribe is built with local-first and explicit control principles.
+Open Assist is built with local-first and explicit control principles.
 
 ## Privacy model
 
@@ -30,4 +30,4 @@ You choose:
 - Rewrite strength
 - Insertion behavior
 
-KeyScribe prioritizes explicit opt-in behavior for any external model usage.
+Open Assist prioritizes explicit opt-in behavior for any external model usage.

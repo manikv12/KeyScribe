@@ -3,19 +3,19 @@
 <plist version="1.0">
     <dict>
         <key>CFBundleIdentifier</key>
-        <string>com.keyscribe.KeyScribe</string>
+        <string>com.manikvashith.OpenAssist</string>
         <key>CFBundleName</key>
-        <string>KeyScribe</string>
+        <string>Open Assist</string>
         <key>CFBundleExecutable</key>
-        <string>KeyScribe</string>
+        <string>OpenAssist</string>
         <key>CFBundlePackageType</key>
         <string>APPL</string>
         <key>LSUIElement</key>
         <true />
         <key>NSMicrophoneUsageDescription</key>
-        <string>KeyScribe needs microphone access to transcribe your voice.</string>
+        <string>Open Assist needs microphone access to transcribe your voice.</string>
         <key>NSSpeechRecognitionUsageDescription</key>
-        <string>KeyScribe uses speech recognition so you can transcribe while holding the shortcut.</string>
+        <string>Open Assist uses speech recognition so you can transcribe while holding the shortcut.</string>
         <key>LSMinimumSystemVersion</key>
         <string>13.3</string>
         <key>CFBundleIconFile</key>
@@ -27,7 +27,7 @@
         <key>CFBundleVersion</key>
         <string>73</string>
         <key>SUFeedURL</key>
-        <string>https://manikv12.github.io/KeyScribe/appcast.xml</string>
+        <string>https://manikv12.github.io/OpenAssist/appcast.xml</string>
         <key>SUEnableAutomaticChecks</key>
         <true />
         <key>SUPublicEDKey</key>

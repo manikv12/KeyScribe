@@ -1,10 +1,10 @@
-# KeyScribe User Guide
+# Open Assist User Guide
 
-This guide is for end users who want to install KeyScribe, configure it quickly, and use its core features with confidence.
+This guide is for end users who want to install Open Assist, configure it quickly, and use its core features with confidence.
 
-## 1. What KeyScribe Does
+## 1. What Open Assist Does
 
-KeyScribe is a macOS menu-bar dictation app. You press a shortcut, speak, and text is inserted into your active app.
+Open Assist is a macOS menu-bar dictation app. You press a shortcut, speak, and text is inserted into your active app.
 
 Core capabilities:
 
@@ -24,9 +24,9 @@ Core capabilities:
 ## 3. Install and Launch
 
 1. Download the latest release from GitHub Releases.
-2. Open `KeyScribe.app`.
+2. Open `Open Assist.app`.
 3. Approve requested permissions when prompted.
-4. You should now see the KeyScribe icon in the macOS menu bar.
+4. You should now see the Open Assist icon in the macOS menu bar.
 
 ## 4. First-Run Setup Checklist
 
@@ -97,7 +97,7 @@ Provider options include:
 
 ## 8. AI Studio and Local AI Setup
 
-Open **Settings → AI & Models → Open AI Studio**.
+Open **Settings → AI & Models → AI Studio**.
 
 For local AI with no API key:
 
@@ -160,7 +160,7 @@ If update checks fail, confirm the appcast feed is published and reachable by th
 
 ## 11. Privacy and Local Data
 
-KeyScribe is local-first:
+Open Assist is local-first:
 
 - No account required
 - No telemetry by default

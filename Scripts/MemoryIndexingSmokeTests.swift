@@ -425,14 +425,14 @@ struct MemoryIndexingSmokeTests {
         sandboxRoot
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("KeyScribe", isDirectory: true)
+            .appendingPathComponent("OpenAssist", isDirectory: true)
             .appendingPathComponent("Memory", isDirectory: true)
             .appendingPathComponent(fileName)
     }
 
     private static func makeSandbox() throws -> URL {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("keyscribe-memory-smoke-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("openassist-memory-smoke-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         try write(

@@ -231,7 +231,7 @@ struct InsertionReliabilityRunner {
             --expect-result <empty|pasted|copied-only|not-inserted>
 
         Example:
-          /tmp/keyscribe-insertion-reliability \
+          /tmp/openassist-insertion-reliability \
             --text hello --copy true --direct false --typing false --special false \
             --expect-path special-paste-clipboard --expect-result copied-only
         """)

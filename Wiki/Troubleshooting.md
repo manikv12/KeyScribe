@@ -2,7 +2,7 @@
 
 ## No text gets inserted
 
-1. Re-check Accessibility permission in KeyScribe settings.
+1. Re-check Accessibility permission in Open Assist settings.
 2. Confirm your cursor is in an editable text field.
 3. Try fallback insertion mode in settings.
 
@@ -39,4 +39,4 @@ Open an issue with:
 - expected behavior vs actual behavior
 - short reproduction steps
 
-File issues here: [KeyScribe Issues](https://github.com/manikv12/KeyScribe/issues)
+File issues here: [Open Assist Issues](https://github.com/manikv12/OpenAssist/issues)

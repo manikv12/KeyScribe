@@ -18,10 +18,10 @@ struct RecognitionTuningSmokeTests {
         let parsed = RecognitionTuning.parseCustomPhrases("alpha, beta\n gamma\n\n,delta")
         check(parsed == ["alpha", "beta", "gamma", "delta"], "Phrase parsing failed")
 
-        let better = RecognitionTuning.chooseBetterTranscript(primary: "hello", fallback: "hello world from keyscribe")
-        check(better == "hello world from keyscribe", "Best transcript selection failed")
+        let better = RecognitionTuning.chooseBetterTranscript(primary: "hello", fallback: "hello world from openassist")
+        check(better == "hello world from openassist", "Best transcript selection failed")
 
-        let hints = RecognitionTuning.contextualHints(defaults: ["KeyScribe", "dictation", "macOS"], custom: ["dictation", "custom"], limit: 4)
+        let hints = RecognitionTuning.contextualHints(defaults: ["OpenAssist", "dictation", "macOS"], custom: ["dictation", "custom"], limit: 4)
         check(hints.count <= 4, "Hints limit failed")
         check(Set(hints).contains("custom"), "Hints custom merge failed")
 

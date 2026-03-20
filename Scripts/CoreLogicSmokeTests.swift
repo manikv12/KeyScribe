@@ -114,9 +114,9 @@ struct CoreLogicSmokeTests {
     }
 
     private static func testTextCleanupPipeline() {
-        let lightInput = "  hello   world!!   this is is   keyscribe  "
+        let lightInput = "  hello   world!!   this is is   openassist  "
         let lightOutput = TextCleanup.process(lightInput, mode: .light)
-        check(lightOutput == "Hello world! This is keyscribe", "Light cleanup pipeline normalization failed")
+        check(lightOutput == "Hello world! This is openassist", "Light cleanup pipeline normalization failed")
 
         let aggressiveInput = "i m here\n\n\n\nand dont panic??"
         let aggressiveOutput = TextCleanup.process(aggressiveInput, mode: .aggressive)

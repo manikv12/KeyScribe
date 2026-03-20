@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="Assets/AppLogo.png" alt="KeyScribe" width="120" />
+  <img src="Assets/AppLogo.png" alt="Open Assist" width="120" />
 </p>
 
-<h1 align="center">KeyScribe</h1>
+<h1 align="center">Open Assist</h1>
 
 <p align="center">
   A macOS menu-bar dictation app that inserts text into your current app.<br/>
@@ -10,19 +10,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/manikv12/KeyScribe/releases"><img alt="Download" src="https://img.shields.io/github/v/release/manikv12/KeyScribe?label=Download&color=0f172a&style=flat-square" /></a>
+  <a href="https://github.com/manikv12/OpenAssist/releases"><img alt="Download" src="https://img.shields.io/github/v/release/manikv12/OpenAssist?label=Download&color=0f172a&style=flat-square" /></a>
   <img alt="macOS" src="https://img.shields.io/badge/macOS-13.3%2B-blue?style=flat-square" />
   <img alt="Swift" src="https://img.shields.io/badge/Swift-5.9-orange?style=flat-square" />
-  <img alt="License" src="https://img.shields.io/github/license/manikv12/KeyScribe?style=flat-square" />
+  <img alt="License" src="https://img.shields.io/github/license/manikv12/OpenAssist?style=flat-square" />
 </p>
 
 ---
 
-## What KeyScribe Is
+## What Open Assist Is
 
-KeyScribe is a menu-bar app for macOS.
+Open Assist is a menu-bar app for macOS.
 
-You press a shortcut, speak, and KeyScribe inserts the text into the app you are using right now. It is built for fast dictation, low friction, and local-first use.
+You press a shortcut, speak, and Open Assist inserts the text into the app you are using right now. It is built for fast dictation, low friction, and local-first use.
 
 Important behavior today:
 
@@ -79,7 +79,7 @@ Important behavior today:
 - Pinned or automatic rewrite context selection in AI Studio
 - Cross-IDE conversation sharing for matching coding contexts
 - Context mappings and conversation inspection are available in AI Studio
-- External memory indexing exists, but it is still behind the `KEYSCRIBE_FEATURE_AI_MEMORY=1` feature flag
+- External memory indexing exists, but it is still behind the `OPENASSIST_FEATURE_AI_MEMORY=1` feature flag
 
 ### Quality-of-Life Features
 
@@ -97,8 +97,8 @@ Important behavior today:
 - Settings, transcript history, and learned corrections stay on your Mac
 - API keys and OAuth sessions are stored in macOS Keychain
 - If you choose cloud transcription or cloud rewrite providers, your audio/text is sent to that provider
-- Clipboard copying is off by default, so KeyScribe tries to avoid leaving dictation in clipboard history
-- Local crash logs stay on disk in `~/Library/Logs/KeyScribe/`
+- Clipboard copying is off by default, so Open Assist tries to avoid leaving dictation in clipboard history
+- Local crash logs stay on disk in `~/Library/Logs/OpenAssist/`
 
 ---
 
@@ -133,8 +133,8 @@ All shortcuts can be changed in Settings.
 
 ## Quick Start
 
-1. Download the latest release from [GitHub Releases](https://github.com/manikv12/KeyScribe/releases).
-2. Open `KeyScribe.app`.
+1. Download the latest release from [GitHub Releases](https://github.com/manikv12/OpenAssist/releases).
+2. Open `Open Assist.app`.
 3. Grant **Accessibility** and **Microphone** access when prompted.
 4. If you use **Apple Speech**, also grant **Speech Recognition**.
 5. Open **Settings** from the menu bar.
@@ -168,13 +168,13 @@ For a step-by-step walkthrough, see the [User Guide](Docs/User-Guide.md).
 
 This creates:
 
-- `dist/KeyScribe.app`
+- `dist/Open Assist.app`
 
 What `build.sh` does today:
 
 - Downloads `Vendor/Whisper/whisper.xcframework` automatically if it is missing
 - Runs `swift build -c release`
-- Bundles the app into `dist/KeyScribe.app`
+- Bundles the app into `dist/Open Assist.app`
 - Uses ad-hoc signing by default unless `DEVELOPER_ID` is set
 
 ### Useful build options
@@ -184,8 +184,8 @@ What `build.sh` does today:
 ./build.sh --make-dmg
 ```
 
-- `--install` copies the app to `/Applications/KeyScribe.app`
-- `--make-dmg` also creates `dist/KeyScribe.dmg`
+- `--install` copies the app to `/Applications/Open Assist.app`
+- `--make-dmg` also creates `dist/Open Assist.dmg`
 - `--install` also resets Accessibility permission, so you will need to grant it again after install
 
 ### Signed / distribution builds
@@ -202,7 +202,7 @@ There is also a project-specific helper:
 ./build-local.sh --make-dmg
 ```
 
-`Scripts/notarize.sh` notarizes `dist/KeyScribe.dmg` and expects these environment variables:
+`Scripts/notarize.sh` notarizes `dist/Open Assist.dmg` and expects these environment variables:
 
 - `APPLE_ID`
 - `APPLE_TEAM_ID`
@@ -230,7 +230,7 @@ Run insertion reliability checks directly with:
 Scripts/run-insertion-reliability.sh --regression
 ```
 
-The repo also contains `XCTest` coverage for some conversation and settings behavior in `Tests/KeyScribeTests/`.
+The repo also contains `XCTest` coverage for some conversation and settings behavior in `Tests/OpenAssistTests/`.
 
 ---
 
@@ -238,21 +238,21 @@ The repo also contains `XCTest` coverage for some conversation and settings beha
 
 If insertion is not behaving the way you expect, you can enable insertion diagnostics:
 
-- Turn it on in app settings, or set `KEYSCRIBE_INSERTION_DIAGNOSTICS=1`
-- Default log path: `/tmp/keyscribe-insertion-diagnostics.log`
-- You can override the log path with `KEYSCRIBE_INSERTION_DIAGNOSTICS_PATH`
+- Turn it on in app settings, or set `OPENASSIST_INSERTION_DIAGNOSTICS=1`
+- Default log path: `/tmp/openassist-insertion-diagnostics.log`
+- You can override the log path with `OPENASSIST_INSERTION_DIAGNOSTICS_PATH`
 
-Crash logs, when present, are stored locally at `~/Library/Logs/KeyScribe/crash.log`.
+Crash logs, when present, are stored locally at `~/Library/Logs/OpenAssist/crash.log`.
 
 ---
 
 ## Repo Layout
 
 ```text
-Sources/KeyScribe/      App code
+Sources/OpenAssist/      App code
 Resources/              Info.plist, icons, entitlements
 Scripts/                Build, test, release, and utility scripts
-Tests/KeyScribeTests/   XCTest coverage
+Tests/OpenAssistTests/   XCTest coverage
 Docs/                   User-facing docs
 Wiki/                   Extra product notes
 Vendor/Whisper/         Bundled whisper.cpp XCFramework
@@ -260,10 +260,10 @@ Vendor/Whisper/         Bundled whisper.cpp XCFramework
 
 Main app areas:
 
-- `Sources/KeyScribe/App.swift` wires the app lifecycle, menu bar, settings, and windows.
-- `Sources/KeyScribe/Services/` contains transcription, insertion, AI, memory, and settings logic.
-- `Sources/KeyScribe/Views/` contains SwiftUI screens such as the status popover and AI Studio.
-- `Sources/KeyScribe/Support/` contains feature flags, permissions, and window helpers.
+- `Sources/OpenAssist/App.swift` wires the app lifecycle, menu bar, settings, and windows.
+- `Sources/OpenAssist/Services/` contains transcription, insertion, AI, memory, and settings logic.
+- `Sources/OpenAssist/Views/` contains SwiftUI screens such as the status popover and AI Studio.
+- `Sources/OpenAssist/Support/` contains feature flags, permissions, and window helpers.
 
 ---
 
@@ -280,5 +280,5 @@ Main app areas:
 
 - The app currently supports three speech paths: Apple Speech, local `whisper.cpp`, and cloud providers.
 - AI Studio is already integrated and is the main place for rewrite provider setup and local AI setup.
-- The advanced external memory-indexing workflow is present in the codebase, but it is still gated behind `KEYSCRIBE_FEATURE_AI_MEMORY=1`.
+- The advanced external memory-indexing workflow is present in the codebase, but it is still gated behind `OPENASSIST_FEATURE_AI_MEMORY=1`.
 - The old README said the default build created both `.app` and `.dmg`; today, the default build creates the `.app`, and DMG creation is opt-in with `--make-dmg`.

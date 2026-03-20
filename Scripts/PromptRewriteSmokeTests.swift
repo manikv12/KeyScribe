@@ -142,7 +142,7 @@ struct PromptRewriteSmokeTests {
     private static func testStrictProjectIsolation() async {
         do {
             let sandboxRoot = FileManager.default.temporaryDirectory
-                .appendingPathComponent("keyscribe-retrieval-scope-\(UUID().uuidString)", isDirectory: true)
+                .appendingPathComponent("openassist-retrieval-scope-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: sandboxRoot, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: sandboxRoot) }
 

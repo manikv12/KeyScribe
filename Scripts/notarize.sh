@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Notarize a KeyScribe DMG for public distribution.
+# Notarize an Open Assist DMG for public distribution.
 #
 # Prerequisites:
 #   1. Apple Developer Program membership
@@ -12,11 +12,11 @@
 # Usage:
 #   Scripts/notarize.sh [path-to-dmg]
 #
-# If no path is given, defaults to dist/KeyScribe.dmg
+# If no path is given, defaults to dist/Open Assist.dmg
 
 set -euo pipefail
 
-DMG="${1:-dist/KeyScribe.dmg}"
+DMG="${1:-dist/Open Assist.dmg}"
 
 if [ ! -f "$DMG" ]; then
     echo "Error: DMG not found at $DMG"

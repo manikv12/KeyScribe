@@ -11,8 +11,8 @@ This page gets you from install to productive dictation quickly.
 
 ## Install
 
-1. Download the latest `.dmg` or app build from [Releases](https://github.com/manikv12/KeyScribe/releases).
-2. Open `KeyScribe.app`.
+1. Download the latest `.dmg` or app build from [Releases](https://github.com/manikv12/OpenAssist/releases).
+2. Open `Open Assist.app`.
 3. Confirm the menu-bar icon appears.
 
 ## First-run checklist
@@ -48,6 +48,6 @@ In `Settings -> AI and Models`:
 
 ## Next steps
 
-- Learn product value and differentiators: [Why KeyScribe](Why-KeyScribe)
+- Learn product value and differentiators: [Why Open Assist](Why-OpenAssist)
 - Set up local AI with no API key: [AI Rewrite and Context](AI-Rewrite-and-Context)
 - Fix common setup problems: [Troubleshooting](Troubleshooting)
