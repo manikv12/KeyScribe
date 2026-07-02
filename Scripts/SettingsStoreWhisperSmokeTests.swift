@@ -36,15 +36,15 @@ struct SettingsStoreWhisperSmokeTests {
 
             let defaults = UserDefaults.standard
             check(
-                defaults.string(forKey: "KeyScribe.transcriptionEngine") == TranscriptionEngineType.whisperCpp.rawValue,
+                defaults.string(forKey: "OpenAssist.transcriptionEngine") == TranscriptionEngineType.whisperCpp.rawValue,
                 "Engine key should be saved in UserDefaults"
             )
             check(
-                defaults.string(forKey: "KeyScribe.selectedWhisperModelID") == "tiny.en",
+                defaults.string(forKey: "OpenAssist.selectedWhisperModelID") == "tiny.en",
                 "Selected model key should be saved in UserDefaults"
             )
             check(
-                defaults.bool(forKey: "KeyScribe.whisperUseCoreML") == false,
+                defaults.bool(forKey: "OpenAssist.whisperUseCoreML") == false,
                 "Core ML key should be saved in UserDefaults"
             )
 
@@ -76,41 +76,41 @@ struct SettingsStoreWhisperSmokeTests {
                 "Explicitly disabled provider should remain disabled"
             )
 
-            settings.updateDetectedMemorySourceFolders(["/tmp/keyscribe-a", "/tmp/keyscribe-b"])
-            settings.setMemorySourceFolderEnabled("/tmp/keyscribe-b", enabled: false)
-            settings.updateDetectedMemorySourceFolders(["/tmp/keyscribe-a", "/tmp/keyscribe-b", "/tmp/keyscribe-c"])
+            settings.updateDetectedMemorySourceFolders(["/tmp/openassist-a", "/tmp/openassist-b"])
+            settings.setMemorySourceFolderEnabled("/tmp/openassist-b", enabled: false)
+            settings.updateDetectedMemorySourceFolders(["/tmp/openassist-a", "/tmp/openassist-b", "/tmp/openassist-c"])
 
             check(
-                settings.memoryDetectedSourceFolderIDs == ["/tmp/keyscribe-a", "/tmp/keyscribe-b", "/tmp/keyscribe-c"],
+                settings.memoryDetectedSourceFolderIDs == ["/tmp/openassist-a", "/tmp/openassist-b", "/tmp/openassist-c"],
                 "Detected source folders should be normalized and saved"
             )
             check(
-                settings.memoryEnabledSourceFolderIDs == ["/tmp/keyscribe-a", "/tmp/keyscribe-c"],
+                settings.memoryEnabledSourceFolderIDs == ["/tmp/openassist-a", "/tmp/openassist-c"],
                 "Disabled source folders should stay disabled and new folders should default enabled"
             )
             check(
-                settings.isMemorySourceFolderEnabled("/tmp/keyscribe-c"),
+                settings.isMemorySourceFolderEnabled("/tmp/openassist-c"),
                 "Newly detected source folder should be enabled"
             )
             check(
-                !settings.isMemorySourceFolderEnabled("/tmp/keyscribe-b"),
+                !settings.isMemorySourceFolderEnabled("/tmp/openassist-b"),
                 "Explicitly disabled source folder should remain disabled"
             )
 
             check(
-                defaults.bool(forKey: "KeyScribe.memoryIndexingEnabled"),
+                defaults.bool(forKey: "OpenAssist.memoryIndexingEnabled"),
                 "Memory indexing key should be saved in UserDefaults"
             )
             check(
-                defaults.bool(forKey: "KeyScribe.memoryProviderCatalogAutoUpdate") == false,
+                defaults.bool(forKey: "OpenAssist.memoryProviderCatalogAutoUpdate") == false,
                 "Memory catalog auto-update key should be saved in UserDefaults"
             )
             check(
-                defaults.stringArray(forKey: "KeyScribe.memoryEnabledProviderIDs") == ["learned-corrections", "transcript-history"],
+                defaults.stringArray(forKey: "OpenAssist.memoryEnabledProviderIDs") == ["learned-corrections", "transcript-history"],
                 "Enabled provider IDs key should be saved in UserDefaults"
             )
             check(
-                defaults.stringArray(forKey: "KeyScribe.memoryEnabledSourceFolderIDs") == ["/tmp/keyscribe-a", "/tmp/keyscribe-c"],
+                defaults.stringArray(forKey: "OpenAssist.memoryEnabledSourceFolderIDs") == ["/tmp/openassist-a", "/tmp/openassist-c"],
                 "Enabled source folder IDs key should be saved in UserDefaults"
             )
 

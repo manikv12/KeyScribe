@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-APP_NAME="KeyScribe"
-APP_EXECUTABLE="$APP_NAME"
-APP_BUNDLE_ID="com.keyscribe.KeyScribe"
+APP_NAME="Open Assist"
+APP_EXECUTABLE="OpenAssist"
+APP_BUNDLE_ID="com.manikvashith.OpenAssist"
 APP_DIR="dist/${APP_NAME}.app"
 INSTALL_DIR="/Applications/${APP_NAME}.app"
 DMG_ROOT="dist/dmg-root"
@@ -60,8 +60,8 @@ resolve_build_version() {
     echo "1"
 }
 
-APP_MARKETING_VERSION="${KEYSCRIBE_VERSION:-$(resolve_marketing_version)}"
-APP_BUILD_VERSION="${KEYSCRIBE_BUILD_VERSION:-$(resolve_build_version)}"
+APP_MARKETING_VERSION="${OPENASSIST_VERSION:-$(resolve_marketing_version)}"
+APP_BUILD_VERSION="${OPENASSIST_BUILD_VERSION:-$(resolve_build_version)}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -136,7 +136,7 @@ if [ -n "${DEVELOPER_ID:-}" ]; then
         [ -d "$xpc" ] && codesign --force --options runtime --sign "$SIGN_ID" "$xpc"
     done
 
-    codesign --force --deep --options runtime --entitlements Resources/KeyScribe.entitlements --sign "$SIGN_ID" "$APP_DIR"
+    codesign --force --deep --options runtime --entitlements Resources/OpenAssist.entitlements --sign "$SIGN_ID" "$APP_DIR"
 else
     echo "  No DEVELOPER_ID set — using ad-hoc signature."
     echo "  (Set DEVELOPER_ID env var for distribution-ready signing)"

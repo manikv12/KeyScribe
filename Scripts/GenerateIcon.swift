@@ -4,7 +4,7 @@ import AppKit
 
 // MARK: - Load the transparent logo PNG
 
-let logoImagePath = FileManager.default.currentDirectoryPath + "/KeyScribe.png"
+let logoImagePath = FileManager.default.currentDirectoryPath + "/Assets/AppLogo.png"
 
 func loadLogoPNG() -> NSImage? {
     guard let img = NSImage(contentsOfFile: logoImagePath) else {
@@ -130,7 +130,7 @@ func savePNG(_ image: NSImage, to path: String) {
 @MainActor
 func main() {
 let projectDir = FileManager.default.currentDirectoryPath
-let iconsetDir = "/tmp/KeyScribeIcon.iconset"
+let iconsetDir = "/tmp/OpenAssistIcon.iconset"
 let resourcesDir = projectDir + "/Resources"
 
 guard let rawLogo = loadLogoPNG() else {

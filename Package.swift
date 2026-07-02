@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "KeyScribe",
+    name: "OpenAssist",
     platforms: [
         .macOS("13.3")
     ],
     products: [
-        .executable(name: "KeyScribe", targets: ["KeyScribe"])
+        .executable(name: "OpenAssist", targets: ["OpenAssist"])
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
@@ -15,13 +15,13 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "KeyScribe",
+            name: "OpenAssist",
             dependencies: [
                 "whisper",
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "MarkdownUI", package: "swift-markdown-ui")
             ],
-            path: "Sources/KeyScribe",
+            path: "Sources/OpenAssist",
             resources: [.process("../../Resources")]
         ),
         .binaryTarget(
@@ -29,9 +29,9 @@ let package = Package(
             path: "Vendor/Whisper/whisper.xcframework"
         ),
         .testTarget(
-            name: "KeyScribeTests",
-            dependencies: ["KeyScribe"],
-            path: "Tests/KeyScribeTests"
+            name: "OpenAssistTests",
+            dependencies: ["OpenAssist"],
+            path: "Tests/OpenAssistTests"
         )
     ]
 )

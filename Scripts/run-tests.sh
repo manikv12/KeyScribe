@@ -2,109 +2,121 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+SMOKE_TARGET="$(uname -m)-apple-macos13.3"
+
 if [ ! -d "Vendor/Whisper/whisper.xcframework" ]; then
   echo "whisper.xcframework not found, downloading framework..."
   Scripts/update-whisper-framework.sh
 fi
 
-swiftc \
-  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
-  Sources/KeyScribe/Services/DictationInputModeStateMachine.swift \
-  Sources/KeyScribe/Services/TextCleanup.swift \
-  Sources/KeyScribe/Services/RecognitionTuning.swift \
-  Sources/KeyScribe/Services/InsertionDecisionModel.swift \
-  Sources/KeyScribe/Services/InsertionDiagnostics.swift \
-  Sources/KeyScribe/Services/TextInserter.swift \
-  Sources/KeyScribe/Services/InsertionRetryPolicy.swift \
+swiftc -target "$SMOKE_TARGET" \
+  Sources/OpenAssist/Services/ShortcutValidationRules.swift \
+  Sources/OpenAssist/Services/DictationInputModeStateMachine.swift \
+  Sources/OpenAssist/Services/TextCleanup.swift \
+  Sources/OpenAssist/Services/RecognitionTuning.swift \
+  Sources/OpenAssist/Services/InsertionDecisionModel.swift \
+  Sources/OpenAssist/Services/InsertionDiagnostics.swift \
+  Sources/OpenAssist/Services/TextInserter.swift \
+  Sources/OpenAssist/Services/InsertionRetryPolicy.swift \
   Scripts/CoreLogicSmokeTests.swift \
-  -o /tmp/keyscribe-core-smoke-tests
+  -o /tmp/openassist-core-smoke-tests
 
-/tmp/keyscribe-core-smoke-tests
+/tmp/openassist-core-smoke-tests
 Scripts/run-insertion-reliability.sh --regression
 
-swiftc \
-  Sources/KeyScribe/Services/WhisperModelCatalog.swift \
+swiftc -target "$SMOKE_TARGET" \
+  Sources/OpenAssist/Services/WhisperModelCatalog.swift \
   Scripts/WhisperCatalogSmokeTests.swift \
-  -o /tmp/keyscribe-whisper-catalog-smoke-tests
+  -o /tmp/openassist-whisper-catalog-smoke-tests
 
-/tmp/keyscribe-whisper-catalog-smoke-tests
+/tmp/openassist-whisper-catalog-smoke-tests
 
-swiftc \
-  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
-  Sources/KeyScribe/Support/ShortcutValidation.swift \
-  Sources/KeyScribe/Support/FeatureFlags.swift \
-  Sources/KeyScribe/Services/MicrophoneManager.swift \
-  Sources/KeyScribe/Services/TextCleanup.swift \
-  Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
-  Sources/KeyScribe/Services/CrashReporter.swift \
-  Sources/KeyScribe/Services/SettingsStore.swift \
-  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
+swiftc -target "$SMOKE_TARGET" \
+  Sources/OpenAssist/Services/ShortcutValidationRules.swift \
+  Sources/OpenAssist/Support/ShortcutValidation.swift \
+  Sources/OpenAssist/Support/FeatureFlags.swift \
+  Sources/OpenAssist/Services/MicrophoneManager.swift \
+  Sources/OpenAssist/Services/TextCleanup.swift \
+  Sources/OpenAssist/Services/AdaptiveCorrectionStore.swift \
+  Sources/OpenAssist/Services/CrashReporter.swift \
+  Sources/OpenAssist/Services/AutomationAPIModels.swift \
+  Sources/OpenAssist/Services/CodexAutomationSupport.swift \
+  Sources/OpenAssist/Services/SettingsStore.swift \
+  Sources/OpenAssist/Services/PromptRewriteProviderOAuthService.swift \
   Scripts/SettingsStoreWhisperSmokeTests.swift \
-  -o /tmp/keyscribe-settings-whisper-smoke-tests
+  -o /tmp/openassist-settings-whisper-smoke-tests
 
-/tmp/keyscribe-settings-whisper-smoke-tests
+/tmp/openassist-settings-whisper-smoke-tests
 
-swiftc \
-  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
-  Sources/KeyScribe/Support/ShortcutValidation.swift \
-  Sources/KeyScribe/Support/FeatureFlags.swift \
-  Sources/KeyScribe/Services/MicrophoneManager.swift \
-  Sources/KeyScribe/Services/TextCleanup.swift \
-  Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
-  Sources/KeyScribe/Services/CrashReporter.swift \
-  Sources/KeyScribe/Services/SettingsStore.swift \
-  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
-  Sources/KeyScribe/Services/Memory/MemoryModels.swift \
-  Sources/KeyScribe/Services/Memory/MemorySQLiteStore.swift \
-  Sources/KeyScribe/Services/Memory/MemoryRewriteRetrievalService.swift \
-  Sources/KeyScribe/Services/Memory/MemoryRewriteExtractionProvider.swift \
-  Sources/KeyScribe/Services/Memory/ConversationMemoryPromotionService.swift \
-  Sources/KeyScribe/Services/ConversationTagInferenceService.swift \
-  Sources/KeyScribe/Services/LocalAIRuntimeManager.swift \
-  Sources/KeyScribe/Services/PromptRewriteConversationStore.swift \
-  Sources/KeyScribe/Services/PromptRewriteModelCatalogService.swift \
-  Sources/KeyScribe/Services/PromptRewriteService.swift \
+swiftc -target "$SMOKE_TARGET" \
+  Sources/OpenAssist/Services/ShortcutValidationRules.swift \
+  Sources/OpenAssist/Support/ShortcutValidation.swift \
+  Sources/OpenAssist/Support/FeatureFlags.swift \
+  Sources/OpenAssist/Services/MicrophoneManager.swift \
+  Sources/OpenAssist/Services/TextCleanup.swift \
+  Sources/OpenAssist/Services/AdaptiveCorrectionStore.swift \
+  Sources/OpenAssist/Services/CrashReporter.swift \
+  Sources/OpenAssist/Services/AutomationAPIModels.swift \
+  Sources/OpenAssist/Services/CodexAutomationSupport.swift \
+  Sources/OpenAssist/Services/SettingsStore.swift \
+  Sources/OpenAssist/Services/PromptRewriteProviderOAuthService.swift \
+  Sources/OpenAssist/Assistant/AssistantMemoryModels.swift \
+  Sources/OpenAssist/Services/Memory/MemoryModels.swift \
+  Sources/OpenAssist/Services/Memory/MemorySQLiteStore.swift \
+  Sources/OpenAssist/Services/Memory/MemoryRewriteRetrievalService.swift \
+  Sources/OpenAssist/Services/Memory/MemoryRewriteExtractionProvider.swift \
+  Sources/OpenAssist/Services/Memory/ConversationMemoryPromotionService.swift \
+  Sources/OpenAssist/Services/ConversationTagInferenceService.swift \
+  Sources/OpenAssist/Services/LocalAIRuntimeManager.swift \
+  Sources/OpenAssist/Services/PromptRewriteConversationStore.swift \
+  Sources/OpenAssist/Services/PromptRewriteModelCatalogService.swift \
+  Sources/OpenAssist/Services/PromptRewriteService.swift \
   Scripts/PromptRewriteSmokeTests.swift \
-  -o /tmp/keyscribe-prompt-rewrite-smoke-tests
+  -o /tmp/openassist-prompt-rewrite-smoke-tests
 
-/tmp/keyscribe-prompt-rewrite-smoke-tests
+/tmp/openassist-prompt-rewrite-smoke-tests
 
-swiftc \
-  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
-  Sources/KeyScribe/Support/ShortcutValidation.swift \
-  Sources/KeyScribe/Support/FeatureFlags.swift \
-  Sources/KeyScribe/Services/MicrophoneManager.swift \
-  Sources/KeyScribe/Services/TextCleanup.swift \
-  Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
-  Sources/KeyScribe/Services/CrashReporter.swift \
-  Sources/KeyScribe/Services/SettingsStore.swift \
-  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
-  Sources/KeyScribe/Services/PromptRewriteModelCatalogService.swift \
+swiftc -target "$SMOKE_TARGET" \
+  Sources/OpenAssist/Services/ShortcutValidationRules.swift \
+  Sources/OpenAssist/Support/ShortcutValidation.swift \
+  Sources/OpenAssist/Support/FeatureFlags.swift \
+  Sources/OpenAssist/Services/MicrophoneManager.swift \
+  Sources/OpenAssist/Services/TextCleanup.swift \
+  Sources/OpenAssist/Services/AdaptiveCorrectionStore.swift \
+  Sources/OpenAssist/Services/CrashReporter.swift \
+  Sources/OpenAssist/Services/AutomationAPIModels.swift \
+  Sources/OpenAssist/Services/CodexAutomationSupport.swift \
+  Sources/OpenAssist/Services/SettingsStore.swift \
+  Sources/OpenAssist/Services/PromptRewriteProviderOAuthService.swift \
+  Sources/OpenAssist/Services/PromptRewriteModelCatalogService.swift \
   Scripts/PromptRewriteModelCatalogSmokeTests.swift \
-  -o /tmp/keyscribe-prompt-rewrite-model-catalog-smoke-tests
+  -o /tmp/openassist-prompt-rewrite-model-catalog-smoke-tests
 
-/tmp/keyscribe-prompt-rewrite-model-catalog-smoke-tests
+/tmp/openassist-prompt-rewrite-model-catalog-smoke-tests
 
-swiftc \
-  Sources/KeyScribe/Services/Memory/MemoryModels.swift \
-  Sources/KeyScribe/Services/Memory/MemoryProviderDiscoveryService.swift \
-  Sources/KeyScribe/Services/Memory/MemorySourceAdapters.swift \
-  Sources/KeyScribe/Services/ShortcutValidationRules.swift \
-  Sources/KeyScribe/Support/ShortcutValidation.swift \
-  Sources/KeyScribe/Support/FeatureFlags.swift \
-  Sources/KeyScribe/Services/MicrophoneManager.swift \
-  Sources/KeyScribe/Services/TextCleanup.swift \
-  Sources/KeyScribe/Services/AdaptiveCorrectionStore.swift \
-  Sources/KeyScribe/Services/CrashReporter.swift \
-  Sources/KeyScribe/Services/ConversationTagInferenceService.swift \
-  Sources/KeyScribe/Services/SettingsStore.swift \
-  Sources/KeyScribe/Services/PromptRewriteProviderOAuthService.swift \
-  Sources/KeyScribe/Services/PromptRewriteConversationStore.swift \
-  Sources/KeyScribe/Services/Memory/ConversationMemoryPromotionService.swift \
-  Sources/KeyScribe/Services/Memory/MemoryRewriteExtractionProvider.swift \
-  Sources/KeyScribe/Services/Memory/MemorySQLiteStore.swift \
-  Sources/KeyScribe/Services/Memory/MemoryIndexingService.swift \
+swiftc -target "$SMOKE_TARGET" \
+  Sources/OpenAssist/Services/Memory/MemoryModels.swift \
+  Sources/OpenAssist/Services/Memory/MemoryProviderDiscoveryService.swift \
+  Sources/OpenAssist/Services/Memory/MemorySourceAdapters.swift \
+  Sources/OpenAssist/Services/ShortcutValidationRules.swift \
+  Sources/OpenAssist/Support/ShortcutValidation.swift \
+  Sources/OpenAssist/Support/FeatureFlags.swift \
+  Sources/OpenAssist/Services/MicrophoneManager.swift \
+  Sources/OpenAssist/Services/TextCleanup.swift \
+  Sources/OpenAssist/Services/AdaptiveCorrectionStore.swift \
+  Sources/OpenAssist/Services/CrashReporter.swift \
+  Sources/OpenAssist/Services/ConversationTagInferenceService.swift \
+  Sources/OpenAssist/Services/AutomationAPIModels.swift \
+  Sources/OpenAssist/Services/CodexAutomationSupport.swift \
+  Sources/OpenAssist/Services/SettingsStore.swift \
+  Sources/OpenAssist/Services/PromptRewriteProviderOAuthService.swift \
+  Sources/OpenAssist/Services/PromptRewriteConversationStore.swift \
+  Sources/OpenAssist/Assistant/AssistantMemoryModels.swift \
+  Sources/OpenAssist/Services/Memory/ConversationMemoryPromotionService.swift \
+  Sources/OpenAssist/Services/Memory/MemoryRewriteExtractionProvider.swift \
+  Sources/OpenAssist/Services/Memory/MemorySQLiteStore.swift \
+  Sources/OpenAssist/Services/Memory/MemoryIndexingService.swift \
   Scripts/MemoryIndexingSmokeTests.swift \
-  -o /tmp/keyscribe-memory-indexing-smoke-tests
+  -o /tmp/openassist-memory-indexing-smoke-tests
 
-/tmp/keyscribe-memory-indexing-smoke-tests
+/tmp/openassist-memory-indexing-smoke-tests

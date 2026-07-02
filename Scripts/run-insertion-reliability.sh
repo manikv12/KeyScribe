@@ -2,15 +2,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-swiftc \
-  Sources/KeyScribe/Services/InsertionDecisionModel.swift \
-  Sources/KeyScribe/Services/InsertionDiagnostics.swift \
-  Sources/KeyScribe/Services/TextInserter.swift \
+SMOKE_TARGET="$(uname -m)-apple-macos13.3"
+
+swiftc -target "$SMOKE_TARGET" \
+  Sources/OpenAssist/Services/InsertionDecisionModel.swift \
+  Sources/OpenAssist/Services/InsertionDiagnostics.swift \
+  Sources/OpenAssist/Services/TextInserter.swift \
   Scripts/InsertionReliabilityRunner.swift \
-  -o /tmp/keyscribe-insertion-reliability
+  -o /tmp/openassist-insertion-reliability
 
 if [[ $# -eq 0 ]]; then
-  /tmp/keyscribe-insertion-reliability --regression
+  /tmp/openassist-insertion-reliability --regression
 else
-  /tmp/keyscribe-insertion-reliability "$@"
+  /tmp/openassist-insertion-reliability "$@"
 fi

@@ -1,6 +1,6 @@
 # AI Rewrite and Context
 
-AI rewrite in KeyScribe is optional and configurable. You can keep dictation raw, lightly refine it, or strongly rewrite it based on your goals.
+AI rewrite in Open Assist is optional and configurable. You can keep dictation raw, lightly refine it, or strongly rewrite it based on your goals.
 
 ## Supported providers
 
@@ -15,7 +15,7 @@ AI rewrite in KeyScribe is optional and configurable. You can keep dictation raw
 
 Use built-in setup from:
 
-`Settings -> AI Models -> Open AI Studio -> Prompt Models`
+`Settings -> AI Models -> AI Studio -> Prompt Models`
 
 Then:
 
@@ -33,7 +33,7 @@ If local AI later fails, run `Repair Local AI` from AI Studio.
 
 ## Conversation context
 
-KeyScribe can track prior turns per app/thread so rewrites are aware of what you already said.
+Open Assist can track prior turns per app/thread so rewrites are aware of what you already said.
 
 Benefits:
 
